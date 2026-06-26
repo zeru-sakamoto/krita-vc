@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+/* Self-hosted fonts (offline-safe for the desktop app) */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+
+/* ============================================================
+ * Design tokens — mapped from DESIGN.md into Tailwind's @theme
+ * so they surface as utilities (bg-surface-2, text-text-muted,
+ * font-mono, rounded-panel, shadow-float, ...).
+ * ============================================================ */
+@theme {
+  /* Base palette */
+  --color-bg: #131210;
+  --color-surface: #1e1c1a;
+  --color-surface-2: #252320;
+  --color-surface-3: #2c2a27;
+  --color-border: #2d2b28;
+  --color-accent: #e07b39;
+  --color-text: #f0ede8;
+  --color-text-muted: #7a7570;
+  --color-danger: #c84b31;
+
+  /* Status colors (fg variants used for text/icons) */
+  --color-success: #3a7d44;
+  --color-success-fg: #6fcf97;
+  --color-warning: #c49a28;
+  --color-warning-fg: #f2c94c;
+  --color-info: #2d6ea8;
+  --color-info-fg: #56b4e9;
+
+  /* Diff colors */
+  --color-diff-add: #1e3a2f;
+  --color-diff-add-fg: #6fcf97;
+  --color-diff-del: #3a1e1e;
+  --color-diff-del-fg: #eb5757;
+
+  /* Typefaces */
+  --font-ui: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+
+  /* Border radius (Krita near-square corners) */
+  --radius-button: 3px;
+  --radius-panel: 4px;
+  --radius-badge: 2px;
+  --radius-modal: 6px;
+
+  /* Elevation — floating elements only */
+  --shadow-float: 0 4px 16px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 8px 32px rgba(0, 0, 0, 0.7);
+}
+
+/* ============================================================
+ * Tokens Tailwind utilities don't cover cleanly — plain :root
+ * ============================================================ */
+:root {
+  /* Easing curves */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Duration scale */
+  --dur-instant: 100ms;
+  --dur-fast: 160ms;
+  --dur-normal: 220ms;
+  --dur-slow: 320ms;
+
+  /* Z-index scale */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-overlay: 20;
+  --z-panel: 30;
+  --z-modal: 40;
+  --z-toast: 50;
+  --z-tooltip: 60;
+
+  color-scheme: dark;
+}
+
+/* ============================================================
+ * Base / reset
+ * ============================================================ */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden; /* desktop shell — panels scroll internally */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* App chrome should not feel like a web document */
+  user-select: none;
+  cursor: default;
+}
+
+/* Re-enable selection for content the user actually reads */
+.selectable,
+.font-mono {
+  user-select: text;
+}
+
+/* ============================================================
+ * Focus ring — exactly per DESIGN.md (instant, never animated)
+ * ============================================================ */
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 50%, transparent);
+  outline-offset: 2px;
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ============================================================
+ * Thin custom scrollbars — matches the dense tool aesthetic
+ * ============================================================ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-3) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-surface-3);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-surface-3) 60%, var(--color-text-muted));
+  background-clip: content-box;
+}
+
+/* ============================================================
+ * Reduced motion — collapse to <=150ms opacity-only crossfade
+ * ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.15s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.15s !important;
+    transition-property: opacity !important;
+    scroll-behavior: auto !important;
+  }
+}
