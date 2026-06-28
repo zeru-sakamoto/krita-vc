@@ -7,7 +7,7 @@
     "dev": "vite",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"index.html\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"index.html\"",
-    "build": "npm run format && tsc && vite build",
+    "build": "npm run format && cargo fmt --manifest-path src-tauri/Cargo.toml && tsc && vite build",
     "preview": "vite preview",
     "screenshots": "node scripts/screenshots.mjs",
     "tauri": "tauri"
@@ -15,6 +15,7 @@
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

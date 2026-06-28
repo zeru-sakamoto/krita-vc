@@ -1,6 +1,7 @@
 import { GitBranch } from "@phosphor-icons/react";
 import { assetName } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
+import { useRepository } from "../../lib/repository";
 
 interface StatusBarProps {
   /** Currently focused file (left zone) */
@@ -21,8 +22,19 @@ function Separator() {
  */
 export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarProps) {
   const { artistMode } = useArtistMode();
+  const { saving } = useRepository();
   return (
-    <footer className="flex h-6 shrink-0 items-center justify-between border-t border-border bg-surface px-3 text-[11px] text-text-muted">
+    <footer className="relative flex h-6 shrink-0 items-center justify-between border-t border-border bg-surface px-3 text-[11px] text-text-muted">
+      {/* Indeterminate save progress — only while a commit is being written */}
+      {saving && (
+        <div
+          role="progressbar"
+          aria-label="Saving version"
+          className="absolute inset-x-0 -top-px h-0.5 overflow-hidden"
+        >
+          <div className="h-full w-2/5 animate-indeterminate rounded-full bg-accent" />
+        </div>
+      )}
       {/* Left zone — active file */}
       <div className="flex min-w-0 items-center gap-1.5">
         {activeFile ? (

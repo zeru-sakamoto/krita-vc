@@ -8,13 +8,15 @@ Tauri 2 + React 19 + TypeScript desktop app — a version-control client for Kri
 This is a **local-only VCS**: there is intentionally **no remote/push/pull/sync** — no remotes,
 no fetch, no cloud sync. The UI exposes only local operations (commit history, local branches,
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
-The **frontend UI is built out and driven entirely by mock data** (`src/data/`); there is **no
-real backend yet** — nothing talks to git or the filesystem. The Rust side is still the
-scaffolded `greet` command. There is no test runner or linter configured yet — if you add one,
-update this file with the relevant commands.
+The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
+tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`; commands
+in `commands.rs`). The frontend drives it via Tauri `invoke` in the desktop shell (history, scan,
+commit, repo lifecycle) and **falls back to mock data** (`src/data/`) in a plain browser
+(`npm run dev`). Diff rendering is still mock-fed until per-commit diffs are wired up. Rust tests
+live in `src-tauri/tests/`; the frontend has no test runner yet — if you add one, update this file.
 
-Deeper docs live in [`docs/`](docs/README.md): frontend architecture, the visual diff viewer,
-and the mock-data model.
+Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
+control (the backend), and the visual diff viewer.
 
 ## Commands
 
@@ -29,7 +31,7 @@ Package manager is npm (`package-lock.json` is present).
 
 Rust side (run from `src-tauri/`):
 - `cargo check` / `cargo build` — compile the Rust backend without going through the Tauri CLI
-- `cargo test` — run Rust unit tests (none exist yet)
+- `cargo test` — run the Rust tests (engine integration tests in `src-tauri/tests/`)
 
 ## Architecture
 
@@ -58,17 +60,22 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   `Sidebar` (resizable, content switches on the active view) | `MainPanel` (diff) | `Inspector`
   (commit metadata) — plus `StatusBar`.
 - **Repositories** (`src/lib/repository.tsx`): a local repository is a folder the user designates
-  (local-only — no remotes). The `TopBar` switcher selects among them; the selected id persists to
-  `localStorage`. Still **mock** — `MOCK_REPOSITORIES` is illustrative, there is no native folder
-  picker yet (no Tauri dialog plugin), and every repo shows the same commits/branches until the
-  backend lands. "Add repository…" appends a placeholder.
+  (local-only — no remotes). The `TopBar` switcher selects among them; the list + selected id
+  persist to `localStorage`. In the desktop shell, Create/Browse open a native folder picker
+  (`tauri-plugin-dialog`) and init a `.kvc/` store (`init_repository`); commits/history/changes
+  come from the backend keyed by the selected path. In a plain browser there is no picker —
+  `MOCK_REPOSITORIES` seeds the list and "Add repository…" appends a placeholder.
 - **UI primitives** (`src/components/ui/`): `Button.tsx`, `IconButton.tsx` (flat Krita-style, no
   background until hover), `Menu.tsx` (dropdown with outside-click + Esc to close). Shared across
   shell and VCS components.
 - **VCS components** (`src/components/vcs/`): commit cards, the git-style history graph
   (`CommitGraph` + `CommitGraphRail`, lane layout from `lib/graph.ts`; lane colors are a deliberate
   functional exception to the single-accent rule), branch badge, file-status chip, the sidebar
-  panels (`ChangesPanel`, `BranchesPanel` — local branches only), and the diff viewer
+  panels (`ChangesPanel` — working-tree changes with per-file + stage-all/unstage-all toggles;
+  staging is cosmetic since `commit_snapshot` captures the whole tree; while a commit is in flight
+  the staging controls lock, the commit button spins, and the `StatusBar` shows a progress bar, via
+  the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local branches
+  only), and the diff viewer
   (`DiffView`, `ArtDiffView`, `PaletteDiffView`, `LayerStackPanel`, `ArtCanvas`, `CompareSlider`).
 - **Main panel** (`src/components/MainPanel.tsx`): thin wrapper between `AppShell` and `DiffView`;
   handles the empty-state when no commit is selected.

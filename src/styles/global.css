@@ -50,6 +50,17 @@
   /* Elevation — floating elements only */
   --shadow-float: 0 4px 16px rgba(0, 0, 0, 0.5);
   --shadow-modal: 0 8px 32px rgba(0, 0, 0, 0.7);
+
+  /* Indeterminate progress bar (StatusBar, while a commit is saving) */
+  --animate-indeterminate: indeterminate 1.1s ease-in-out infinite;
+  @keyframes indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(350%);
+    }
+  }
 }
 
 /* ============================================================

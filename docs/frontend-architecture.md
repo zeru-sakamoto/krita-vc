@@ -1,7 +1,10 @@
 # Frontend Architecture
 
-The frontend is a Vite + React 19 + TypeScript app rendered in the Tauri webview. It is currently
-**mock-data-driven**: all state originates from `src/data/` and no Tauri `invoke` calls are made yet.
+The frontend is a Vite + React 19 + TypeScript app rendered in the Tauri webview. In the desktop
+shell it drives the real Rust backend through Tauri `invoke` (commit history, working-tree scan,
+repository lifecycle — see [version-control.md](version-control.md)); in a plain browser
+(`npm run dev`) it falls back to the mock modules in `src/data/`. Diff rendering is still
+mock-fed until per-commit diffs are wired up.
 
 ## Styling
 
@@ -59,11 +62,14 @@ Two pieces of state live **outside** `AppShell`, each in a React context so any 
 them without prop-drilling: the global Artist Mode flag
 ([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)) and the
 selected repository ([`src/lib/repository.tsx`](../src/lib/repository.tsx) — list + `currentId`,
-persisted to `localStorage`; the `TopBar` switcher reads it). Both providers are mounted in
+persisted to `localStorage`; the `TopBar` switcher reads it). The repository context also owns
+`refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `scanning`
+busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a commit,
+`scanning` spins the Changes refresh button. Both providers are mounted in
 [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
-(`Sidebar`), the art-diff canvas height (`ArtDiffView`), staging toggles (`ChangesPanel`),
+(`Sidebar`), the art-diff canvas height (`ArtDiffView`), per-file staging toggles (`ChangesPanel`),
 checked-out branch (`BranchesPanel`), and the diff view/compare/highlight controls (`ArtDiffView`).
 Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize.ts) hook
 (pointer-capture drag, clamped, persisted under a `krita-vc:` key).
@@ -80,7 +86,10 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   to the single-accent rule (accent for the mainline, then `info`/`success`/`warning` tokens).
   Selection drives the main panel.
 - **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): working-tree changes
-  grouped Staged / Unstaged; stage/unstage is mock-only local state.
+  (from `scan_repository`, or mock data in the browser) grouped Staged / Unstaged, with per-file
+  and **Stage all / Unstage all** toggles. Staging is cosmetic — `commit_snapshot` captures the
+  whole working tree. While a commit is in flight the staging controls lock, the commit button
+  shows a spinner, and the `StatusBar` shows an indeterminate progress bar (shared `saving` flag).
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
   list; checkout sets a local highlight only. This is a local-only VCS — there are no remotes.
 

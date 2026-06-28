@@ -1,24 +1,46 @@
-import { useState } from "react";
-import { Minus, Plus } from "@phosphor-icons/react";
+import { useEffect, useState } from "react";
+import { CircleNotch, Minus, Plus } from "@phosphor-icons/react";
+import { invoke } from "@tauri-apps/api/core";
 import type { WorkingChange } from "../../types";
 import { FileStatusChip } from "./FileStatusChip";
+import { useRepository } from "../../lib/repository";
+import { inTauri } from "../../lib/tauri";
+import { MOCK_WORKING_CHANGES } from "../../data/mockData";
 
 function Section({
   title,
   items,
   action,
   onToggle,
+  onToggleAll,
+  disabled,
 }: {
   title: string;
   items: WorkingChange[];
   action: "stage" | "unstage";
   onToggle: (path: string) => void;
+  /** Stage all / unstage all. */
+  onToggleAll: () => void;
+  /** True while a commit is in flight — staging is locked. */
+  disabled: boolean;
 }) {
   return (
     <div>
-      <h3 className="flex h-8 shrink-0 items-center justify-between px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
-        {title}
-        <span>{items.length}</span>
+      <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
+        <span className="flex items-center gap-2">
+          {title}
+          <span className="text-text-muted/70">{items.length}</span>
+        </span>
+        {items.length > 0 && (
+          <button
+            type="button"
+            onClick={onToggleAll}
+            disabled={disabled}
+            className="rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-white/5 hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            {action === "stage" ? "Stage all" : "Unstage all"}
+          </button>
+        )}
       </h3>
       <ul className="flex flex-col">
         {items.map(({ change }) => (
@@ -35,7 +57,8 @@ function Section({
               title={action === "stage" ? "Stage" : "Unstage"}
               aria-label={action === "stage" ? "Stage file" : "Unstage file"}
               onClick={() => onToggle(change.path)}
-              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-white/5 hover:text-text group-hover:opacity-100"
+              disabled={disabled}
+              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-white/5 hover:text-text group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {action === "stage" ? <Plus size={13} /> : <Minus size={13} />}
             </button>
@@ -50,23 +73,117 @@ function Section({
 }
 
 /**
- * Working-tree changes, grouped into Staged / Unstaged. Staging is mock-only
- * (toggles local state for feel) — no backend git involvement.
+ * Working-tree changes from the real scanner (`scan_repository`) for the selected
+ * repository. In a plain browser (no backend) it falls back to mock data. Staging is
+ * cosmetic local state — this VCS commits the whole working tree, not a staging area.
  */
-export function ChangesPanel({ changes }: { changes: WorkingChange[] }) {
-  const [items, setItems] = useState(changes);
+export function ChangesPanel() {
+  const { current, refreshNonce, refresh, saving, setSaving, setScanning } = useRepository();
+  const [items, setItems] = useState<WorkingChange[]>(inTauri() ? [] : MOCK_WORKING_CHANGES);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    if (!inTauri()) {
+      setItems(MOCK_WORKING_CHANGES);
+      return;
+    }
+    let cancelled = false;
+    setScanning(true);
+    invoke<WorkingChange[]>("scan_repository", { path: current.path })
+      .then((changes) => {
+        if (!cancelled) {
+          setItems(changes);
+          setError(null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setItems([]);
+          setError(String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setScanning(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [current.path, refreshNonce, setScanning]);
 
   const toggle = (path: string) =>
     setItems((prev) => prev.map((c) => (c.change.path === path ? { ...c, staged: !c.staged } : c)));
+  const setAll = (staged: boolean) => setItems((prev) => prev.map((c) => ({ ...c, staged })));
+
+  const commit = async () => {
+    if (!message.trim() || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await invoke("commit_snapshot", {
+        path: current.path,
+        message: message.trim(),
+        author: "You",
+      });
+      setMessage("");
+      refresh(); // refetch changes (now clean) + history
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (error && items.length === 0) {
+    return (
+      <p className="px-3 py-2 text-[12px] text-text-muted">Couldn’t scan this folder: {error}</p>
+    );
+  }
 
   const staged = items.filter((c) => c.staged);
   const unstaged = items.filter((c) => !c.staged);
 
   return (
     <div className="flex flex-col">
-      <Section title="Staged" items={staged} action="unstage" onToggle={toggle} />
+      <Section
+        title="Staged"
+        items={staged}
+        action="unstage"
+        onToggle={toggle}
+        onToggleAll={() => setAll(false)}
+        disabled={saving}
+      />
       <div className="my-1 h-px bg-border" />
-      <Section title="Changes" items={unstaged} action="stage" onToggle={toggle} />
+      <Section
+        title="Changes"
+        items={unstaged}
+        action="stage"
+        onToggle={toggle}
+        onToggleAll={() => setAll(true)}
+        disabled={saving}
+      />
+
+      {inTauri() && (
+        <div className="mt-1 flex flex-col gap-2 border-t border-border p-3">
+          <textarea
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            placeholder="Describe this version…"
+            rows={2}
+            className="resize-none rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+          />
+          {error && <p className="text-[11px] text-danger">{error}</p>}
+          <button
+            type="button"
+            onClick={commit}
+            disabled={!message.trim() || items.length === 0 || saving}
+            className="flex items-center justify-center gap-1.5 rounded-button bg-accent/15 px-2 py-1.5 text-[12px] font-medium text-accent transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {saving && <CircleNotch size={13} className="animate-spin" />}
+            {saving ? "Saving version…" : "Commit version"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

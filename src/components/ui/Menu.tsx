@@ -9,6 +9,8 @@ export interface MenuItem {
   detail?: string;
   /** Marks the currently active item (shows a check + accent text). */
   selected?: boolean;
+  /** Optional trailing action (e.g. a remove button), revealed on row hover. */
+  action?: React.ReactNode;
   onSelect: () => void;
 }
 
@@ -16,8 +18,8 @@ interface MenuProps {
   /** Render-prop for the trigger; receives whether the menu is open. */
   trigger: (open: boolean) => React.ReactNode;
   items: MenuItem[];
-  /** Optional sticky action row pinned to the bottom (e.g. "Add repository…"). */
-  footer?: MenuItem;
+  /** Optional sticky action rows pinned to the bottom (e.g. "Create"/"Browse"). */
+  footer?: MenuItem[];
   /** Min width of the popover. */
   minWidth?: number;
 }
@@ -49,33 +51,39 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
   }, [open]);
 
   const renderItem = (item: MenuItem) => (
-    <button
-      key={item.id}
-      type="button"
-      role="menuitem"
-      onClick={() => {
-        item.onSelect();
-        setOpen(false);
-      }}
-      className={[
-        "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
-        "transition-colors hover:bg-white/5",
-        item.selected ? "text-accent" : "text-text",
-      ].join(" ")}
-    >
-      {item.icon && <span className="shrink-0 text-text-muted">{item.icon}</span>}
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate">{item.label}</span>
-        {item.detail && (
-          <span className="truncate font-mono text-[10px] text-text-muted">{item.detail}</span>
+    <div key={item.id} className="group relative flex items-center">
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          item.onSelect();
+          setOpen(false);
+        }}
+        className={[
+          "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
+          "transition-colors hover:bg-white/5",
+          item.selected ? "text-accent" : "text-text",
+        ].join(" ")}
+      >
+        {item.icon && <span className="shrink-0 text-text-muted">{item.icon}</span>}
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate">{item.label}</span>
+          {item.detail && (
+            <span className="truncate font-mono text-[10px] text-text-muted">{item.detail}</span>
+          )}
+        </span>
+        {item.selected && (
+          <span aria-hidden className="shrink-0 text-accent">
+            ✓
+          </span>
         )}
-      </span>
-      {item.selected && (
-        <span aria-hidden className="shrink-0 text-accent">
-          ✓
+      </button>
+      {item.action && (
+        <span className="absolute right-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+          {item.action}
         </span>
       )}
-    </button>
+    </div>
   );
 
   return (
@@ -95,10 +103,12 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
           id={menuId}
           role="menu"
           style={{ minWidth }}
-          className="absolute left-0 top-[calc(100%+4px)] z-(--z-overlay) overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)"
+          className="absolute left-0 top-[calc(100%+4px)] z-(--z-modal) overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)"
         >
           <div className="max-h-72 overflow-auto py-1">{items.map(renderItem)}</div>
-          {footer && <div className="border-t border-border py-1">{renderItem(footer)}</div>}
+          {footer && footer.length > 0 && (
+            <div className="border-t border-border py-1">{footer.map(renderItem)}</div>
+          )}
         </div>
       )}
     </div>

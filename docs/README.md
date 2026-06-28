@@ -2,18 +2,18 @@
 
 Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + TypeScript).
 
-> **Status:** the frontend is fully built but **driven by mock data** — nothing talks to git or
-> the filesystem yet. The Rust backend is still the scaffolded `greet` command. These docs describe
-> the frontend as it stands and mark the seams where the real backend will plug in.
+> **Status:** the Rust backend is a working custom local VCS (the `.kvc/` store — see below); the
+> frontend calls it through Tauri commands in the desktop shell and falls back to mock data
+> (`src/data/`) in a plain browser. Diff rendering is still mock until per-commit diffs are wired up.
 
 ## Contents
 
 - [**Frontend architecture**](frontend-architecture.md) — app shell, the four zones, state
   ownership, the component map, and **Artist Mode** (the global friendly-labels toggle).
+- [**File tracking & version control**](version-control.md) — the Rust backend: the `.kvc/` store,
+  the scanner, commits, delta-chain storage, the `.kra` tile engine, and the Tauri commands.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, the generated-SVG mock art, and the highlight/compare modes.
-- [**Mock data model**](mock-data.md) — the domain types in `src/types.ts` and the mock modules in
-  `src/data/`, plus the plan for replacing them with a real backend.
 
 ## See also
 

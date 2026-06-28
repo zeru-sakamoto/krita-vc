@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PaintBrush, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { Sidebar } from "./Sidebar";
@@ -7,8 +7,10 @@ import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
 import { MainPanel } from "../MainPanel";
 import { IconButton } from "../ui/IconButton";
-import { MOCK_BRANCHES, MOCK_COMMITS, MOCK_DIFF_BY_COMMIT } from "../../data/mockData";
+import { MOCK_BRANCHES, MOCK_DIFF_BY_COMMIT } from "../../data/mockData";
 import { useArtistMode } from "../../lib/artistMode";
+import { useRepository } from "../../lib/repository";
+import { useCommits } from "../../lib/repoData";
 import { versionLabel, versionNumbers } from "../../lib/friendly";
 
 /**
@@ -18,18 +20,29 @@ import { versionLabel, versionNumbers } from "../../lib/friendly";
  */
 export function AppShell() {
   const { artistMode, toggle: toggleArtistMode } = useArtistMode();
+  const { current, refreshNonce } = useRepository();
+  const commits = useCommits(current.path, refreshNonce);
   const [activeView, setActiveView] = useState<ActivityView>("history");
-  const [selectedId, setSelectedId] = useState<string | null>(MOCK_COMMITS[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+
+  // Keep a valid selection as history loads/changes (default to the newest commit).
+  useEffect(() => {
+    if (commits.length === 0) {
+      setSelectedId(null);
+    } else if (!commits.some((c) => c.id === selectedId)) {
+      setSelectedId(commits[0].id);
+    }
+  }, [commits, selectedId]);
 
   const currentBranch = useMemo(
     () => MOCK_BRANCHES.find((b) => b.kind === "current") ?? MOCK_BRANCHES[0],
     []
   );
-  const versions = useMemo(() => versionNumbers(MOCK_COMMITS), []);
+  const versions = useMemo(() => versionNumbers(commits), [commits]);
   const selectedCommit = useMemo(
-    () => MOCK_COMMITS.find((c) => c.id === selectedId) ?? null,
-    [selectedId]
+    () => commits.find((c) => c.id === selectedId) ?? null,
+    [commits, selectedId]
   );
   const selectedVersion = selectedId ? (versions.get(selectedId) ?? 0) : 0;
   const diff = selectedId ? (MOCK_DIFF_BY_COMMIT[selectedId] ?? []) : [];
@@ -46,7 +59,7 @@ export function AppShell() {
         <div className="flex min-w-0 flex-1 border-l border-border">
           <Sidebar
             view={activeView}
-            commits={MOCK_COMMITS}
+            commits={commits}
             currentBranch={currentBranch}
             selectedId={selectedId}
             onSelect={setSelectedId}
@@ -116,7 +129,7 @@ export function AppShell() {
         activeFile={activeFile}
         dirty
         branch={currentBranch.name}
-        commitCount={MOCK_COMMITS.length}
+        commitCount={commits.length}
       />
     </div>
   );

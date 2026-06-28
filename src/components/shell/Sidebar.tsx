@@ -1,4 +1,4 @@
-import { CaretDown, DotsThreeVertical } from "@phosphor-icons/react";
+import { ArrowsClockwise, CaretDown, DotsThreeVertical } from "@phosphor-icons/react";
 import { DockerPanel } from "./DockerPanel";
 import type { ActivityView } from "./ActivityBar";
 import { IconButton } from "../ui/IconButton";
@@ -6,8 +6,9 @@ import { BranchBadge } from "../vcs/BranchBadge";
 import { CommitGraph } from "../vcs/CommitGraph";
 import { ChangesPanel } from "../vcs/ChangesPanel";
 import { BranchesPanel } from "../vcs/BranchesPanel";
-import { MOCK_BRANCHES, MOCK_WORKING_CHANGES } from "../../data/mockData";
+import { MOCK_BRANCHES } from "../../data/mockData";
 import { useResize } from "../../lib/useResize";
+import { useRepository } from "../../lib/repository";
 import type { Branch, Commit } from "../../types";
 
 const PANEL_TITLE: Record<ActivityView, string> = {
@@ -30,6 +31,7 @@ interface SidebarProps {
  * (DESIGN.md → Layout & App Shell → Sidebar / Resize handle)
  */
 export function Sidebar({ view, commits, currentBranch, selectedId, onSelect }: SidebarProps) {
+  const { refresh, scanning } = useRepository();
   const {
     size: width,
     onPointerDown,
@@ -48,7 +50,20 @@ export function Sidebar({ view, commits, currentBranch, selectedId, onSelect }: 
       <DockerPanel
         title={PANEL_TITLE[view]}
         className="flex-1"
-        actions={<IconButton icon={DotsThreeVertical} label="Panel options" size={16} />}
+        actions={
+          view === "changes" ? (
+            <IconButton
+              icon={ArrowsClockwise}
+              label="Rescan for changes"
+              size={16}
+              spinning={scanning}
+              disabled={scanning}
+              onClick={refresh}
+            />
+          ) : (
+            <IconButton icon={DotsThreeVertical} label="Panel options" size={16} />
+          )
+        }
       >
         {view === "history" && (
           <>
@@ -69,7 +84,7 @@ export function Sidebar({ view, commits, currentBranch, selectedId, onSelect }: 
           </>
         )}
 
-        {view === "changes" && <ChangesPanel changes={MOCK_WORKING_CHANGES} />}
+        {view === "changes" && <ChangesPanel />}
 
         {view === "branches" && <BranchesPanel branches={MOCK_BRANCHES} />}
       </DockerPanel>

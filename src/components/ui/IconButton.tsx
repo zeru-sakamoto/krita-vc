@@ -9,6 +9,8 @@ interface IconButtonProps {
   /** Icon px size — 20 default, 16 dense (docker headers), 24 toolbar */
   size?: number;
   disabled?: boolean;
+  /** Spin the icon (in-progress feedback, e.g. a rescan). */
+  spinning?: boolean;
   onClick?: () => void;
 }
 
@@ -22,6 +24,7 @@ export function IconButton({
   active = false,
   size = 20,
   disabled = false,
+  spinning = false,
   onClick,
 }: IconButtonProps) {
   return (
@@ -40,7 +43,7 @@ export function IconButton({
         active ? "bg-accent/12 text-text" : "",
       ].join(" ")}
     >
-      <IconCmp size={size} weight="regular" />
+      <IconCmp size={size} weight="regular" className={spinning ? "animate-spin" : undefined} />
     </button>
   );
 }
