@@ -60,6 +60,9 @@ fn rel_path(root: &Path, path: &Path) -> String {
 fn walk_err(e: walkdir::Error) -> KvcError {
     match e.into_io_error() {
         Some(io) => KvcError::Io(io),
-        None => KvcError::Io(io::Error::new(io::ErrorKind::Other, "directory walk failed")),
+        None => KvcError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            "directory walk failed",
+        )),
     }
 }

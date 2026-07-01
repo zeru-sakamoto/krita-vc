@@ -7,11 +7,11 @@ import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
 import { MainPanel } from "../MainPanel";
 import { IconButton } from "../ui/IconButton";
-import { MOCK_BRANCHES, MOCK_DIFF_BY_COMMIT } from "../../data/mockData";
+import { MOCK_BRANCHES } from "../../data/mockData";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
-import { useCommits } from "../../lib/repoData";
-import { versionLabel, versionNumbers } from "../../lib/friendly";
+import { useCommits, useCommitDiff, useWorkingDiff } from "../../lib/repoData";
+import { versionLabel, versionNumbers, assetName } from "../../lib/friendly";
 
 /**
  * Root application shell — owns layout + view state, wires the four zones
@@ -24,6 +24,7 @@ export function AppShell() {
   const commits = useCommits(current.path, refreshNonce);
   const [activeView, setActiveView] = useState<ActivityView>("history");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [focusedFile, setFocusedFile] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(true);
 
   // Keep a valid selection as history loads/changes (default to the newest commit).
@@ -45,8 +46,21 @@ export function AppShell() {
     [commits, selectedId]
   );
   const selectedVersion = selectedId ? (versions.get(selectedId) ?? 0) : 0;
-  const diff = selectedId ? (MOCK_DIFF_BY_COMMIT[selectedId] ?? []) : [];
+
+  // In the Changes view, a clicked file shows its working-tree diff; otherwise the selected
+  // commit's diff. Both hooks run (the inactive one gets a null id and stays empty).
+  const showWorking = activeView === "changes" && focusedFile != null;
+  const commitDiff = useCommitDiff(current.path, selectedId, refreshNonce);
+  const workingDiff = useWorkingDiff(current.path, showWorking ? focusedFile : null, refreshNonce);
+  const { entries: diff, error: diffError } = showWorking ? workingDiff : commitDiff;
   const activeFile = diff[0]?.path ?? null;
+
+  const emptyHint =
+    activeView === "changes"
+      ? "Select a changed file to preview."
+      : artistMode
+        ? "Select a version to view its changes."
+        : "Select a commit to view its diff.";
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-text">
@@ -63,12 +77,23 @@ export function AppShell() {
             currentBranch={currentBranch}
             selectedId={selectedId}
             onSelect={setSelectedId}
+            focusedFile={focusedFile}
+            onFocusFile={setFocusedFile}
           />
 
           <div className="flex min-w-0 flex-1 flex-col border-l border-border">
             {/* Toolbar — commit context (left) + inspector toggle (right) */}
             <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-              {selectedCommit ? (
+              {showWorking ? (
+                <>
+                  <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+                    Unsaved changes
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[13px] text-text">
+                    {artistMode ? assetName(focusedFile) : focusedFile}
+                  </span>
+                </>
+              ) : selectedCommit ? (
                 <>
                   <span
                     className={[
@@ -112,7 +137,7 @@ export function AppShell() {
             </div>
 
             <div className="flex min-h-0 flex-1">
-              <MainPanel commit={selectedCommit} diff={diff} />
+              <MainPanel diff={diff} error={diffError} emptyHint={emptyHint} />
               {inspectorOpen && (
                 <Inspector
                   commit={selectedCommit}

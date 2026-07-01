@@ -60,11 +60,18 @@ pub fn parse(bytes: &[u8]) -> Result<TiledBlock> {
         let compression = parts[2].to_string();
         let len: usize = parts[3].parse().map_err(|_| bad("bad tile len"))?;
 
-        let end = pos.checked_add(len).filter(|&e| e <= bytes.len())
+        let end = pos
+            .checked_add(len)
+            .filter(|&e| e <= bytes.len())
             .ok_or_else(|| bad("tile data past end of block"))?;
         let data = bytes[pos..end].to_vec();
         pos = end;
-        tiles.push(Tile { x, y, compression, data });
+        tiles.push(Tile {
+            x,
+            y,
+            compression,
+            data,
+        });
     }
 
     Ok(TiledBlock { header, tiles })

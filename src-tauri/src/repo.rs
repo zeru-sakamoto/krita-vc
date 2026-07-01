@@ -36,7 +36,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { version: 1, delta_chain_max: 20, tile_size: 64 }
+        Config {
+            version: 1,
+            delta_chain_max: 20,
+            tile_size: 64,
+        }
     }
 }
 
@@ -167,8 +171,7 @@ impl Repo {
 /// Atomic JSON write: serialize to a temp file in the same dir, then rename over the
 /// target (Rust's `fs::rename` replaces the destination on Windows and POSIX).
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| io_at(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
@@ -177,7 +180,8 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).map_err(|e| io_at(path, e))?;
-    serde_json::from_slice(&bytes).map_err(|e| KvcError::BadIndex(format!("{}: {e}", path.display())))
+    serde_json::from_slice(&bytes)
+        .map_err(|e| KvcError::BadIndex(format!("{}: {e}", path.display())))
 }
 
 /// blake3 of a byte slice as lowercase hex.

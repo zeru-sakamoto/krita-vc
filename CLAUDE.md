@@ -11,9 +11,10 @@ working-tree changes). Don't add remote-facing affordances unless the project sc
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`; commands
 in `commands.rs`). The frontend drives it via Tauri `invoke` in the desktop shell (history, scan,
-commit, repo lifecycle) and **falls back to mock data** (`src/data/`) in a plain browser
-(`npm run dev`). Diff rendering is still mock-fed until per-commit diffs are wired up. Rust tests
-live in `src-tauri/tests/`; the frontend has no test runner yet — if you add one, update this file.
+commit, repo lifecycle, rollback/undo, and per-commit visual diffs) and **falls back to mock
+data** (`src/data/`) in a plain browser (`npm run dev`). `.kra` diffs are real (per-layer PNG
+rasters + composite via `commit_diff`); non-`.kra` diffs are still minimal/mock. Rust tests live
+in `src-tauri/tests/`; the frontend has no test runner yet — if you add one, update this file.
 
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
 control (the backend), and the visual diff viewer.
@@ -82,7 +83,10 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
 - **Diff viewer** — `DiffView` routes each `DiffEntry` by `kind`: art (`.kra`) files render as a
   **visual layer diff** (`ArtDiffView` → `LayerStackPanel` + `ArtCanvas`/`CompareSlider`) inside a
   **drag-resizable region** (vertical handle on its bottom edge; height persisted via `useResize`,
-  content scrolls when shrunk). Palette (`.gpl`) files have `kind: "palette"` and always render
+  content scrolls when shrunk). Real `.kra` diffs arrive via `commit_diff` (`useCommitDiff`);
+  each layer's raster comes as SVG `<image>` markup so the SVG-compositing viewer is unchanged,
+  and the Composite view uses the `.kra`'s `mergedimage.png`. Palette (`.gpl`) files have
+  `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**
   Artist Mode gated. Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`

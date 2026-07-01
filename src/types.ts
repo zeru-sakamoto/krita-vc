@@ -101,6 +101,13 @@ export interface ArtDiff {
   layers: ArtLayer[];
   /** Changed-region boxes for the highlight overlay. */
   regions: ChangeRegion[];
+  /**
+   * Composite (whole-image) markup for each state, used for the "Composite" view when the
+   * backend supplies it (real `.kra` mergedimage.png). When absent, the composite is derived
+   * by stacking `layers` (the mock-data path). null = no such state (added/removed file).
+   */
+  beforeImage?: string | null;
+  afterImage?: string | null;
 }
 
 export type SwatchChange = "added" | "removed" | "modified" | "unchanged";

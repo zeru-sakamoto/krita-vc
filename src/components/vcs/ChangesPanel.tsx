@@ -14,6 +14,8 @@ function Section({
   onToggle,
   onToggleAll,
   disabled,
+  focusedFile,
+  onFocusFile,
 }: {
   title: string;
   items: WorkingChange[];
@@ -23,6 +25,9 @@ function Section({
   onToggleAll: () => void;
   /** True while a commit is in flight — staging is locked. */
   disabled: boolean;
+  /** File whose working-tree diff is currently shown in the main panel. */
+  focusedFile: string | null;
+  onFocusFile: (path: string) => void;
 }) {
   return (
     <div>
@@ -46,12 +51,20 @@ function Section({
         {items.map(({ change }) => (
           <li
             key={change.path}
-            className="group flex items-center gap-2 px-3 py-1 hover:bg-white/5"
+            className={[
+              "group flex items-center gap-2 px-3 py-1",
+              change.path === focusedFile ? "bg-accent/12" : "hover:bg-white/5",
+            ].join(" ")}
           >
             <FileStatusChip status={change.status} />
-            <span className="selectable min-w-0 flex-1 truncate font-mono text-[12px] text-text">
+            <button
+              type="button"
+              onClick={() => onFocusFile(change.path)}
+              title="Show this file's changes"
+              className="min-w-0 flex-1 truncate text-left font-mono text-[12px] text-text hover:text-accent"
+            >
               {change.path}
-            </span>
+            </button>
             <button
               type="button"
               title={action === "stage" ? "Stage" : "Unstage"}
@@ -77,7 +90,13 @@ function Section({
  * repository. In a plain browser (no backend) it falls back to mock data. Staging is
  * cosmetic local state — this VCS commits the whole working tree, not a staging area.
  */
-export function ChangesPanel() {
+export function ChangesPanel({
+  focusedFile,
+  onFocusFile,
+}: {
+  focusedFile: string | null;
+  onFocusFile: (path: string) => void;
+}) {
   const { current, refreshNonce, refresh, saving, setSaving, setScanning } = useRepository();
   const [items, setItems] = useState<WorkingChange[]>(inTauri() ? [] : MOCK_WORKING_CHANGES);
   const [error, setError] = useState<string | null>(null);
@@ -152,6 +171,8 @@ export function ChangesPanel() {
         onToggle={toggle}
         onToggleAll={() => setAll(false)}
         disabled={saving}
+        focusedFile={focusedFile}
+        onFocusFile={onFocusFile}
       />
       <div className="my-1 h-px bg-border" />
       <Section
@@ -161,6 +182,8 @@ export function ChangesPanel() {
         onToggle={toggle}
         onToggleAll={() => setAll(true)}
         disabled={saving}
+        focusedFile={focusedFile}
+        onFocusFile={onFocusFile}
       />
 
       {inTauri() && (

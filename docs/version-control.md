@@ -93,11 +93,25 @@ pixels if footprint ever demands it.
 metadata changes — added / removed / opacity / blend / rename, matched by uuid then name — can be
 reported between two commits (`diff_maindoc`).
 
-## Restoring
+## Restoring, rollback & undo
 
 `commit::file_at_commit` rebuilds the exact bytes of a file as of any commit: for `.kra` it
 reconstructs from the manifest (`reconstruct_kra`), otherwise from the blob stream. The
 `restore_file` command writes those bytes back into the working tree.
+
+Two higher-level history operations build on this ([`commit.rs`](../src-tauri/src/commit.rs)):
+
+- **Rollback** (`rollback_to_commit`) — since commits store only their *changed* files, the full
+  tree state at commit N is the fold of every commit up to N (`tree_at`, last-writer-wins per
+  path, dropping deletions). Rollback materializes that state into the working tree (writing each
+  file, deleting ones that didn't exist at N) then records it as a **new** commit via
+  `commit_snapshot` — non-destructive; history stays linear and reversible. Returns `Nothing` if
+  the tree already matches.
+- **Undo last commit** (`undo_last_commit`) — a *soft* reset: pops the last commit and rewinds
+  only the index entries for the paths it touched (recomputing each file's whole-file blake3 from
+  its most-recent surviving version). The working tree is left untouched, so the undone edits
+  resurface as uncommitted changes. Orphaned objects/chain versions are left in place (they're
+  content-addressed and dedup on any re-commit).
 
 ## Tauri commands
 
@@ -117,6 +131,9 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `list_commits(path)` | The commit log (oldest-first; the frontend reverses for newest-first). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
+| `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |
+| `undo_last_commit(path)` | Drop the last commit (keep working-tree changes); returns the new head or null. |
+| `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (per-layer PNG rasters + composite + change regions), others as minimal text entries. |
 
 ## Frontend integration
 
@@ -129,7 +146,10 @@ The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell
 - **In a plain browser** (`npm run dev`, no backend) — these fall back to the mock modules in
   `src/data/` so the UI can still be built and reviewed.
 
-`list_commits` / `scan_repository` are re-fetched whenever the repository context bumps
-`refreshNonce` (e.g. after a commit, or the Changes refresh button). Diff rendering
-(art/palette/text routing in `DiffView`) is still fed by `src/data/` mock diffs until per-commit
-diff data is wired to `layer_diff` + reconstructed rasters.
+`list_commits` / `scan_repository` / `commit_diff` are re-fetched whenever the repository context
+bumps `refreshNonce` (e.g. after a commit, rollback, or undo). Per-commit diffs are now **real**
+for `.kra` files: [`useCommitDiff`](../src/lib/repoData.ts) calls `commit_diff`, which supplies
+per-layer PNG rasters (as SVG `<image>` markup, so the existing SVG-compositing viewer renders
+them unchanged) plus a `mergedimage.png` composite and tile-derived change regions. Non-`.kra`
+files still get minimal text entries (real line/palette diffs are deferred). In a plain browser
+the hook falls back to the `src/data/` mock diffs.

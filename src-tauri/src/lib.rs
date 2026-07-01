@@ -3,6 +3,7 @@ pub mod commit;
 pub mod delta;
 pub mod error;
 pub mod kra;
+pub mod raster;
 pub mod repo;
 pub mod scan;
 pub mod tiles;
@@ -22,6 +23,10 @@ pub fn run() {
             commands::list_commits,
             commands::layer_diff,
             commands::restore_file,
+            commands::rollback_to_commit,
+            commands::undo_last_commit,
+            commands::commit_diff,
+            commands::working_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

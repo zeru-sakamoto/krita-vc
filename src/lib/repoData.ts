@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Commit, FileStatus } from "../types";
-import { MOCK_COMMITS } from "../data/mockData";
+import type { Commit, DiffEntry, FileStatus } from "../types";
+import { MOCK_COMMITS, MOCK_DIFF_BY_COMMIT } from "../data/mockData";
 import { inTauri } from "./tauri";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
@@ -57,4 +57,73 @@ export function useCommits(path: string, nonce = 0): Commit[] {
   }, [path, nonce]);
 
   return commits;
+}
+
+/** A diff result plus any backend error, so callers can show a message instead of a blank panel. */
+export interface DiffResult {
+  entries: DiffEntry[];
+  error: string | null;
+}
+
+/**
+ * The visual diff for a single commit via `commit_diff` (art files carry real per-layer PNG
+ * rasters + a composite; other files get a minimal text entry). Falls back to the mock diff
+ * map in a plain browser. `nonce` forces a refetch after a mutating command (rollback/undo).
+ * A backend failure surfaces via `error` rather than silently blanking the panel.
+ */
+export function useCommitDiff(path: string, commitId: string | null, nonce = 0): DiffResult {
+  const [result, setResult] = useState<DiffResult>({ entries: [], error: null });
+
+  useEffect(() => {
+    if (!commitId) {
+      setResult({ entries: [], error: null });
+      return;
+    }
+    if (!inTauri()) {
+      setResult({ entries: MOCK_DIFF_BY_COMMIT[commitId] ?? [], error: null });
+      return;
+    }
+    let cancelled = false;
+    invoke<DiffEntry[]>("commit_diff", { path, commitId })
+      .then((entries) => {
+        if (!cancelled) setResult({ entries, error: null });
+      })
+      .catch((e) => {
+        if (!cancelled) setResult({ entries: [], error: String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, commitId, nonce]);
+
+  return result;
+}
+
+/**
+ * The visual diff for a single working-tree file (working copy vs its last committed version)
+ * via `working_diff`. Empty when `file` is null. Browser/mock has no working diff, so it stays
+ * empty there. `nonce` forces a refetch after a rescan/commit.
+ */
+export function useWorkingDiff(path: string, file: string | null, nonce = 0): DiffResult {
+  const [result, setResult] = useState<DiffResult>({ entries: [], error: null });
+
+  useEffect(() => {
+    if (!file || !inTauri()) {
+      setResult({ entries: [], error: null });
+      return;
+    }
+    let cancelled = false;
+    invoke<DiffEntry[]>("working_diff", { path, file })
+      .then((entries) => {
+        if (!cancelled) setResult({ entries, error: null });
+      })
+      .catch((e) => {
+        if (!cancelled) setResult({ entries: [], error: String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, file, nonce]);
+
+  return result;
 }

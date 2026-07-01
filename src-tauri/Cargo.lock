@@ -2048,6 +2048,7 @@ name = "krita-vc"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "png 0.17.16",
  "qbsdiff",
  "rayon",
  "roxmltree",

@@ -27,6 +27,10 @@ interface RepositoryValue {
   createRepository: (parentPath: string, name: string) => Promise<void>;
   /** Drop a repo from the list; if `deleteFolder`, also delete it on disk. */
   removeRepository: (id: string, deleteFolder: boolean) => Promise<void>;
+  /** Restore the working tree to `commitId` and record it as a new commit. */
+  rollbackToCommit: (commitId: string) => Promise<void>;
+  /** Undo the last commit, keeping working-tree changes. */
+  undoLastCommit: () => Promise<void>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
@@ -154,6 +158,32 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     [repositories, currentId]
   );
 
+  // Roll the working tree back to a commit (records a new commit); history refetches after.
+  const rollbackToCommit = useCallback(
+    async (commitId: string) => {
+      if (!inTauri()) return;
+      setSaving(true);
+      try {
+        await invoke("rollback_to_commit", { path: current.path, commitId, author: "You" });
+        refresh();
+      } finally {
+        setSaving(false);
+      }
+    },
+    [current, refresh]
+  );
+
+  const undoLastCommit = useCallback(async () => {
+    if (!inTauri()) return;
+    setSaving(true);
+    try {
+      await invoke("undo_last_commit", { path: current.path });
+      refresh();
+    } finally {
+      setSaving(false);
+    }
+  }, [current, refresh]);
+
   const value = useMemo<RepositoryValue>(
     () => ({
       repositories,
@@ -163,6 +193,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       browseRepository,
       createRepository,
       removeRepository,
+      rollbackToCommit,
+      undoLastCommit,
       refreshNonce,
       refresh,
       saving,
@@ -178,6 +210,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       browseRepository,
       createRepository,
       removeRepository,
+      rollbackToCommit,
+      undoLastCommit,
       refreshNonce,
       refresh,
       saving,

@@ -31,7 +31,6 @@ export function TopBar() {
         type="button"
         title="Remove repository"
         aria-label={`Remove ${repo.name}`}
-        disabled={repositories.length === 1}
         onClick={(e) => {
           e.stopPropagation();
           setModal({ kind: "remove", repo });
@@ -157,7 +156,9 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
   const [confirmPath, setConfirmPath] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const canConfirm = !busy && (!deleteFolder || confirmPath === repo.path);
+  // ponytail: last two path segments (parent\repo) — enough to confirm intent without typing the full path
+  const shortPath = repo.path.split(/[\\/]/).filter(Boolean).slice(-2).join("\\");
+  const canConfirm = !busy && (!deleteFolder || confirmPath.replace(/\//g, "\\") === shortPath);
 
   const remove = async () => {
     if (!canConfirm) return;
@@ -224,13 +225,13 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
       {deleteFolder && (
         <div className="mt-3">
           <label className="mb-1 block text-[12px] text-text-muted">
-            Type the full path to confirm: <span className="font-mono text-text">{repo.path}</span>
+            Type <span className="font-mono text-text">{shortPath}</span> to confirm:
           </label>
           <input
             autoFocus
             value={confirmPath}
             onChange={(e) => setConfirmPath(e.target.value)}
-            placeholder={repo.path}
+            placeholder={shortPath}
             className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger focus:outline-none"
           />
         </div>

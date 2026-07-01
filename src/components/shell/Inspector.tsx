@@ -1,10 +1,14 @@
-import { X } from "@phosphor-icons/react";
+import { useState } from "react";
+import { ArrowCounterClockwise, X } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
+import { Button } from "../ui/Button";
+import { Modal } from "../ui/Modal";
 import { FileStatusChip } from "../vcs/FileStatusChip";
 import type { Commit } from "../../types";
 import { fullTimestamp } from "../../lib/format";
 import { assetName, versionLabel } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
+import { useRepository } from "../../lib/repository";
 
 interface InspectorProps {
   commit: Commit | null;
@@ -28,6 +32,22 @@ function MetaRow({ label, children }: { label: string; children: React.ReactNode
  */
 export function Inspector({ commit, version, onClose }: InspectorProps) {
   const { artistMode } = useArtistMode();
+  const { rollbackToCommit, saving } = useRepository();
+  const [confirmRestore, setConfirmRestore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const restoreLabel = artistMode ? `Version ${version}` : (commit?.hash ?? "");
+
+  const onRestore = async () => {
+    setError(null);
+    try {
+      await rollbackToCommit(commit!.id);
+      setConfirmRestore(false);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <div className="flex h-full w-70 shrink-0 flex-col border-l border-border">
       {/* Single header row — py-1.5, aligns with the "Modified Hero" file header */}
@@ -91,6 +111,47 @@ export function Inspector({ commit, version, onClose }: InspectorProps) {
           </div>
         )}
       </div>
+
+      {/* Restore (rollback) action */}
+      {commit && (
+        <div className="shrink-0 border-t border-border bg-surface-2 px-3 py-2">
+          <Button
+            variant="default"
+            className="w-full"
+            disabled={saving}
+            onClick={() => {
+              setError(null);
+              setConfirmRestore(true);
+            }}
+          >
+            <ArrowCounterClockwise size={14} />
+            {artistMode ? "Restore this version" : "Roll back to this commit"}
+          </Button>
+        </div>
+      )}
+
+      {confirmRestore && commit && (
+        <Modal
+          title={artistMode ? `Restore ${restoreLabel}?` : `Roll back to ${restoreLabel}?`}
+          onClose={() => (saving ? undefined : setConfirmRestore(false))}
+          footer={
+            <>
+              <Button onClick={() => setConfirmRestore(false)} disabled={saving}>
+                Cancel
+              </Button>
+              <Button variant="primary" onClick={onRestore} disabled={saving}>
+                {saving ? "Restoring…" : artistMode ? "Restore this version" : "Roll back"}
+              </Button>
+            </>
+          }
+        >
+          <p className="text-[13px] leading-relaxed text-text-muted">
+            This copies that version's files into your working folder and saves the result as a new
+            version. Nothing in your history is lost — you can always come back.
+          </p>
+          {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+        </Modal>
+      )}
     </div>
   );
 }

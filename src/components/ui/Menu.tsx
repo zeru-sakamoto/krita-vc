@@ -65,6 +65,9 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
           item.selected ? "text-accent" : "text-text",
         ].join(" ")}
       >
+        <span aria-hidden className="w-3 shrink-0 text-accent">
+          {item.selected && "✓"}
+        </span>
         {item.icon && <span className="shrink-0 text-text-muted">{item.icon}</span>}
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate">{item.label}</span>
@@ -72,11 +75,6 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
             <span className="truncate font-mono text-[10px] text-text-muted">{item.detail}</span>
           )}
         </span>
-        {item.selected && (
-          <span aria-hidden className="shrink-0 text-accent">
-            ✓
-          </span>
-        )}
       </button>
       {item.action && (
         <span className="absolute right-1.5 opacity-0 transition-opacity group-hover:opacity-100">

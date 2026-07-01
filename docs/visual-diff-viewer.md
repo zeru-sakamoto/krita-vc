@@ -103,8 +103,21 @@ ArtDiffView
                         highlightMode ∈ { box, mask } controls the overlay style
 ```
 
-## Replacing the mock
+## Real backend data
 
-`ArtDiff`/`ArtLayer` are the swap point. A real backend would supply per-layer rasters (PNG/data
-URLs) and changed-region geometry instead of SVG strings; `ArtCanvas`/`LayerStackPanel` would render
-those images, and `mockArt.ts` would be deleted. Component props (`DiffEntry`) stay the same.
+`ArtDiff`/`ArtLayer` are the swap point, and for `.kra` files the backend now fills it. The
+`commit_diff` command (see [version-control.md](version-control.md)) reconstructs each paint
+layer's pixels from its stored tiles (LZF-decoded, planar BGRA → RGBA, PNG-encoded) and returns
+them as **SVG `<image href="data:image/png;base64,…">` markup** in `ArtLayer.before`/`after` — so
+`layersBody`/`wrapSvg`/`ArtCanvas`/`CompareSlider` composite them with **zero rendering changes**
+(blend modes, checkerboard, overlays all still apply). It also supplies:
+
+- **Composite** — `mergedimage.png` at each state in `ArtDiff.beforeImage`/`afterImage`. The
+  "Composite" navigator row prefers this (a reliable whole-image render) over stacking layers;
+  `ArtDiffView` swaps in a single composite "layer" when these are present.
+- **Change regions** — one normalized bounding box over the tiles that differ between the two
+  commits (no pixel decode; just tile-hash comparison), feeding the box-highlight overlay.
+
+`mockArt.ts` stays for the browser fallback (`useCommitDiff` uses it when not in the Tauri shell).
+Deferred (ponytail): non-RGBA-8 colorspaces (those layers fall back to the composite), and
+per-layer change regions with labels.

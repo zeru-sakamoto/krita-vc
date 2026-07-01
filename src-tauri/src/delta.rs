@@ -66,11 +66,20 @@ impl Repo {
                 let compressed = zstd::encode_all(bytes, 3)?;
                 let object = format!("{hash}.full");
                 write_object(&objects, &object, &compressed)?;
-                Version { hash: hash.clone(), object, base: None, chain_len: 0 }
+                Version {
+                    hash: hash.clone(),
+                    object,
+                    base: None,
+                    chain_len: 0,
+                }
             }
         };
 
-        self.chains.0.entry(key.to_string()).or_default().push(version);
+        self.chains
+            .0
+            .entry(key.to_string())
+            .or_default()
+            .push(version);
         Ok(hash)
     }
 

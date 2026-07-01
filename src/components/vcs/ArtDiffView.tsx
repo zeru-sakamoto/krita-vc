@@ -68,10 +68,26 @@ export function ArtDiffView({ diff, palette }: { diff: ArtDiff; palette?: Palett
   const [highlightMode, setHighlightMode] = useState<HighlightMode>("box");
 
   const layers = useMemo(() => {
-    if (selectedId === COMPOSITE_ID) return diff.layers;
+    if (selectedId === COMPOSITE_ID) {
+      // Prefer the backend's real composite (mergedimage.png) over stacking layers, so the
+      // composite is correct even if some layers can't be rastered. Mock data omits these.
+      if (diff.beforeImage !== undefined || diff.afterImage !== undefined) {
+        const composite: ArtDiff["layers"][number] = {
+          id: COMPOSITE_ID,
+          name: "Composite",
+          opacity: 100,
+          blendMode: "normal",
+          change: "modified",
+          before: diff.beforeImage ?? null,
+          after: diff.afterImage ?? null,
+        };
+        return [composite];
+      }
+      return diff.layers;
+    }
     const found = diff.layers.find((l) => l.id === selectedId);
     return found ? [found] : diff.layers;
-  }, [diff.layers, selectedId]);
+  }, [diff, selectedId]);
 
   const showPalette = selectedId === PALETTE_ID && palette != null;
 
