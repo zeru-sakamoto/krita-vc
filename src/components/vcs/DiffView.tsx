@@ -137,7 +137,16 @@ function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
   );
 }
 
-export function DiffView({ entries }: { entries: DiffEntry[] }) {
+interface DiffViewProps {
+  entries: DiffEntry[];
+  /** Diff source, forwarded to art views for lazy per-layer raster loading. Absent in mock/browser. */
+  repoPath?: string;
+  commitId?: string | null;
+  working?: boolean;
+  nonce?: number;
+}
+
+export function DiffView({ entries, repoPath, commitId, working, nonce }: DiffViewProps) {
   const { artistMode } = useArtistMode();
 
   // Partition entries by kind so we can attach the first palette to the first art diff's navigator.
@@ -154,7 +163,15 @@ export function DiffView({ entries }: { entries: DiffEntry[] }) {
     <div className="h-full flex flex-col overflow-auto bg-bg">
       {/* Art diffs — first one gets the palette embedded in its navigator */}
       {artDiffs.map((diff, i) => (
-        <ArtDiffView key={diff.path} diff={diff} palette={i === 0 ? attachedPalette : undefined} />
+        <ArtDiffView
+          key={diff.path}
+          diff={diff}
+          palette={i === 0 ? attachedPalette : undefined}
+          repoPath={repoPath}
+          commitId={commitId}
+          working={working}
+          nonce={nonce}
+        />
       ))}
 
       {/* Palette-only: if there are palettes but no art diff, show standalone */}

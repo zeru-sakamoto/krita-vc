@@ -14,6 +14,17 @@ edition = "2021"
 name = "krita_vc_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Dev builds run the same image/compression hot loops as release — unoptimized they are
+# 10-50x slower and make `tauri dev` feel broken. Deps at full opt, our crate at 1.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -25,7 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zip = "2"
 qbsdiff = "1"
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 roxmltree = "0.20"
 walkdir = "2"
 rayon = "1"

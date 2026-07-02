@@ -10,8 +10,10 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 /// Returns `(relativePath, status)` pairs for everything that differs from the index.
-/// ponytail: re-hashes every file each scan. Fine for art repos; if it ever bites,
-/// cache size+mtime in the index and hash only on mismatch.
+/// A tracked file whose size+mtime still match the index is assumed unchanged and skipped
+/// without reading/hashing it — the win for big `.kra` files. Anything else is hashed and
+/// compared against the committed hash (so a size-preserving edit or an mtime touch is still
+/// classified correctly).
 pub fn scan(repo: &Repo) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -32,9 +34,20 @@ pub fn scan(repo: &Repo) -> Result<Vec<(String, String)>> {
         let rel = rel_path(&repo.root, entry.path());
         seen.insert(rel.clone());
 
+        // Fast path: a tracked file with matching size+mtime is unchanged — don't read it.
+        let tracked = repo.index.files.get(&rel);
+        if let Some(tf) = tracked {
+            if let Ok(meta) = entry.metadata() {
+                let (size, mtime) = crate::repo::size_mtime(&meta);
+                if size == tf.size && mtime == tf.mtime && (size, mtime) != (0, 0) {
+                    continue;
+                }
+            }
+        }
+
         let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
         let hash = hash_bytes(&bytes);
-        match repo.index.files.get(&rel) {
+        match tracked {
             None => out.push((rel, "U".into())),
             Some(tf) if tf.hash != hash => out.push((rel, "M".into())),
             Some(_) => {}

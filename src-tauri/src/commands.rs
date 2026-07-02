@@ -6,6 +6,7 @@ use crate::error::{KvcError, Result};
 use crate::kra::{self, LayerDiff, LayerNode};
 use crate::repo::{Commit, CommittedFile, Repo};
 use crate::{commit, scan};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -60,7 +61,7 @@ pub async fn delete_repository(path: String) -> std::result::Result<(), String> 
 #[tauri::command]
 pub async fn scan_repository(path: String) -> std::result::Result<Vec<WorkingChange>, String> {
     run(move || {
-        let repo = Repo::open(Path::new(&path))?;
+        let repo = Repo::open_light(Path::new(&path))?;
         Ok(scan::scan(&repo)?
             .into_iter()
             .map(|(path, status)| WorkingChange {
@@ -88,7 +89,7 @@ pub async fn commit_snapshot(
 #[tauri::command]
 pub async fn list_commits(path: String) -> std::result::Result<Vec<Commit>, String> {
     run(move || {
-        let repo = Repo::open(Path::new(&path))?;
+        let repo = Repo::open_light(Path::new(&path))?;
         Ok(repo.commits.clone())
     })
     .await
@@ -105,12 +106,23 @@ pub async fn layer_diff(
 ) -> std::result::Result<Vec<LayerDiff>, String> {
     run(move || {
         let repo = Repo::open(Path::new(&path))?;
-        let old = commit::file_at_commit(&repo, &file, &old_commit)?;
-        let new = commit::file_at_commit(&repo, &file, &new_commit)?;
-        kra::diff_maindoc(
-            &kra::read_entry(&old, "maindoc.xml")?,
-            &kra::read_entry(&new, "maindoc.xml")?,
-        )
+        // Pull just maindoc.xml out of each side's manifest — rebuilding the whole archive
+        // (every tile of every layer) for one small entry dominated this command's cost.
+        let maindoc = |commit_id: &str| -> Result<Vec<u8>> {
+            let tree = commit::tree_at_commit(&repo.commits, commit_id)
+                .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
+            let f = tree
+                .get(&file)
+                .ok_or_else(|| KvcError::NotTracked(file.clone()))?;
+            let hash = f
+                .content
+                .as_deref()
+                .ok_or_else(|| KvcError::NotTracked(format!("{file} (deleted)")))?;
+            let manifest = kra::load_manifest(&repo, &file, hash)?;
+            kra::entry_bytes(&repo, &file, &manifest, "maindoc.xml")?
+                .ok_or_else(|| KvcError::CorruptZip("no maindoc.xml".into()))
+        };
+        kra::diff_maindoc(&maindoc(&old_commit)?, &maindoc(&new_commit)?)
     })
     .await
 }
@@ -176,33 +188,33 @@ pub struct RegionDto {
     label: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LayerDto {
-    id: String,
-    name: String,
-    opacity: i64,
-    blend_mode: String,
-    change: String,
+    pub id: String,
+    pub name: String,
+    pub opacity: i64,
+    pub blend_mode: String,
+    pub change: String,
     /// Inner SVG `<image>` markup for each state, or null when the layer is absent then.
-    before: Option<String>,
-    after: Option<String>,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtDiffDto {
-    path: String,
-    status: String,
-    width: u32,
-    height: u32,
-    layers: Vec<LayerDto>,
-    regions: Vec<RegionDto>,
+    pub path: String,
+    pub status: String,
+    pub width: u32,
+    pub height: u32,
+    pub layers: Vec<LayerDto>,
+    pub regions: Vec<RegionDto>,
     /// Composite (mergedimage.png) for each state as `<image>` markup — the reliable composite.
     #[serde(skip_serializing_if = "Option::is_none")]
-    before_image: Option<String>,
+    pub before_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    after_image: Option<String>,
+    pub after_image: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -245,86 +257,171 @@ fn layer_id(l: &LayerNode) -> String {
     }
 }
 
-/// Build the visual diff for one `.kra` file: per-layer rasters (before/after) + composite.
-fn art_diff(repo: &Repo, f: &CommittedFile, old: Option<&CommittedFile>) -> Result<DiffEntryDto> {
-    let path = &f.path;
-    let new_manifest = f
-        .content
-        .as_deref()
-        .ok_or_else(|| KvcError::NotTracked(format!("{path} (no content)")))?;
+/// Composite (mergedimage.png) as a capped PNG data URL. The decode/resize/encode runs once per
+/// unique composite — the result is disk-cached in `.kvc/cache/` keyed by the entry's content
+/// hash, and on a hit `bytes` is never called (no reconstruct at all).
+fn composite_data_url(
+    repo: &Repo,
+    content_hash: Option<String>,
+    bytes: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<Option<String>> {
+    let cache_dir = repo.cache_dir();
+    let key = content_hash.map(|h| kra::composite_cache_key(&h));
+    if let Some(k) = &key {
+        if let Some(png) = crate::raster::cache_read(&cache_dir, k) {
+            return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
+        }
+    }
+    let Some(b) = bytes()? else { return Ok(None) };
+    let capped = crate::raster::cap_png(&b);
+    if let Some(k) = &key {
+        crate::raster::cache_write(&cache_dir, k, &capped);
+    }
+    Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
+}
+
+/// Build the visual diff for one `.kra` file: layer metadata + composite, and (only when
+/// `with_rasters`) each layer's before/after PNG. The composite (mergedimage.png) and metadata
+/// are cheap; the per-layer rasters are the expensive part, so the default per-commit diff omits
+/// them (`with_rasters = false`) and the UI fetches them lazily via `commit_layers`/`working_layers`.
+/// `on_layer` (raster path only) is called with each finished layer as rayon completes it —
+/// out of order — so the UI can render layers progressively instead of waiting for the slowest.
+pub fn art_diff_dto(
+    repo: &Repo,
+    path: &str,
+    status: &str,
+    new_src: &kra::KraSource,
+    old: Option<&CommittedFile>,
+    with_rasters: bool,
+    on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
+) -> Result<ArtDiffDto> {
+    // Reconstruct + parse the old side's manifest ONCE; every layer/region/composite read below
+    // reuses it instead of re-reconstructing (walking the patch chain) per call. The new side
+    // is either a committed manifest (loaded once by the caller) or an in-memory working file.
+    let old_manifest = match old.and_then(|o| o.content.as_deref()) {
+        Some(h) => Some(kra::load_manifest(repo, path, h)?),
+        None => None,
+    };
+
     let new_meta = {
-        let xml = kra::entry_bytes(repo, path, new_manifest, "maindoc.xml")?
+        let xml = new_src
+            .entry_bytes(repo, path, "maindoc.xml")?
             .ok_or_else(|| KvcError::CorruptZip("no maindoc.xml".into()))?;
         kra::parse_image_meta(&xml)?
     };
     let (w, h) = (new_meta.width, new_meta.height);
 
-    let old_manifest = old.and_then(|o| o.content.as_deref());
-    let old_meta = match old_manifest {
-        Some(hh) => match kra::entry_bytes(repo, path, hh, "maindoc.xml")? {
+    let old_meta = match &old_manifest {
+        Some(m) => match kra::entry_bytes(repo, path, m, "maindoc.xml")? {
             Some(xml) => Some(kra::parse_image_meta(&xml)?),
             None => None,
         },
         None => None,
     };
-    let changed_entries = match old_manifest {
-        Some(hh) => kra::changed_entry_paths(repo, path, hh, new_manifest)?,
-        None => Default::default(),
-    };
+    let new_tiles = new_src.tile_index();
+    let old_tiles = old_manifest.as_ref().map(|m| m.tile_index());
+    let changed_entries = old_tiles
+        .as_ref()
+        .map(|ot| kra::changed_entry_paths(ot, &new_tiles))
+        .unwrap_or_default();
 
+    // "meet" (not "none"): rasters keep their own aspect ratio, letterboxed inside the document
+    // box — a before-side from a version with different canvas dimensions must not stretch.
     let img = |url: String| {
-        format!("<image href=\"{url}\" x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"none\"/>")
+        format!("<image href=\"{url}\" x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"xMidYMid meet\"/>")
     };
 
-    let mut layers: Vec<LayerDto> = Vec::new();
-    for nl in &new_meta.layers {
-        let entry_path = format!("{}/layers/{}", new_meta.name, nl.filename);
-        let ol = old_meta
-            .as_ref()
-            .and_then(|m| m.layers.iter().find(|o| layer_id(o) == layer_id(nl)));
-        let change = if old_meta.is_none() || ol.is_none() {
-            "added"
-        } else {
-            let meta_changed = ol
-                .map(|o| o.opacity != nl.opacity || o.blend != nl.blend || o.name != nl.name)
-                .unwrap_or(false);
-            if meta_changed || changed_entries.contains(&entry_path) {
-                "modified"
+    // One tile cache for the whole request: before/after sides of a modified layer share most
+    // tiles by content hash, so each shared tile reconstructs once.
+    let tile_cache = crate::delta::TileCache::new();
+
+    // Rasterize layers in parallel — each layer's decode/blit/PNG-encode is independent and only
+    // reads &Repo. Order is preserved by par_iter's indexed collect.
+    let mut layers: Vec<LayerDto> = new_meta
+        .layers
+        .par_iter()
+        .map(|nl| -> Result<LayerDto> {
+            let entry_path = format!("{}/layers/{}", new_meta.name, nl.filename);
+            let ol = old_meta
+                .as_ref()
+                .and_then(|m| m.layers.iter().find(|o| layer_id(o) == layer_id(nl)));
+            let change = if old_meta.is_none() || ol.is_none() {
+                "added"
             } else {
-                "unchanged"
+                let meta_changed = ol
+                    .map(|o| o.opacity != nl.opacity || o.blend != nl.blend || o.name != nl.name)
+                    .unwrap_or(false);
+                if meta_changed || changed_entries.contains(&entry_path) {
+                    "modified"
+                } else {
+                    "unchanged"
+                }
+            };
+            let (after, before) = if with_rasters {
+                let after = new_src
+                    .layer_raster(repo, path, &new_meta.name, &nl.filename, w, h, &tile_cache)?
+                    .map(img);
+                // An unchanged layer's pixels are identical on both sides — reuse the raster
+                // instead of decoding + encoding it twice.
+                let before = match (change, &old_manifest, &old_meta, ol) {
+                    ("added", ..) => None,
+                    ("unchanged", ..) => after.clone(),
+                    (_, Some(om_manifest), Some(om), Some(o)) => kra::layer_raster(
+                        repo,
+                        path,
+                        om_manifest,
+                        &om.name,
+                        &o.filename,
+                        w,
+                        h,
+                        &tile_cache,
+                    )?
+                    .map(img),
+                    _ => None,
+                };
+                (after, before)
+            } else {
+                (None, None)
+            };
+            let dto = LayerDto {
+                id: layer_id(nl),
+                name: nl.name.clone(),
+                opacity: to_percent(nl.opacity),
+                blend_mode: blend_mode(&nl.blend),
+                change: change.into(),
+                before,
+                after,
+            };
+            if let Some(cb) = on_layer {
+                cb(dto.clone());
             }
-        };
-        let after =
-            kra::layer_raster(repo, path, new_manifest, &new_meta.name, &nl.filename, w, h)?
-                .map(img);
-        let before = match (change, old_manifest, &old_meta, ol) {
-            ("added", ..) => None,
-            (_, Some(oh), Some(om), Some(o)) => {
-                kra::layer_raster(repo, path, oh, &om.name, &o.filename, w, h)?.map(img)
-            }
-            _ => None,
-        };
-        layers.push(LayerDto {
-            id: layer_id(nl),
-            name: nl.name.clone(),
-            opacity: to_percent(nl.opacity),
-            blend_mode: blend_mode(&nl.blend),
-            change: change.into(),
-            before,
-            after,
-        });
-    }
+            Ok(dto)
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Layers removed since the parent commit.
-    if let (Some(om), Some(oh)) = (&old_meta, old_manifest) {
+    if let (Some(om), Some(om_manifest)) = (&old_meta, &old_manifest) {
         for ol in &om.layers {
             if !new_meta
                 .layers
                 .iter()
                 .any(|nl| layer_id(nl) == layer_id(ol))
             {
-                let before =
-                    kra::layer_raster(repo, path, oh, &om.name, &ol.filename, w, h)?.map(img);
-                layers.push(LayerDto {
+                let before = if with_rasters {
+                    kra::layer_raster(
+                        repo,
+                        path,
+                        om_manifest,
+                        &om.name,
+                        &ol.filename,
+                        w,
+                        h,
+                        &tile_cache,
+                    )?
+                    .map(img)
+                } else {
+                    None
+                };
+                let dto = LayerDto {
                     id: layer_id(ol),
                     name: ol.name.clone(),
                     opacity: to_percent(ol.opacity),
@@ -332,20 +429,30 @@ fn art_diff(repo: &Repo, f: &CommittedFile, old: Option<&CommittedFile>) -> Resu
                     change: "removed".into(),
                     before,
                     after: None,
-                });
+                };
+                if let Some(cb) = on_layer {
+                    cb(dto.clone());
+                }
+                layers.push(dto);
             }
         }
     }
     layers.reverse(); // Krita writes top-first; the UI stacks bottom→top.
 
-    let after_image = kra::entry_data_url(repo, path, new_manifest, "mergedimage.png")?.map(img);
-    let before_image = match old_manifest {
-        Some(oh) => kra::entry_data_url(repo, path, oh, "mergedimage.png")?.map(img),
+    let after_image = composite_data_url(repo, new_src.entry_hash("mergedimage.png"), || {
+        new_src.entry_bytes(repo, path, "mergedimage.png")
+    })?
+    .map(&img);
+    let before_image = match &old_manifest {
+        Some(m) => composite_data_url(repo, m.entry_hash("mergedimage.png"), || {
+            kra::entry_bytes(repo, path, m, "mergedimage.png")
+        })?
+        .map(&img),
         None => None,
     };
     let mut regions = Vec::new();
-    if let Some(oh) = old_manifest {
-        if let Some((x, y, rw, rh)) = kra::changed_region(repo, path, oh, new_manifest, w, h)? {
+    if let Some(ot) = &old_tiles {
+        if let Some((x, y, rw, rh)) = kra::changed_region(ot, &new_tiles, w, h) {
             regions.push(RegionDto {
                 x,
                 y,
@@ -356,16 +463,16 @@ fn art_diff(repo: &Repo, f: &CommittedFile, old: Option<&CommittedFile>) -> Resu
         }
     }
 
-    Ok(DiffEntryDto::Art(ArtDiffDto {
-        path: path.clone(),
-        status: f.status.clone(),
+    Ok(ArtDiffDto {
+        path: path.to_string(),
+        status: status.to_string(),
         width: w.max(0) as u32,
         height: h.max(0) as u32,
         layers,
         regions,
         before_image,
         after_image,
-    }))
+    })
 }
 
 /// Minimal text placeholder for a file (non-.kra, deleted, or an .kra we couldn't raster).
@@ -377,19 +484,52 @@ fn text_entry(f: &CommittedFile) -> DiffEntryDto {
     })
 }
 
-/// The visual diff for one file: an art diff for a rasterable `.kra`, else a text placeholder.
-/// A failed `.kra` raster degrades to a text entry rather than aborting the whole diff, so one
-/// unsupported/broken file can't blank the entire panel.
-fn diff_entry(repo: &Repo, f: &CommittedFile, old: Option<&CommittedFile>) -> DiffEntryDto {
+/// The visual diff for one file: an art diff (metadata + composite, rasters only when
+/// `with_rasters`) for a rasterable `.kra`, else a text placeholder. A failed `.kra` raster
+/// degrades to a text entry rather than aborting the whole diff, so one unsupported/broken file
+/// can't blank the entire panel.
+fn diff_entry(
+    repo: &Repo,
+    f: &CommittedFile,
+    old: Option<&CommittedFile>,
+    with_rasters: bool,
+) -> DiffEntryDto {
     if f.is_kra && f.status != "D" {
-        art_diff(repo, f, old).unwrap_or_else(|_| text_entry(f))
+        committed_art_dto(repo, f, old, with_rasters, None)
+            .map(DiffEntryDto::Art)
+            .unwrap_or_else(|_| text_entry(f))
     } else {
         text_entry(f)
     }
 }
 
-/// The full visual diff for a commit: one entry per changed file. `.kra` files render as art
-/// diffs (per-layer rasters + composite); everything else is a minimal text entry.
+/// Art diff for a committed `.kra`: load its manifest once, then run the shared builder.
+pub fn committed_art_dto(
+    repo: &Repo,
+    f: &CommittedFile,
+    old: Option<&CommittedFile>,
+    with_rasters: bool,
+    on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
+) -> Result<ArtDiffDto> {
+    let hash = f
+        .content
+        .as_deref()
+        .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))?;
+    let manifest = kra::load_manifest(repo, &f.path, hash)?;
+    art_diff_dto(
+        repo,
+        &f.path,
+        &f.status,
+        &kra::KraSource::Committed(&manifest),
+        old,
+        with_rasters,
+        on_layer,
+    )
+}
+
+/// The visual diff for a commit: one entry per changed file. `.kra` files render as art diffs
+/// (composite + layer metadata; the heavy per-layer rasters are fetched lazily via `commit_layers`
+/// so the panel appears immediately). Everything else is a minimal text entry.
 /// ponytail: real line/palette diffs for non-.kra files are deferred — the focus is .kra fidelity.
 #[tauri::command]
 pub async fn commit_diff(
@@ -413,48 +553,152 @@ pub async fn commit_diff(
         Ok(commit
             .files
             .iter()
-            .map(|f| diff_entry(&repo, f, parent_tree.get(&f.path)))
+            .map(|f| diff_entry(&repo, f, parent_tree.get(&f.path), false))
             .collect())
     })
     .await
 }
 
-/// The visual diff for a single working-tree file vs its last committed version. Stages the
-/// working `.kra` into the object store (`commit_kra` — objects only, no commit) to get a
-/// manifest hash, then reuses the same art-diff rasterizer. `None` old side (untracked file or
-/// empty history) yields an all-"added" diff.
+/// The per-layer rasters (before/after) for one `.kra` file in a commit — the expensive part of
+/// the diff, loaded on demand after `commit_diff` has already shown the composite + layer list.
+/// Each layer is **streamed** through `on_layer` the moment its rasters finish (out of order —
+/// the frontend merges by layer id); the command resolving means every layer has been sent.
+/// Sends nothing if the file isn't a rasterable `.kra` in that commit.
+#[tauri::command]
+pub async fn commit_layers(
+    path: String,
+    commit_id: String,
+    file: String,
+    on_layer: tauri::ipc::Channel<LayerDto>,
+) -> std::result::Result<(), String> {
+    run(move || {
+        let repo = Repo::open(Path::new(&path))?;
+        let commit = repo
+            .commits
+            .iter()
+            .find(|c| c.id == commit_id)
+            .cloned()
+            .ok_or_else(|| KvcError::NoCommit(commit_id.clone()))?;
+        let Some(f) = commit.files.iter().find(|f| f.path == file) else {
+            return Ok(());
+        };
+        if !f.is_kra || f.status == "D" {
+            return Ok(());
+        }
+        let parent_tree = commit
+            .parents
+            .first()
+            .and_then(|p| commit::tree_at_commit(&repo.commits, p))
+            .unwrap_or_default();
+        committed_art_dto(
+            &repo,
+            f,
+            parent_tree.get(&file),
+            true,
+            Some(&|dto| {
+                let _ = on_layer.send(dto);
+            }),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Last-committed entry for `file` (the "before" side of a working diff), if any.
+fn last_committed(repo: &Repo, file: &str) -> Option<CommittedFile> {
+    repo.commits
+        .last()
+        .map(|c| c.id.clone())
+        .and_then(|head| commit::tree_at_commit(&repo.commits, &head))
+        .and_then(|tree| tree.get(file).cloned())
+}
+
+/// Working-tree art diff, shared by `working_diff` and `working_layers`. Parses the working
+/// `.kra` **in memory** (`parse_working`) — viewing a diff never touches the object store:
+/// no bsdiff, no chain reconstructs, no writes. `None` old side (untracked file or empty
+/// history) yields an all-"added" diff.
+fn working_art_dto(
+    repo: &Repo,
+    file: &str,
+    with_rasters: bool,
+    on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
+) -> Result<ArtDiffDto> {
+    let abs = repo.root.join(file);
+    let bytes = std::fs::read(&abs).map_err(|e| crate::error::io_at(&abs, e))?;
+    let working = kra::parse_working(&bytes)?;
+    let old = last_committed(repo, file);
+    let status = if old.is_some() { "M" } else { "A" };
+    art_diff_dto(
+        repo,
+        file,
+        status,
+        &kra::KraSource::Working(&working),
+        old.as_ref(),
+        with_rasters,
+        on_layer,
+    )
+}
+
+/// The visual diff for a single working-tree file vs its last committed version. Read-only:
+/// the working `.kra` is diffed straight from memory, nothing is staged into the store.
 #[tauri::command]
 pub async fn working_diff(
     path: String,
     file: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
-        let abs = repo.root.join(&file);
-        let bytes = std::fs::read(&abs).map_err(|e| crate::error::io_at(&abs, e))?;
-        let is_kra = file.to_lowercase().ends_with(".kra");
+        let repo = Repo::open(Path::new(&path))?;
+        if !file.to_lowercase().ends_with(".kra") {
+            let old = last_committed(&repo, &file);
+            return Ok(vec![text_entry(&CommittedFile {
+                path: file.clone(),
+                status: if old.is_some() {
+                    "M".into()
+                } else {
+                    "A".into()
+                },
+                content: None,
+                is_kra: false,
+            })]);
+        }
+        let entry = working_art_dto(&repo, &file, false, None)
+            .map(DiffEntryDto::Art)
+            .unwrap_or_else(|_| {
+                text_entry(&CommittedFile {
+                    path: file.clone(),
+                    status: "M".into(),
+                    content: None,
+                    is_kra: true,
+                })
+            });
+        Ok(vec![entry])
+    })
+    .await
+}
 
-        // Last-committed version of this file (if any), for the "before" side.
-        let old = repo
-            .commits
-            .last()
-            .map(|c| c.id.clone())
-            .and_then(|head| commit::tree_at_commit(&repo.commits, &head))
-            .and_then(|tree| tree.get(&file).cloned());
-        let status = if old.is_some() { "M" } else { "A" };
-
-        let content = if is_kra {
-            Some(kra::commit_kra(&mut repo, &file, &bytes)?)
-        } else {
-            None
-        };
-        let working = CommittedFile {
-            path: file.clone(),
-            status: status.into(),
-            content,
-            is_kra,
-        };
-        Ok(vec![diff_entry(&repo, &working, old.as_ref())])
+/// The per-layer rasters for a single working-tree `.kra` file (working copy vs its last committed
+/// version) — the lazy counterpart to `working_diff`, mirroring `commit_layers` (streamed the
+/// same way: one `on_layer` message per finished layer, out of order).
+#[tauri::command]
+pub async fn working_layers(
+    path: String,
+    file: String,
+    on_layer: tauri::ipc::Channel<LayerDto>,
+) -> std::result::Result<(), String> {
+    run(move || {
+        if !file.to_lowercase().ends_with(".kra") {
+            return Ok(());
+        }
+        let repo = Repo::open(Path::new(&path))?;
+        working_art_dto(
+            &repo,
+            &file,
+            true,
+            Some(&|dto| {
+                let _ = on_layer.send(dto);
+            }),
+        )?;
+        Ok(())
     })
     .await
 }

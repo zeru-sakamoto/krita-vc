@@ -39,8 +39,13 @@ file against `index.json`:
 | `D` | deleted — in the index but absent on disk |
 
 Unchanged files produce nothing. The `.kvc/` directory and Krita lock/autosave files (`*.kra~`)
-are skipped. ponytail: every file is re-hashed each scan — fine for art repos; cache size+mtime
-in the index if it ever bites. There is **no staging area** — the scanner reports the whole
+are skipped. A file whose **size + mtime still match the index** (`TrackedFile.size`/`mtime`,
+nanosecond resolution) is assumed unchanged and skipped without being read or hashed — the win
+for big `.kra` files. Everything else is hashed and compared against the committed blake3, so a
+size-preserving edit or an mtime touch is still classified correctly. ponytail: this relies on
+the OS updating mtime on every save (Krita rewrites the file, so it does); the upgrade path for a
+mtime-preserving tool is git's "racy" rule (re-hash anything whose mtime isn't strictly older
+than the last index write). There is **no staging area** — the scanner reports the whole
 working-tree delta and a commit captures all of it (the frontend's stage toggles are cosmetic).
 
 ## Committing — `commit_snapshot`
@@ -51,10 +56,13 @@ working-tree delta and a commit captures all of it (the frontend's stage toggles
 - **`.kra`** → `kra::commit_kra` decomposes the archive (see below) and returns its manifest hash.
 - **anything else** → `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash.
 
-Each non-deleted file's blake3 is written back into the index, and a `Commit` is recorded with
-`parents` set to the previous head (linear history; first parent = mainline). Returns
-`KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex chars of a
-blake3 over the timestamp + message + per-file content hashes.
+Each non-deleted file's blake3 (plus its size + mtime, for the scanner's fast path) is written
+back into the index, and a `Commit` is recorded with `parents` set to the previous head (linear
+history; first parent = mainline). Returns `KvcError::Nothing` if the tree is clean. The commit
+id/hash is the first 12 hex chars of a blake3 over the timestamp + message + per-file content
+hashes. State is flushed with `Repo::save`, which writes `index.json`/`chains.json`/`commits.json`
+as **compact** JSON (`chains.json` — every version of every stream — is rewritten each commit, so
+pretty-printing it was a real cost as history grew).
 
 ## Delta-chain storage
 
@@ -62,14 +70,22 @@ blake3 over the timestamp + message + per-file content hashes.
 file, a `.kra` manifest, a layer entry, or a single tile), keyed by a string. `store_stream`:
 
 1. **Dedup** — if the content hash already exists in the stream's chain, return it; store nothing.
-2. **Patch** — if the chain head is under `delta_chain_max` (20), store a `bsdiff` patch against
-   the head (`<hash>.patch`).
-3. **Snapshot** — otherwise (first version, or threshold reached) store a fresh `zstd` full
-   snapshot (`<hash>.full`), resetting the chain length.
+2. **Patch** — if the content is at least 64 KB, not already compressed (PNG/zip/zstd magic), and
+   the chain head is under `delta_chain_max` (20), store a `bsdiff` patch against the head
+   (`<hash>.patch`). Patching only pays for large diff-friendly data (the `.kra` manifests):
+   small streams (tiles) cost a chain-walk reconstruct + suffix-sort `bsdiff` to save a couple of
+   KB, and compressed payloads yield patches near full size.
+3. **Snapshot** — otherwise (first version, small/compressed content, or threshold reached) store
+   a fresh `zstd` full snapshot (`<hash>.full`), resetting the chain length.
 
 `reconstruct(key, hash)` walks the patch chain back to its full snapshot, applies patches, and
 **verifies** the rebuilt bytes hash to the requested hash (integrity guard). Objects are
 content-addressed, so writing an object that already exists is a no-op (cross-file dedup).
+
+`store_stream` is split into `prepare_stream` (`&self`, read-only: dedup check, reconstruct base,
+`bsdiff` + verify or `zstd` — the CPU cost) and `commit_prepared` (`&mut self`: write the object,
+push the version). This lets many independent streams be prepared in parallel and then folded in
+serially — used by the `.kra` tile engine below.
 
 ## `.kra` tile engine
 
@@ -79,7 +95,9 @@ decompose it into streams so small edits stay small:
 - **Tiled layer-data entries** (binary blocks under `<doc>/layers/`, detected by a `VERSION `
   header) are parsed into individual tiles; **each tile becomes its own stream**
   (`kra:<path>:tile:<entry>:<x>,<y>`). Unchanged tiles dedup automatically — a one-corner edit
-  only stores those tiles.
+  only stores those tiles. Tiles are `prepare_stream`'d **in parallel** (`rayon`) — the diff/zstd
+  work fans across cores — then `commit_prepared` serially (each tile is a distinct key, so no
+  race), which is the bulk of a commit's cost.
 - **Every other archive entry** becomes one stream (`kra:<path>:entry:<name>`).
 - A **JSON manifest** (`kra:<path>:manifest`) records entry order, per-entry blob hashes, and
   per-tile refs — enough to reassemble a logically identical archive (`mimetype` stays first and
@@ -133,7 +151,10 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |
 | `undo_last_commit(path)` | Drop the last commit (keep working-tree changes); returns the new head or null. |
-| `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (per-layer PNG rasters + composite + change regions), others as minimal text entries. |
+| `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (**composite + layer metadata + change regions**, no per-layer rasters — those load lazily), others as minimal text entries. |
+| `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
+| `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
+| `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
 
 ## Frontend integration
 
@@ -147,9 +168,16 @@ The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell
   `src/data/` so the UI can still be built and reviewed.
 
 `list_commits` / `scan_repository` / `commit_diff` are re-fetched whenever the repository context
-bumps `refreshNonce` (e.g. after a commit, rollback, or undo). Per-commit diffs are now **real**
-for `.kra` files: [`useCommitDiff`](../src/lib/repoData.ts) calls `commit_diff`, which supplies
-per-layer PNG rasters (as SVG `<image>` markup, so the existing SVG-compositing viewer renders
-them unchanged) plus a `mergedimage.png` composite and tile-derived change regions. Non-`.kra`
-files still get minimal text entries (real line/palette diffs are deferred). In a plain browser
-the hook falls back to the `src/data/` mock diffs.
+bumps `refreshNonce` (e.g. after a commit, rollback, or undo). Per-commit diffs are **real** for
+`.kra` files, and load in **two stages** so the panel appears immediately:
+[`useCommitDiff`](../src/lib/repoData.ts) calls `commit_diff` for the `mergedimage.png` composite,
+layer metadata, and tile-derived change regions (fast); then
+[`useArtLayers`](../src/lib/repoData.ts) lazily calls `commit_layers` (or `working_layers`) for
+that file's per-layer PNG rasters (as SVG `<image>` markup, so the SVG-compositing viewer renders
+them unchanged), which [`ArtDiffView`](../src/components/vcs/ArtDiffView.tsx) merges in when they
+arrive. Both hooks expose a `loading` flag: `MainPanel` shows an "Analyzing changes…" spinner for
+the initial diff, and `ArtDiffView` a "Loading layers…" indicator while the rasters stream in.
+Layer rasters are downscaled to a longest side of `raster::MAX_RASTER_DIM` (2048px) before
+encoding — a diff preview never needs full document resolution, and full-res PNG encode was the
+diff's dominant cost. Non-`.kra` files still get minimal text entries (real line/palette diffs are
+deferred). In a plain browser the hooks fall back to the `src/data/` mock diffs.

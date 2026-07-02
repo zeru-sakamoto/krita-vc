@@ -1,3 +1,4 @@
+import { CircleNotchIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
 import { compositeSvg } from "../../data/mockArt";
 import { assetName } from "../../lib/friendly";
@@ -77,6 +78,8 @@ interface LayerStackPanelProps {
   palette?: PaletteDiff;
   selectedId: string;
   onSelect: (id: string) => void;
+  /** Layers whose rasters are still streaming in — their thumbs show a spinner. */
+  pendingIds?: Set<string>;
 }
 
 /**
@@ -85,7 +88,13 @@ interface LayerStackPanelProps {
  *   2. Color Palette — single selectable row per palette (when palette prop is provided).
  * (DESIGN.md → Layout & App Shell → Docker / Panel System)
  */
-export function LayerStackPanel({ diff, palette, selectedId, onSelect }: LayerStackPanelProps) {
+export function LayerStackPanel({
+  diff,
+  palette,
+  selectedId,
+  onSelect,
+  pendingIds,
+}: LayerStackPanelProps) {
   // Derive an overall palette change status: prefer M > A > D over unchanged swatches.
   const paletteStatus: FileStatus | null = palette ? (palette.status ?? null) : null;
 
@@ -109,7 +118,13 @@ export function LayerStackPanel({ diff, palette, selectedId, onSelect }: LayerSt
           const status = CHANGE_STATUS[l.change];
           return (
             <Row key={l.id} selected={selectedId === l.id} onClick={() => onSelect(l.id)}>
-              <Thumb svg={compositeSvg([l], state, diff.width, diff.height)} />
+              {pendingIds?.has(l.id) ? (
+                <div className="grid h-7 w-9 shrink-0 place-items-center rounded-badge border border-border bg-surface-2">
+                  <CircleNotchIcon size={12} className="animate-spin text-text-muted" />
+                </div>
+              ) : (
+                <Thumb svg={compositeSvg([l], state, diff.width, diff.height)} />
+              )}
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate text-[12px] text-text">{l.name}</span>
                 <span className="truncate font-mono text-[10px] text-text-muted">

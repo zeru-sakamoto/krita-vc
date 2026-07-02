@@ -105,19 +105,42 @@ ArtDiffView
 
 ## Real backend data
 
-`ArtDiff`/`ArtLayer` are the swap point, and for `.kra` files the backend now fills it. The
-`commit_diff` command (see [version-control.md](version-control.md)) reconstructs each paint
-layer's pixels from its stored tiles (LZF-decoded, planar BGRA → RGBA, PNG-encoded) and returns
-them as **SVG `<image href="data:image/png;base64,…">` markup** in `ArtLayer.before`/`after` — so
-`layersBody`/`wrapSvg`/`ArtCanvas`/`CompareSlider` composite them with **zero rendering changes**
-(blend modes, checkerboard, overlays all still apply). It also supplies:
+`ArtDiff`/`ArtLayer` are the swap point, and for `.kra` files the backend fills it in **two
+stages** so the panel appears immediately instead of blocking on every layer's raster:
 
-- **Composite** — `mergedimage.png` at each state in `ArtDiff.beforeImage`/`afterImage`. The
-  "Composite" navigator row prefers this (a reliable whole-image render) over stacking layers;
-  `ArtDiffView` swaps in a single composite "layer" when these are present.
-- **Change regions** — one normalized bounding box over the tiles that differ between the two
-  commits (no pixel decode; just tile-hash comparison), feeding the box-highlight overlay.
+1. **`commit_diff`** (see [version-control.md](version-control.md)) returns the cheap parts up
+   front — layer *metadata* (`ArtLayer` with `before`/`after` = `null`), the composite, and change
+   regions:
+   - **Composite** — `mergedimage.png` at each state in `ArtDiff.beforeImage`/`afterImage`,
+     re-encoded down to ≤`MAX_RASTER_DIM` (`raster::cap_png`; full-resolution composites of big
+     canvases dominated the IPC payload). The "Composite" navigator row prefers this over
+     stacking layers; `ArtDiffView` swaps in a single composite "layer" when these are present, so
+     the default view is correct the instant the diff loads.
+   - **Change regions** — one normalized bounding box over the tiles that differ between the two
+     commits (no pixel decode; just tile-hash comparison), feeding the box-highlight overlay.
+2. **`commit_layers`** (or `working_layers`) is then fetched lazily by
+   [`useArtLayers`](../src/lib/repoData.ts) and **streamed**: the command takes a Tauri
+   `Channel<LayerDto>` and sends each layer the moment its rasters finish (rayon-parallel, so
+   out of order; the frontend merges by layer id over the metadata from stage 1). Each layer's
+   pixels are reconstructed from stored tiles (LZF-decoded, planar BGRA → RGBA, downscaled to
+   ≤`MAX_RASTER_DIM`, PNG-encoded) and arrive as **SVG `<image href="data:image/png;base64,…">`
+   markup** in `ArtLayer.before`/`after`, so `layersBody`/`wrapSvg`/`ArtCanvas`/`CompareSlider`
+   composite them with **zero rendering changes** (blend modes, checkerboard, overlays all still
+   apply). Layers pop in one by one; not-yet-arrived layers show a spinner thumb in the navigator
+   (and a canvas spinner if selected), with the "Loading layers…" header indicator until the
+   whole set lands.
 
-`mockArt.ts` stays for the browser fallback (`useCommitDiff` uses it when not in the Tauri shell).
-Deferred (ponytail): non-RGBA-8 colorspaces (those layers fall back to the composite), and
-per-layer change regions with labels.
+Rasters use `preserveAspectRatio="xMidYMid meet"` (never `none`), so a before-side from a version
+with different canvas dimensions letterboxes instead of stretching.
+
+**Caching:** every capped PNG (composite and per-layer) is written to **`.kvc/cache/`**, keyed by
+a hash of the content that produced it (composite: the entry's content hash; layer: tile
+positions + hashes + dims + cap). Keys are content-derived, so entries never invalidate, unchanged
+layers share one entry across commits and across the committed/working paths, and a repeat view —
+including after an app restart — skips reconstruct/decode/encode entirely. In-session, the
+frontend also memoizes `commit_diff` results and streamed layer sets (small LRU maps in
+`repoData.ts`).
+
+`mockArt.ts` stays for the browser fallback (the hooks use it when not in the Tauri shell).
+Deferred (ponytail): non-RGBA-8 colorspaces (those layers fall back to the composite), per-layer
+change regions with labels, and `.kvc/cache` eviction (capped PNGs are small).

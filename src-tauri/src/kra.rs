@@ -7,14 +7,22 @@
 use crate::error::{KvcError, Result};
 use crate::repo::Repo;
 use crate::tiles::{self, Tile, TiledBlock};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct KraManifest {
+pub struct KraManifest {
     entries: Vec<KraEntry>,
+}
+
+/// Reconstruct + parse a manifest once. The diff path reuses one parsed `KraManifest` across all
+/// layer/region/composite reads instead of re-reconstructing (walking the patch chain) per call.
+pub fn load_manifest(repo: &Repo, relpath: &str, manifest_hash: &str) -> Result<KraManifest> {
+    let mbytes = repo.reconstruct(&manifest_key(relpath), manifest_hash)?;
+    serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,10 +69,19 @@ pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<S
 
         if tiles::is_tiled(&buf) {
             let block = tiles::parse(&buf)?;
+            // Prepare every tile in parallel (the CPU cost: reconstruct base + bsdiff + verify, or
+            // zstd for a fresh tile), then fold the results into the repo serially. Each tile is a
+            // distinct stream key, so the parallel prepares don't race on the same chain.
+            let repo_ref: &Repo = repo;
+            let prepared: Vec<crate::delta::Prepared> = block
+                .tiles
+                .par_iter()
+                .map(|t| repo_ref.prepare_stream(&tile_key(relpath, &name, t.x, t.y), &t.data))
+                .collect::<Result<Vec<_>>>()?;
             let mut refs = Vec::with_capacity(block.tiles.len());
-            for t in &block.tiles {
+            for (t, p) in block.tiles.iter().zip(prepared) {
                 let key = tile_key(relpath, &name, t.x, t.y);
-                let hash = repo.store_stream(&key, &t.data)?;
+                let hash = repo.commit_prepared(&key, p)?;
                 refs.push(TileRef {
                     x: t.x,
                     y: t.y,
@@ -329,23 +346,59 @@ fn tile_dims(header: &str) -> (i64, i64, usize) {
     )
 }
 
+/// Cache key for one layer raster: a hash of everything that determines the output pixels —
+/// the tiles (position + content hash), canvas dims, and the resolution cap. Derivable from a
+/// committed manifest's refs and a working file's precomputed hashes alike, so unchanged layers
+/// share one cache entry across commits and across the committed/working paths.
+fn raster_cache_key(
+    entry_path: &str,
+    tiles: &mut [(i64, i64, &str)],
+    width: i64,
+    height: i64,
+) -> String {
+    tiles.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    h.update(
+        format!(
+            "layer\0{entry_path}\0{width}x{height}\0{}",
+            crate::raster::MAX_RASTER_DIM
+        )
+        .as_bytes(),
+    );
+    for (x, y, hash) in tiles.iter() {
+        h.update(format!("\0{x},{y},{hash}").as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Cache key for a capped composite (mergedimage.png), from its content hash.
+pub fn composite_cache_key(content_hash: &str) -> String {
+    blake3::hash(
+        format!(
+            "composite\0{content_hash}\0{}",
+            crate::raster::MAX_RASTER_DIM
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
 /// Reconstruct one paint layer's pixels as a full `width`x`height` PNG data URL, or `None` if
 /// the layer has no tile data / uses an unsupported colorspace.
 pub fn layer_raster(
     repo: &Repo,
     relpath: &str,
-    manifest_hash: &str,
+    manifest: &KraManifest,
     image_name: &str,
     layer_filename: &str,
     width: i64,
     height: i64,
+    cache: &crate::delta::TileCache,
 ) -> Result<Option<String>> {
     if layer_filename.is_empty() || width <= 0 || height <= 0 {
         return Ok(None);
     }
-    let mbytes = repo.reconstruct(&manifest_key(relpath), manifest_hash)?;
-    let manifest: KraManifest =
-        serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     let entry_path = format!("{image_name}/layers/{layer_filename}");
     let Some((header, refs)) = manifest.entries.iter().find_map(|e| match e {
         KraEntry::Tiled {
@@ -362,18 +415,39 @@ pub fn layer_raster(
     if tw <= 0 || th <= 0 || ps != 4 {
         return Ok(None); // ponytail: RGBA8 tiles only.
     }
-    let mut canvas = vec![0u8; (width * height * 4) as usize];
-    for tr in refs {
-        let data = repo.reconstruct(&tile_key(relpath, &entry_path, tr.x, tr.y), &tr.hash)?;
-        if let Some(px) = crate::raster::tile_to_rgba(&data, tw as usize, th as usize, ps) {
-            crate::raster::blit(&mut canvas, width, height, tr.x, tr.y, &px, tw, th);
-        }
+    let cache_dir = repo.cache_dir();
+    let mut key_tiles: Vec<(i64, i64, &str)> =
+        refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
+    let key = raster_cache_key(&entry_path, &mut key_tiles, width, height);
+    if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
+        return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
     }
-    Ok(Some(crate::raster::rgba_to_png_data_url(
-        &canvas,
-        width as u32,
-        height as u32,
-    )?))
+    // Reconstruct + LZF-decode tiles in parallel (nested rayon inside the per-layer par_iter is
+    // fine — one work-stealing pool), then blit serially into the shared canvas.
+    let decoded: Vec<Option<(i64, i64, Vec<u8>)>> = refs
+        .par_iter()
+        .map(|tr| -> Result<Option<(i64, i64, Vec<u8>)>> {
+            let data = cache.get_or_reconstruct(
+                repo,
+                &tile_key(relpath, &entry_path, tr.x, tr.y),
+                &tr.hash,
+            )?;
+            Ok(
+                crate::raster::tile_to_rgba(&data, tw as usize, th as usize, ps)
+                    .map(|px| (tr.x, tr.y, px)),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut canvas = vec![0u8; (width * height * 4) as usize];
+    for (x, y, px) in decoded.into_iter().flatten() {
+        crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
+    }
+    // Cap the raster resolution before encoding — a diff preview never needs full document pixels,
+    // and full-res PNG encode was the diff's dominant cost.
+    let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
+    let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
+    crate::raster::cache_write(&cache_dir, &key, &png);
+    Ok(Some(crate::raster::png_bytes_to_data_url(&png)))
 }
 
 /// Reconstruct a single non-tiled archive entry's raw bytes from a manifest (cheap — avoids
@@ -381,12 +455,9 @@ pub fn layer_raster(
 pub fn entry_bytes(
     repo: &Repo,
     relpath: &str,
-    manifest_hash: &str,
+    manifest: &KraManifest,
     name: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let mbytes = repo.reconstruct(&manifest_key(relpath), manifest_hash)?;
-    let manifest: KraManifest =
-        serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     let Some(blob) = manifest.entries.iter().find_map(|e| match e {
         KraEntry::Raw { path, blob, .. } if path == name => Some(blob.clone()),
         _ => None,
@@ -400,110 +471,324 @@ pub fn entry_bytes(
 pub fn entry_data_url(
     repo: &Repo,
     relpath: &str,
-    manifest_hash: &str,
+    manifest: &KraManifest,
     name: &str,
 ) -> Result<Option<String>> {
-    Ok(entry_bytes(repo, relpath, manifest_hash, name)?
+    Ok(entry_bytes(repo, relpath, manifest, name)?
         .map(|b| crate::raster::png_bytes_to_data_url(&b)))
 }
 
-/// The set of tiled layer-data entry paths whose tiles differ between two manifests (added,
-/// removed, or hash-changed tiles). Used to flag which layers actually changed pixels.
-pub fn changed_entry_paths(
-    repo: &Repo,
-    relpath: &str,
-    old_manifest: &str,
-    new_manifest: &str,
-) -> Result<std::collections::HashSet<String>> {
-    let load = |h: &str| -> Result<KraManifest> {
-        let b = repo.reconstruct(&manifest_key(relpath), h)?;
-        serde_json::from_slice(&b).map_err(|e| KvcError::BadIndex(e.to_string()))
-    };
-    let (old, new) = (load(old_manifest)?, load(new_manifest)?);
-    let mut out = std::collections::HashSet::new();
-    for entry in &new.entries {
-        let KraEntry::Tiled { path, tiles, .. } = entry else {
-            continue;
-        };
-        let old_tiles: std::collections::HashMap<(i64, i64), &str> = old
-            .entries
+/// entry path -> (tile width, tile height, [(x, y, content hash)]) for every tiled entry —
+/// the common shape the change detectors below compare. Buildable from a committed manifest
+/// or an in-memory working file, so both diff paths share one implementation.
+pub type TileIndex = std::collections::HashMap<String, (i64, i64, Vec<(i64, i64, String)>)>;
+
+impl KraManifest {
+    /// Content hash of a non-tiled entry, if present — a cache key without reconstructing bytes.
+    pub fn entry_hash(&self, name: &str) -> Option<String> {
+        self.entries.iter().find_map(|e| match e {
+            KraEntry::Raw { path, blob, .. } if path == name => Some(blob.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn tile_index(&self) -> TileIndex {
+        self.entries
             .iter()
-            .find_map(|e| match e {
-                KraEntry::Tiled { path: p, tiles, .. } if p == path => Some(tiles),
+            .filter_map(|e| match e {
+                KraEntry::Tiled {
+                    path,
+                    header,
+                    tiles,
+                } => {
+                    let (tw, th, _) = tile_dims(header);
+                    let ts = tiles.iter().map(|t| (t.x, t.y, t.hash.clone())).collect();
+                    Some((path.clone(), (tw, th, ts)))
+                }
                 _ => None,
             })
-            .map(|ts| ts.iter().map(|t| ((t.x, t.y), t.hash.as_str())).collect())
+            .collect()
+    }
+}
+
+/// The set of tiled layer-data entry paths whose tiles differ between two sides (added,
+/// removed, or hash-changed tiles). Used to flag which layers actually changed pixels.
+pub fn changed_entry_paths(old: &TileIndex, new: &TileIndex) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (path, (_, _, tiles)) in new {
+        let old_tiles: std::collections::HashMap<(i64, i64), &str> = old
+            .get(path)
+            .map(|(_, _, ts)| ts.iter().map(|(x, y, h)| ((*x, *y), h.as_str())).collect())
             .unwrap_or_default();
         let changed = tiles.len() != old_tiles.len()
             || tiles
                 .iter()
-                .any(|t| old_tiles.get(&(t.x, t.y)) != Some(&t.hash.as_str()));
+                .any(|(x, y, h)| old_tiles.get(&(*x, *y)) != Some(&h.as_str()));
         if changed {
             out.insert(path.clone());
         }
     }
-    Ok(out)
+    out
 }
 
-/// One normalized (0..1) bounding box over the tiles that changed between two manifests.
+/// One normalized (0..1) bounding box over the tiles that changed between two sides.
 /// ponytail: a single union box across all layers — cheap and enough for the highlight overlay;
 /// per-layer boxes if the UI ever needs them.
 pub fn changed_region(
-    repo: &Repo,
-    relpath: &str,
-    old_manifest: &str,
-    new_manifest: &str,
+    old: &TileIndex,
+    new: &TileIndex,
     width: i64,
     height: i64,
-) -> Result<Option<(f64, f64, f64, f64)>> {
+) -> Option<(f64, f64, f64, f64)> {
     if width <= 0 || height <= 0 {
-        return Ok(None);
+        return None;
     }
-    let load = |h: &str| -> Result<KraManifest> {
-        let b = repo.reconstruct(&manifest_key(relpath), h)?;
-        serde_json::from_slice(&b).map_err(|e| KvcError::BadIndex(e.to_string()))
-    };
-    let (old, new) = (load(old_manifest)?, load(new_manifest)?);
 
     // Map each tiled entry to (x,y)->hash for the old side, then flag changed/new tiles.
     let mut min = (i64::MAX, i64::MAX);
     let mut max = (i64::MIN, i64::MIN);
     let mut seen = false;
-    for entry in &new.entries {
-        let KraEntry::Tiled {
-            path,
-            header,
-            tiles,
-        } = entry
-        else {
-            continue;
-        };
-        let (tw, th, _) = tile_dims(header);
+    for (path, (tw, th, tiles)) in new {
         let old_tiles: std::collections::HashMap<(i64, i64), &str> = old
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                KraEntry::Tiled { path: p, tiles, .. } if p == path => Some(tiles),
-                _ => None,
-            })
-            .map(|ts| ts.iter().map(|t| ((t.x, t.y), t.hash.as_str())).collect())
+            .get(path)
+            .map(|(_, _, ts)| ts.iter().map(|(x, y, h)| ((*x, *y), h.as_str())).collect())
             .unwrap_or_default();
-        for t in tiles {
-            if old_tiles.get(&(t.x, t.y)) != Some(&t.hash.as_str()) {
+        for (x, y, h) in tiles {
+            if old_tiles.get(&(*x, *y)) != Some(&h.as_str()) {
                 seen = true;
-                min = (min.0.min(t.x), min.1.min(t.y));
-                max = (max.0.max(t.x + tw), max.1.max(t.y + th));
+                min = (min.0.min(*x), min.1.min(*y));
+                max = (max.0.max(x + tw), max.1.max(y + th));
             }
         }
     }
     if !seen {
-        return Ok(None);
+        return None;
     }
     let x = (min.0.max(0) as f64) / width as f64;
     let y = (min.1.max(0) as f64) / height as f64;
     let w = ((max.0.min(width) - min.0.max(0)) as f64 / width as f64).clamp(0.0, 1.0);
     let h = ((max.1.min(height) - min.1.max(0)) as f64 / height as f64).clamp(0.0, 1.0);
-    Ok(Some((x, y, w, h)))
+    Some((x, y, w, h))
+}
+
+// --- working-tree .kra (in-memory, read-only diff path) --------------------------------
+
+/// A working-tree .kra parsed once into memory. Viewing a diff must never write to the
+/// store: tiles keep their raw bytes (rasters decode straight from RAM — no chain
+/// reconstruct, no bsdiff, no object writes) and per-tile content hashes are computed up
+/// front for change detection against a committed manifest.
+pub struct WorkingKra {
+    entries: Vec<WorkingEntry>,
+}
+
+enum WorkingEntry {
+    Raw {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    Tiled {
+        path: String,
+        header: String,
+        tiles: Vec<Tile>,
+        /// content hash per tile, parallel to `tiles`
+        hashes: Vec<String>,
+    },
+}
+
+/// Decompose `file_bytes` (a .kra) in memory — the read-only counterpart of [`commit_kra`].
+pub fn parse_working(file_bytes: &[u8]) -> Result<WorkingKra> {
+    let mut zip = ZipArchive::new(Cursor::new(file_bytes)).map_err(zip_err)?;
+    let mut entries = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(zip_err)?;
+        if f.is_dir() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        drop(f);
+
+        if tiles::is_tiled(&buf) {
+            let block = tiles::parse(&buf)?;
+            let hashes = block
+                .tiles
+                .par_iter()
+                .map(|t| crate::repo::hash_bytes(&t.data))
+                .collect();
+            entries.push(WorkingEntry::Tiled {
+                path: name,
+                header: block.header,
+                tiles: block.tiles,
+                hashes,
+            });
+        } else {
+            entries.push(WorkingEntry::Raw {
+                path: name,
+                bytes: buf,
+            });
+        }
+    }
+    Ok(WorkingKra { entries })
+}
+
+impl WorkingKra {
+    pub fn tile_index(&self) -> TileIndex {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                WorkingEntry::Tiled {
+                    path,
+                    header,
+                    tiles,
+                    hashes,
+                } => {
+                    let (tw, th, _) = tile_dims(header);
+                    let ts = tiles
+                        .iter()
+                        .zip(hashes)
+                        .map(|(t, h)| (t.x, t.y, h.clone()))
+                        .collect();
+                    Some((path.clone(), (tw, th, ts)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn entry_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.entries.iter().find_map(|e| match e {
+            WorkingEntry::Raw { path, bytes } if path == name => Some(bytes.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Content hash of a non-tiled entry, if present (working counterpart of
+    /// [`KraManifest::entry_hash`] — the bytes are already in RAM, so hash them directly).
+    pub fn entry_hash(&self, name: &str) -> Option<String> {
+        self.entry_bytes(name).map(crate::repo::hash_bytes)
+    }
+
+    /// Same output as [`layer_raster`] but decoded straight from the in-memory tiles.
+    /// `cache_dir` is the repo's `.kvc/cache/` — keys are content-derived, so working and
+    /// committed rasters of identical pixels share entries.
+    pub fn layer_raster(
+        &self,
+        entry_path: &str,
+        width: i64,
+        height: i64,
+        cache_dir: &std::path::Path,
+    ) -> Result<Option<String>> {
+        if width <= 0 || height <= 0 {
+            return Ok(None);
+        }
+        let Some((header, tiles, hashes)) = self.entries.iter().find_map(|e| match e {
+            WorkingEntry::Tiled {
+                path,
+                header,
+                tiles,
+                hashes,
+            } if path == entry_path => Some((header, tiles, hashes)),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let (tw, th, ps) = tile_dims(header);
+        if tw <= 0 || th <= 0 || ps != 4 {
+            return Ok(None); // ponytail: RGBA8 tiles only.
+        }
+        let mut key_tiles: Vec<(i64, i64, &str)> = tiles
+            .iter()
+            .zip(hashes)
+            .map(|(t, h)| (t.x, t.y, h.as_str()))
+            .collect();
+        let key = raster_cache_key(entry_path, &mut key_tiles, width, height);
+        if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
+            return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
+        }
+        // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
+        let decoded: Vec<(i64, i64, Vec<u8>)> = tiles
+            .par_iter()
+            .filter_map(|t| {
+                crate::raster::tile_to_rgba(&t.data, tw as usize, th as usize, ps)
+                    .map(|px| (t.x, t.y, px))
+            })
+            .collect();
+        let mut canvas = vec![0u8; (width * height * 4) as usize];
+        for (x, y, px) in decoded {
+            crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
+        }
+        let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
+        let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
+        crate::raster::cache_write(cache_dir, &key, &png);
+        Ok(Some(crate::raster::png_bytes_to_data_url(&png)))
+    }
+}
+
+/// The "new" side of an art diff: a committed manifest (tiles come from the object store) or
+/// an in-memory working file (tiles already in RAM). Lets one diff builder serve both paths.
+pub enum KraSource<'a> {
+    Committed(&'a KraManifest),
+    Working(&'a WorkingKra),
+}
+
+impl KraSource<'_> {
+    pub fn tile_index(&self) -> TileIndex {
+        match self {
+            KraSource::Committed(m) => m.tile_index(),
+            KraSource::Working(w) => w.tile_index(),
+        }
+    }
+
+    pub fn entry_bytes(&self, repo: &Repo, relpath: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            KraSource::Committed(m) => entry_bytes(repo, relpath, m, name),
+            KraSource::Working(w) => Ok(w.entry_bytes(name).map(|b| b.to_vec())),
+        }
+    }
+
+    /// Content hash of a non-tiled entry, if present — the composite's cache key.
+    pub fn entry_hash(&self, name: &str) -> Option<String> {
+        match self {
+            KraSource::Committed(m) => m.entry_hash(name),
+            KraSource::Working(w) => w.entry_hash(name),
+        }
+    }
+
+    pub fn layer_raster(
+        &self,
+        repo: &Repo,
+        relpath: &str,
+        image_name: &str,
+        layer_filename: &str,
+        width: i64,
+        height: i64,
+        cache: &crate::delta::TileCache,
+    ) -> Result<Option<String>> {
+        match self {
+            KraSource::Committed(m) => layer_raster(
+                repo,
+                relpath,
+                m,
+                image_name,
+                layer_filename,
+                width,
+                height,
+                cache,
+            ),
+            KraSource::Working(w) => {
+                if layer_filename.is_empty() {
+                    return Ok(None);
+                }
+                w.layer_raster(
+                    &format!("{image_name}/layers/{layer_filename}"),
+                    width,
+                    height,
+                    &repo.cache_dir(),
+                )
+            }
+        }
+    }
 }
 
 // --- helpers ---------------------------------------------------------------------------

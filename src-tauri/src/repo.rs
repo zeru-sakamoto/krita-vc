@@ -24,6 +24,11 @@ pub fn kvc_dir(root: &Path) -> PathBuf {
 pub fn objects_dir(root: &Path) -> PathBuf {
     kvc_dir(root).join("objects")
 }
+/// Content-addressed capped-raster cache (see `raster::cache_read`/`cache_write`). Created by
+/// `init`; writes `create_dir_all` lazily so repos from before the cache existed keep working.
+pub fn cache_dir(root: &Path) -> PathBuf {
+    kvc_dir(root).join("cache")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +56,13 @@ pub struct TrackedFile {
     /// blake3 of the whole working-tree file as last committed.
     pub hash: String,
     pub is_kra: bool,
+    /// Size + mtime of the file as last committed, so the scanner can skip re-hashing unchanged
+    /// files (a big `.kra` is expensive to read+hash). `#[serde(default)]` = 0 for pre-existing
+    /// indexes, which never match a real file and so safely force a re-hash. See [`crate::scan`].
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,6 +135,7 @@ impl Repo {
             return Err(KvcError::AlreadyRepo(root.to_path_buf()));
         }
         std::fs::create_dir_all(objects_dir(root)).map_err(|e| io_at(&kvc, e))?;
+        std::fs::create_dir_all(cache_dir(root)).map_err(|e| io_at(&kvc, e))?;
         write_json(&kvc.join("config.json"), &Config::default())?;
         write_json(&kvc.join("index.json"), &Index::default())?;
         write_json(&kvc.join("chains.json"), &Chains::default())?;
@@ -154,8 +167,29 @@ impl Repo {
         })
     }
 
+    /// Like [`Repo::open`] but skips `chains.json` — by far the largest state file (every
+    /// version of every tile stream). For read paths that never touch storage (scan, log).
+    /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo.
+    pub fn open_light(root: &Path) -> Result<Repo> {
+        if !Self::is_repo(root) {
+            return Err(KvcError::NotARepo(root.to_path_buf()));
+        }
+        let kvc = kvc_dir(root);
+        Ok(Repo {
+            root: root.to_path_buf(),
+            config: read_json(&kvc.join("config.json"))?,
+            index: read_json(&kvc.join("index.json"))?,
+            chains: Chains::default(),
+            commits: read_json(&kvc.join("commits.json"))?,
+        })
+    }
+
     pub fn objects_dir(&self) -> PathBuf {
         objects_dir(&self.root)
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        cache_dir(&self.root)
     }
 
     /// Flush mutated state atomically.
@@ -170,8 +204,11 @@ impl Repo {
 
 /// Atomic JSON write: serialize to a temp file in the same dir, then rename over the
 /// target (Rust's `fs::rename` replaces the destination on Windows and POSIX).
+/// ponytail: compact (not pretty) — `.kvc/` JSON is machine state, and `chains.json`
+/// (every version of every tile stream) is rewritten in full on every commit; pretty-printing
+/// it dominated commit time as history grew.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    let bytes = serde_json::to_vec(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| io_at(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
@@ -184,9 +221,32 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .map_err(|e| KvcError::BadIndex(format!("{}: {e}", path.display())))
 }
 
-/// blake3 of a byte slice as lowercase hex.
+/// blake3 of a byte slice as lowercase hex. Multi-MB buffers (whole .kra files on scan/commit)
+/// hash multi-core; small buffers (tiles) stay on the cheap single-threaded path.
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
+    if bytes.len() >= 1 << 20 {
+        let mut h = blake3::Hasher::new();
+        h.update_rayon(bytes);
+        h.finalize().to_hex().to_string()
+    } else {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+}
+
+/// `(size, mtime)` for a path, for the scanner's re-hash cache. mtime is **nanoseconds** since the
+/// epoch — second resolution is too coarse (a save in the same second as the last commit, at the
+/// same size, would be missed). Best-effort: 0 if unavailable (forces a re-hash, which is safe).
+/// ponytail: relies on the OS updating mtime on every save (Krita rewrites the file, so it does);
+/// a tool that preserves mtime while changing same-size content would slip past — upgrade path is
+/// git's "racy" rule (re-hash anything whose mtime isn't strictly older than the last index write).
+pub fn size_mtime(meta: &std::fs::Metadata) -> (u64, u64) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (meta.len(), mtime)
 }
 
 /// Current time as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), no date crate.

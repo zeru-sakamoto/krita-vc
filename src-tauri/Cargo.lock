@@ -299,6 +299,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq 0.4.2",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]

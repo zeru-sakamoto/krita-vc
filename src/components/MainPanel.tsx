@@ -1,4 +1,4 @@
-import { FilesIcon, WarningIcon } from "@phosphor-icons/react";
+import { CircleNotchIcon, FilesIcon, WarningIcon } from "@phosphor-icons/react";
 import { DiffView } from "./vcs/DiffView";
 import type { DiffEntry } from "../types";
 
@@ -6,8 +6,15 @@ interface MainPanelProps {
   diff: DiffEntry[];
   /** Backend diff error, shown in place of the empty state so failures aren't silently blank. */
   error?: string | null;
+  /** True while the diff is being computed — shows a spinner instead of the empty state. */
+  loading?: boolean;
   /** Prompt shown when there's nothing to display and no error (context-dependent). */
   emptyHint?: string;
+  /** Diff source, threaded to art views so they can lazily fetch per-layer rasters. */
+  repoPath?: string;
+  commitId?: string | null;
+  working?: boolean;
+  nonce?: number;
 }
 
 /**
@@ -15,11 +22,26 @@ interface MainPanelProps {
  * Hosts the diff for the selected commit or focused working-tree file.
  * (DESIGN.md → Layout & App Shell → Canvas Area)
  */
-export function MainPanel({ diff, error, emptyHint }: MainPanelProps) {
+export function MainPanel({
+  diff,
+  error,
+  loading,
+  emptyHint,
+  repoPath,
+  commitId,
+  working,
+  nonce,
+}: MainPanelProps) {
   if (diff.length > 0) {
     return (
       <main className="flex min-w-0 flex-1 flex-col bg-bg">
-        <DiffView entries={diff} />
+        <DiffView
+          entries={diff}
+          repoPath={repoPath}
+          commitId={commitId}
+          working={working}
+          nonce={nonce}
+        />
       </main>
     );
   }
@@ -27,7 +49,12 @@ export function MainPanel({ diff, error, emptyHint }: MainPanelProps) {
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-bg">
       <div className="grid flex-1 place-items-center text-text-muted">
-        {error ? (
+        {loading ? (
+          <div className="flex flex-col items-center gap-2">
+            <CircleNotchIcon size={28} className="animate-spin text-accent" />
+            <p className="text-[13px]">Analyzing changes…</p>
+          </div>
+        ) : error ? (
           <div className="flex max-w-sm flex-col items-center gap-2 px-4 text-center">
             <WarningIcon size={32} weight="regular" className="text-danger" />
             <p className="text-[13px]">Couldn’t build this diff.</p>

@@ -52,7 +52,11 @@ export function AppShell() {
   const showWorking = activeView === "changes" && focusedFile != null;
   const commitDiff = useCommitDiff(current.path, selectedId, refreshNonce);
   const workingDiff = useWorkingDiff(current.path, showWorking ? focusedFile : null, refreshNonce);
-  const { entries: diff, error: diffError } = showWorking ? workingDiff : commitDiff;
+  const {
+    entries: diff,
+    error: diffError,
+    loading: diffLoading,
+  } = showWorking ? workingDiff : commitDiff;
   const activeFile = diff[0]?.path ?? null;
 
   const emptyHint =
@@ -137,7 +141,16 @@ export function AppShell() {
             </div>
 
             <div className="flex min-h-0 flex-1">
-              <MainPanel diff={diff} error={diffError} emptyHint={emptyHint} />
+              <MainPanel
+                diff={diff}
+                error={diffError}
+                loading={diffLoading}
+                emptyHint={emptyHint}
+                repoPath={current.path}
+                commitId={showWorking ? null : selectedId}
+                working={showWorking}
+                nonce={refreshNonce}
+              />
               {inspectorOpen && (
                 <Inspector
                   commit={selectedCommit}

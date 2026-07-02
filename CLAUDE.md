@@ -12,12 +12,17 @@ The Rust side is a **working custom local VCS** — its own `.kvc/` store (not g
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`; commands
 in `commands.rs`). The frontend drives it via Tauri `invoke` in the desktop shell (history, scan,
 commit, repo lifecycle, rollback/undo, and per-commit visual diffs) and **falls back to mock
-data** (`src/data/`) in a plain browser (`npm run dev`). `.kra` diffs are real (per-layer PNG
-rasters + composite via `commit_diff`); non-`.kra` diffs are still minimal/mock. Rust tests live
-in `src-tauri/tests/`; the frontend has no test runner yet — if you add one, update this file.
+data** (`src/data/`) in a plain browser (`npm run dev`). `.kra` diffs are real and load in two
+stages: `commit_diff` returns the capped composite + layer metadata fast, then `commit_layers`/
+`working_layers` **stream** per-layer PNG rasters over a Tauri `Channel` as each finishes, with
+capped PNGs persisted in a content-addressed `.kvc/cache/` (see the diff viewer section);
+non-`.kra` diffs are still minimal/mock. Rust tests live in `src-tauri/tests/`; the frontend has no test
+runner yet — if you add one, update this file.
 
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
-control (the backend), and the visual diff viewer.
+control (the backend), the visual diff viewer, and [performance](docs/performance.md) (why the
+`.kra` diff path is fast: staged/streamed loading, rayon parallelism, the `.kvc/cache/` raster
+cache, raster downscaling, and the dev/release build profile).
 
 ## Commands
 
@@ -79,13 +84,19 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   only), and the diff viewer
   (`DiffView`, `ArtDiffView`, `PaletteDiffView`, `LayerStackPanel`, `ArtCanvas`, `CompareSlider`).
 - **Main panel** (`src/components/MainPanel.tsx`): thin wrapper between `AppShell` and `DiffView`;
-  handles the empty-state when no commit is selected.
+  handles the empty-state when no commit is selected, and shows an "Analyzing changes…" spinner
+  while the diff loads (the `loading` flag from `useCommitDiff`/`useWorkingDiff`).
 - **Diff viewer** — `DiffView` routes each `DiffEntry` by `kind`: art (`.kra`) files render as a
   **visual layer diff** (`ArtDiffView` → `LayerStackPanel` + `ArtCanvas`/`CompareSlider`) inside a
   **drag-resizable region** (vertical handle on its bottom edge; height persisted via `useResize`,
-  content scrolls when shrunk). Real `.kra` diffs arrive via `commit_diff` (`useCommitDiff`);
-  each layer's raster comes as SVG `<image>` markup so the SVG-compositing viewer is unchanged,
-  and the Composite view uses the `.kra`'s `mergedimage.png`. Palette (`.gpl`) files have
+  content scrolls when shrunk). Real `.kra` diffs load in two stages so the panel appears
+  immediately: `commit_diff` (`useCommitDiff`) supplies the capped composite + layer metadata,
+  then the heavy per-layer rasters stream in via `useArtLayers` → `commit_layers`/
+  `working_layers`, one `Channel` message per finished layer (merged into `effectiveDiff` by id
+  as each lands; pending layers show spinner thumbs plus the "Loading layers…" indicator). Each
+  layer's raster comes as SVG `<image>` markup so the SVG-compositing viewer is unchanged, and
+  the Composite view uses the `.kra`'s `mergedimage.png` (downscaled to the raster cap). Capped
+  PNGs are cached content-addressed in `.kvc/cache/`, so repeat views skip rasterization. Palette (`.gpl`) files have
   `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**

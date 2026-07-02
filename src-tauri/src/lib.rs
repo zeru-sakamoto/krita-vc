@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 pub mod commit;
 pub mod delta;
 pub mod error;
@@ -26,7 +26,9 @@ pub fn run() {
             commands::rollback_to_commit,
             commands::undo_last_commit,
             commands::commit_diff,
+            commands::commit_layers,
             commands::working_diff,
+            commands::working_layers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

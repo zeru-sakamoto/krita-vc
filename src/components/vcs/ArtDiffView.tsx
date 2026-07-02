@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import {
   ArrowsLeftRight,
   BoundingBox,
+  CircleNotchIcon,
   Columns,
   Eye,
   EyeSlash,
@@ -11,6 +12,7 @@ import type { ArtDiff, DiffState, PaletteDiff } from "../../types";
 import { IconButton } from "../ui/IconButton";
 import { FileStatusChip } from "./FileStatusChip";
 import { useArtistMode } from "../../lib/artistMode";
+import { useArtLayers } from "../../lib/repoData";
 import { assetName } from "../../lib/friendly";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
@@ -60,34 +62,74 @@ function Pane({
  * When a `palette` prop is supplied, a "Color Palette" section appears below the
  * layers in the navigator. Selecting it swaps the right pane to the palette grid.
  */
-export function ArtDiffView({ diff, palette }: { diff: ArtDiff; palette?: PaletteDiff }) {
+interface ArtDiffViewProps {
+  diff: ArtDiff;
+  palette?: PaletteDiff;
+  /** Diff source for lazily fetching this file's per-layer rasters. Absent in mock/browser. */
+  repoPath?: string;
+  commitId?: string | null;
+  working?: boolean;
+  nonce?: number;
+}
+
+export function ArtDiffView({
+  diff,
+  palette,
+  repoPath,
+  commitId,
+  working,
+  nonce,
+}: ArtDiffViewProps) {
   const { artistMode } = useArtistMode();
   const [selectedId, setSelectedId] = useState<string>(COMPOSITE_ID);
   const [viewMode, setViewMode] = useState<ViewMode>("split");
   const [highlightOn, setHighlightOn] = useState(true);
   const [highlightMode, setHighlightMode] = useState<HighlightMode>("box");
 
+  // The per-commit diff ships layer *metadata* but not the heavy per-layer rasters; those stream
+  // in one at a time (keyed by layer id) and merge over the metadata as they land. Until a
+  // layer arrives its metadata row still renders, and the composite (mergedimage.png) is
+  // available from the start.
+  const { layers: fetchedLayers, loading: layersLoading } = useArtLayers(
+    repoPath ?? "",
+    diff.path,
+    {
+      commitId: commitId ?? null,
+      working: working ?? false,
+      nonce,
+    }
+  );
+  const effectiveDiff = useMemo<ArtDiff>(() => {
+    if (!fetchedLayers || fetchedLayers.size === 0) return diff;
+    return { ...diff, layers: diff.layers.map((l) => fetchedLayers.get(l.id) ?? l) };
+  }, [diff, fetchedLayers]);
+  // Layers whose rasters haven't streamed in yet — spinners in the navigator and canvas.
+  const pendingIds = useMemo(() => {
+    if (!layersLoading) return new Set<string>();
+    return new Set(diff.layers.filter((l) => !fetchedLayers?.has(l.id)).map((l) => l.id));
+  }, [diff, fetchedLayers, layersLoading]);
+
   const layers = useMemo(() => {
     if (selectedId === COMPOSITE_ID) {
       // Prefer the backend's real composite (mergedimage.png) over stacking layers, so the
       // composite is correct even if some layers can't be rastered. Mock data omits these.
-      if (diff.beforeImage !== undefined || diff.afterImage !== undefined) {
+      if (effectiveDiff.beforeImage !== undefined || effectiveDiff.afterImage !== undefined) {
         const composite: ArtDiff["layers"][number] = {
           id: COMPOSITE_ID,
           name: "Composite",
           opacity: 100,
           blendMode: "normal",
           change: "modified",
-          before: diff.beforeImage ?? null,
-          after: diff.afterImage ?? null,
+          before: effectiveDiff.beforeImage ?? null,
+          after: effectiveDiff.afterImage ?? null,
         };
         return [composite];
       }
-      return diff.layers;
+      return effectiveDiff.layers;
     }
-    const found = diff.layers.find((l) => l.id === selectedId);
-    return found ? [found] : diff.layers;
-  }, [diff, selectedId]);
+    const found = effectiveDiff.layers.find((l) => l.id === selectedId);
+    return found ? [found] : effectiveDiff.layers;
+  }, [effectiveDiff, selectedId]);
 
   const showPalette = selectedId === PALETTE_ID && palette != null;
 
@@ -104,14 +146,21 @@ export function ArtDiffView({ diff, palette }: { diff: ArtDiff; palette?: Palett
         >
           {artistMode ? assetName(diff.path) : diff.path}
         </span>
+        {layersLoading && (
+          <span className="ml-auto flex items-center gap-1 text-[11px] text-text-muted">
+            <CircleNotchIcon size={12} className="animate-spin" />
+            Loading layers…
+          </span>
+        )}
       </div>
 
       <div className="flex flex-1 min-h-0">
         <LayerStackPanel
-          diff={diff}
+          diff={effectiveDiff}
           palette={palette}
           selectedId={selectedId}
           onSelect={setSelectedId}
+          pendingIds={pendingIds}
         />
 
         <div className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -163,15 +212,16 @@ export function ArtDiffView({ diff, palette }: { diff: ArtDiff; palette?: Palett
                 />
               </div>
 
-              {/* Canvas */}
-              <div className="min-h-0 flex-1 overflow-auto">
+              {/* Canvas — overflow-hidden, never auto: the SVG scales to fit its pane, so
+                  scrolling could only ever crop the artwork. */}
+              <div className="relative min-h-0 flex-1 overflow-hidden">
                 {viewMode === "split" ? (
                   <div className="flex h-full">
-                    <Pane label="Before" diff={diff} layers={layers} state="before" />
+                    <Pane label="Before" diff={effectiveDiff} layers={layers} state="before" />
                     <div className="w-px shrink-0 bg-border" />
                     <Pane
                       label="After"
-                      diff={diff}
+                      diff={effectiveDiff}
                       layers={layers}
                       state="after"
                       overlay={highlightOn}
@@ -180,11 +230,17 @@ export function ArtDiffView({ diff, palette }: { diff: ArtDiff; palette?: Palett
                   </div>
                 ) : (
                   <CompareSlider
-                    diff={diff}
+                    diff={effectiveDiff}
                     layers={layers}
                     overlay={highlightOn}
                     highlightMode={highlightMode}
                   />
+                )}
+                {/* The selected layer's raster is still streaming in. */}
+                {pendingIds.has(selectedId) && (
+                  <div className="absolute inset-0 grid place-items-center bg-bg/40">
+                    <CircleNotchIcon size={24} className="animate-spin text-accent" />
+                  </div>
                 )}
               </div>
             </>

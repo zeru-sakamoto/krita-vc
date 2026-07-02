@@ -1,6 +1,6 @@
 //! End-to-end engine tests against real file I/O in tempdirs (no logic mocked).
 
-use krita_vc_lib::{commit, error::KvcError, kra, repo, scan, tiles};
+use krita_vc_lib::{commands, commit, delta, error::KvcError, kra, raster, repo, scan, tiles};
 use std::io::Write;
 
 // --- fixtures --------------------------------------------------------------------------
@@ -234,6 +234,62 @@ fn kra_tile_dedup_and_restore() {
     assert_eq!(l1.tiles[0].data, l2.tiles[0].data);
 }
 
+// --- working diff path: in-memory, never writes ----------------------------------------
+
+#[test]
+fn working_kra_diff_is_read_only_and_detects_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let kra1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, b"tileAAAA"), (0, 64, b"tileBBBB")]),
+        ),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "tester").unwrap();
+    let objs_before = count_objects(root);
+
+    // A working copy with one edited tile, parsed in memory (the working-diff path).
+    let kra2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, b"tileAAAA"), (0, 64, b"tileZZZZ")]),
+        ),
+    ]);
+    let working = kra::parse_working(&kra2).unwrap();
+
+    // Change detection against the committed manifest flags exactly the edited layer.
+    let manifest_hash = c1
+        .files
+        .iter()
+        .find(|f| f.path == "art.kra")
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+    let manifest = kra::load_manifest(&r, "art.kra", &manifest_hash).unwrap();
+    let changed = kra::changed_entry_paths(&manifest.tile_index(), &working.tile_index());
+    assert_eq!(
+        changed,
+        std::iter::once("img/layers/layer1".to_string()).collect()
+    );
+
+    // An untouched working copy reports no changed entries.
+    let same = kra::parse_working(&kra1).unwrap();
+    assert!(kra::changed_entry_paths(&manifest.tile_index(), &same.tile_index()).is_empty());
+
+    // Viewing a working diff writes nothing to the object store.
+    assert_eq!(count_objects(root), objs_before);
+}
+
 // --- scanner ---------------------------------------------------------------------------
 
 #[test]
@@ -288,6 +344,8 @@ fn open_errors_and_index_roundtrip() {
         repo::TrackedFile {
             hash: "h".into(),
             is_kra: false,
+            size: 0,
+            mtime: 0,
         },
     );
     r.save().unwrap();
@@ -444,7 +502,7 @@ fn kra_layer_raster_decodes_to_png() {
     ]);
     std::fs::write(root.join("art.kra"), &kra).unwrap();
     let c = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
-    let manifest = c
+    let manifest_hash = c
         .files
         .iter()
         .find(|f| f.path == "art.kra")
@@ -452,6 +510,7 @@ fn kra_layer_raster_decodes_to_png() {
         .content
         .clone()
         .unwrap();
+    let manifest = kra::load_manifest(&r, "art.kra", &manifest_hash).unwrap();
 
     // maindoc metadata parses.
     let meta = kra::parse_image_meta(&maindoc_raster()).unwrap();
@@ -462,7 +521,8 @@ fn kra_layer_raster_decodes_to_png() {
     assert_eq!(meta.layers[0].filename, "layer1");
 
     // The layer decodes to a real PNG data URL.
-    let url = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 64, 64).unwrap();
+    let cache = delta::TileCache::new();
+    let url = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 64, 64, &cache).unwrap();
     let url = url.expect("layer1 should decode to a raster");
     assert!(url.starts_with("data:image/png;base64,"));
     assert!(url.len() > 100, "expected a non-trivial PNG payload");
@@ -491,14 +551,165 @@ fn kra_changed_entry_paths_flags_edited_layer() {
     std::fs::write(root.join("art.kra"), mk(solid_rgba_tile(99, 20, 30, 255))).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
 
-    let m1 = c1.files[0].content.clone().unwrap();
-    let m2 = c2.files[0].content.clone().unwrap();
-    let changed = kra::changed_entry_paths(&r, "art.kra", &m1, &m2).unwrap();
+    let m1 = kra::load_manifest(&r, "art.kra", &c1.files[0].content.clone().unwrap()).unwrap();
+    let m2 = kra::load_manifest(&r, "art.kra", &c2.files[0].content.clone().unwrap()).unwrap();
+    let (t1, t2) = (m1.tile_index(), m2.tile_index());
+    let changed = kra::changed_entry_paths(&t1, &t2);
     assert!(
         changed.contains("img/layers/layer1"),
         "edited layer must be flagged"
     );
 
-    let region = kra::changed_region(&r, "art.kra", &m1, &m2, 64, 64).unwrap();
+    let region = kra::changed_region(&t1, &t2, 64, 64);
     assert!(region.is_some(), "an edited tile yields a change region");
+}
+
+// --- progressive layer streaming + persistent raster cache -----------------------------
+
+fn maindoc_layers(layers: &[(&str, &str, &str)]) -> Vec<u8> {
+    let body: String = layers
+        .iter()
+        .map(|(name, uuid, filename)| {
+            format!(
+                r#"<layer name="{name}" uuid="{uuid}" opacity="255" compositeop="normal" nodetype="paintlayer" filename="{filename}"/>"#
+            )
+        })
+        .collect();
+    format!(
+        r#"<!DOCTYPE DOC>
+<DOC><IMAGE name="img" width="64" height="64"><layers>{body}</layers></IMAGE></DOC>"#
+    )
+    .into_bytes()
+}
+
+/// Every layer of a raster diff (kept and removed alike) must be streamed through `on_layer`
+/// exactly as it appears in the returned set — the frontend renders from the stream alone.
+#[test]
+fn art_diff_streams_every_layer_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // v1: two layers; v2: layer2 removed → the v2 diff has one kept + one removed layer.
+    let v1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        (
+            "maindoc.xml",
+            maindoc_layers(&[("Base", "base", "layer1"), ("Top", "top", "layer2")]),
+        ),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(10, 20, 30, 255))]),
+        ),
+        (
+            "img/layers/layer2",
+            tiled(&[(0, 0, &solid_rgba_tile(40, 50, 60, 255))]),
+        ),
+    ]);
+    let v2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc_layers(&[("Base", "base", "layer1")])),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(10, 20, 30, 255))]),
+        ),
+    ]);
+    std::fs::write(root.join("art.kra"), &v1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    std::fs::write(root.join("art.kra"), &v2).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let parent_tree = commit::tree_at_commit(&r.commits, &c1.id).unwrap();
+    let f = c2.files.iter().find(|f| f.path == "art.kra").unwrap();
+    let streamed = std::sync::Mutex::new(Vec::new());
+    let dto = commands::committed_art_dto(
+        &r,
+        f,
+        parent_tree.get("art.kra"),
+        true,
+        Some(&|l| streamed.lock().unwrap().push(l)),
+    )
+    .unwrap();
+    let streamed = streamed.into_inner().unwrap();
+
+    assert_eq!(dto.layers.len(), 2, "one kept + one removed layer");
+    assert!(dto.layers.iter().any(|l| l.change == "removed"));
+    assert_eq!(streamed.len(), dto.layers.len());
+    for l in &dto.layers {
+        assert!(
+            streamed.iter().any(|s| s.id == l.id
+                && s.change == l.change
+                && s.before == l.before
+                && s.after == l.after),
+            "layer {} must be streamed with identical payload",
+            l.id
+        );
+    }
+}
+
+/// A second rasterization of identical content must come from `.kvc/cache/`, not a re-decode.
+#[test]
+fn layer_raster_reads_from_disk_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let kra_bytes = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc_raster()),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(10, 20, 30, 255))]),
+        ),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra_bytes).unwrap();
+    let c = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    let manifest = kra::load_manifest(&r, "art.kra", &c.files[0].content.clone().unwrap()).unwrap();
+
+    let first = kra::layer_raster(
+        &r,
+        "art.kra",
+        &manifest,
+        "img",
+        "layer1",
+        64,
+        64,
+        &delta::TileCache::new(),
+    )
+    .unwrap()
+    .unwrap();
+
+    // Exactly one cached PNG was written; replace its bytes to prove the next read uses it.
+    let cache_dir = root.join(".kvc/cache");
+    let cached: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(cached.len(), 1, "first rasterization populates the cache");
+    std::fs::write(&cached[0], b"MARKER").unwrap();
+
+    let second = kra::layer_raster(
+        &r,
+        "art.kra",
+        &manifest,
+        "img",
+        "layer1",
+        64,
+        64,
+        &delta::TileCache::new(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(second, raster::png_bytes_to_data_url(b"MARKER"));
+    assert_ne!(first, second);
+
+    // Same pixels via the in-memory working path share the cache entry.
+    let working = kra::parse_working(&kra_bytes).unwrap();
+    let from_working = working
+        .layer_raster("img/layers/layer1", 64, 64, &cache_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(from_working, second);
 }

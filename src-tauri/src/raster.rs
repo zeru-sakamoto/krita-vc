@@ -84,9 +84,18 @@ pub fn tile_to_rgba(stored: &[u8], tw: usize, th: usize, pixelsize: usize) -> Op
 /// Copy a `tw*th` RGBA tile into a `iw*ih` RGBA canvas at pixel offset `(tx, ty)`, clipping to
 /// the canvas bounds (tiles can extend past the image edge, or sit at negative offsets).
 pub fn blit(canvas: &mut [u8], iw: i64, ih: i64, tx: i64, ty: i64, tile: &[u8], tw: i64, th: i64) {
+    let full_rows = tx >= 0 && tx + tw <= iw;
     for row in 0..th {
         let cy = ty + row;
         if cy < 0 || cy >= ih {
+            continue;
+        }
+        // Common case: the whole tile row is inside the canvas — one memcpy per row.
+        if full_rows {
+            let src = (row * tw * 4) as usize;
+            let dst = ((cy * iw + tx) * 4) as usize;
+            let len = (tw * 4) as usize;
+            canvas[dst..dst + len].copy_from_slice(&tile[src..src + len]);
             continue;
         }
         for col in 0..tw {
@@ -101,20 +110,115 @@ pub fn blit(canvas: &mut [u8], iw: i64, ih: i64, tx: i64, ty: i64, tile: &[u8], 
     }
 }
 
-/// Encode an RGBA8 buffer as a PNG and wrap it in a `data:` URL.
-pub fn rgba_to_png_data_url(rgba: &[u8], width: u32, height: u32) -> Result<String> {
+/// Longest-side cap for per-layer diff rasters. These are only ever shown scaled-to-fit in a
+/// preview pane or a ~30px thumbnail, so full document resolution (Krita canvases run into the
+/// thousands of px) is wasted — it bloats PNG-encode time and the base64 payload shipped to the
+/// webview. ponytail: a flat cap with nearest-neighbour resampling; bump it or switch to a box
+/// filter if a diff ever needs pixel-accurate zoom.
+pub const MAX_RASTER_DIM: u32 = 2048;
+
+/// Downscale an RGBA8 buffer so its longest side is at most `MAX_RASTER_DIM`, returning the new
+/// buffer and dimensions. Returns the input unchanged when it's already within the cap.
+/// Nearest-neighbour — cheap and adequate for a scaled-down diff preview.
+pub fn cap_rgba(rgba: &[u8], width: u32, height: u32) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
+    let longest = width.max(height);
+    if longest <= MAX_RASTER_DIM || width == 0 || height == 0 {
+        return (std::borrow::Cow::Borrowed(rgba), width, height);
+    }
+    let scale = MAX_RASTER_DIM as f64 / longest as f64;
+    let nw = ((width as f64 * scale).round() as u32).max(1);
+    let nh = ((height as f64 * scale).round() as u32).max(1);
+    let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    for y in 0..nh {
+        let sy = (y as u64 * height as u64 / nh as u64) as usize;
+        for x in 0..nw {
+            let sx = (x as u64 * width as u64 / nw as u64) as usize;
+            let src = (sy * width as usize + sx) * 4;
+            let dst = (y as usize * nw as usize + x as usize) * 4;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    (std::borrow::Cow::Owned(out), nw, nh)
+}
+
+/// Encode an RGBA8 buffer as PNG bytes.
+pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     let mut png = Vec::new();
     {
         let mut enc = png::Encoder::new(Cursor::new(&mut png), width, height);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
+        // ponytail: these rasters are transient data-URLs for the webview — encode speed matters,
+        // byte size doesn't. Fast deflate + no row filter over max compression.
+        enc.set_compression(png::Compression::Fast);
+        enc.set_filter(png::FilterType::NoFilter);
         let mut w = enc
             .write_header()
             .map_err(|e| KvcError::BadTiles(format!("png header: {e}")))?;
         w.write_image_data(rgba)
             .map_err(|e| KvcError::BadTiles(format!("png data: {e}")))?;
     }
-    Ok(png_bytes_to_data_url(&png))
+    Ok(png)
+}
+
+/// Encode an RGBA8 buffer as a PNG and wrap it in a `data:` URL.
+pub fn rgba_to_png_data_url(rgba: &[u8], width: u32, height: u32) -> Result<String> {
+    Ok(png_bytes_to_data_url(&rgba_to_png(rgba, width, height)?))
+}
+
+/// Re-encode an already-encoded PNG (e.g. mergedimage.png) so its longest side fits
+/// `MAX_RASTER_DIM`. Full-resolution composites of large canvases dominated the diff's IPC
+/// payload — the webview only ever shows them scaled to fit. Returns the input untouched when
+/// it's already small enough or on anything we can't decode (16-bit, palette, grayscale,
+/// malformed) — shipping the original is always a safe fallback.
+pub fn cap_png(png_bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let Ok(mut reader) = decoder.read_info() else {
+        return std::borrow::Cow::Borrowed(png_bytes);
+    };
+    let info = reader.info();
+    let (w, h) = (info.width, info.height);
+    let (color, depth) = (info.color_type, info.bit_depth);
+    if w.max(h) <= MAX_RASTER_DIM
+        || depth != png::BitDepth::Eight
+        || !matches!(color, png::ColorType::Rgba | png::ColorType::Rgb)
+    {
+        return std::borrow::Cow::Borrowed(png_bytes);
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let Ok(frame) = reader.next_frame(&mut buf) else {
+        return std::borrow::Cow::Borrowed(png_bytes);
+    };
+    buf.truncate(frame.buffer_size());
+    let rgba: Vec<u8> = match color {
+        png::ColorType::Rgba => buf,
+        _ => buf
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+    };
+    let (capped, cw, ch) = cap_rgba(&rgba, w, h);
+    match rgba_to_png(&capped, cw, ch) {
+        Ok(png) => std::borrow::Cow::Owned(png),
+        Err(_) => std::borrow::Cow::Borrowed(png_bytes),
+    }
+}
+
+// --- persistent raster cache (.kvc/cache/) ----------------------------------------------
+// Final capped PNGs keyed by a content hash of everything that produced them, so entries are
+// immutable and never need invalidation. Both helpers are best-effort: a cold or unwritable
+// cache must never fail a diff. ponytail: no eviction — capped PNGs are small; add LRU pruning
+// if .kvc/cache ever matters.
+
+/// Read a cached capped PNG, or `None` on miss/any error.
+pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
+    std::fs::read(cache_dir.join(format!("{key}.png"))).ok()
+}
+
+/// Write a capped PNG into the cache (creating the dir for pre-cache repos).
+pub fn cache_write(cache_dir: &std::path::Path, key: &str, png: &[u8]) {
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(cache_dir.join(format!("{key}.png")), png);
 }
 
 /// Wrap already-encoded PNG bytes (e.g. mergedimage.png) in a `data:` URL.
@@ -207,5 +311,31 @@ mod tests {
         let rgba = vec![255u8; 4 * 4 * 4]; // 4x4 opaque white
         let url = rgba_to_png_data_url(&rgba, 4, 4).unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn cap_png_shrinks_oversized() {
+        let w = MAX_RASTER_DIM + 100;
+        let rgba = vec![128u8; w as usize * 4]; // w x 1 strip
+        let png = rgba_to_png(&rgba, w, 1).unwrap();
+        let capped = cap_png(&png);
+        assert!(matches!(capped, std::borrow::Cow::Owned(_)));
+        let reader = png::Decoder::new(Cursor::new(&capped[..]))
+            .read_info()
+            .unwrap();
+        let info = reader.info();
+        assert_eq!(info.width.max(info.height), MAX_RASTER_DIM);
+    }
+
+    #[test]
+    fn cap_png_passthrough_small_and_malformed() {
+        // Already within the cap → returned byte-identical (borrowed).
+        let png = rgba_to_png(&[0u8; 16], 2, 2).unwrap();
+        assert!(matches!(cap_png(&png), std::borrow::Cow::Borrowed(_)));
+        // Undecodable input → returned untouched, never an error.
+        assert!(matches!(
+            cap_png(b"not a png"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

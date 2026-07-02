@@ -29,6 +29,9 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
 
         let abs = repo.root.join(&rel);
         let bytes = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
+        let (size, mtime) = std::fs::metadata(&abs)
+            .map(|m| crate::repo::size_mtime(&m))
+            .unwrap_or((0, 0));
         let is_kra = rel.to_lowercase().ends_with(".kra");
 
         let content = if is_kra {
@@ -42,6 +45,8 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
             TrackedFile {
                 hash: hash_bytes(&bytes),
                 is_kra,
+                size,
+                mtime,
             },
         );
 
@@ -209,11 +214,15 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
     }
     for pf in restores {
         let bytes = bytes_of(repo, &pf)?;
+        // size/mtime left 0: the working-tree file is untouched by a soft undo, so its real mtime
+        // is unknown here — 0 never matches, forcing the next scan to re-hash (correct, conservative).
         repo.index.files.insert(
             pf.path.clone(),
             TrackedFile {
                 hash: hash_bytes(&bytes),
                 is_kra: pf.is_kra,
+                size: 0,
+                mtime: 0,
             },
         );
     }
