@@ -36,6 +36,29 @@ pub enum KvcError {
     #[error("no such commit: {0}")]
     NoCommit(String),
 
+    // The "unsaved changes" prefix is matched by the frontend to show a friendly
+    // save-first prompt — keep it stable.
+    #[error("unsaved changes: save or discard your work before switching branches")]
+    DirtyTree,
+
+    #[error("no such branch: {0}")]
+    NoBranch(String),
+
+    #[error("branch already exists: {0}")]
+    BranchExists(String),
+
+    #[error("invalid branch name: {0}")]
+    BadBranchName(String),
+
+    #[error("nothing to merge: {0}")]
+    NothingToMerge(String),
+
+    #[error("cannot delete the branch you are working on")]
+    DeleteCurrent,
+
+    #[error("cannot undo: {0}")]
+    CannotUndo(String),
+
     #[error(transparent)]
     Io(#[from] io::Error),
 }

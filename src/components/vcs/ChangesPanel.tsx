@@ -5,7 +5,6 @@ import type { WorkingChange } from "../../types";
 import { FileStatusChip } from "./FileStatusChip";
 import { useRepository } from "../../lib/repository";
 import { inTauri } from "../../lib/tauri";
-import { MOCK_WORKING_CHANGES } from "../../data/mockData";
 
 function Section({
   title,
@@ -87,8 +86,8 @@ function Section({
 
 /**
  * Working-tree changes from the real scanner (`scan_repository`) for the selected
- * repository. In a plain browser (no backend) it falls back to mock data. Staging is
- * cosmetic local state — this VCS commits the whole working tree, not a staging area.
+ * repository. Empty in a plain browser (no backend). Staging is cosmetic local
+ * state — this VCS commits the whole working tree, not a staging area.
  */
 export function ChangesPanel({
   focusedFile,
@@ -98,18 +97,21 @@ export function ChangesPanel({
   onFocusFile: (path: string) => void;
 }) {
   const { current, refreshNonce, refresh, saving, setSaving, setScanning } = useRepository();
-  const [items, setItems] = useState<WorkingChange[]>(inTauri() ? [] : MOCK_WORKING_CHANGES);
+  const [items, setItems] = useState<WorkingChange[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
 
+  const path = current?.path ?? null;
+
   useEffect(() => {
-    if (!inTauri()) {
-      setItems(MOCK_WORKING_CHANGES);
+    // No backend in a plain browser (`npm run dev`), nothing to scan without a repo.
+    if (!inTauri() || !path) {
+      setItems([]);
       return;
     }
     let cancelled = false;
     setScanning(true);
-    invoke<WorkingChange[]>("scan_repository", { path: current.path })
+    invoke<WorkingChange[]>("scan_repository", { path })
       .then((changes) => {
         if (!cancelled) {
           setItems(changes);
@@ -128,19 +130,19 @@ export function ChangesPanel({
     return () => {
       cancelled = true;
     };
-  }, [current.path, refreshNonce, setScanning]);
+  }, [path, refreshNonce, setScanning]);
 
   const toggle = (path: string) =>
     setItems((prev) => prev.map((c) => (c.change.path === path ? { ...c, staged: !c.staged } : c)));
   const setAll = (staged: boolean) => setItems((prev) => prev.map((c) => ({ ...c, staged })));
 
   const commit = async () => {
-    if (!message.trim() || saving) return;
+    if (!message.trim() || saving || !path) return;
     setSaving(true);
     setError(null);
     try {
       await invoke("commit_snapshot", {
-        path: current.path,
+        path,
         message: message.trim(),
         author: "You",
       });

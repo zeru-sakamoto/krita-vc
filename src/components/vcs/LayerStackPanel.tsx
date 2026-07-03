@@ -1,6 +1,6 @@
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
-import { compositeSvg } from "../../data/mockArt";
+import { compositeSvg } from "../../lib/svgArt";
 import { assetName } from "../../lib/friendly";
 import { FileStatusChip } from "./FileStatusChip";
 

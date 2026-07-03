@@ -13,6 +13,8 @@ export type BranchKind = "local" | "current";
 export interface Branch {
   name: string;
   kind: BranchKind;
+  /** Tip commit id; null/absent for a branch with no commits yet. */
+  tip?: string | null;
 }
 
 /** A local repository — a folder the user has designated. Local-only (no remotes). */
@@ -104,7 +106,7 @@ export interface ArtDiff {
   /**
    * Composite (whole-image) markup for each state, used for the "Composite" view when the
    * backend supplies it (real `.kra` mergedimage.png). When absent, the composite is derived
-   * by stacking `layers` (the mock-data path). null = no such state (added/removed file).
+   * by stacking `layers`. null = no such state (added/removed file).
    */
   beforeImage?: string | null;
   afterImage?: string | null;

@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { ArtDiff, ArtLayer, DiffState } from "../../types";
-import { layersBody, wrapSvg } from "../../data/mockArt";
+import { layersBody, wrapSvg } from "../../lib/svgArt";
 
 const ACCENT = "#e07b39";
 

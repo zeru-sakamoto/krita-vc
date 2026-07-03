@@ -139,7 +139,7 @@ function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
 
 interface DiffViewProps {
   entries: DiffEntry[];
-  /** Diff source, forwarded to art views for lazy per-layer raster loading. Absent in mock/browser. */
+  /** Diff source, forwarded to art views for lazy per-layer raster loading. Absent in the browser. */
   repoPath?: string;
   commitId?: string | null;
   working?: boolean;

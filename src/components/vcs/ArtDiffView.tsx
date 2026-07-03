@@ -65,7 +65,7 @@ function Pane({
 interface ArtDiffViewProps {
   diff: ArtDiff;
   palette?: PaletteDiff;
-  /** Diff source for lazily fetching this file's per-layer rasters. Absent in mock/browser. */
+  /** Diff source for lazily fetching this file's per-layer rasters. Absent in the browser. */
   repoPath?: string;
   commitId?: string | null;
   working?: boolean;
@@ -112,7 +112,7 @@ export function ArtDiffView({
   const layers = useMemo(() => {
     if (selectedId === COMPOSITE_ID) {
       // Prefer the backend's real composite (mergedimage.png) over stacking layers, so the
-      // composite is correct even if some layers can't be rastered. Mock data omits these.
+      // composite is correct even if some layers can't be rastered.
       if (effectiveDiff.beforeImage !== undefined || effectiveDiff.afterImage !== undefined) {
         const composite: ArtDiff["layers"][number] = {
           id: COMPOSITE_ID,

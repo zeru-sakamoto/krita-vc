@@ -2,6 +2,7 @@ import { GitBranch } from "@phosphor-icons/react";
 import { assetName } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
+import { inTauri } from "../../lib/tauri";
 
 interface StatusBarProps {
   /** Currently focused file (left zone) */
@@ -47,15 +48,19 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
         )}
       </div>
 
-      {/* Right zone — mock badge, branch, count */}
+      {/* Right zone — browser-preview badge (no backend outside the desktop shell), branch, count */}
       <div className="flex shrink-0 items-center gap-2.5">
-        <span
-          className="rounded-badge bg-warning/20 px-1.5 py-px font-medium uppercase tracking-wide text-warning-fg"
-          title="The UI is running on mock data — no backend is wired up yet."
-        >
-          Mock Data
-        </span>
-        <Separator />
+        {!inTauri() && (
+          <>
+            <span
+              className="rounded-badge bg-warning/20 px-1.5 py-px font-medium uppercase tracking-wide text-warning-fg"
+              title="No backend in the browser. Run the desktop app to work with real repositories."
+            >
+              Browser preview
+            </span>
+            <Separator />
+          </>
+        )}
         <span className="flex items-center gap-1">
           <GitBranch size={12} />
           {branch}

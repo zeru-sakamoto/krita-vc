@@ -60,7 +60,7 @@ export function TopBar() {
   return (
     <header className="flex h-9 shrink-0 items-center border-b border-border bg-surface px-2">
       <Menu
-        trigger={() => <RepoTrigger name={current.name} />}
+        trigger={() => <RepoTrigger name={current?.name ?? "Open a repository…"} />}
         items={items}
         footer={footer}
         minWidth={240}
@@ -94,10 +94,8 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
 
   const pickParent = async () => {
-    if (!inTauri()) {
-      setParent("C:/Art"); // ponytail: no native picker in the browser; mock a parent for dev
-      return;
-    }
+    // No native picker outside the desktop shell.
+    if (!inTauri()) return;
     const picked = await open({ directory: true, title: "Choose where to create the repository" });
     if (typeof picked === "string") setParent(picked);
   };

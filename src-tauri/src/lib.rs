@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod commands;
 pub mod commit;
 pub mod delta;
@@ -21,6 +22,11 @@ pub fn run() {
             commands::scan_repository,
             commands::commit_snapshot,
             commands::list_commits,
+            commands::list_branches,
+            commands::create_branch,
+            commands::switch_branch,
+            commands::merge_branch,
+            commands::delete_branch,
             commands::layer_diff,
             commands::restore_file,
             commands::rollback_to_commit,

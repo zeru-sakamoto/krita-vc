@@ -1,7 +1,8 @@
-import type { Commit } from "../../types";
+import type { Branch, Commit } from "../../types";
 import { relativeTime } from "../../lib/format";
 import { versionLabel } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
+import { BranchBadge } from "./BranchBadge";
 
 interface CommitCardProps {
   commit: Commit;
@@ -9,13 +10,15 @@ interface CommitCardProps {
   version: number;
   selected: boolean;
   onSelect: (id: string) => void;
+  /** Branches whose tip is this commit — rendered as small badges. */
+  tips?: Branch[];
 }
 
 /**
  * Commit card for the history timeline.
  * (DESIGN.md → VCS Component Patterns → Commit Card)
  */
-export function CommitCard({ commit, version, selected, onSelect }: CommitCardProps) {
+export function CommitCard({ commit, version, selected, onSelect, tips }: CommitCardProps) {
   const { artistMode } = useArtistMode();
   return (
     <button
@@ -30,14 +33,20 @@ export function CommitCard({ commit, version, selected, onSelect }: CommitCardPr
     >
       <div className="flex items-baseline justify-between gap-2">
         <span
-          className={["text-[12px] text-text-muted", artistMode ? "font-medium" : "font-mono"].join(
-            " "
-          )}
+          className={[
+            "shrink-0 text-[12px] text-text-muted",
+            artistMode ? "font-medium" : "font-mono",
+          ].join(" ")}
         >
           {artistMode ? versionLabel(version) : commit.hash}
         </span>
-        <span className="shrink-0 text-[11px] text-text-muted">
-          {relativeTime(commit.timestamp)}
+        <span className="flex min-w-0 items-center gap-1">
+          {tips?.map((b) => (
+            <BranchBadge key={b.name} branch={b} />
+          ))}
+          <span className="shrink-0 text-[11px] text-text-muted">
+            {relativeTime(commit.timestamp)}
+          </span>
         </span>
       </div>
       <p className="mt-1 line-clamp-2 text-[13px] leading-snug text-text">{commit.message}</p>

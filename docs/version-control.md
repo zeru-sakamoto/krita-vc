@@ -6,8 +6,8 @@ repository, decomposing `.kra` archives down to individual 64×64 tiles so an ed
 the tiles that actually changed. Local-only: no remotes, no network.
 
 The frontend calls into this through Tauri commands (`@tauri-apps/api/core` `invoke`); see
-[Swapping in the backend](#frontend-integration) for how the UI consumes it (and falls back to
-mock data in a plain browser).
+[Frontend integration](#frontend-integration) for how the UI consumes it (in a plain browser,
+with no backend, the UI renders empty states).
 
 ## `.kvc/` store layout
 
@@ -18,9 +18,13 @@ mock data in a plain browser).
   config.json    engine config: delta-chain threshold (default 20), tile size (64)
   index.json     committed head per tracked file — drives the scanner
   chains.json    every stored version of every delta stream — drives storage/restore
-  commits.json   the commit log (oldest-first)
+  commits.json   the commit log (oldest-first, append-order = topological order)
+  branches.json  branch name → tip commit id, plus the current branch
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff)
 ```
+
+A repo from before branching existed (no `branches.json`) migrates on open: everything is
+treated as `main` with its tip at the newest commit, persisted by the next save.
 
 State is loaded into a `Repo` struct (`Repo::open`), mutated in memory, then flushed with
 `Repo::save`. JSON writes are **atomic** (write to `*.json.tmp`, then `rename` over the target).
@@ -57,12 +61,23 @@ working-tree delta and a commit captures all of it (the frontend's stage toggles
 - **anything else** → `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash.
 
 Each non-deleted file's blake3 (plus its size + mtime, for the scanner's fast path) is written
-back into the index, and a `Commit` is recorded with `parents` set to the previous head (linear
-history; first parent = mainline). Returns `KvcError::Nothing` if the tree is clean. The commit
-id/hash is the first 12 hex chars of a blake3 over the timestamp + message + per-file content
-hashes. State is flushed with `Repo::save`, which writes `index.json`/`chains.json`/`commits.json`
+back into the index, and a `Commit` is recorded with `parents` set to the **current branch tip**
+(first parent = mainline; a merge commit has two parents) and the branch name stamped on it
+(cosmetic — the frontend uses it for labels/colors). The branch tip then advances to the new
+commit. Returns `KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex
+chars of a blake3 over the timestamp + message + parents + per-file content hashes. State is
+flushed with `Repo::save`, which writes `index.json`/`chains.json`/`commits.json`/`branches.json`
 as **compact** JSON (`chains.json` — every version of every stream — is rewritten each commit, so
 pretty-printing it was a real cost as history grew).
+
+### The first-parent-delta invariant
+
+`Commit.files` holds only the *changed* files, and is by invariant **exactly the diff of the
+commit's tree against its first parent's tree** (merge commits are constructed to record the
+merged result's full diff vs their first parent). The effective tree at any commit is therefore
+a fold along the **first-parent chain** only (`tree_at_commit`), root → commit; second parents
+exist purely for graph drawing and reachability. This keeps tree computation correct and cheap
+(O(first-parent depth)) even though `commits.json` interleaves branches.
 
 ## Delta-chain storage
 
@@ -119,17 +134,42 @@ reconstructs from the manifest (`reconstruct_kra`), otherwise from the blob stre
 
 Two higher-level history operations build on this ([`commit.rs`](../src-tauri/src/commit.rs)):
 
-- **Rollback** (`rollback_to_commit`) — since commits store only their *changed* files, the full
-  tree state at commit N is the fold of every commit up to N (`tree_at`, last-writer-wins per
-  path, dropping deletions). Rollback materializes that state into the working tree (writing each
-  file, deleting ones that didn't exist at N) then records it as a **new** commit via
-  `commit_snapshot` — non-destructive; history stays linear and reversible. Returns `Nothing` if
-  the tree already matches.
-- **Undo last commit** (`undo_last_commit`) — a *soft* reset: pops the last commit and rewinds
-  only the index entries for the paths it touched (recomputing each file's whole-file blake3 from
-  its most-recent surviving version). The working tree is left untouched, so the undone edits
-  resurface as uncommitted changes. Orphaned objects/chain versions are left in place (they're
-  content-addressed and dedup on any re-commit).
+- **Rollback** (`rollback_to_commit`) — computes the target tree via `tree_at_commit` (the
+  first-parent fold), materializes it into the working tree (skipping files whose committed
+  content already matches the current tree, writing the rest, deleting ones that didn't exist at
+  the target) then records it as a **new** commit on the current branch via `commit_snapshot` —
+  non-destructive and reversible. Returns `Nothing` if the tree already matches.
+- **Undo last commit** (`undo_last_commit`) — a *soft* reset of the **current branch tip** (which
+  may sit mid-vec after a switch): removes that commit by id, rewinds the branch tip to its first
+  parent, and rewinds only the index entries for the paths it touched (from the new tip's tree).
+  Refused (`CannotUndo`) if a later commit builds on the tip or another branch points at it. The
+  working tree is left untouched, so the undone edits resurface as uncommitted changes. Orphaned
+  objects/chain versions are left in place (they're content-addressed and dedup on any re-commit).
+
+## Branches — create, switch, merge
+
+[`branch.rs`](../src-tauri/src/branch.rs). Branches are named tips over the shared commit DAG
+(`branches.json`); delta streams are keyed by file path, not branch, so identical content
+deduplicates across branches for free.
+
+- **Create** (`create_branch`) — validate the name (1–60 chars, no Windows-hostile punctuation),
+  record it at the current tip, and switch to it. The tree is identical, so this is **O(1)** —
+  no file I/O beyond `branches.json` (`save_branches`, which never touches `chains.json`).
+- **Switch** (`switch_branch`) — refused on a dirty tree (`DirtyTree`; a clean scan also proves
+  no untracked files can be clobbered). Computes both branch trees and calls `materialize_tree`,
+  which rewrites **only files whose committed content hash differs** — unchanged files are never
+  read, reconstructed, or rewritten (their index entries carry over, keeping the scanner's
+  size/mtime fast path warm). Index and working tree land exactly on the target branch.
+- **Merge** (`merge_branch`, source → current) — **fast-forwards** when the current tip is an
+  ancestor of the source tip (tip moves, no new commit). Otherwise a per-file **three-way**
+  against the merge base (first common ancestor): changed only in source → taken; changed only
+  in current → kept (no entry — the first parent already has it); changed in **both** → the
+  source version wins and the entry is flagged `"C"` (art files can't be content-merged; the UI
+  surfaces the flag as "Needs review"). The merge commit has `parents: [current_tip, source_tip]`
+  and its `files` is the merged result's diff vs the first parent — preserving the fold
+  invariant. `NothingToMerge` when the source is already part of the current branch.
+- **Delete** (`delete_branch`) — removes the label only (refused for the current branch); its
+  commits stay in `commits.json` as harmless unreachable data.
 
 ## Tauri commands
 
@@ -146,7 +186,12 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `delete_repository(path)` | Permanently delete the folder (guarded by `is_repo`). |
 | `scan_repository(path)` | Working-tree changes as `WorkingChange[]` (`staged: false`). |
 | `commit_snapshot(path, message, author)` | Commit the whole working tree; returns the `Commit`. |
-| `list_commits(path)` | The commit log (oldest-first; the frontend reverses for newest-first). |
+| `list_commits(path)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. |
+| `list_branches(path)` | All local branches as `{ name, tip, current }`. |
+| `create_branch(path, name)` | Create + switch to a branch at the current tip (instant). Returns the branch list. |
+| `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
+| `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
+| `delete_branch(path, name)` | Remove a branch label (not the current one). Returns the branch list. |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |
@@ -162,10 +207,13 @@ The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell
 
 - **In Tauri** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx) calls `scan_repository`
   / `commit_snapshot`; [`useCommits`](../src/lib/repoData.ts) calls `list_commits` and maps
-  `BackendCommit` → the frontend `Commit` shape; [`repository.tsx`](../src/lib/repository.tsx)
-  drives `init`/`is`/`delete` and the native folder picker (`tauri-plugin-dialog`).
-- **In a plain browser** (`npm run dev`, no backend) — these fall back to the mock modules in
-  `src/data/` so the UI can still be built and reviewed.
+  `BackendCommit` → the frontend `Commit` shape; [`useBranches`](../src/lib/repoData.ts) calls
+  `list_branches`; [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, the
+  native folder picker (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, branch
+  create/switch/merge/delete).
+- **In a plain browser** (`npm run dev`, no backend) — the hooks return empty results and
+  repository/branch actions are no-ops; the status bar shows a "Browser preview" badge. There is
+  no mock data.
 
 `list_commits` / `scan_repository` / `commit_diff` are re-fetched whenever the repository context
 bumps `refreshNonce` (e.g. after a commit, rollback, or undo). Per-commit diffs are **real** for
@@ -180,4 +228,4 @@ the initial diff, and `ArtDiffView` a "Loading layers…" indicator while the ra
 Layer rasters are downscaled to a longest side of `raster::MAX_RASTER_DIM` (2048px) before
 encoding — a diff preview never needs full document resolution, and full-res PNG encode was the
 diff's dominant cost. Non-`.kra` files still get minimal text entries (real line/palette diffs are
-deferred). In a plain browser the hooks fall back to the `src/data/` mock diffs.
+deferred).

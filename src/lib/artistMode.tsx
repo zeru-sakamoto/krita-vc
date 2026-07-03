@@ -6,8 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useState } from "rea
  * file paths, "Version N" instead of hashes, words+icons instead of M/A/D.
  * When off, the original technical view is shown verbatim.
  *
- * This is a pure presentation concern — it never touches the (mock) data layer,
- * so it stays valid once a real backend lands.
+ * This is a pure presentation concern — it never touches the data layer.
  */
 
 const STORAGE_KEY = "krita-vc:artist-mode";

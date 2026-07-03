@@ -86,11 +86,108 @@ pub async fn commit_snapshot(
     .await
 }
 
+/// Commits reachable from the current branch tip, in stored (topological) order — commits
+/// on merged branches appear, commits unique to other branches don't.
 #[tauri::command]
 pub async fn list_commits(path: String) -> std::result::Result<Vec<Commit>, String> {
     run(move || {
         let repo = Repo::open_light(Path::new(&path))?;
-        Ok(repo.commits.clone())
+        let reach = match repo.branches.tip() {
+            Some(tip) => commit::ancestors(&repo.commits, tip),
+            None => return Ok(Vec::new()),
+        };
+        Ok(repo
+            .commits
+            .iter()
+            .filter(|c| reach.contains(&c.id))
+            .cloned()
+            .collect())
+    })
+    .await
+}
+
+// --- branches ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchDto {
+    pub name: String,
+    pub tip: Option<String>,
+    pub current: bool,
+}
+
+fn branch_dtos(repo: &Repo) -> Vec<BranchDto> {
+    repo.branches
+        .branches
+        .iter()
+        .map(|(name, tip)| BranchDto {
+            name: name.clone(),
+            tip: (!tip.is_empty()).then(|| tip.clone()),
+            current: *name == repo.branches.current,
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn list_branches(path: String) -> std::result::Result<Vec<BranchDto>, String> {
+    run(move || {
+        let repo = Repo::open_light(Path::new(&path))?;
+        Ok(branch_dtos(&repo))
+    })
+    .await
+}
+
+/// Create a branch at the current tip and switch to it (instant — the tree is identical).
+#[tauri::command]
+pub async fn create_branch(
+    path: String,
+    name: String,
+) -> std::result::Result<Vec<BranchDto>, String> {
+    run(move || {
+        let mut repo = Repo::open_light(Path::new(&path))?;
+        crate::branch::create_branch(&mut repo, &name)?;
+        Ok(branch_dtos(&repo))
+    })
+    .await
+}
+
+/// Switch the working tree to `name`; rewrites only files that differ between the branches.
+#[tauri::command]
+pub async fn switch_branch(
+    path: String,
+    name: String,
+) -> std::result::Result<Vec<BranchDto>, String> {
+    run(move || {
+        let mut repo = Repo::open(Path::new(&path))?;
+        crate::branch::switch_branch(&mut repo, &name)?;
+        Ok(branch_dtos(&repo))
+    })
+    .await
+}
+
+/// Merge `source` into the current branch (fast-forward or two-parent merge commit).
+#[tauri::command]
+pub async fn merge_branch(
+    path: String,
+    source: String,
+    author: String,
+) -> std::result::Result<Commit, String> {
+    run(move || {
+        let mut repo = Repo::open(Path::new(&path))?;
+        crate::branch::merge_branch(&mut repo, &source, &author)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_branch(
+    path: String,
+    name: String,
+) -> std::result::Result<Vec<BranchDto>, String> {
+    run(move || {
+        let mut repo = Repo::open_light(Path::new(&path))?;
+        crate::branch::delete_branch(&mut repo, &name)?;
+        Ok(branch_dtos(&repo))
     })
     .await
 }
@@ -605,11 +702,12 @@ pub async fn commit_layers(
 }
 
 /// Last-committed entry for `file` (the "before" side of a working diff), if any.
+/// Head = the current branch tip, not `commits.last()` — after a switch the newest
+/// commit in the vec can belong to another branch.
 fn last_committed(repo: &Repo, file: &str) -> Option<CommittedFile> {
-    repo.commits
-        .last()
-        .map(|c| c.id.clone())
-        .and_then(|head| commit::tree_at_commit(&repo.commits, &head))
+    repo.branches
+        .tip()
+        .and_then(|head| commit::tree_at_commit(&repo.commits, head))
         .and_then(|tree| tree.get(file).cloned())
 }
 

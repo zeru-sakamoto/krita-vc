@@ -7,6 +7,7 @@
 //!   index.json     committed head per tracked file (drives the scanner)
 //!   chains.json    every stored version of every delta stream (drives storage/restore)
 //!   commits.json   commit log
+//!   branches.json  branch name -> tip commit id, plus the current branch
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
 //! ```
 
@@ -111,7 +112,64 @@ pub struct Commit {
     pub author: String,
     pub timestamp: String,
     pub parents: Vec<String>,
+    /// Branch the commit was made on. Cosmetic (frontend labels/colors) — never used for
+    /// correctness. Pre-branching commits deserialize as `""`.
+    #[serde(default)]
+    pub branch: String,
+    /// Invariant: exactly the diff of this commit's tree against its **first parent's** tree
+    /// (merge commits record every path where the merged result differs from the first parent).
+    /// `tree_at_commit` relies on this to fold along the first-parent chain only.
     pub files: Vec<CommittedFile>,
+}
+
+/// Local branches: name -> tip commit id (`""` = branch has no commits yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Branches {
+    pub current: String,
+    pub branches: BTreeMap<String, String>,
+}
+
+impl Default for Branches {
+    fn default() -> Self {
+        let mut branches = BTreeMap::new();
+        branches.insert("main".to_string(), String::new());
+        Branches {
+            current: "main".to_string(),
+            branches,
+        }
+    }
+}
+
+impl Branches {
+    /// Tip commit id of the current branch, `None` if the branch has no commits yet.
+    pub fn tip(&self) -> Option<&str> {
+        self.branches
+            .get(&self.current)
+            .map(String::as_str)
+            .filter(|t| !t.is_empty())
+    }
+
+    pub fn tip_of(&self, name: &str) -> Option<&str> {
+        self.branches
+            .get(name)
+            .map(String::as_str)
+            .filter(|t| !t.is_empty())
+    }
+
+    pub fn set_tip(&mut self, id: &str) {
+        self.branches.insert(self.current.clone(), id.to_string());
+    }
+
+    /// Migration for repos created before branching existed: everything lives on `main`,
+    /// whose tip is the newest commit. Persisted by the next `save()`.
+    fn migrated(commits: &[Commit]) -> Branches {
+        let mut b = Branches::default();
+        if let Some(last) = commits.last() {
+            b.set_tip(&last.id);
+        }
+        b
+    }
 }
 
 /// Loaded repository state. Mutated in-memory then flushed with [`Repo::save`].
@@ -121,6 +179,7 @@ pub struct Repo {
     pub index: Index,
     pub chains: Chains,
     pub commits: Vec<Commit>,
+    pub branches: Branches,
 }
 
 impl Repo {
@@ -140,6 +199,7 @@ impl Repo {
         write_json(&kvc.join("index.json"), &Index::default())?;
         write_json(&kvc.join("chains.json"), &Chains::default())?;
         write_json(&kvc.join("commits.json"), &Vec::<Commit>::new())?;
+        write_json(&kvc.join("branches.json"), &Branches::default())?;
         Ok(())
     }
 
@@ -158,12 +218,15 @@ impl Repo {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
         let kvc = kvc_dir(root);
+        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
+        let branches = read_branches(&kvc, &commits)?;
         Ok(Repo {
             root: root.to_path_buf(),
             config: read_json(&kvc.join("config.json"))?,
             index: read_json(&kvc.join("index.json"))?,
             chains: read_json(&kvc.join("chains.json"))?,
-            commits: read_json(&kvc.join("commits.json"))?,
+            commits,
+            branches,
         })
     }
 
@@ -175,12 +238,15 @@ impl Repo {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
         let kvc = kvc_dir(root);
+        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
+        let branches = read_branches(&kvc, &commits)?;
         Ok(Repo {
             root: root.to_path_buf(),
             config: read_json(&kvc.join("config.json"))?,
             index: read_json(&kvc.join("index.json"))?,
             chains: Chains::default(),
-            commits: read_json(&kvc.join("commits.json"))?,
+            commits,
+            branches,
         })
     }
 
@@ -198,7 +264,14 @@ impl Repo {
         write_json(&kvc.join("index.json"), &self.index)?;
         write_json(&kvc.join("chains.json"), &self.chains)?;
         write_json(&kvc.join("commits.json"), &self.commits)?;
+        write_json(&kvc.join("branches.json"), &self.branches)?;
         Ok(())
+    }
+
+    /// Flush only `branches.json` — safe on a [`Repo::open_light`] repo, where a full
+    /// [`Repo::save`] would truncate `chains.json` to the default empty map.
+    pub fn save_branches(&self) -> Result<()> {
+        write_json(&kvc_dir(&self.root).join("branches.json"), &self.branches)
     }
 }
 
@@ -213,6 +286,17 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     std::fs::write(&tmp, &bytes).map_err(|e| io_at(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
     Ok(())
+}
+
+/// Load `branches.json`, migrating pre-branching repos in-memory (no write on the read path;
+/// the next `save()` persists it).
+fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
+    let path = kvc.join("branches.json");
+    if path.is_file() {
+        read_json(&path)
+    } else {
+        Ok(Branches::migrated(commits))
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

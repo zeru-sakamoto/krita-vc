@@ -5,7 +5,7 @@
 use crate::error::{io_at, KvcError, Result};
 use crate::repo::{hash_bytes, Commit, CommittedFile, Repo, TrackedFile};
 use crate::{kra, scan};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
@@ -64,22 +64,24 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
 
     let timestamp = crate::repo::now_iso();
     let parents: Vec<String> = repo
-        .commits
-        .last()
-        .map(|c| vec![c.id.clone()])
+        .branches
+        .tip()
+        .map(|t| vec![t.to_string()])
         .unwrap_or_default();
-    let id = commit_id(&timestamp, message, &files);
+    let id = commit_id(&timestamp, message, &parents, &files);
 
     let commit = Commit {
         id: id.clone(),
-        hash: id,
+        hash: id.clone(),
         message: message.to_string(),
         author: author.to_string(),
         timestamp,
         parents,
+        branch: repo.branches.current.clone(),
         files,
     };
     repo.commits.push(commit.clone());
+    repo.branches.set_tip(&id);
     repo.save()?;
     Ok(commit)
 }
@@ -108,12 +110,28 @@ pub fn file_at_commit(repo: &Repo, relpath: &str, commit_id: &str) -> Result<Vec
     }
 }
 
-/// Effective tree state (path -> its committed entry) after applying `commits[..=idx]`.
-/// Commits store only their *changed* files, so the full tree is the fold of every commit
-/// up to `idx`, last-writer-wins per path, dropping paths whose latest entry is a deletion.
-fn tree_at(commits: &[Commit], idx: usize) -> BTreeMap<String, CommittedFile> {
+/// Effective tree state (path -> committed entry) as of `commit_id`, or `None` if unknown.
+///
+/// Commits store only their *changed* files, and each commit's `files` is by invariant the
+/// exact diff against its **first parent** (merge commits record the full merged-result diff
+/// vs their first parent). So the tree is a fold along the first-parent chain, root -> commit;
+/// second parents exist only for graph drawing and reachability.
+pub fn tree_at_commit(
+    commits: &[Commit],
+    commit_id: &str,
+) -> Option<BTreeMap<String, CommittedFile>> {
+    let by_id: HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut chain: Vec<&Commit> = Vec::new();
+    let mut cur = *by_id.get(commit_id)?;
+    loop {
+        chain.push(cur);
+        match cur.parents.first() {
+            Some(p) => cur = by_id.get(p.as_str())?,
+            None => break,
+        }
+    }
     let mut tree = BTreeMap::new();
-    for c in &commits[..=idx] {
+    for c in chain.iter().rev() {
         for f in &c.files {
             if f.status == "D" {
                 tree.remove(&f.path);
@@ -122,16 +140,31 @@ fn tree_at(commits: &[Commit], idx: usize) -> BTreeMap<String, CommittedFile> {
             }
         }
     }
-    tree
+    Some(tree)
 }
 
-/// Effective tree state (path -> committed entry) as of `commit_id`, or `None` if unknown.
-pub fn tree_at_commit(
-    commits: &[Commit],
-    commit_id: &str,
-) -> Option<BTreeMap<String, CommittedFile>> {
-    let idx = commits.iter().position(|c| c.id == commit_id)?;
-    Some(tree_at(commits, idx))
+/// Every commit id reachable from `tip` (inclusive) over the full parent set.
+pub fn ancestors(commits: &[Commit], tip: &str) -> HashSet<String> {
+    let by_id: HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut seen = HashSet::new();
+    let mut queue = vec![tip.to_string()];
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(c) = by_id.get(id.as_str()) {
+            queue.extend(c.parents.iter().cloned());
+        }
+    }
+    seen
+}
+
+/// Tree of the current branch tip (empty for a branch with no commits).
+pub fn current_tree(repo: &Repo) -> BTreeMap<String, CommittedFile> {
+    repo.branches
+        .tip()
+        .and_then(|t| tree_at_commit(&repo.commits, t))
+        .unwrap_or_default()
 }
 
 /// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob).
@@ -147,21 +180,66 @@ fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
     }
 }
 
+/// Make the working tree **and index** match `target`, rewriting only files whose committed
+/// `content` hash differs from `current` — the fast-switch path: unchanged files are never
+/// read, reconstructed, or rewritten (their index entries carry over untouched, so size/mtime
+/// stay valid for the scanner).
+pub fn materialize_tree(
+    repo: &mut Repo,
+    current: &BTreeMap<String, CommittedFile>,
+    target: &BTreeMap<String, CommittedFile>,
+) -> Result<()> {
+    for (path, f) in target {
+        if current.get(path).map(|c| &c.content) == Some(&f.content) {
+            continue;
+        }
+        let bytes = bytes_of(repo, f)?;
+        let abs = repo.root.join(path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        }
+        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        let (size, mtime) = std::fs::metadata(&abs)
+            .map(|m| crate::repo::size_mtime(&m))
+            .unwrap_or((0, 0));
+        repo.index.files.insert(
+            path.clone(),
+            TrackedFile {
+                hash: hash_bytes(&bytes),
+                is_kra: f.is_kra,
+                size,
+                mtime,
+            },
+        );
+    }
+    for path in current.keys() {
+        if !target.contains_key(path) {
+            let abs = repo.root.join(path);
+            if abs.exists() {
+                std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
+            }
+            repo.index.files.remove(path);
+        }
+    }
+    Ok(())
+}
+
 /// Return the working tree to its state at `commit_id`, then record that as a **new** commit
-/// (non-destructive; history stays linear and reversible). Reuses `commit_snapshot` to capture
+/// on the current branch (non-destructive and reversible). Reuses `commit_snapshot` to capture
 /// the result. Errors `NoCommit` if the id is unknown, or `Nothing` if the tree already matches.
 pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Result<Commit> {
-    let idx = repo
-        .commits
-        .iter()
-        .position(|c| c.id == commit_id)
+    let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
-    let target = tree_at(&repo.commits, idx);
+    let current = current_tree(repo);
 
-    // Materialize every file from the target state into the working tree.
-    for f in target.values() {
+    // Materialize only what differs; the index is left alone so commit_snapshot's scan
+    // picks the rewritten files up as changes.
+    for (path, f) in &target {
+        if current.get(path).map(|c| &c.content) == Some(&f.content) {
+            continue;
+        }
         let bytes = bytes_of(repo, f)?;
-        let abs = repo.root.join(&f.path);
+        let abs = repo.root.join(path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
@@ -177,8 +255,26 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         }
     }
 
-    let message = format!("Restored to Version {}", idx + 1);
+    let message = format!("Restored to {}", version_label(repo, commit_id));
     commit_snapshot(repo, &message, author)
+}
+
+/// "Version N" where N is the target's 1-based position among commits reachable from the
+/// current branch tip (matches the frontend's per-branch version numbering), falling back
+/// to the short id for unreachable commits.
+fn version_label(repo: &Repo, commit_id: &str) -> String {
+    if let Some(tip) = repo.branches.tip() {
+        let reach = ancestors(&repo.commits, tip);
+        let pos = repo
+            .commits
+            .iter()
+            .filter(|c| reach.contains(&c.id))
+            .position(|c| c.id == commit_id);
+        if let Some(pos) = pos {
+            return format!("Version {}", pos + 1);
+        }
+    }
+    format!("version {commit_id}")
 }
 
 /// Undo the most recent commit, **keeping working-tree files as-is** (soft reset): the undone
@@ -188,23 +284,43 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
 /// ponytail: objects/chain versions from the popped commit are left in place — they're
 /// content-addressed, so they're harmless orphans and dedup on any future re-commit.
 pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
-    let last = match repo.commits.pop() {
-        Some(c) => c,
+    let tip_id = match repo.branches.tip() {
+        Some(t) => t.to_string(),
         None => return Ok(None),
     };
+    // The tip may sit mid-vec after a branch switch — locate and remove it by id, but only
+    // when nothing else depends on it: no child commit anywhere, no other branch tip on it.
+    let pos = repo
+        .commits
+        .iter()
+        .position(|c| c.id == tip_id)
+        .ok_or_else(|| KvcError::NoCommit(tip_id.clone()))?;
+    if repo.commits.iter().any(|c| c.parents.contains(&tip_id)) {
+        return Err(KvcError::CannotUndo(
+            "later versions build on this one".into(),
+        ));
+    }
+    if repo
+        .branches
+        .branches
+        .iter()
+        .any(|(name, tip)| *name != repo.branches.current && *tip == tip_id)
+    {
+        return Err(KvcError::CannotUndo(
+            "another branch points at this version".into(),
+        ));
+    }
+    let last = repo.commits.remove(pos);
+    repo.branches
+        .set_tip(last.parents.first().map(String::as_str).unwrap_or(""));
 
-    // For each path the undone commit touched, find its most-recent surviving entry.
+    // For each path the undone commit touched, rewind the index to the new tip's tree.
+    let tip_tree = current_tree(repo);
     let mut restores: Vec<CommittedFile> = Vec::new();
     let mut removes: Vec<String> = Vec::new();
     for f in &last.files {
-        let prior = repo
-            .commits
-            .iter()
-            .rev()
-            .flat_map(|c| c.files.iter())
-            .find(|pf| pf.path == f.path);
-        match prior {
-            Some(pf) if pf.status != "D" && pf.content.is_some() => restores.push(pf.clone()),
+        match tip_tree.get(&f.path) {
+            Some(pf) if pf.content.is_some() => restores.push(pf.clone()),
             _ => removes.push(f.path.clone()),
         }
     }
@@ -227,11 +343,21 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
         );
     }
     repo.save()?;
-    Ok(repo.commits.last().cloned())
+    let new_tip = repo
+        .branches
+        .tip()
+        .and_then(|t| repo.commits.iter().find(|c| c.id == t))
+        .cloned();
+    Ok(new_tip)
 }
 
-fn commit_id(timestamp: &str, message: &str, files: &[CommittedFile]) -> String {
-    let mut seed = format!("{timestamp}\n{message}\n");
+pub(crate) fn commit_id(
+    timestamp: &str,
+    message: &str,
+    parents: &[String],
+    files: &[CommittedFile],
+) -> String {
+    let mut seed = format!("{timestamp}\n{message}\n{}\n", parents.join(","));
     for f in files {
         seed.push_str(&format!(
             "{}:{}\n",

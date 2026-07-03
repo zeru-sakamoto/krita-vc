@@ -1,10 +1,11 @@
 # Frontend Architecture
 
 The frontend is a Vite + React 19 + TypeScript app rendered in the Tauri webview. In the desktop
-shell it drives the real Rust backend through Tauri `invoke` (commit history, working-tree scan,
-repository lifecycle — see [version-control.md](version-control.md)); in a plain browser
-(`npm run dev`) it falls back to the mock modules in `src/data/`. Diff rendering is still
-mock-fed until per-commit diffs are wired up.
+shell it drives the real Rust backend through Tauri `invoke` (commit history, branches,
+working-tree scan, per-commit visual diffs, repository lifecycle — see
+[version-control.md](version-control.md)). There is **no mock data**: in a plain browser
+(`npm run dev`, no backend) the data hooks return empty results, repository actions are no-ops,
+and the status bar shows a "Browser preview" badge — the browser build is for UI work only.
 
 ## Styling
 
@@ -17,7 +18,9 @@ mock-fed until per-commit diffs are wired up.
 
 ## App shell — the four zones
 
-[`AppShell`](../src/components/shell/AppShell.tsx) owns layout and view state and wires the zones:
+[`AppShell`](../src/components/shell/AppShell.tsx) splits on the selected repository: with none
+selected (fresh install) it renders a welcome state pointing at the top-bar switcher; otherwise
+`RepoShell` owns layout and view state and wires the zones:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -48,7 +51,7 @@ bar + scroll area) used by the Sidebar and Inspector.
 
 ## State ownership
 
-State lives in `AppShell` and flows down via props:
+State lives in `RepoShell` and flows down via props:
 
 | State | Drives |
 |-------|--------|
@@ -56,7 +59,11 @@ State lives in `AppShell` and flows down via props:
 | `selectedId` | Selected commit → main-panel diff + inspector. |
 | `inspectorOpen` | Inspector visibility. |
 
-Derived per render: `currentBranch`, `selectedCommit`, and `diff` (`MOCK_DIFF_BY_COMMIT[selectedId]`).
+Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) — `useCommits`
+(branch-scoped history), `useBranches` (local branches + current + tips), `useCommitDiff` /
+`useWorkingDiff` (visual diffs), `useArtLayers` (streamed per-layer rasters) — all keyed by the
+selected repository path and the shared `refreshNonce`. Derived per render: `currentBranch`
+(from `useBranches`), `selectedCommit`, and `diff`.
 
 Two pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
@@ -70,7 +77,8 @@ busy flags — `saving` locks staging and drives the `StatusBar` progress bar du
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
 (`Sidebar`), the art-diff canvas height (`ArtDiffView`), per-file staging toggles (`ChangesPanel`),
-checked-out branch (`BranchesPanel`), and the diff view/compare/highlight controls (`ArtDiffView`).
+modal open/close state (`BranchesPanel`, `Sidebar`), and the diff view/compare/highlight controls
+(`ArtDiffView`).
 Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize.ts) hook
 (pointer-capture drag, clamped, persisted under a `krita-vc:` key).
 
@@ -78,20 +86,29 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
 
 `Sidebar` is a thin router on `view` (keeping the resizable shell + `DockerPanel` wrapper):
 
-- **`history`** — branch selector + [`CommitGraph`](../src/components/vcs/CommitGraph.tsx): a
-  git-style graph where each version block (`CommitCard`) is paired with a rail
+- **`history`** — a live **branch switcher** (the `Menu` primitive: pick a branch to switch to it,
+  footer row opens the create-branch modal) + [`CommitGraph`](../src/components/vcs/CommitGraph.tsx):
+  a git-style graph where each version block (`CommitCard`) is paired with a rail
   ([`CommitGraphRail`](../src/components/vcs/CommitGraphRail.tsx)) drawing its node and the lane lines
-  connecting it to its neighbors, so branch divergence and merges read at a glance. Lane layout is
-  computed by [`buildGraph`](../src/lib/graph.ts); lane colors are a deliberate functional exception
-  to the single-accent rule (accent for the mainline, then `info`/`success`/`warning` tokens).
-  Selection drives the main panel.
+  connecting it to its neighbors, so branch divergence and merges read at a glance. History is
+  **scoped to the current branch** (`list_commits` returns commits reachable from its tip, so a
+  merged branch's versions appear under the target branch). Lane layout is computed by
+  [`buildGraph`](../src/lib/graph.ts); node colors are stable **per branch**
+  (`branchColorMap` — accent for the current branch, then `info`/`success`/`warning` tokens, a
+  deliberate functional exception to the single-accent rule), and branch tips get a `BranchBadge`
+  on their commit card. Selection drives the main panel.
 - **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): working-tree changes
-  (from `scan_repository`, or mock data in the browser) grouped Staged / Unstaged, with per-file
+  (from `scan_repository`) grouped Staged / Unstaged, with per-file
   and **Stage all / Unstage all** toggles. Staging is cosmetic — `commit_snapshot` captures the
   whole working tree. While a commit is in flight the staging controls lock, the commit button
   shows a spinner, and the `StatusBar` shows an indeterminate progress bar (shared `saving` flag).
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
-  list; checkout sets a local highlight only. This is a local-only VCS — there are no remotes.
+  list with **real actions** — click a branch to switch, hover (or keyboard-focus) a row for
+  "Merge into current" and "Delete" (both behind plain-language confirm modals), "New branch"
+  opens the create modal. Shared dialogs live in
+  [`BranchDialogs.tsx`](../src/components/vcs/BranchDialogs.tsx); the backend's dirty-tree error
+  (stable `"unsaved changes"` prefix) becomes a friendly save-first prompt with a jump to the
+  Changes view. This is a local-only VCS — there are no remotes.
 
 ## Diff viewer
 
@@ -138,12 +155,12 @@ concepts, not jargon.
 ## Component map
 
 ```
-AppShell
+AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ TopBar ─ Menu (repository switcher)
 ├─ ActivityBar
-├─ Sidebar ─ DockerPanel ─┬─ history  → BranchBadge + CommitGraph ─ CommitGraphRail + CommitCard
+├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
-│                         └─ branches → BranchesPanel ─ BranchBadge
+│                         └─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
 ├─ MainPanel ─ DiffView ──┬─ art     → ArtDiffView ─┬─ LayerStackPanel ─ FileStatusChip
 │                         │          (+ 1st palette)  ├─ ArtCanvas        (side-by-side)
 │                         │                           └─ CompareSlider ─ ArtCanvas (swipe)
@@ -163,9 +180,12 @@ outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStat
 [`BranchBadge`](../src/components/vcs/BranchBadge.tsx).
 
 Cross-cutting libs: [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx) (the toggle context),
-[`src/lib/repository.tsx`](../src/lib/repository.tsx) (selected-repository context),
+[`src/lib/repository.tsx`](../src/lib/repository.tsx) (selected-repository context + all
+mutating actions: commit/rollback/undo, branch create/switch/merge/delete),
+[`src/lib/repoData.ts`](../src/lib/repoData.ts) (data hooks: commits, branches, diffs, layers),
 [`src/lib/useResize.ts`](../src/lib/useResize.ts) (shared drag-resize hook),
-[`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout),
+[`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
+[`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
 [`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `assetKind`,
 `statusVerb`, `parsePaletteDiff`, `rgbToHex`, `versionNumbers`/`versionLabel`),
 [`src/lib/format.ts`](../src/lib/format.ts) (timestamps).

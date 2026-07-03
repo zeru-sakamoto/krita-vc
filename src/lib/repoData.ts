@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { ArtLayer, Commit, DiffEntry, FileStatus } from "../types";
-import { MOCK_COMMITS, MOCK_DIFF_BY_COMMIT } from "../data/mockData";
+import type { ArtLayer, Branch, Commit, DiffEntry, FileStatus } from "../types";
 import { inTauri } from "./tauri";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
@@ -12,20 +11,22 @@ interface BackendCommit {
   author: string;
   timestamp: string;
   parents: string[];
+  branch?: string;
   files: { path: string; status: string; content: string | null; isKra: boolean }[];
 }
 
 /**
  * Real commit history for `path` via `list_commits`, newest-first and mapped to the
- * frontend `Commit` shape (the graph + inspector consume it). Falls back to mock data
- * in a plain browser. `nonce` lets callers force a refetch (e.g. after committing).
+ * frontend `Commit` shape (the graph + inspector consume it). Empty in a plain browser
+ * (no backend). `nonce` lets callers force a refetch (e.g. after committing).
  */
 export function useCommits(path: string, nonce = 0): Commit[] {
-  const [commits, setCommits] = useState<Commit[]>(inTauri() ? [] : MOCK_COMMITS);
+  const [commits, setCommits] = useState<Commit[]>([]);
 
   useEffect(() => {
+    // No backend in a plain browser (`npm run dev`) — history stays empty.
     if (!inTauri()) {
-      setCommits(MOCK_COMMITS);
+      setCommits([]);
       return;
     }
     let cancelled = false;
@@ -42,6 +43,8 @@ export function useCommits(path: string, nonce = 0): Commit[] {
               author: c.author,
               timestamp: c.timestamp,
               parents: c.parents,
+              // Pre-branching commits are stamped "" — leave those unset.
+              branch: c.branch || undefined,
               changes: c.files.map((f) => ({ path: f.path, status: f.status as FileStatus })),
             })
           )
@@ -59,6 +62,51 @@ export function useCommits(path: string, nonce = 0): Commit[] {
   return commits;
 }
 
+/** Shape returned by the branch Tauri commands (serde camelCase). */
+interface BackendBranch {
+  name: string;
+  tip: string | null;
+  current: boolean;
+}
+
+function mapBranches(bs: BackendBranch[]): Branch[] {
+  return bs.map((b) => ({
+    name: b.name,
+    kind: b.current ? "current" : "local",
+    tip: b.tip,
+  }));
+}
+
+/**
+ * Local branches for `path` via `list_branches` (current branch flagged, tips included).
+ * Empty in a plain browser (no backend). `nonce` forces a refetch after any
+ * branch mutation (create/switch/merge/delete all bump the shared refresh nonce).
+ */
+export function useBranches(path: string, nonce = 0): Branch[] {
+  const [branches, setBranches] = useState<Branch[]>([]);
+
+  useEffect(() => {
+    // No backend in a plain browser — a fresh repo always shows "main" via AppShell's fallback.
+    if (!inTauri()) {
+      setBranches([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<BackendBranch[]>("list_branches", { path })
+      .then((bs) => {
+        if (!cancelled) setBranches(mapBranches(bs));
+      })
+      .catch(() => {
+        if (!cancelled) setBranches([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce]);
+
+  return branches;
+}
+
 /** A diff result plus any backend error, so callers can show a message instead of a blank panel. */
 export interface DiffResult {
   entries: DiffEntry[];
@@ -69,8 +117,8 @@ export interface DiffResult {
 
 /**
  * The visual diff for a single commit via `commit_diff` (art files carry real per-layer PNG
- * rasters + a composite; other files get a minimal text entry). Falls back to the mock diff
- * map in a plain browser. `nonce` forces a refetch after a mutating command (rollback/undo).
+ * rasters + a composite; other files get a minimal text entry). Empty in a plain browser
+ * (no backend). `nonce` forces a refetch after a mutating command (rollback/undo).
  * A backend failure surfaces via `error` rather than silently blanking the panel.
  */
 /**
@@ -90,7 +138,7 @@ export function useCommitDiff(path: string, commitId: string | null, nonce = 0):
       return;
     }
     if (!inTauri()) {
-      setResult({ entries: MOCK_DIFF_BY_COMMIT[commitId] ?? [], error: null, loading: false });
+      setResult({ entries: [], error: null, loading: false });
       return;
     }
     const key = `${path}|${commitId}|${nonce}`;
@@ -124,8 +172,8 @@ export function useCommitDiff(path: string, commitId: string | null, nonce = 0):
 
 /**
  * The visual diff for a single working-tree file (working copy vs its last committed version)
- * via `working_diff`. Empty when `file` is null. Browser/mock has no working diff, so it stays
- * empty there. `nonce` forces a refetch after a rescan/commit.
+ * via `working_diff`. Empty when `file` is null or in a plain browser (no backend).
+ * `nonce` forces a refetch after a rescan/commit.
  */
 export function useWorkingDiff(path: string, file: string | null, nonce = 0): DiffResult {
   const [result, setResult] = useState<DiffResult>({ entries: [], error: null, loading: false });
@@ -157,8 +205,8 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
  * already rendered the composite + layer list. The backend **streams** each layer over a Tauri
  * `Channel` the moment its rasters finish (out of order), so the returned map grows layer by
  * layer and the UI can paint them progressively; `loading` stays true until the whole set has
- * arrived. Returns `null` in a plain browser (mock diffs already carry their rasters) — callers
- * fall back to whatever layers the diff shipped.
+ * arrived. Returns `null` in a plain browser (no backend) — callers fall back to whatever
+ * layers the diff shipped.
  */
 /**
  * Loaded layer rasters keyed by request identity, so revisiting a commit/file doesn't

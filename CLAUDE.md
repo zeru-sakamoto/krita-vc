@@ -9,14 +9,22 @@ This is a **local-only VCS**: there is intentionally **no remote/push/pull/sync*
 no fetch, no cloud sync. The UI exposes only local operations (commit history, local branches,
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
-tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`; commands
-in `commands.rs`). The frontend drives it via Tauri `invoke` in the desktop shell (history, scan,
-commit, repo lifecycle, rollback/undo, and per-commit visual diffs) and **falls back to mock
-data** (`src/data/`) in a plain browser (`npm run dev`). `.kra` diffs are real and load in two
+tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`;
+commands in `commands.rs`). **Branching is real**: `.kvc/branches.json` maps branch name → tip
+commit id (+ the current branch); create is O(1), switch rewrites only files that differ between
+branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
+version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
+commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
+commits reachable from the current branch tip. The frontend drives it via Tauri `invoke` in the
+desktop shell (history, scan, commit, repo lifecycle, rollback/undo, branch create/switch/merge/
+delete, and per-commit visual diffs). **There is no mock data**: in a plain browser
+(`npm run dev`, no backend) the data hooks return empty results, repository/branch actions are
+no-ops, and the status bar shows a "Browser preview" badge — browser mode is for UI work only.
+`.kra` diffs are real and load in two
 stages: `commit_diff` returns the capped composite + layer metadata fast, then `commit_layers`/
 `working_layers` **stream** per-layer PNG rasters over a Tauri `Channel` as each finishes, with
 capped PNGs persisted in a content-addressed `.kvc/cache/` (see the diff viewer section);
-non-`.kra` diffs are still minimal/mock. Rust tests live in `src-tauri/tests/`; the frontend has no test
+non-`.kra` diffs are still minimal. Rust tests live in `src-tauri/tests/`; the frontend has no test
 runner yet — if you add one, update this file.
 
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
@@ -54,23 +62,26 @@ Recommended editor setup (from README): VS Code with the Tauri and rust-analyzer
 
 ## Frontend architecture (`src/`)
 
-Mock-data-driven UI; design is specified in `DESIGN.md` and tokens are mapped into Tailwind v4
+Backend-driven UI; design is specified in `DESIGN.md` and tokens are mapped into Tailwind v4
 `@theme` in `src/styles/global.css` (utilities like `bg-surface-2`, `text-text-muted`,
-`rounded-panel`). Domain types live in `src/types.ts`; mock data in `src/data/`; cross-cutting
+`rounded-panel`). Domain types live in `src/types.ts`; data hooks in `src/lib/repoData.ts`
+(commits, branches, diffs, streamed layers — keyed by repo path + `refreshNonce`); cross-cutting
 presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist-friendly labels,
 `artistMode.tsx` the global toggle context, `repository.tsx` the selected-repository context,
-`useResize.ts` the shared drag-resize hook, `graph.ts` history-graph lane layout).
+`useResize.ts` the shared drag-resize hook, `graph.ts` history-graph lane layout,
+`svgArt.ts` SVG layer compositing).
 
-- **Shell** (`src/components/shell/`): `AppShell.tsx` owns layout + view state and wires a top bar
-  plus four zones — `TopBar` (repository switcher) above `ActivityBar` (changes/history/branches) |
-  `Sidebar` (resizable, content switches on the active view) | `MainPanel` (diff) | `Inspector`
-  (commit metadata) — plus `StatusBar`.
+- **Shell** (`src/components/shell/`): `AppShell.tsx` splits on the selected repository — a
+  welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
+  and wires a top bar plus four zones — `TopBar` (repository switcher) above `ActivityBar`
+  (changes/history/branches) | `Sidebar` (resizable, content switches on the active view) |
+  `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`.
 - **Repositories** (`src/lib/repository.tsx`): a local repository is a folder the user designates
   (local-only — no remotes). The `TopBar` switcher selects among them; the list + selected id
-  persist to `localStorage`. In the desktop shell, Create/Browse open a native folder picker
-  (`tauri-plugin-dialog`) and init a `.kvc/` store (`init_repository`); commits/history/changes
-  come from the backend keyed by the selected path. In a plain browser there is no picker —
-  `MOCK_REPOSITORIES` seeds the list and "Add repository…" appends a placeholder.
+  persist to `localStorage` (`current` is null until the user adds one). In the desktop shell,
+  Create/Browse open a native folder picker (`tauri-plugin-dialog`) and init a `.kvc/` store
+  (`init_repository`); commits/history/changes come from the backend keyed by the selected path.
+  In a plain browser there is no picker and repository actions are no-ops.
 - **UI primitives** (`src/components/ui/`): `Button.tsx`, `IconButton.tsx` (flat Krita-style, no
   background until hover), `Menu.tsx` (dropdown with outside-click + Esc to close). Shared across
   shell and VCS components.
@@ -80,8 +91,14 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   panels (`ChangesPanel` — working-tree changes with per-file + stage-all/unstage-all toggles;
   staging is cosmetic since `commit_snapshot` captures the whole tree; while a commit is in flight
   the staging controls lock, the commit button spins, and the `StatusBar` shows a progress bar, via
-  the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local branches
-  only), and the diff viewer
+  the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
+  branches with **real actions**: click to switch, hover-row merge/delete with confirm modals, a
+  "New branch" modal; shared dialogs live in `BranchDialogs.tsx`, and the backend's dirty-tree
+  error — matched on its stable `"unsaved changes"` prefix — becomes a friendly save-first prompt
+  with a jump to the Changes view. The History sidebar has a live branch-switcher `Menu` (with a
+  "New branch…" footer), the graph colors nodes per branch (`branchColorMap` in `lib/graph.ts`,
+  current branch = accent) and badges branch tips on their commit cards, and `useBranches` in
+  `lib/repoData.ts` feeds it all via `list_branches`), and the diff viewer
   (`DiffView`, `ArtDiffView`, `PaletteDiffView`, `LayerStackPanel`, `ArtCanvas`, `CompareSlider`).
 - **Main panel** (`src/components/MainPanel.tsx`): thin wrapper between `AppShell` and `DiffView`;
   handles the empty-state when no commit is selected, and shows an "Analyzing changes…" spinner
@@ -101,10 +118,10 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**
   Artist Mode gated. Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
-  (one-line summary) on, `DiffFileBlock` (raw line diff with +/− and line numbers) off. Mock layer
-  imagery is **generated inline SVG** (`src/data/mockArt.ts`) — no assets, no deps, composited
-  offline. Palette mock data lives in `src/data/mockPalette.ts`. See
-  [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md).
+  (one-line summary) on, `DiffFileBlock` (raw line diff with +/− and line numbers) off. Layer
+  imagery is composited from **inline SVG markup strings** (`src/lib/svgArt.ts` — `layersBody`/
+  `wrapSvg`/`compositeSvg`), which is how the backend's base64-PNG rasters render with no raster
+  pipeline in the viewer. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md).
 - **Artist Mode** — a global toggle (default on) that swaps technical strings for plain-language
   labels app-wide: friendly diffs, `Version N` instead of hashes, asset names instead of file
   paths, words+icons instead of `M/A/D`. State + persistence in `src/lib/artistMode.tsx`
@@ -112,7 +129,6 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   friendly labels over git/code jargon in new UI, and gate any unavoidable technical detail behind
   Artist Mode being off. See [`docs/frontend-architecture.md`](docs/frontend-architecture.md#artist-mode).
 
-When the backend lands, replace the `src/data/` mock modules with data fetched via Tauri `invoke`
-(keyed by the selected repository path; a real folder picker needs `tauri-plugin-dialog`); the
-component/prop boundaries (`Repository`, `DiffEntry`, `Commit` — incl. `parents` lineage — `Branch`,
-`WorkingChange`) are designed to be the swap point.
+All data flows through Tauri `invoke` keyed by the selected repository path; the component/prop
+boundaries (`Repository`, `DiffEntry`, `Commit` — incl. `parents` lineage — `Branch` incl. `tip`,
+`WorkingChange`) are the contract between `src/lib/repoData.ts`/`repository.tsx` and the UI.

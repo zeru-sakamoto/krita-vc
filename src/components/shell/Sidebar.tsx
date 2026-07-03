@@ -1,15 +1,27 @@
 import { useState } from "react";
-import { ArrowsClockwise, ArrowUUpLeft, CaretDown, DotsThreeVertical } from "@phosphor-icons/react";
+import {
+  ArrowsClockwise,
+  ArrowUUpLeft,
+  CaretDown,
+  DotsThreeVertical,
+  Plus,
+} from "@phosphor-icons/react";
 import { DockerPanel } from "./DockerPanel";
 import type { ActivityView } from "./ActivityBar";
 import { IconButton } from "../ui/IconButton";
 import { Button } from "../ui/Button";
+import { Menu } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { BranchBadge } from "../vcs/BranchBadge";
 import { CommitGraph } from "../vcs/CommitGraph";
 import { ChangesPanel } from "../vcs/ChangesPanel";
 import { BranchesPanel } from "../vcs/BranchesPanel";
-import { MOCK_BRANCHES } from "../../data/mockData";
+import {
+  CreateBranchModal,
+  SaveFirstModal,
+  errorText,
+  isUnsavedChangesError,
+} from "../vcs/BranchDialogs";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
@@ -24,12 +36,15 @@ const PANEL_TITLE: Record<ActivityView, string> = {
 interface SidebarProps {
   view: ActivityView;
   commits: Commit[];
+  branches: Branch[];
   currentBranch: Branch;
   selectedId: string | null;
   onSelect: (id: string) => void;
   /** Working-tree file whose diff is shown in the main panel (Changes view). */
   focusedFile: string | null;
   onFocusFile: (path: string) => void;
+  /** Jump to the Changes view (used by the save-first prompt). */
+  onShowChanges: () => void;
 }
 
 /**
@@ -40,16 +55,32 @@ interface SidebarProps {
 export function Sidebar({
   view,
   commits,
+  branches,
   currentBranch,
   selectedId,
   onSelect,
   focusedFile,
   onFocusFile,
+  onShowChanges,
 }: SidebarProps) {
-  const { refresh, scanning, undoLastCommit, saving } = useRepository();
+  const { refresh, scanning, undoLastCommit, switchBranch, saving } = useRepository();
   const { artistMode } = useArtistMode();
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [saveFirst, setSaveFirst] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  const onSwitch = async (name: string) => {
+    if (name === currentBranch.name || saving) return;
+    setSwitchError(null);
+    try {
+      await switchBranch(name);
+    } catch (e) {
+      if (isUnsavedChangesError(e)) setSaveFirst(true);
+      else setSwitchError(errorText(e));
+    }
+  };
 
   const onUndo = async () => {
     setUndoError(null);
@@ -95,16 +126,33 @@ export function Sidebar({
       >
         {view === "history" && (
           <>
-            {/* Branch selector */}
+            {/* Branch selector — the history below shows this branch's line of versions */}
             <div className="flex items-center justify-between gap-2 h-8 border-b border-border px-3 py-1.5">
-              <button
-                type="button"
-                className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-white/5"
-                title="Switch branch (mock)"
-              >
-                <BranchBadge branch={currentBranch} />
-                <CaretDown size={12} className="text-text-muted" />
-              </button>
+              <Menu
+                trigger={() => (
+                  <span
+                    className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-white/5"
+                    title={artistMode ? "Choose which version line to view" : "Switch branch"}
+                  >
+                    <BranchBadge branch={currentBranch} />
+                    <CaretDown size={12} className="text-text-muted" />
+                  </span>
+                )}
+                items={branches.map((b) => ({
+                  id: b.name,
+                  label: b.name,
+                  selected: b.kind === "current",
+                  onSelect: () => void onSwitch(b.name),
+                }))}
+                footer={[
+                  {
+                    id: "new-branch",
+                    label: artistMode ? "New version line…" : "New branch…",
+                    icon: <Plus size={13} />,
+                    onSelect: () => setCreateOpen(true),
+                  },
+                ]}
+              />
               <div className="flex items-center gap-1">
                 <span className="text-[11px] text-text-muted">
                   {commits.length} {artistMode ? "versions" : "commits"}
@@ -122,13 +170,20 @@ export function Sidebar({
               </div>
             </div>
 
-            <CommitGraph commits={commits} selectedId={selectedId} onSelect={onSelect} />
+            {switchError && <p className="px-3 pt-2 text-[12px] text-danger">{switchError}</p>}
+
+            <CommitGraph
+              commits={commits}
+              selectedId={selectedId}
+              onSelect={onSelect}
+              branches={branches}
+            />
           </>
         )}
 
         {view === "changes" && <ChangesPanel focusedFile={focusedFile} onFocusFile={onFocusFile} />}
 
-        {view === "branches" && <BranchesPanel branches={MOCK_BRANCHES} />}
+        {view === "branches" && <BranchesPanel branches={branches} onShowChanges={onShowChanges} />}
       </DockerPanel>
 
       {/* Resize handle */}
@@ -140,6 +195,11 @@ export function Sidebar({
         onPointerUp={onPointerUp}
         className="absolute right-0 top-0 z-(--z-panel) h-full w-1 translate-x-1/2 cursor-col-resize bg-border transition-colors hover:bg-accent"
       />
+
+      {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}
+      {saveFirst && (
+        <SaveFirstModal onClose={() => setSaveFirst(false)} onShowChanges={onShowChanges} />
+      )}
 
       {confirmUndo && (
         <Modal

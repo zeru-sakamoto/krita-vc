@@ -26,6 +26,25 @@ export function laneColor(lane: number): string {
   return LANE_COLORS[lane % LANE_COLORS.length];
 }
 
+/**
+ * Stable branch → color assignment: the current branch always gets the accent (lane-0)
+ * color, other branches take the remaining palette in order of first appearance
+ * (newest-first). Used to color graph *nodes* by the branch a commit was made on, so a
+ * branch keeps its identity even when lane assignment shifts; segments stay lane-colored
+ * (they trace lanes, not branches). Commits from before branching existed have no
+ * `branch` and fall back to their lane color.
+ */
+export function branchColorMap(commits: Commit[], currentBranch?: string): Map<string, string> {
+  const map = new Map<string, string>();
+  if (currentBranch) map.set(currentBranch, LANE_COLORS[0]);
+  for (const c of commits) {
+    if (c.branch && !map.has(c.branch)) {
+      map.set(c.branch, LANE_COLORS[map.size % LANE_COLORS.length]);
+    }
+  }
+  return map;
+}
+
 export interface GraphSegment {
   x1: number;
   y1: number;

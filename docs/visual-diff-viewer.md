@@ -9,8 +9,9 @@ text files (config, settings) render as a friendly one-line summary (`FriendlyFi
 Mode, or a code-style line diff (`DiffFileBlock`) with it off. See
 [frontend-architecture.md → Diff viewer](frontend-architecture.md#diff-viewer).
 
-> All imagery is **generated inline SVG** — no external assets, no dependencies, composited offline
-> in the webview. This is mock data; the real backend will supply actual `.kra` layer rasters.
+> All imagery arrives as **inline SVG markup strings** and is composited in the webview — real
+> `.kra` layer rasters come from the backend as SVG `<image>` elements wrapping base64 PNGs, so
+> the viewer needs no raster pipeline of its own.
 
 ## Data model (`src/types.ts`)
 
@@ -41,19 +42,13 @@ interface ArtLayer {
 A layer's pixels at each state are just **SVG markup strings**. `before`/`after` differ for a
 modified layer; one side is `null` for added/removed layers.
 
-## Generated mock art (`src/data/mockArt.ts`)
-
-Scenes (hero character, forest background, sword prop, villain) are assembled from `ArtLayer`s built
-with the terse `layer(id, name, before, after?, opts)` helper. Compositing helpers:
+## SVG compositing helpers (`src/lib/svgArt.ts`)
 
 | Helper | Purpose |
 |--------|---------|
 | `layersBody(layers, state)` | Inner markup for the layers at one state; each layer wrapped in a `<g>` with `opacity` + `mix-blend-mode` (`blendCss` maps `BlendMode` → CSS). Skips `null` markup. |
 | `wrapSvg(body, w, h)` | Wraps markup in a scalable, self-contained `<svg>` (`viewBox`, `preserveAspectRatio`). |
 | `compositeSvg(layers, state, w, h)` | `wrapSvg(layersBody(...))` — used for thumbnails and the slider. |
-
-Pre-built `ArtDiff`s are exported as `ART_DIFFS` and referenced from `MOCK_DIFF_BY_COMMIT` in
-`src/data/mockData.ts`.
 
 ## Components
 
@@ -141,6 +136,5 @@ including after an app restart — skips reconstruct/decode/encode entirely. In-
 frontend also memoizes `commit_diff` results and streamed layer sets (small LRU maps in
 `repoData.ts`).
 
-`mockArt.ts` stays for the browser fallback (the hooks use it when not in the Tauri shell).
 Deferred (ponytail): non-RGBA-8 colorspaces (those layers fall back to the composite), per-layer
 change regions with labels, and `.kvc/cache` eviction (capped PNGs are small).

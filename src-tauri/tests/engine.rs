@@ -1,6 +1,8 @@
 //! End-to-end engine tests against real file I/O in tempdirs (no logic mocked).
 
-use krita_vc_lib::{commands, commit, delta, error::KvcError, kra, raster, repo, scan, tiles};
+use krita_vc_lib::{
+    branch, commands, commit, delta, error::KvcError, kra, raster, repo, scan, tiles,
+};
 use std::io::Write;
 
 // --- fixtures --------------------------------------------------------------------------
@@ -712,4 +714,289 @@ fn layer_raster_reads_from_disk_cache() {
         .unwrap()
         .unwrap();
     assert_eq!(from_working, second);
+}
+
+// --- branching: create / switch / merge / delete ---------------------------------------
+
+/// Fresh repo with two committed files, ready for branch tests.
+fn seeded_repo(dir: &tempfile::TempDir) -> repo::Repo {
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    std::fs::write(root.join("a.txt"), b"base-a").unwrap();
+    std::fs::write(root.join("b.txt"), b"base-b").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    r
+}
+
+#[test]
+fn create_and_switch_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+
+    // Create is instant and switches immediately, at the same tip.
+    branch::create_branch(&mut r, "idea").unwrap();
+    assert_eq!(r.branches.current, "idea");
+    assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
+
+    // Commit on the branch, then bounce between the two trees.
+    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
+    assert_eq!(c2.parents, vec![c1.id.clone()]);
+    assert_eq!(c2.branch, "idea");
+
+    branch::switch_branch(&mut r, "main").unwrap();
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    branch::switch_branch(&mut r, "idea").unwrap();
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"idea-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    // State survives a reopen (branches.json persisted).
+    let r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(r2.branches.current, "idea");
+    assert_eq!(r2.branches.tip(), Some(c2.id.as_str()));
+}
+
+#[test]
+fn switch_skips_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    branch::create_branch(&mut r, "idea").unwrap();
+    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
+
+    // b.txt is identical on both branches; switching must never rewrite it.
+    let before = std::fs::metadata(root.join("b.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+    let after = std::fs::metadata(root.join("b.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(before, after, "unchanged file was rewritten on switch");
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+}
+
+#[test]
+fn switch_refuses_dirty_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    branch::create_branch(&mut r, "idea").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+
+    std::fs::write(root.join("a.txt"), b"unsaved edit").unwrap();
+    assert!(matches!(
+        branch::switch_branch(&mut r, "idea"),
+        Err(KvcError::DirtyTree)
+    ));
+    // The unsaved edit is untouched.
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"unsaved edit");
+    assert_eq!(r.branches.current, "main");
+}
+
+#[test]
+fn merge_fast_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    branch::create_branch(&mut r, "feat").unwrap();
+    std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+
+    // main has not moved -> fast-forward: no new commit, tip jumps, tree materializes.
+    let merged = branch::merge_branch(&mut r, "feat", "t").unwrap();
+    assert_eq!(merged.id, c2.id);
+    assert_eq!(r.commits.len(), 2);
+    assert_eq!(r.branches.tip(), Some(c2.id.as_str()));
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"feat-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    // Merging again: nothing to do.
+    assert!(matches!(
+        branch::merge_branch(&mut r, "feat", "t"),
+        Err(KvcError::NothingToMerge(_))
+    ));
+}
+
+#[test]
+fn merge_three_way_no_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+
+    branch::create_branch(&mut r, "feat").unwrap();
+    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "feat edits b", "t").unwrap();
+
+    branch::switch_branch(&mut r, "main").unwrap();
+    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    let c3 = commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
+
+    let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
+    assert_eq!(m.parents, vec![c3.id.clone(), c2.id.clone()]);
+    // Only the source-side change is recorded (diff vs first parent).
+    assert_eq!(m.files.len(), 1);
+    assert_eq!(m.files[0].path, "b.txt");
+    assert_eq!(m.files[0].status, "M");
+
+    // Working tree has both sides; the merged tree folds correctly via first parents.
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"main-a");
+    assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"feat-b");
+    assert!(scan::scan(&r).unwrap().is_empty());
+    let tree = commit::tree_at_commit(&r.commits, &m.id).unwrap();
+    assert_ne!(
+        tree["a.txt"].content,
+        c1.files.iter().find(|f| f.path == "a.txt").unwrap().content
+    );
+
+    // Reachability: everything is now part of main's history.
+    let reach = commit::ancestors(&r.commits, &m.id);
+    for c in [&c1.id, &c2.id, &c3.id, &m.id] {
+        assert!(reach.contains(c.as_str()));
+    }
+}
+
+#[test]
+fn merge_three_way_conflict_takes_source_and_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    branch::create_branch(&mut r, "feat").unwrap();
+    std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
+    commit::commit_snapshot(&mut r, "feat edits a", "t").unwrap();
+
+    branch::switch_branch(&mut r, "main").unwrap();
+    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
+
+    let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
+    let entry = m.files.iter().find(|f| f.path == "a.txt").unwrap();
+    assert_eq!(entry.status, "C");
+    // Source wins on disk.
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"feat-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+}
+
+#[test]
+fn list_commits_scoped_by_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+
+    branch::create_branch(&mut r, "feat").unwrap();
+    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
+
+    // main's history excludes the branch-only commit until it is merged.
+    let main_reach = commit::ancestors(&r.commits, &c3.id);
+    assert!(main_reach.contains(c1.id.as_str()) && main_reach.contains(c3.id.as_str()));
+    assert!(!main_reach.contains(c2.id.as_str()));
+
+    let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
+    let merged_reach = commit::ancestors(&r.commits, &m.id);
+    assert!(
+        merged_reach.contains(c2.id.as_str()),
+        "merged branch commits join the target's history"
+    );
+}
+
+#[test]
+fn migration_missing_branches_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+    drop(r);
+
+    // Simulate a pre-branching repo.
+    std::fs::remove_file(root.join(".kvc/branches.json")).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.branches.current, "main");
+    assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
+
+    // The next commit persists branches.json and chains parentage correctly.
+    std::fs::write(root.join("a.txt"), b"v2").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    assert_eq!(c2.parents, vec![c1.id.clone()]);
+    assert!(root.join(".kvc/branches.json").is_file());
+}
+
+#[test]
+fn undo_respects_branch_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+
+    branch::create_branch(&mut r, "feat").unwrap();
+    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
+
+    // Commit parent is the branch tip, not the newest commit in the vec.
+    assert_eq!(c3.parents, vec![c1.id.clone()]);
+
+    // Undo on main removes only c3; feat's commit survives mid-vec.
+    let head = commit::undo_last_commit(&mut r).unwrap();
+    assert_eq!(head.unwrap().id, c1.id);
+    assert!(r.commits.iter().any(|c| c.id == c2.id));
+    assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
+
+    // c1 now has a child (c2 on feat) -> undoing it is refused.
+    assert!(matches!(
+        commit::undo_last_commit(&mut r),
+        Err(KvcError::CannotUndo(_))
+    ));
+}
+
+#[test]
+fn branch_name_validation_and_delete_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = seeded_repo(&dir);
+
+    assert!(matches!(
+        branch::create_branch(&mut r, "  "),
+        Err(KvcError::BadBranchName(_))
+    ));
+    assert!(matches!(
+        branch::create_branch(&mut r, "a/b"),
+        Err(KvcError::BadBranchName(_))
+    ));
+    assert!(matches!(
+        branch::create_branch(&mut r, "main"),
+        Err(KvcError::BranchExists(_))
+    ));
+
+    branch::create_branch(&mut r, "idea").unwrap();
+    assert!(matches!(
+        branch::delete_branch(&mut r, "idea"),
+        Err(KvcError::DeleteCurrent)
+    ));
+    assert!(matches!(
+        branch::delete_branch(&mut r, "ghost"),
+        Err(KvcError::NoBranch(_))
+    ));
+
+    branch::switch_branch(&mut r, "main").unwrap();
+    branch::delete_branch(&mut r, "idea").unwrap();
+    assert!(!r.branches.branches.contains_key("idea"));
 }

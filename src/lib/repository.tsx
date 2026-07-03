@@ -2,15 +2,14 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Repository } from "../types";
-import { MOCK_REPOSITORIES } from "../data/mockData";
 import { inTauri } from "./tauri";
 
 /**
  * Selected local repository. The app is local-only (no remotes); a repository is a
  * folder the user designates. In the Tauri shell "Add repository…" opens a native
  * folder picker, initializes a `.kvc/` store there if needed (`init_repository`),
- * and the real list is persisted to localStorage. In a plain browser (`npm run dev`,
- * no backend) it falls back to the mock list + a placeholder append.
+ * and the list is persisted to localStorage. In a plain browser (`npm run dev`,
+ * no backend) the list starts empty and repository actions are no-ops.
  */
 
 const STORAGE_KEY = "krita-vc:repository";
@@ -18,7 +17,8 @@ const LIST_KEY = "krita-vc:repositories";
 
 interface RepositoryValue {
   repositories: Repository[];
-  current: Repository;
+  /** Selected repository, or null when the list is empty (fresh install). */
+  current: Repository | null;
   currentId: string;
   setCurrent: (id: string) => void;
   /** Open an existing folder as a repository (init `.kvc/` if absent). */
@@ -31,6 +31,14 @@ interface RepositoryValue {
   rollbackToCommit: (commitId: string) => Promise<void>;
   /** Undo the last commit, keeping working-tree changes. */
   undoLastCommit: () => Promise<void>;
+  /** Create a branch at the current tip and switch to it (instant, no file I/O). */
+  createBranch: (name: string) => Promise<void>;
+  /** Switch the working tree to a branch (rewrites only files that differ). */
+  switchBranch: (name: string) => Promise<void>;
+  /** Merge a branch into the current one (fast-forward or merge commit). */
+  mergeBranch: (source: string) => Promise<void>;
+  /** Remove a branch label (its versions stay in history). */
+  deleteBranch: (name: string) => Promise<void>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
@@ -54,17 +62,17 @@ function basename(path: string): string {
 }
 
 function readStoredList(): Repository[] {
-  if (typeof localStorage === "undefined") return MOCK_REPOSITORIES;
+  if (typeof localStorage === "undefined") return [];
   try {
     const raw = localStorage.getItem(LIST_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Repository[];
-      if (Array.isArray(parsed) && parsed.length) return parsed;
+      if (Array.isArray(parsed)) return parsed;
     }
   } catch {
-    // fall through to mock seed
+    // fall through to an empty list
   }
-  return MOCK_REPOSITORIES;
+  return [];
 }
 
 export function RepositoryProvider({ children }: { children: React.ReactNode }) {
@@ -106,35 +114,17 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   }, []);
 
   const browseRepository = useCallback(async () => {
-    // Browser fallback: no native picker — append a placeholder.
-    if (!inTauri()) {
-      setRepositories((prev) => {
-        const n = prev.length + 1;
-        const repo: Repository = {
-          id: `repo-new-${n}`,
-          name: `new-repository-${n}`,
-          path: `C:/Art/new-repository-${n}`,
-        };
-        setCurrentId(repo.id);
-        return [...prev, repo];
-      });
-      return;
-    }
+    // No native picker in a plain browser — repository management needs the desktop shell.
+    if (!inTauri()) return;
     const picked = await open({ directory: true, title: "Select a folder to version-control" });
     if (typeof picked === "string") await addPath(picked);
   }, [addPath]);
 
   const createRepository = useCallback(
     async (parentPath: string, name: string) => {
-      const path = joinPath(parentPath, name.trim());
-      if (!inTauri()) {
-        const repo: Repository = { id: path, name: name.trim(), path };
-        setRepositories((prev) => (prev.some((r) => r.id === repo.id) ? prev : [...prev, repo]));
-        setCurrentId(repo.id);
-        return;
-      }
+      if (!inTauri()) return;
       // init_repository's create_dir_all makes the new folder (and parents) if missing.
-      await addPath(path);
+      await addPath(joinPath(parentPath, name.trim()));
     },
     [addPath]
   );
@@ -154,14 +144,14 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   const current = useMemo(
-    () => repositories.find((r) => r.id === currentId) ?? repositories[0],
+    () => repositories.find((r) => r.id === currentId) ?? repositories[0] ?? null,
     [repositories, currentId]
   );
 
   // Roll the working tree back to a commit (records a new commit); history refetches after.
   const rollbackToCommit = useCallback(
     async (commitId: string) => {
-      if (!inTauri()) return;
+      if (!inTauri() || !current) return;
       setSaving(true);
       try {
         await invoke("rollback_to_commit", { path: current.path, commitId, author: "You" });
@@ -174,7 +164,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   const undoLastCommit = useCallback(async () => {
-    if (!inTauri()) return;
+    if (!inTauri() || !current) return;
     setSaving(true);
     try {
       await invoke("undo_last_commit", { path: current.path });
@@ -183,6 +173,40 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       setSaving(false);
     }
   }, [current, refresh]);
+
+  // Branch mutations share one shape: invoke + refresh with the saving flag held (locks
+  // staging, drives the StatusBar progress bar). Errors rethrow so panels can show friendly
+  // messages (e.g. the dirty-tree save-first prompt). No-ops without a backend/repository.
+  const branchMutation = useCallback(
+    async (command: string, args: Record<string, string>) => {
+      if (!inTauri() || !current) return;
+      setSaving(true);
+      try {
+        await invoke(command, { path: current.path, ...args });
+        refresh();
+      } finally {
+        setSaving(false);
+      }
+    },
+    [current, refresh]
+  );
+
+  const createBranch = useCallback(
+    (name: string) => branchMutation("create_branch", { name }),
+    [branchMutation]
+  );
+  const switchBranch = useCallback(
+    (name: string) => branchMutation("switch_branch", { name }),
+    [branchMutation]
+  );
+  const mergeBranch = useCallback(
+    (source: string) => branchMutation("merge_branch", { source, author: "You" }),
+    [branchMutation]
+  );
+  const deleteBranch = useCallback(
+    (name: string) => branchMutation("delete_branch", { name }),
+    [branchMutation]
+  );
 
   const value = useMemo<RepositoryValue>(
     () => ({
@@ -195,6 +219,10 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       removeRepository,
       rollbackToCommit,
       undoLastCommit,
+      createBranch,
+      switchBranch,
+      mergeBranch,
+      deleteBranch,
       refreshNonce,
       refresh,
       saving,
@@ -212,6 +240,10 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       removeRepository,
       rollbackToCommit,
       undoLastCommit,
+      createBranch,
+      switchBranch,
+      mergeBranch,
+      deleteBranch,
       refreshNonce,
       refresh,
       saving,
