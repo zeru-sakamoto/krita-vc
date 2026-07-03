@@ -31,8 +31,12 @@ interface RepositoryValue {
   rollbackToCommit: (commitId: string) => Promise<void>;
   /** Undo the last commit, keeping working-tree changes. */
   undoLastCommit: () => Promise<void>;
-  /** Create a branch at the current tip and switch to it (instant, no file I/O). */
-  createBranch: (name: string) => Promise<void>;
+  /**
+   * Create a branch and switch to it. Starts at the current tip (instant, no file I/O)
+   * unless `base` names another branch, which switches the working tree to that branch's
+   * files first (refused while there are unsaved changes).
+   */
+  createBranch: (name: string, base?: string) => Promise<void>;
   /** Switch the working tree to a branch (rewrites only files that differ). */
   switchBranch: (name: string) => Promise<void>;
   /** Merge a branch into the current one (fast-forward or merge commit). */
@@ -192,7 +196,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   const createBranch = useCallback(
-    (name: string) => branchMutation("create_branch", { name }),
+    (name: string, base?: string) =>
+      branchMutation("create_branch", base ? { name, base } : { name }),
     [branchMutation]
   );
   const switchBranch = useCallback(

@@ -737,7 +737,7 @@ fn create_and_switch_roundtrip() {
     let c1 = r.commits[0].clone();
 
     // Create is instant and switches immediately, at the same tip.
-    branch::create_branch(&mut r, "idea").unwrap();
+    branch::create_branch(&mut r, "idea", None).unwrap();
     assert_eq!(r.branches.current, "idea");
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
 
@@ -767,7 +767,7 @@ fn switch_skips_unchanged_files() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    branch::create_branch(&mut r, "idea").unwrap();
+    branch::create_branch(&mut r, "idea", None).unwrap();
     std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
@@ -790,7 +790,7 @@ fn switch_refuses_dirty_tree() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
-    branch::create_branch(&mut r, "idea").unwrap();
+    branch::create_branch(&mut r, "idea", None).unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
     std::fs::write(root.join("a.txt"), b"unsaved edit").unwrap();
@@ -809,7 +809,7 @@ fn merge_fast_forward() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    branch::create_branch(&mut r, "feat").unwrap();
+    branch::create_branch(&mut r, "feat", None).unwrap();
     std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
@@ -836,7 +836,7 @@ fn merge_three_way_no_conflict() {
     let mut r = seeded_repo(&dir);
     let c1 = r.commits[0].clone();
 
-    branch::create_branch(&mut r, "feat").unwrap();
+    branch::create_branch(&mut r, "feat", None).unwrap();
     std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "feat edits b", "t").unwrap();
 
@@ -874,7 +874,7 @@ fn merge_three_way_conflict_takes_source_and_flags() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    branch::create_branch(&mut r, "feat").unwrap();
+    branch::create_branch(&mut r, "feat", None).unwrap();
     std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
     commit::commit_snapshot(&mut r, "feat edits a", "t").unwrap();
 
@@ -897,7 +897,7 @@ fn list_commits_scoped_by_branch() {
     let mut r = seeded_repo(&dir);
     let c1 = r.commits[0].clone();
 
-    branch::create_branch(&mut r, "feat").unwrap();
+    branch::create_branch(&mut r, "feat", None).unwrap();
     std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
@@ -945,7 +945,7 @@ fn undo_respects_branch_tip() {
     let mut r = seeded_repo(&dir);
     let c1 = r.commits[0].clone();
 
-    branch::create_branch(&mut r, "feat").unwrap();
+    branch::create_branch(&mut r, "feat", None).unwrap();
     std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
@@ -974,19 +974,19 @@ fn branch_name_validation_and_delete_guards() {
     let mut r = seeded_repo(&dir);
 
     assert!(matches!(
-        branch::create_branch(&mut r, "  "),
+        branch::create_branch(&mut r, "  ", None),
         Err(KvcError::BadBranchName(_))
     ));
     assert!(matches!(
-        branch::create_branch(&mut r, "a/b"),
+        branch::create_branch(&mut r, "a/b", None),
         Err(KvcError::BadBranchName(_))
     ));
     assert!(matches!(
-        branch::create_branch(&mut r, "main"),
+        branch::create_branch(&mut r, "main", None),
         Err(KvcError::BranchExists(_))
     ));
 
-    branch::create_branch(&mut r, "idea").unwrap();
+    branch::create_branch(&mut r, "idea", None).unwrap();
     assert!(matches!(
         branch::delete_branch(&mut r, "idea"),
         Err(KvcError::DeleteCurrent)
@@ -999,4 +999,245 @@ fn branch_name_validation_and_delete_guards() {
     branch::switch_branch(&mut r, "main").unwrap();
     branch::delete_branch(&mut r, "idea").unwrap();
     assert!(!r.branches.branches.contains_key("idea"));
+}
+
+#[test]
+fn create_branch_from_other_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].clone();
+
+    // Diverge on "idea", then start a new branch from main's tree while standing on idea.
+    branch::create_branch(&mut r, "idea", None).unwrap();
+    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
+
+    branch::create_branch(&mut r, "third", Some("main")).unwrap();
+    assert_eq!(r.branches.current, "third");
+    assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
+    // The working tree was materialized to main's files.
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    // Unknown base -> error; unsaved changes -> refused, nothing moves.
+    assert!(matches!(
+        branch::create_branch(&mut r, "x", Some("ghost")),
+        Err(KvcError::NoBranch(_))
+    ));
+    std::fs::write(root.join("a.txt"), b"unsaved").unwrap();
+    assert!(matches!(
+        branch::create_branch(&mut r, "x", Some("idea")),
+        Err(KvcError::DirtyTree)
+    ));
+    assert_eq!(r.branches.current, "third");
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"unsaved");
+}
+
+#[test]
+fn commit_crc_skip_reuses_unchanged_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let kra1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, b"tileAAAA")])),
+        ("img/layers/layer2", tiled(&[(0, 0, b"tileBBBB")])),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    // Edit only layer2; layer1 and maindoc.xml keep their crc32+size and must be reused.
+    let kra2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, b"tileAAAA")])),
+        ("img/layers/layer2", tiled(&[(0, 0, b"tileZZZZ")])),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra2).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let h1 = c1.files[0].content.clone().unwrap();
+    let h2 = c2.files[0].content.clone().unwrap();
+    let m1 = kra::load_manifest(&r, "art.kra", &h1).unwrap();
+    let m2 = kra::load_manifest(&r, "art.kra", &h2).unwrap();
+    let (t1, t2) = (m1.tile_index(), m2.tile_index());
+    assert_eq!(
+        t1["img/layers/layer1"], t2["img/layers/layer1"],
+        "unchanged layer must keep identical tile refs"
+    );
+    assert_ne!(t1["img/layers/layer2"], t2["img/layers/layer2"]);
+    assert_eq!(m1.entry_hash("maindoc.xml"), m2.entry_hash("maindoc.xml"));
+
+    // The reconstructed v2 archive carries the same logical content as the working file.
+    let rebuilt = kra::reconstruct_kra(&r, "art.kra", &h2).unwrap();
+    let rb = kra::parse_working(&rebuilt).unwrap();
+    let wk = kra::parse_working(&kra2).unwrap();
+    assert_eq!(rb.tile_index(), wk.tile_index());
+    assert_eq!(
+        kra::read_entry(&rebuilt, "maindoc.xml").unwrap(),
+        maindoc(255)
+    );
+    assert_eq!(
+        kra::read_entry(&rebuilt, "mimetype").unwrap(),
+        b"application/x-krita"
+    );
+
+    // Reconstructed files round-trip through the crc fast path: after a rewrite (as a branch
+    // switch does), an untouched re-commit sees no changes at all.
+    std::fs::write(root.join("art.kra"), &rebuilt).unwrap();
+    let s = scan::scan(&r).unwrap();
+    if !s.is_empty() {
+        // The rebuilt zip's bytes differ from the working file; committing it must reuse
+        // every stream (same manifest content) rather than re-storing anything.
+        let objs = count_objects(root);
+        let c3 = commit::commit_snapshot(&mut r, "rebuilt", "t").unwrap();
+        assert_eq!(c3.files[0].content.clone().unwrap(), h2);
+        assert_eq!(count_objects(root), objs);
+    }
+}
+
+// --- chains persistence: binary format, legacy migration, skip-on-clean -----------------
+
+#[test]
+fn chains_binary_format_and_legacy_json_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    let h = r.store_stream("file:x", b"some data").unwrap();
+    r.save().unwrap();
+    assert!(root.join(".kvc/chains.bin").is_file());
+    assert!(!root.join(".kvc/chains.json").exists());
+
+    // Simulate a repo from before the binary format: chains as JSON, no chains.bin.
+    let json = serde_json::to_vec(&r.chains).unwrap();
+    std::fs::write(root.join(".kvc/chains.json"), &json).unwrap();
+    std::fs::remove_file(root.join(".kvc/chains.bin")).unwrap();
+
+    let mut r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(r2.reconstruct("file:x", &h).unwrap(), b"some data");
+
+    // The next stream commit + save migrates to chains.bin and retires the JSON file.
+    r2.store_stream("file:y", b"more").unwrap();
+    r2.save().unwrap();
+    assert!(root.join(".kvc/chains.bin").is_file());
+    assert!(!root.join(".kvc/chains.json").exists());
+    let r3 = repo::Repo::open(root).unwrap();
+    assert!(r3.chains.0.contains_key("file:x") && r3.chains.0.contains_key("file:y"));
+    assert_eq!(r3.reconstruct("file:x", &h).unwrap(), b"some data");
+}
+
+#[test]
+fn switch_skips_chains_rewrite_commit_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    branch::create_branch(&mut r, "idea", None).unwrap();
+    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
+
+    // Sentinel: replace chains.bin on disk; a switch (no new stream versions) must not
+    // rewrite it, so the sentinel survives.
+    let chains_path = root.join(".kvc/chains.bin");
+    let committed = std::fs::read(&chains_path).unwrap();
+    std::fs::write(&chains_path, b"SENTINEL").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+    assert_eq!(
+        std::fs::read(&chains_path).unwrap(),
+        b"SENTINEL",
+        "switch must not rewrite the chains file"
+    );
+    std::fs::write(&chains_path, &committed).unwrap();
+
+    // A commit stores new stream versions and must rewrite it.
+    std::fs::write(root.join("a.txt"), b"main-a2").unwrap();
+    commit::commit_snapshot(&mut r, "on main", "t").unwrap();
+    assert_ne!(std::fs::read(&chains_path).unwrap(), b"SENTINEL");
+    let r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(r2.chains.0.len(), r.chains.0.len());
+}
+
+// --- incremental .kra materialization on switch ------------------------------------------
+
+#[test]
+fn kra_switch_materializes_incrementally() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let t1 = tiled(&[(0, 0, &[1u8; 500]), (64, 0, &[2u8; 500])]);
+    let t2 = tiled(&[(0, 0, &[3u8; 500])]);
+    let base = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", t1.clone()),
+        ("img/layers/layer2", t2.clone()),
+    ]);
+    std::fs::write(root.join("art.kra"), &base).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "base", "t").unwrap();
+
+    // Branch edits layer2 (one tile changed, one added) and maindoc; layer1 is untouched.
+    branch::create_branch(&mut r, "idea", None).unwrap();
+    let t2b = tiled(&[(0, 0, &[9u8; 500]), (64, 64, &[7u8; 500])]);
+    let edited = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(128)),
+        ("img/layers/layer1", t1),
+        ("img/layers/layer2", t2b.clone()),
+    ]);
+    std::fs::write(root.join("art.kra"), &edited).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "edit", "t").unwrap();
+
+    // The incremental path directly: rebuild c1's file from c2's on-disk working copy and
+    // compare every entry against the full store reconstruction.
+    let hash_of = |c: &repo::Commit| {
+        c.files
+            .iter()
+            .find(|f| f.path == "art.kra")
+            .unwrap()
+            .content
+            .clone()
+            .unwrap()
+    };
+    let (h1, h2) = (hash_of(&c1), hash_of(&c2));
+    let working = std::fs::read(root.join("art.kra")).unwrap();
+    let incremental = kra::materialize_kra(&r, "art.kra", &h1, &h2, &working).unwrap();
+    let full = kra::reconstruct_kra(&r, "art.kra", &h1).unwrap();
+    for name in [
+        "mimetype",
+        "maindoc.xml",
+        "img/layers/layer1",
+        "img/layers/layer2",
+    ] {
+        assert_eq!(
+            kra::read_entry(&incremental, name).unwrap(),
+            kra::read_entry(&full, name).unwrap(),
+            "entry {name} differs from the full reconstruction"
+        );
+    }
+
+    // End-to-end: bounce between branches; content is exact and the tree stays clean.
+    branch::switch_branch(&mut r, "main").unwrap();
+    let on_main = std::fs::read(root.join("art.kra")).unwrap();
+    assert_eq!(
+        kra::read_entry(&on_main, "maindoc.xml").unwrap(),
+        maindoc(255)
+    );
+    assert_eq!(kra::read_entry(&on_main, "img/layers/layer2").unwrap(), t2);
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    branch::switch_branch(&mut r, "idea").unwrap();
+    let on_idea = std::fs::read(root.join("art.kra")).unwrap();
+    assert_eq!(
+        kra::read_entry(&on_idea, "maindoc.xml").unwrap(),
+        maindoc(128)
+    );
+    assert_eq!(kra::read_entry(&on_idea, "img/layers/layer2").unwrap(), t2b);
+    assert!(scan::scan(&r).unwrap().is_empty());
 }

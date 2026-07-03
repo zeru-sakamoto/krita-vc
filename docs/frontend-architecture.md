@@ -105,7 +105,10 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
   list with **real actions** — click a branch to switch, hover (or keyboard-focus) a row for
   "Merge into current" and "Delete" (both behind plain-language confirm modals), "New branch"
-  opens the create modal. Shared dialogs live in
+  opens the create modal. The create modal's base-branch picker (a plain `<select>`, only shown
+  when more than one branch exists) defaults to the current branch — picking another one is passed
+  through as `createBranch(name, base)`, which materializes that branch's tree before recording the
+  new branch (refused, with a friendly prompt, on unsaved changes). Shared dialogs live in
   [`BranchDialogs.tsx`](../src/components/vcs/BranchDialogs.tsx); the backend's dirty-tree error
   (stable `"unsaved changes"` prefix) becomes a friendly save-first prompt with a jump to the
   Changes view. This is a local-only VCS — there are no remotes.

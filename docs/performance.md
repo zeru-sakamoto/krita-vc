@@ -34,6 +34,14 @@ Independent per-layer/per-tile work is farmed across cores instead of running se
   reconstruct+bsdiff+verify/zstd) over every tile with `par_iter()`, then folds the results into
   the repo serially with `commit_prepared` — each tile is a distinct chain key, so parallel
   prepare can't race, only the final write needs `&mut`.
+- **`.kra` reconstruction** — `reconstruct_kra` (`kra.rs`) resolves every manifest entry's bytes
+  (tile-chain replay included) with `par_iter()` before writing the zip serially in manifest
+  order; branch switch/rollback normally take the cheaper incremental path (`materialize_kra`,
+  below) and fall back to this.
+- **Object writes on commit** — `commit_prepared_batch` (`delta.rs`) writes all of a layer's new
+  tile objects in parallel before the serial chain fold; content-addressed writes are independent
+  and idempotent, and thousands of serial small-file creates (NTFS + Defender) were a dominant
+  commit cost on Windows.
 - **Per-tile decode within one layer** — `layer_raster` reconstructs + LZF-decodes each tile in
   parallel, then blits serially into the shared canvas (nested rayon is fine — one work-stealing
   pool).
@@ -57,6 +65,10 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Manifest reuse** — `kra::load_manifest` reconstructs+parses a `.kra` manifest once per diff
   request; every layer/region/composite read reuses the parsed struct instead of re-walking the
   patch chain per call.
+- **Commit-time crc32/size skip** — `commit_kra` compares each zip entry's crc32 + uncompressed
+  size (from the central directory, no inflate needed) against the previous commit's manifest for
+  that path (`commit_snapshot` passes it in); a match reuses the old manifest entry untouched, so
+  an edit to one layer doesn't re-inflate or re-store every other entry in the archive.
 - **`layer_diff` command** — pulls only `maindoc.xml` out of each side's manifest instead of
   reconstructing the whole archive for a single small entry.
 - **`TileCache`** (`delta.rs`) — a request-scoped cache keyed by content hash; the before/after
@@ -68,9 +80,19 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   working `.kra` straight from an in-memory `ZipArchive`; no `bsdiff`, no chain reconstruct, no
   object writes. Older code staged the working file into the object store just to reuse the
   rasterizer — viewing a diff should never write.
-- **`Repo::open_light`** — skips loading `chains.json` (by far the largest state file — every
+- **`Repo::open_light`** — skips loading the chains file (by far the largest state file — every
   version of every tile stream ever committed) for read paths that never touch storage
   (`scan_repository`, `list_commits`).
+- **Incremental `.kra` materialization on switch/merge/rollback** — `kra::materialize_kra`
+  rebuilds the target version *out of the working file*: entries identical between the current
+  and target manifests are `raw_copy_file`d from the on-disk zip (no store reads, no
+  inflate/deflate; each entry verified against the manifest's recorded crc32+size first), and a
+  changed tiled entry lifts its unchanged tiles from the working copy in memory — only tiles
+  whose content differs replay from the object store. Switch cost tracks the diff between
+  branches, not document size. Any mismatch or error falls back to the full `reconstruct_kra`.
+- **Chains skipped when clean** — `Repo::save` only rewrites the chains file when a new stream
+  version was actually committed (`chains_dirty`); switch, merge, and undo mutate only
+  index/commits/branches, so they no longer pay an O(history) state rewrite.
 - **Read-path integrity check dropped** — `reconstruct` no longer re-hashes rebuilt bytes; every
   patch is already round-trip-verified when it's *written* (`prepare_stream`), and objects are
   content-addressed, so a second hash on every read was pure redundancy on the hottest loop in the
@@ -89,6 +111,9 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **`blit`'s row-memcpy fast path** (`raster.rs`) — when a tile sits fully inside the canvas
   (the common case), one row is one `copy_from_slice` instead of a per-pixel loop with bounds
   checks.
+- **No recompression of already-compressed zip entries** — `reconstruct_kra` stores (rather than
+  deflates) any entry whose bytes already look compressed (`delta::looks_compressed`), since
+  deflating a PNG/zstd/zip payload a second time buys nothing.
 
 ## Caching across requests
 
@@ -107,9 +132,12 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 ## State-file writes
 
 - **Compact JSON** (`repo.rs::write_json`) — `.kvc/*.json` is machine state, not something a human
-  reads; `serde_json::to_vec` instead of `to_vec_pretty`. `chains.json` (every version of every
-  tile stream) is rewritten in full on every commit, so pretty-printing it scaled badly with
-  history size.
+  reads; `serde_json::to_vec` instead of `to_vec_pretty`.
+- **Binary chains file** (`repo.rs::write_chains`/`read_chains`) — chains are rewritten in full on
+  every commit and parsed on every `Repo::open`, and dwarf the other state files, so they moved
+  from JSON to zstd-compressed bincode (`chains.bin`): an order of magnitude faster to
+  parse/serialize *and* several times smaller on disk. Legacy `chains.json` repos are read
+  transparently and migrated by the next commit's save.
 
 ## Build configuration
 
@@ -140,6 +168,8 @@ Marked inline where they occur — noted here as a single index:
 - Scanner fast path relies on the OS updating mtime on every save (Krita does); upgrade path if
   that ever breaks is git's "racy" index rule (re-hash anything whose mtime isn't strictly older
   than the last index write).
+- Commit-time entry skip uses crc32+size as the change detector (~2⁻³² false-match chance per
+  changed entry); upgrade path is hashing the compressed bytes instead.
 - Delta patch/snapshot thresholds (64 KB, chain length 20) are untuned constants — revisit if
   storage size ever matters more than it does now.
 - `.kvc/cache/` has no eviction — capped PNGs are small; add LRU pruning if that stops being true.

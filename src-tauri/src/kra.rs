@@ -25,7 +25,7 @@ pub fn load_manifest(repo: &Repo, relpath: &str, manifest_hash: &str) -> Result<
     serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum KraEntry {
     /// A non-tiled archive entry stored as a single stream (`blob` = content hash).
@@ -33,16 +33,43 @@ enum KraEntry {
         path: String,
         blob: String,
         stored: bool,
+        /// zip crc32 + uncompressed size of the source entry — lets the next commit skip
+        /// re-inflating an unchanged entry. 0/0 on manifests from before these fields existed
+        /// (never matches, so those fall back to full processing).
+        #[serde(default)]
+        crc32: u32,
+        #[serde(default)]
+        size: u64,
     },
     /// A tiled layer-data entry: header + per-tile stream references.
     Tiled {
         path: String,
         header: String,
         tiles: Vec<TileRef>,
+        #[serde(default)]
+        crc32: u32,
+        #[serde(default)]
+        size: u64,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl KraEntry {
+    fn path(&self) -> &str {
+        match self {
+            KraEntry::Raw { path, .. } | KraEntry::Tiled { path, .. } => path,
+        }
+    }
+
+    fn crc_size(&self) -> (u32, u64) {
+        match self {
+            KraEntry::Raw { crc32, size, .. } | KraEntry::Tiled { crc32, size, .. } => {
+                (*crc32, *size)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TileRef {
     x: i64,
     y: i64,
@@ -52,8 +79,19 @@ struct TileRef {
 }
 
 /// Decompose `file_bytes` (a .kra) into streams and return the manifest's content hash.
-/// Unchanged tiles dedup automatically inside [`Repo::store_stream`].
-pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<String> {
+/// Unchanged tiles dedup automatically inside [`Repo::store_stream`]. When `prev` (the
+/// path's manifest at the current tip) is given, entries whose zip crc32 + uncompressed
+/// size match the previous commit are reused verbatim without even being inflated — the
+/// commit cost becomes proportional to the layers that actually changed.
+pub fn commit_kra(
+    repo: &mut Repo,
+    relpath: &str,
+    file_bytes: &[u8],
+    prev: Option<&KraManifest>,
+) -> Result<String> {
+    let prev_by_name: std::collections::HashMap<&str, &KraEntry> = prev
+        .map(|m| m.entries.iter().map(|e| (e.path(), e)).collect())
+        .unwrap_or_default();
     let mut zip = ZipArchive::new(Cursor::new(file_bytes)).map_err(zip_err)?;
     let mut entries = Vec::new();
 
@@ -63,6 +101,19 @@ pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<S
             continue;
         }
         let name = f.name().to_string();
+        // crc32/size come from the central directory — no decompression needed to compare.
+        // ponytail: crc32+size as the change detector (~2^-32 false-match per changed entry);
+        // upgrade path is hashing the compressed bytes.
+        let (crc32, size) = (f.crc32(), f.size());
+        if size > 0 {
+            if let Some(pe) = prev_by_name.get(name.as_str()) {
+                if pe.crc_size() == (crc32, size) {
+                    entries.push((*pe).clone());
+                    drop(f);
+                    continue;
+                }
+            }
+        }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
         drop(f);
@@ -70,29 +121,36 @@ pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<S
         if tiles::is_tiled(&buf) {
             let block = tiles::parse(&buf)?;
             // Prepare every tile in parallel (the CPU cost: reconstruct base + bsdiff + verify, or
-            // zstd for a fresh tile), then fold the results into the repo serially. Each tile is a
-            // distinct stream key, so the parallel prepares don't race on the same chain.
+            // zstd for a fresh tile), then batch-commit: object writes run in parallel too, only
+            // the chain pushes fold serially. Each tile is a distinct stream key, so nothing races.
             let repo_ref: &Repo = repo;
-            let prepared: Vec<crate::delta::Prepared> = block
+            let items: Vec<(String, crate::delta::Prepared)> = block
                 .tiles
                 .par_iter()
-                .map(|t| repo_ref.prepare_stream(&tile_key(relpath, &name, t.x, t.y), &t.data))
+                .map(|t| {
+                    let key = tile_key(relpath, &name, t.x, t.y);
+                    let p = repo_ref.prepare_stream(&key, &t.data)?;
+                    Ok((key, p))
+                })
                 .collect::<Result<Vec<_>>>()?;
-            let mut refs = Vec::with_capacity(block.tiles.len());
-            for (t, p) in block.tiles.iter().zip(prepared) {
-                let key = tile_key(relpath, &name, t.x, t.y);
-                let hash = repo.commit_prepared(&key, p)?;
-                refs.push(TileRef {
+            let hashes = repo.commit_prepared_batch(items)?;
+            let refs = block
+                .tiles
+                .iter()
+                .zip(hashes)
+                .map(|(t, hash)| TileRef {
                     x: t.x,
                     y: t.y,
                     compression: t.compression.clone(),
                     hash,
-                });
-            }
+                })
+                .collect();
             entries.push(KraEntry::Tiled {
                 path: name,
                 header: block.header,
                 tiles: refs,
+                crc32,
+                size,
             });
         } else {
             let stored = name == "mimetype";
@@ -101,6 +159,8 @@ pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<S
                 path: name,
                 blob: hash,
                 stored,
+                crc32,
+                size,
             });
         }
     }
@@ -113,42 +173,254 @@ pub fn commit_kra(repo: &mut Repo, relpath: &str, file_bytes: &[u8]) -> Result<S
 /// Reassemble a valid .kra from a manifest version. Krita reads entries by name, so the
 /// rebuilt archive is logically identical (mimetype stays first/stored, tiles uncompressed).
 pub fn reconstruct_kra(repo: &Repo, relpath: &str, manifest_hash: &str) -> Result<Vec<u8>> {
-    let mbytes = repo.reconstruct(&manifest_key(relpath), manifest_hash)?;
-    let manifest: KraManifest =
-        serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    let manifest = load_manifest(repo, relpath, manifest_hash)?;
 
-    let mut out = Vec::new();
-    {
-        let mut zw = ZipWriter::new(Cursor::new(&mut out));
-        for entry in &manifest.entries {
+    // Reconstruct every entry's bytes in parallel — this is the branch-switch CPU cost
+    // (delta-chain replay per tile). The zip write below stays serial and in manifest order.
+    let prepared: Vec<(&str, Vec<u8>, bool)> = manifest
+        .entries
+        .par_iter()
+        .map(|entry| -> Result<(&str, Vec<u8>, bool)> {
             match entry {
-                KraEntry::Raw { path, blob, stored } => {
-                    zw.start_file(path.as_str(), opts(*stored))
-                        .map_err(zip_err)?;
+                KraEntry::Raw {
+                    path, blob, stored, ..
+                } => {
                     let bytes = repo.reconstruct(&entry_key(relpath, path), blob)?;
-                    zw.write_all(&bytes)?;
+                    // Already-compressed entries (mergedimage.png, previews) gain ~nothing
+                    // from deflate — store them and skip the recompression.
+                    let stored = *stored || crate::delta::looks_compressed(&bytes);
+                    Ok((path.as_str(), bytes, stored))
                 }
                 KraEntry::Tiled {
                     path,
                     header,
                     tiles: refs,
+                    ..
                 } => {
-                    let mut block = TiledBlock {
+                    let tiles = refs
+                        .par_iter()
+                        .map(|tr| -> Result<Tile> {
+                            let key = tile_key(relpath, path, tr.x, tr.y);
+                            Ok(Tile {
+                                x: tr.x,
+                                y: tr.y,
+                                compression: tr.compression.clone(),
+                                data: repo.reconstruct(&key, &tr.hash)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let block = TiledBlock {
                         header: header.clone(),
-                        tiles: Vec::new(),
+                        tiles,
                     };
-                    for tr in refs {
-                        let key = tile_key(relpath, path, tr.x, tr.y);
-                        let data = repo.reconstruct(&key, &tr.hash)?;
-                        block.tiles.push(Tile {
-                            x: tr.x,
-                            y: tr.y,
-                            compression: tr.compression.clone(),
-                            data,
-                        });
+                    Ok((path.as_str(), tiles::serialize(&block), true))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut out = Vec::new();
+    {
+        let mut zw = ZipWriter::new(Cursor::new(&mut out));
+        for (path, bytes, stored) in &prepared {
+            zw.start_file(*path, opts(*stored)).map_err(zip_err)?;
+            zw.write_all(bytes)?;
+        }
+        zw.finish().map_err(zip_err)?;
+    }
+    Ok(out)
+}
+
+/// Sort-normalized tile identity of a tiled entry, for order-independent comparison.
+fn tile_set(ts: &[TileRef]) -> Vec<(i64, i64, &str, &str)> {
+    let mut v: Vec<_> = ts
+        .iter()
+        .map(|t| (t.x, t.y, t.hash.as_str(), t.compression.as_str()))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// Rebuild `relpath`'s bytes at manifest `target_hash`, reusing `working_bytes` — the on-disk
+/// working copy, which matches the `current_hash` manifest (switch/merge/rollback run only on a
+/// clean tree; each zip entry is re-verified against the manifest's recorded crc32+size anyway).
+///
+/// Entries identical between the two manifests are **raw-copied** out of the working zip — no
+/// store reads, no inflate/deflate. A changed tiled entry lifts its unchanged tiles from the
+/// working copy in memory and replays only differing tiles from the object store. The cost of a
+/// branch switch becomes proportional to what actually changed, not to document size. Callers
+/// fall back to the full [`reconstruct_kra`] on any error.
+pub fn materialize_kra(
+    repo: &Repo,
+    relpath: &str,
+    target_hash: &str,
+    current_hash: &str,
+    working_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    use std::collections::{HashMap, HashSet};
+
+    let target = load_manifest(repo, relpath, target_hash)?;
+    let current = load_manifest(repo, relpath, current_hash)?;
+    let cur_by_path: HashMap<&str, &KraEntry> =
+        current.entries.iter().map(|e| (e.path(), e)).collect();
+    let mut zip = ZipArchive::new(Cursor::new(working_bytes)).map_err(zip_err)?;
+
+    /// How one target entry reaches the output zip.
+    enum Plan {
+        /// Identical to the working copy: raw-copy that zip entry (index into the working zip).
+        Copy(usize),
+        /// Rebuilt bytes (index into `built`).
+        Build(usize),
+    }
+    enum Build<'a> {
+        Raw(&'a str, &'a str, bool),
+        Tiled {
+            path: &'a str,
+            header: &'a str,
+            refs: &'a [TileRef],
+            /// (x, y) -> raw tile data lifted from the working copy; only tiles absent here
+            /// are reconstructed from the store.
+            reuse: HashMap<(i64, i64), Vec<u8>>,
+        },
+    }
+
+    // Serial classification pass (the working ZipArchive hands out entries one at a time).
+    let mut plan: Vec<Plan> = Vec::with_capacity(target.entries.len());
+    let mut builds: Vec<Build> = Vec::new();
+    for entry in &target.entries {
+        let path = entry.path();
+        let cur = cur_by_path.get(path).copied();
+        // The working zip entry is trustworthy iff its crc32+size match what the current
+        // manifest recorded at commit time ((0, 0) = pre-crc manifest, never trusted).
+        let valid_idx = cur.and_then(|c| {
+            let (crc, size) = c.crc_size();
+            if (crc, size) == (0, 0) {
+                return None;
+            }
+            let idx = zip.index_for_name(path)?;
+            let f = zip.by_index_raw(idx).ok()?;
+            ((f.crc32(), f.size()) == (crc, size)).then_some(idx)
+        });
+
+        let same = match (entry, cur) {
+            (KraEntry::Raw { blob, .. }, Some(KraEntry::Raw { blob: cb, .. })) => blob == cb,
+            (
+                KraEntry::Tiled { header, tiles, .. },
+                Some(KraEntry::Tiled {
+                    header: ch,
+                    tiles: ct,
+                    ..
+                }),
+            ) => header == ch && tile_set(tiles) == tile_set(ct),
+            _ => false,
+        };
+        if same {
+            if let Some(idx) = valid_idx {
+                plan.push(Plan::Copy(idx));
+                continue;
+            }
+        }
+
+        match entry {
+            KraEntry::Raw {
+                path, blob, stored, ..
+            } => builds.push(Build::Raw(path, blob, *stored)),
+            KraEntry::Tiled {
+                path,
+                header,
+                tiles: refs,
+                ..
+            } => {
+                let mut reuse = HashMap::new();
+                if let (Some(KraEntry::Tiled { tiles: ct, .. }), Some(idx)) = (cur, valid_idx) {
+                    let cur_hash: HashMap<(i64, i64), &str> =
+                        ct.iter().map(|t| ((t.x, t.y), t.hash.as_str())).collect();
+                    let wanted: HashSet<(i64, i64)> = refs
+                        .iter()
+                        .filter(|t| cur_hash.get(&(t.x, t.y)) == Some(&t.hash.as_str()))
+                        .map(|t| (t.x, t.y))
+                        .collect();
+                    if !wanted.is_empty() {
+                        let mut f = zip.by_index(idx).map_err(zip_err)?;
+                        let mut buf = Vec::new();
+                        f.read_to_end(&mut buf)?;
+                        drop(f);
+                        if tiles::is_tiled(&buf) {
+                            for t in tiles::parse(&buf)?.tiles {
+                                if wanted.contains(&(t.x, t.y)) {
+                                    reuse.insert((t.x, t.y), t.data);
+                                }
+                            }
+                        }
                     }
-                    zw.start_file(path.as_str(), opts(true)).map_err(zip_err)?;
-                    zw.write_all(&tiles::serialize(&block))?;
+                }
+                builds.push(Build::Tiled {
+                    path,
+                    header,
+                    refs,
+                    reuse,
+                });
+            }
+        }
+        plan.push(Plan::Build(builds.len() - 1));
+    }
+
+    // Parallel rebuild of everything that couldn't be raw-copied (same shape as reconstruct_kra).
+    let built: Vec<(String, Vec<u8>, bool)> = builds
+        .par_iter()
+        .map(|b| -> Result<(String, Vec<u8>, bool)> {
+            match b {
+                Build::Raw(path, blob, stored) => {
+                    let bytes = repo.reconstruct(&entry_key(relpath, path), blob)?;
+                    let stored = *stored || crate::delta::looks_compressed(&bytes);
+                    Ok((path.to_string(), bytes, stored))
+                }
+                Build::Tiled {
+                    path,
+                    header,
+                    refs,
+                    reuse,
+                } => {
+                    let tiles = refs
+                        .par_iter()
+                        .map(|tr| -> Result<Tile> {
+                            let data = match reuse.get(&(tr.x, tr.y)) {
+                                Some(d) => d.clone(),
+                                None => repo
+                                    .reconstruct(&tile_key(relpath, path, tr.x, tr.y), &tr.hash)?,
+                            };
+                            Ok(Tile {
+                                x: tr.x,
+                                y: tr.y,
+                                compression: tr.compression.clone(),
+                                data,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let block = TiledBlock {
+                        header: (*header).to_string(),
+                        tiles,
+                    };
+                    Ok((path.to_string(), tiles::serialize(&block), true))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Serial zip write in target-manifest order.
+    let mut out = Vec::new();
+    {
+        let mut zw = ZipWriter::new(Cursor::new(&mut out));
+        for p in &plan {
+            match p {
+                Plan::Copy(idx) => {
+                    let f = zip.by_index_raw(*idx).map_err(zip_err)?;
+                    zw.raw_copy_file(f).map_err(zip_err)?;
+                }
+                Plan::Build(i) => {
+                    let (path, bytes, stored) = &built[*i];
+                    zw.start_file(path, opts(*stored)).map_err(zip_err)?;
+                    zw.write_all(bytes)?;
                 }
             }
         }
@@ -405,6 +677,7 @@ pub fn layer_raster(
             path,
             header,
             tiles,
+            ..
         } if *path == entry_path => Some((header, tiles)),
         _ => None,
     }) else {
@@ -500,6 +773,7 @@ impl KraManifest {
                     path,
                     header,
                     tiles,
+                    ..
                 } => {
                     let (tw, th, _) = tile_dims(header);
                     let ts = tiles.iter().map(|t| (t.x, t.y, t.hash.clone())).collect();

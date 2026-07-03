@@ -137,15 +137,22 @@ pub async fn list_branches(path: String) -> std::result::Result<Vec<BranchDto>, 
     .await
 }
 
-/// Create a branch at the current tip and switch to it (instant — the tree is identical).
+/// Create a branch and switch to it. Without `base` it starts at the current tip (instant —
+/// the tree is identical); with a different `base` branch it materializes that branch's tree,
+/// which needs the full repo (chains) and a clean working tree.
 #[tauri::command]
 pub async fn create_branch(
     path: String,
     name: String,
+    base: Option<String>,
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
-        let mut repo = Repo::open_light(Path::new(&path))?;
-        crate::branch::create_branch(&mut repo, &name)?;
+        let mut repo = if base.is_some() {
+            Repo::open(Path::new(&path))?
+        } else {
+            Repo::open_light(Path::new(&path))?
+        };
+        crate::branch::create_branch(&mut repo, &name, base.as_deref())?;
         Ok(branch_dtos(&repo))
     })
     .await

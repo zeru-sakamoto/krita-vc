@@ -5,7 +5,9 @@
 //! .kvc/
 //!   config.json    engine config (delta-chain threshold, tile size)
 //!   index.json     committed head per tracked file (drives the scanner)
-//!   chains.json    every stored version of every delta stream (drives storage/restore)
+//!   chains.bin     every stored version of every delta stream (drives storage/restore);
+//!                  zstd-compressed bincode — repos from before this format carry a legacy
+//!                  chains.json instead, migrated on the next commit
 //!   commits.json   commit log
 //!   branches.json  branch name -> tip commit id, plus the current branch
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
@@ -180,6 +182,10 @@ pub struct Repo {
     pub chains: Chains,
     pub commits: Vec<Commit>,
     pub branches: Branches,
+    /// True once a new stream version has been committed (`Repo::commit_prepared` — the only
+    /// chain mutation). [`Repo::save`] skips rewriting the chains file (the largest state file)
+    /// when clean, so switch/merge/undo never pay for it.
+    pub(crate) chains_dirty: bool,
 }
 
 impl Repo {
@@ -197,7 +203,7 @@ impl Repo {
         std::fs::create_dir_all(cache_dir(root)).map_err(|e| io_at(&kvc, e))?;
         write_json(&kvc.join("config.json"), &Config::default())?;
         write_json(&kvc.join("index.json"), &Index::default())?;
-        write_json(&kvc.join("chains.json"), &Chains::default())?;
+        write_chains(&kvc, &Chains::default())?;
         write_json(&kvc.join("commits.json"), &Vec::<Commit>::new())?;
         write_json(&kvc.join("branches.json"), &Branches::default())?;
         Ok(())
@@ -224,13 +230,14 @@ impl Repo {
             root: root.to_path_buf(),
             config: read_json(&kvc.join("config.json"))?,
             index: read_json(&kvc.join("index.json"))?,
-            chains: read_json(&kvc.join("chains.json"))?,
+            chains: read_chains(&kvc)?,
             commits,
             branches,
+            chains_dirty: false,
         })
     }
 
-    /// Like [`Repo::open`] but skips `chains.json` — by far the largest state file (every
+    /// Like [`Repo::open`] but skips the chains file — by far the largest state file (every
     /// version of every tile stream). For read paths that never touch storage (scan, log).
     /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo.
     pub fn open_light(root: &Path) -> Result<Repo> {
@@ -247,6 +254,7 @@ impl Repo {
             chains: Chains::default(),
             commits,
             branches,
+            chains_dirty: false,
         })
     }
 
@@ -258,34 +266,71 @@ impl Repo {
         cache_dir(&self.root)
     }
 
-    /// Flush mutated state atomically.
-    pub fn save(&self) -> Result<()> {
+    /// Flush mutated state atomically. The chains file — the largest, every version of every
+    /// tile stream — is only rewritten when a new stream version was actually committed
+    /// (`chains_dirty`); switch/merge/undo mutate only index/commits/branches.
+    pub fn save(&mut self) -> Result<()> {
         let kvc = kvc_dir(&self.root);
         write_json(&kvc.join("index.json"), &self.index)?;
-        write_json(&kvc.join("chains.json"), &self.chains)?;
+        if self.chains_dirty {
+            write_chains(&kvc, &self.chains)?;
+            self.chains_dirty = false;
+        }
         write_json(&kvc.join("commits.json"), &self.commits)?;
         write_json(&kvc.join("branches.json"), &self.branches)?;
         Ok(())
     }
 
     /// Flush only `branches.json` — safe on a [`Repo::open_light`] repo, where a full
-    /// [`Repo::save`] would truncate `chains.json` to the default empty map.
+    /// [`Repo::save`] rewrites index/commits from possibly-partial state.
     pub fn save_branches(&self) -> Result<()> {
         write_json(&kvc_dir(&self.root).join("branches.json"), &self.branches)
     }
 }
 
-/// Atomic JSON write: serialize to a temp file in the same dir, then rename over the
-/// target (Rust's `fs::rename` replaces the destination on Windows and POSIX).
-/// ponytail: compact (not pretty) — `.kvc/` JSON is machine state, and `chains.json`
-/// (every version of every tile stream) is rewritten in full on every commit; pretty-printing
-/// it dominated commit time as history grew.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| io_at(&tmp, e))?;
+/// Atomic write: bytes to a temp file in the same dir, then rename over the target
+/// (Rust's `fs::rename` replaces the destination on Windows and POSIX).
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| io_at(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
     Ok(())
+}
+
+/// ponytail: compact (not pretty) — `.kvc/` JSON is machine state; pretty-printing scaled
+/// badly with history size back when chains were JSON too.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    write_atomic(path, &bytes)
+}
+
+/// `chains.bin`: zstd-compressed bincode. Chains are rewritten in full on every commit and
+/// parsed on every `Repo::open`, and dwarf the other state files (one entry per version of
+/// every tile stream ever committed) — JSON there dominated commit/switch time *and* disk.
+/// zstd level 1: the stream keys are highly repetitive, so even the fastest level compresses
+/// them several-fold. A successful write retires a legacy `chains.json`.
+fn write_chains(kvc: &Path, chains: &Chains) -> Result<()> {
+    let plain = bincode::serialize(chains).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    let bytes = zstd::encode_all(&plain[..], 1).map_err(KvcError::Io)?;
+    write_atomic(&kvc.join("chains.bin"), &bytes)?;
+    let legacy = kvc.join("chains.json");
+    if legacy.exists() {
+        let _ = std::fs::remove_file(legacy);
+    }
+    Ok(())
+}
+
+/// Load chains, preferring `chains.bin`; repos from before the binary format fall back to
+/// their legacy `chains.json` (migrated by the next [`write_chains`]).
+fn read_chains(kvc: &Path) -> Result<Chains> {
+    let bin = kvc.join("chains.bin");
+    if bin.is_file() {
+        let raw = std::fs::read(&bin).map_err(|e| io_at(&bin, e))?;
+        let plain = zstd::decode_all(&raw[..]).map_err(KvcError::Io)?;
+        bincode::deserialize(&plain).map_err(|e| KvcError::BadIndex(e.to_string()))
+    } else {
+        read_json(&kvc.join("chains.json"))
+    }
 }
 
 /// Load `branches.json`, migrating pre-branching repos in-memory (no write on the read path;

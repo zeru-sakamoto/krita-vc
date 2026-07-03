@@ -14,6 +14,10 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
         return Err(KvcError::Nothing);
     }
 
+    // Tree at the current tip, so each .kra commit can hand its previous manifest to
+    // `commit_kra` and skip re-inflating unchanged zip entries.
+    let prev_tree = current_tree(repo);
+
     let mut files = Vec::new();
     for (rel, status) in changes {
         if status == "D" {
@@ -35,7 +39,12 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
         let is_kra = rel.to_lowercase().ends_with(".kra");
 
         let content = if is_kra {
-            kra::commit_kra(repo, &rel, &bytes)?
+            let prev = prev_tree
+                .get(&rel)
+                .filter(|f| f.is_kra)
+                .and_then(|f| f.content.as_deref())
+                .and_then(|h| kra::load_manifest(repo, &rel, h).ok());
+            kra::commit_kra(repo, &rel, &bytes, prev.as_ref())?
         } else {
             repo.store_stream(&format!("file:{rel}"), &bytes)?
         };
@@ -180,6 +189,32 @@ fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
     }
 }
 
+/// Reconstruct `target`'s bytes for one file, incrementally when possible: for a `.kra` whose
+/// current committed version is on disk (materialize runs only on a clean tree), unchanged
+/// entries/tiles are lifted straight from the working file instead of replayed from the object
+/// store ([`kra::materialize_kra`]). Any failure falls back to the full store rebuild.
+fn restore_bytes(
+    repo: &Repo,
+    target: &CommittedFile,
+    current: Option<&CommittedFile>,
+) -> Result<Vec<u8>> {
+    if target.is_kra {
+        if let (Some(th), Some(ch)) = (
+            target.content.as_deref(),
+            current
+                .filter(|c| c.is_kra)
+                .and_then(|c| c.content.as_deref()),
+        ) {
+            if let Ok(working) = std::fs::read(repo.root.join(&target.path)) {
+                if let Ok(bytes) = kra::materialize_kra(repo, &target.path, th, ch, &working) {
+                    return Ok(bytes);
+                }
+            }
+        }
+    }
+    bytes_of(repo, target)
+}
+
 /// Make the working tree **and index** match `target`, rewriting only files whose committed
 /// `content` hash differs from `current` — the fast-switch path: unchanged files are never
 /// read, reconstructed, or rewritten (their index entries carry over untouched, so size/mtime
@@ -193,7 +228,7 @@ pub fn materialize_tree(
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let bytes = bytes_of(repo, f)?;
+        let bytes = restore_bytes(repo, f, current.get(path))?;
         let abs = repo.root.join(path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
@@ -238,7 +273,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let bytes = bytes_of(repo, f)?;
+        let bytes = restore_bytes(repo, f, current.get(path))?;
         let abs = repo.root.join(path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;

@@ -8,17 +8,37 @@ use crate::repo::{Commit, CommittedFile, Repo};
 use crate::scan;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Create `name` at the current tip and switch to it. The tree is identical, so this is
-/// O(1) — no file I/O beyond saving `.kvc/` state.
-pub fn create_branch(repo: &mut Repo, name: &str) -> Result<()> {
+/// Create `name` and switch to it. With no `base` (or base == current branch) the new branch
+/// starts at the current tip and the tree is identical, so this is O(1) — no file I/O beyond
+/// saving `.kvc/` state. Basing on another branch materializes that branch's tree first (same
+/// rules as [`switch_branch`]: refuses on a dirty tree, rewrites only differing files).
+pub fn create_branch(repo: &mut Repo, name: &str, base: Option<&str>) -> Result<()> {
     let name = validate_name(name)?;
     if repo.branches.branches.contains_key(&name) {
         return Err(KvcError::BranchExists(name));
     }
-    let tip = repo.branches.tip().unwrap_or("").to_string();
-    repo.branches.branches.insert(name.clone(), tip);
-    repo.branches.current = name;
-    repo.save_branches()
+    match base.filter(|b| *b != repo.branches.current) {
+        None => {
+            let tip = repo.branches.tip().unwrap_or("").to_string();
+            repo.branches.branches.insert(name.clone(), tip);
+            repo.branches.current = name;
+            repo.save_branches()
+        }
+        Some(b) => {
+            let tip = repo
+                .branches
+                .tip_of(b)
+                .map(str::to_string)
+                .ok_or_else(|| KvcError::NoBranch(b.to_string()))?;
+            ensure_clean(repo)?;
+            let current = current_tree(repo);
+            let target = tree_at_commit(&repo.commits, &tip).unwrap_or_default();
+            materialize_tree(repo, &current, &target)?;
+            repo.branches.branches.insert(name.clone(), tip);
+            repo.branches.current = name;
+            repo.save()
+        }
+    }
 }
 
 /// Switch the working tree to `name`. Refuses on a dirty tree (a clean scan also proves

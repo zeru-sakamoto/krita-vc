@@ -117,15 +117,36 @@ impl Repo {
             Prepared::New { version, object } => {
                 let objects = self.objects_dir();
                 write_object(&objects, &object.0, &object.1)?;
-                let hash = version.hash.clone();
-                self.chains
-                    .0
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(version);
-                Ok(hash)
+                Ok(self.push_version(key.to_string(), version))
             }
         }
+    }
+
+    /// Apply many [`Prepared`] versions at once: all new objects are written **in parallel**
+    /// (content-addressed writes are independent and idempotent — on Windows especially,
+    /// thousands of serial small-file creates were a dominant commit cost), then the chain
+    /// pushes fold serially. Returns the content hashes in input order.
+    pub fn commit_prepared_batch(&mut self, items: Vec<(String, Prepared)>) -> Result<Vec<String>> {
+        use rayon::prelude::*;
+        let objects = self.objects_dir();
+        items.par_iter().try_for_each(|(_, p)| match p {
+            Prepared::New { object, .. } => write_object(&objects, &object.0, &object.1),
+            Prepared::Dedup(_) => Ok(()),
+        })?;
+        Ok(items
+            .into_iter()
+            .map(|(key, p)| match p {
+                Prepared::Dedup(hash) => hash,
+                Prepared::New { version, .. } => self.push_version(key, version),
+            })
+            .collect())
+    }
+
+    fn push_version(&mut self, key: String, version: Version) -> String {
+        self.chains_dirty = true;
+        let hash = version.hash.clone();
+        self.chains.0.entry(key).or_default().push(version);
+        hash
     }
 
     /// Rebuild the exact bytes for version `hash` of `key`, walking the patch chain back
@@ -189,7 +210,7 @@ impl TileCache {
 
 /// Already-compressed payloads (PNG, zip, zstd) don't bsdiff usefully — patches come out
 /// near full size while costing a suffix sort.
-fn looks_compressed(bytes: &[u8]) -> bool {
+pub(crate) fn looks_compressed(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x89PNG")
         || bytes.starts_with(b"PK\x03\x04")
         || bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])

@@ -11,8 +11,8 @@ working-tree changes). Don't add remote-facing affordances unless the project sc
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`;
 commands in `commands.rs`). **Branching is real**: `.kvc/branches.json` maps branch name → tip
-commit id (+ the current branch); create is O(1), switch rewrites only files that differ between
-branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
+commit id (+ the current branch); create is O(1) (an optional base branch materializes that
+branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
 commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
 commits reachable from the current branch tip. The frontend drives it via Tauri `invoke` in the

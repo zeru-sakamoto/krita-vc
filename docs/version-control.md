@@ -17,7 +17,9 @@ with no backend, the UI renders empty states).
 .kvc/
   config.json    engine config: delta-chain threshold (default 20), tile size (64)
   index.json     committed head per tracked file — drives the scanner
-  chains.json    every stored version of every delta stream — drives storage/restore
+  chains.bin     every stored version of every delta stream — drives storage/restore
+                 (zstd-compressed bincode; repos from before this format carry a legacy
+                 chains.json instead, migrated by the next commit's save)
   commits.json   the commit log (oldest-first, append-order = topological order)
   branches.json  branch name → tip commit id, plus the current branch
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff)
@@ -27,7 +29,8 @@ A repo from before branching existed (no `branches.json`) migrates on open: ever
 treated as `main` with its tip at the newest commit, persisted by the next save.
 
 State is loaded into a `Repo` struct (`Repo::open`), mutated in memory, then flushed with
-`Repo::save`. JSON writes are **atomic** (write to `*.json.tmp`, then `rename` over the target).
+`Repo::save`. State writes are **atomic** (write to a `*.tmp` sibling, then `rename` over the
+target).
 Hashing is **blake3** throughout (`hash_bytes`); timestamps are ISO-8601 UTC computed without a
 date crate (`now_iso` / `epoch_to_iso`).
 
@@ -66,9 +69,11 @@ back into the index, and a `Commit` is recorded with `parents` set to the **curr
 (cosmetic — the frontend uses it for labels/colors). The branch tip then advances to the new
 commit. Returns `KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex
 chars of a blake3 over the timestamp + message + parents + per-file content hashes. State is
-flushed with `Repo::save`, which writes `index.json`/`chains.json`/`commits.json`/`branches.json`
-as **compact** JSON (`chains.json` — every version of every stream — is rewritten each commit, so
-pretty-printing it was a real cost as history grew).
+flushed with `Repo::save`, which writes `index.json`/`commits.json`/`branches.json` as
+**compact** JSON and `chains.bin` (every version of every stream) as zstd-compressed bincode —
+it's rewritten in full each commit, so both its parse and serialize cost scale with history and
+JSON there dominated commit/open time (and disk). `save` skips the chains file entirely when no
+new stream version was committed (`chains_dirty`), so switch/merge/undo never rewrite it.
 
 ### The first-parent-delta invariant
 
@@ -114,9 +119,20 @@ decompose it into streams so small edits stay small:
   work fans across cores — then `commit_prepared` serially (each tile is a distinct key, so no
   race), which is the bulk of a commit's cost.
 - **Every other archive entry** becomes one stream (`kra:<path>:entry:<name>`).
-- A **JSON manifest** (`kra:<path>:manifest`) records entry order, per-entry blob hashes, and
-  per-tile refs — enough to reassemble a logically identical archive (`mimetype` stays first and
-  stored; tiles re-emitted uncompressed in their original block format).
+- A **JSON manifest** (`kra:<path>:manifest`) records entry order, per-entry blob hashes, per-tile
+  refs, and each entry's zip **crc32 + uncompressed size** — enough to reassemble a logically
+  identical archive (`mimetype` stays first and stored; tiles re-emitted uncompressed in their
+  original block format).
+- **Commit-time entry skip** — `commit_kra` takes the previous commit's manifest for that path
+  (`commit_snapshot` looks it up via the current tip's tree) and, for each zip entry whose crc32 +
+  size (read from the central directory, no decompression needed) match the previous manifest's,
+  reuses that manifest entry verbatim instead of inflating/re-storing it. Commit cost becomes
+  proportional to the entries that actually changed. ponytail: crc32+size as the change detector
+  (~2⁻³² false-match chance per changed entry); upgrade path is hashing the compressed bytes.
+- **Reconstruction is parallel** — `reconstruct_kra` resolves every entry's bytes (patch-chain
+  replay per tile) with `rayon`'s `par_iter`, then writes the zip serially in manifest order.
+  Entries that already look compressed (`delta::looks_compressed` — PNG/zip/zstd magic) are
+  stored instead of re-deflated, since recompressing already-compressed bytes buys nothing.
 
 ponytail: tiles are diffed as opaque LZF-compressed blobs — Krita's LZF is never decoded, so
 delta quality on already-compressed bytes is limited. Upgrade path: decode LZF and delta raw
@@ -152,14 +168,25 @@ Two higher-level history operations build on this ([`commit.rs`](../src-tauri/sr
 (`branches.json`); delta streams are keyed by file path, not branch, so identical content
 deduplicates across branches for free.
 
-- **Create** (`create_branch`) — validate the name (1–60 chars, no Windows-hostile punctuation),
-  record it at the current tip, and switch to it. The tree is identical, so this is **O(1)** —
-  no file I/O beyond `branches.json` (`save_branches`, which never touches `chains.json`).
+- **Create** (`create_branch`) — validate the name (1–60 chars, no Windows-hostile punctuation).
+  With no `base` (or `base` == the current branch) it records the new name at the current tip and
+  switches to it; the tree is identical, so this is **O(1)** — no file I/O beyond `branches.json`
+  (`save_branches`, which never touches the chains file). With a *different* `base` branch, it
+  refuses on a dirty tree and materializes that branch's tree first (same rewrite-only-differing-
+  files path as `switch_branch`), then records the new branch at `base`'s tip — this needs the
+  full repo (`Repo::open`, not `open_light`) since it walks `tree_at_commit`.
 - **Switch** (`switch_branch`) — refused on a dirty tree (`DirtyTree`; a clean scan also proves
   no untracked files can be clobbered). Computes both branch trees and calls `materialize_tree`,
   which rewrites **only files whose committed content hash differs** — unchanged files are never
   read, reconstructed, or rewritten (their index entries carry over, keeping the scanner's
-  size/mtime fast path warm). Index and working tree land exactly on the target branch.
+  size/mtime fast path warm). A differing `.kra` is rebuilt **incrementally**
+  (`kra::materialize_kra`): entries identical between the two manifests are raw-copied out of the
+  on-disk working file (verified per entry against the manifest's recorded crc32+size), a changed
+  tiled entry lifts its unchanged tiles from the working copy in memory, and only tiles whose
+  content actually differs replay from the object store — so switch cost tracks what changed
+  between the branches, not document size (full `reconstruct_kra` remains the fallback). Index
+  and working tree land exactly on the target branch, and the chains file is not rewritten
+  (nothing new was stored).
 - **Merge** (`merge_branch`, source → current) — **fast-forwards** when the current tip is an
   ancestor of the source tip (tip moves, no new commit). Otherwise a per-file **three-way**
   against the merge base (first common ancestor): changed only in source → taken; changed only
@@ -188,7 +215,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `commit_snapshot(path, message, author)` | Commit the whole working tree; returns the `Commit`. |
 | `list_commits(path)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. |
 | `list_branches(path)` | All local branches as `{ name, tip, current }`. |
-| `create_branch(path, name)` | Create + switch to a branch at the current tip (instant). Returns the branch list. |
+| `create_branch(path, name, base?)` | Create + switch to a branch. No `base` (or `base` = current): instant, at the current tip. Different `base`: materializes that branch's tree first (refused on unsaved changes). Returns the branch list. |
 | `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one). Returns the branch list. |
