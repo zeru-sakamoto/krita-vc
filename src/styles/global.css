@@ -86,6 +86,7 @@
   --z-modal: 40;
   --z-toast: 50;
   --z-tooltip: 60;
+  --z-blocking: 70;
 
   color-scheme: dark;
 }

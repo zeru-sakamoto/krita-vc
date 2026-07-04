@@ -9,8 +9,15 @@ This is a **local-only VCS**: there is intentionally **no remote/push/pull/sync*
 no fetch, no cloud sync. The UI exposes only local operations (commit history, local branches,
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
-tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`;
-commands in `commands.rs`). **Branching is real**: `.kvc/branches.json` maps branch name → tip
+tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
+`gc`; commands in `commands.rs`). Storage layout: chains are **sharded per tracked file**
+(`.kvc/chains/`, lazy-loaded; legacy monolithic `chains.bin`/`chains.json` migrate on first
+save), loose objects are sharded 256-way (`objects/<xx>/`, flat legacy stays readable), and a
+commit with ≥32 new objects writes **one pack file** (`objects/pack/*.pack`) instead of loose
+files — per-file creates dominated large commits on Windows. A user-facing **"Clean up
+storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powered confirm
+modal in `TopBar`) reclaims history unreachable from any branch tip; the raster cache
+(`.kvc/cache/`) is size-budgeted (`Config.cacheMaxBytes`) with LRU pruning. **Branching is real**: `.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
@@ -22,9 +29,12 @@ delete, and per-commit visual diffs). **There is no mock data**: in a plain brow
 no-ops, and the status bar shows a "Browser preview" badge — browser mode is for UI work only.
 `.kra` diffs are real and load in two
 stages: `commit_diff` returns the capped composite + layer metadata fast, then `commit_layers`/
-`working_layers` **stream** per-layer PNG rasters over a Tauri `Channel` as each finishes, with
-capped PNGs persisted in a content-addressed `.kvc/cache/` (see the diff viewer section);
-non-`.kra` diffs are still minimal. Rust tests live in `src-tauri/tests/`; the frontend has no test
+`working_layers` **stream** per-layer rasters over a Tauri `Channel` as each finishes, with
+capped PNGs persisted in a content-addressed `.kvc/cache/` (see the diff viewer section).
+In the desktop shell rasters ship as **`kvcimg://` URLs** served straight from that cache
+(registered in `lib.rs`, handler `commands::serve_raster` — no base64, browser-cacheable);
+outside the shell or on a cache-write failure they fall back to base64 data URLs.
+Non-`.kra` diffs are still minimal. Rust tests live in `src-tauri/tests/`; the frontend has no test
 runner yet — if you add one, update this file.
 
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
@@ -46,6 +56,9 @@ Package manager is npm (`package-lock.json` is present).
 Rust side (run from `src-tauri/`):
 - `cargo check` / `cargo build` — compile the Rust backend without going through the Tauri CLI
 - `cargo test` — run the Rust tests (engine integration tests in `src-tauri/tests/`)
+- `cargo test --release --test bench -- --ignored --nocapture` — performance baseline
+  (`tests/bench.rs`, `#[ignore]`d by default): synthesizes a Krita-scale document and times
+  commit/switch/rollback/diff against the <10s target
 
 ## Architecture
 
@@ -75,7 +88,10 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
   and wires a top bar plus four zones — `TopBar` (repository switcher) above `ActivityBar`
   (changes/history/branches) | `Sidebar` (resizable, content switches on the active view) |
-  `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`.
+  `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`. `BusyOverlay.tsx` is a
+  full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
+  during any write op (commit, branch switch/merge/create/delete, rollback, undo, cleanup),
+  driven by `busyMessage` on the repository context — stops a stray click racing a file rewrite.
 - **Repositories** (`src/lib/repository.tsx`): a local repository is a folder the user designates
   (local-only — no remotes). The `TopBar` switcher selects among them; the list + selected id
   persist to `localStorage` (`current` is null until the user adds one). In the desktop shell,

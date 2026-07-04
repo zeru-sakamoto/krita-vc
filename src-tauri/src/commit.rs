@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
-    let changes = scan::scan(repo)?;
+    let changes = scan::scan_detailed(repo)?;
     if changes.is_empty() {
         return Err(KvcError::Nothing);
     }
@@ -19,8 +19,9 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
     let prev_tree = current_tree(repo);
 
     let mut files = Vec::new();
-    for (rel, status) in changes {
-        if status == "D" {
+    for change in changes {
+        let rel = change.rel;
+        if change.status == "D" {
             repo.index.files.remove(&rel);
             files.push(CommittedFile {
                 path: rel,
@@ -31,11 +32,10 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
             continue;
         }
 
+        // The scan already read + hashed this file; re-reading here is a page-cache hit, and
+        // reusing its hash/size/mtime drops the second full blake3 pass a big .kra used to pay.
         let abs = repo.root.join(&rel);
         let bytes = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
-        let (size, mtime) = std::fs::metadata(&abs)
-            .map(|m| crate::repo::size_mtime(&m))
-            .unwrap_or((0, 0));
         let is_kra = rel.to_lowercase().ends_with(".kra");
 
         let content = if is_kra {
@@ -52,16 +52,16 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
         repo.index.files.insert(
             rel.clone(),
             TrackedFile {
-                hash: hash_bytes(&bytes),
+                hash: change.hash,
                 is_kra,
-                size,
-                mtime,
+                size: change.size,
+                mtime: change.mtime,
             },
         );
 
         files.push(CommittedFile {
             path: rel,
-            status: if status == "U" {
+            status: if change.status == "U" {
                 "A".into()
             } else {
                 "M".into()
@@ -260,15 +260,23 @@ pub fn materialize_tree(
 }
 
 /// Return the working tree to its state at `commit_id`, then record that as a **new** commit
-/// on the current branch (non-destructive and reversible). Reuses `commit_snapshot` to capture
-/// the result. Errors `NoCommit` if the id is unknown, or `Nothing` if the tree already matches.
+/// on the current branch (non-destructive and reversible). Errors `NoCommit` if the id is
+/// unknown, or `Nothing` if the tree already matches.
+///
+/// The commit is synthesized directly from the target-vs-current tree diff: every restored
+/// file's content hash is already recorded in the target tree, so re-scanning and re-running
+/// the whole `.kra` decompose (`commit_snapshot`) just to rediscover those hashes doubled the
+/// rollback cost. The diff vs the current tip is exactly the first-parent invariant a commit's
+/// `files` must satisfy, and zero new objects are needed — everything is already stored.
 pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Result<Commit> {
     let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
     let current = current_tree(repo);
 
-    // Materialize only what differs; the index is left alone so commit_snapshot's scan
-    // picks the rewritten files up as changes.
+    let mut files: Vec<CommittedFile> = Vec::new();
+
+    // Materialize and record only what differs, updating the index as we go (fresh size/mtime
+    // keep the scanner's fast path valid, exactly like `materialize_tree`).
     for (path, f) in &target {
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
@@ -279,6 +287,28 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
         std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        let (size, mtime) = std::fs::metadata(&abs)
+            .map(|m| crate::repo::size_mtime(&m))
+            .unwrap_or((0, 0));
+        repo.index.files.insert(
+            path.clone(),
+            TrackedFile {
+                hash: hash_bytes(&bytes),
+                is_kra: f.is_kra,
+                size,
+                mtime,
+            },
+        );
+        files.push(CommittedFile {
+            path: path.clone(),
+            status: if current.contains_key(path) {
+                "M".into()
+            } else {
+                "A".into()
+            },
+            content: f.content.clone(),
+            is_kra: f.is_kra,
+        });
     }
     // Remove currently-tracked files that didn't exist at the target commit.
     for path in repo.index.files.keys().cloned().collect::<Vec<_>>() {
@@ -287,11 +317,47 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
             if abs.exists() {
                 std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
             }
+            repo.index.files.remove(&path);
+        }
+    }
+    // Deletions recorded against the first-parent tree only (the fold invariant).
+    for (path, cf) in &current {
+        if !target.contains_key(path) {
+            files.push(CommittedFile {
+                path: path.clone(),
+                status: "D".into(),
+                content: None,
+                is_kra: cf.is_kra,
+            });
         }
     }
 
+    if files.is_empty() {
+        return Err(KvcError::Nothing);
+    }
+
     let message = format!("Restored to {}", version_label(repo, commit_id));
-    commit_snapshot(repo, &message, author)
+    let timestamp = crate::repo::now_iso();
+    let parents: Vec<String> = repo
+        .branches
+        .tip()
+        .map(|t| vec![t.to_string()])
+        .unwrap_or_default();
+    let id = self::commit_id(&timestamp, &message, &parents, &files);
+    let commit = Commit {
+        id: id.clone(),
+        hash: id.clone(),
+        message,
+        author: author.to_string(),
+        timestamp,
+        parents,
+        branch: repo.branches.current.clone(),
+        files,
+    };
+    repo.commits.push(commit.clone());
+    repo.branches.set_tip(&id);
+    repo.save()?;
+    Ok(commit)
 }
 
 /// "Version N" where N is the target's 1-based position among commits reachable from the

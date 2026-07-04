@@ -15,18 +15,37 @@ with no backend, the UI renders empty states).
 
 ```text
 .kvc/
-  config.json    engine config: delta-chain threshold (default 20), tile size (64)
+  config.json    engine config: delta-chain threshold (default 20), tile size (64),
+                 raster cache byte budget (cacheMaxBytes, default 512 MB)
   index.json     committed head per tracked file — drives the scanner
-  chains.bin     every stored version of every delta stream — drives storage/restore
-                 (zstd-compressed bincode; repos from before this format carry a legacy
-                 chains.json instead, migrated by the next commit's save)
+  chains/        per-tracked-file shards, each every stored version of that file's delta
+                 streams (zstd-compressed bincode, <blake3(relpath)[..16]>.bin, faulted in
+                 on first touch); a legacy monolithic chains.bin (or older chains.json)
+                 is read transparently and split into shards on the next commit's save
   commits.json   the commit log (oldest-first, append-order = topological order)
   branches.json  branch name → tip commit id, plus the current branch
-  objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff)
+  objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff),
+                 sharded 256-way (objects/<hash[..2]>/, flat legacy paths still read); a
+                 commit with ≥32 new objects writes them as one objects/pack/<hash>.pack
+                 instead of one loose file each
+  cache/         content-addressed capped PNG rasters for the diff viewer, served from disk
+                 (see Raster delivery below); size-budgeted with LRU pruning
 ```
 
 A repo from before branching existed (no `branches.json`) migrates on open: everything is
 treated as `main` with its tip at the newest commit, persisted by the next save.
+
+Nothing on the hot path ever deletes stored data — undo and branch-delete just drop a
+reference, leaving orphaned commits/chain versions/objects behind (harmless, since objects are
+content-addressed and dedup on any re-commit). The user-facing **"Clean up storage"** action
+(`cleanup_repository`, mark-and-sweep in [`gc.rs`](../src-tauri/src/gc.rs)) reclaims everything
+unreachable from any branch tip: unreachable commits leave the log, dead chain versions leave
+their shards, dead loose objects are deleted, and packs are dropped (fully dead) or rewritten
+with survivors only. A live patch's whole chain back to its full snapshot counts as reachable.
+State files are rewritten before any object is deleted, so a crash mid-sweep only leaves
+re-collectable orphans. A `dry_run` mode reports what a real pass would free without touching
+anything — the frontend runs it on modal open, then confirms before the real pass. See
+[performance.md](performance.md#storage-reclamation-gcrs) for the full mark-and-sweep writeup.
 
 State is loaded into a `Repo` struct (`Repo::open`), mutated in memory, then flushed with
 `Repo::save`. State writes are **atomic** (write to a `*.tmp` sibling, then `rename` over the
@@ -70,10 +89,13 @@ back into the index, and a `Commit` is recorded with `parents` set to the **curr
 commit. Returns `KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex
 chars of a blake3 over the timestamp + message + parents + per-file content hashes. State is
 flushed with `Repo::save`, which writes `index.json`/`commits.json`/`branches.json` as
-**compact** JSON and `chains.bin` (every version of every stream) as zstd-compressed bincode —
-it's rewritten in full each commit, so both its parse and serialize cost scale with history and
-JSON there dominated commit/open time (and disk). `save` skips the chains file entirely when no
-new stream version was committed (`chains_dirty`), so switch/merge/undo never rewrite it.
+**compact** JSON and rewrites only the per-file chain shards a commit actually dirtied
+(`ChainStore` per-shard dirty tracking) as zstd-compressed bincode — a commit's chain-write cost
+scales with the files it touched, not total repo history. `save` skips shards entirely when no
+new stream version was committed there, so switch/merge/undo never rewrite chains at all. A
+batch of ≥32 distinct new objects is written as one pack file instead of one loose file each
+(see [performance.md](performance.md#state-file-writes) — per-file creates dominated large
+commits on Windows).
 
 ### The first-parent-delta invariant
 
@@ -198,6 +220,19 @@ deduplicates across branches for free.
 - **Delete** (`delete_branch`) — removes the label only (refused for the current branch); its
   commits stay in `commits.json` as harmless unreachable data.
 
+## Raster delivery (`kvcimg` URI scheme)
+
+In the desktop shell, cached diff rasters ship as `kvcimg://` URLs (`raster::raster_url`)
+instead of base64 data-URLs: the webview fetches the PNG straight from `.kvc/cache/` via a
+registered URI scheme handler (`commands::serve_raster`, wired in [`lib.rs`](../src-tauri/src/lib.rs))
+— no base64 inflation, no multi-MB IPC payload, and content-addressed keys let the response
+carry `Cache-Control: immutable` so repeat views are browser-cache hits. The handler only ever
+serves `<registered repo root>/.kvc/cache/<hex key>.png` for roots a diff command has already
+registered (`register_served_repo` — the diff commands call it before opening the repo); it
+can't be steered at an arbitrary path. Outside the shell, or if a cache write fails, rasters
+fall back to base64 data URLs, which always work. See
+[performance.md](performance.md#raster-delivery-kvcimg-uri-scheme) for the rationale.
+
 ## Tauri commands
 
 Registered in [`lib.rs`](../src-tauri/src/lib.rs); thin wrappers in
@@ -219,6 +254,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one). Returns the branch list. |
+| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip. `dryRun` reports what would be freed without deleting anything. |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |

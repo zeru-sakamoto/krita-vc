@@ -57,10 +57,25 @@ fn maindoc(lines_opacity: i64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Object files across the sharded (`objects/<xx>/`) and legacy flat layouts.
 fn count_objects(root: &std::path::Path) -> usize {
-    std::fs::read_dir(root.join(".kvc/objects"))
-        .unwrap()
-        .count()
+    fn walk(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(&p)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&root.join(".kvc/objects"))
 }
 
 // --- the critical path: delta chains reconstruct exactly -------------------------------
@@ -87,7 +102,7 @@ fn delta_roundtrip_and_threshold() {
         assert_eq!(&r.reconstruct(key, h).unwrap(), body);
     }
 
-    let chain = &r.chains.0[key];
+    let chain = r.chains.chain(key).unwrap();
     let max = r.config.delta_chain_max;
     assert!(
         chain.iter().all(|v| v.chain_len <= max),
@@ -354,7 +369,7 @@ fn open_errors_and_index_roundtrip() {
 
     let r2 = repo::Repo::open(root).unwrap();
     assert!(r2.index.files.contains_key("x"));
-    assert!(r2.chains.0.contains_key("file:x"));
+    assert!(r2.chains.chain("file:x").is_some());
 
     assert_eq!(repo::epoch_to_iso(0), "1970-01-01T00:00:00Z");
     assert_eq!(repo::epoch_to_iso(1_609_459_200), "2021-01-01T00:00:00Z");
@@ -464,6 +479,57 @@ fn rollback_restores_tree_as_new_commit() {
         commit::rollback_to_commit(&mut r, &c3.id, "t"),
         Err(KvcError::Nothing)
     ));
+}
+
+/// Rollback synthesizes its commit from already-stored content — it must not store a single
+/// new object (everything it restores is by definition already in the store), and undoing it
+/// must round-trip cleanly.
+#[test]
+fn rollback_kra_writes_no_new_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let mk = |tile: &[u8]| {
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&[(0, 0, tile)])),
+        ])
+    };
+    std::fs::write(root.join("art.kra"), mk(b"tileAAAA")).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileZZZZ")).unwrap();
+    commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let objs = count_objects(root);
+    let c3 = commit::rollback_to_commit(&mut r, &c1.id, "t").unwrap();
+    assert_eq!(
+        count_objects(root),
+        objs,
+        "rollback must not store new objects"
+    );
+    // The restored working file carries v1's content and the tree is clean.
+    let on_disk = std::fs::read(root.join("art.kra")).unwrap();
+    let l = tiles::parse(&kra::read_entry(&on_disk, "img/layers/layer1").unwrap()).unwrap();
+    assert_eq!(l.tiles[0].data, b"tileAAAA");
+    assert!(scan::scan(&r).unwrap().is_empty());
+    // The rollback commit records the same content hash as the original version.
+    assert_eq!(
+        c3.files[0].content,
+        c1.files
+            .iter()
+            .find(|f| f.path == "art.kra")
+            .unwrap()
+            .content
+    );
+    // And it round-trips through undo (index rewinds, working file untouched).
+    commit::undo_last_commit(&mut r).unwrap();
+    assert!(scan::scan(&r)
+        .unwrap()
+        .iter()
+        .any(|(p, st)| p == "art.kra" && st == "M"));
 }
 
 // --- .kra per-layer raster reconstruction (visual diff) -------------------------------
@@ -1100,39 +1166,59 @@ fn commit_crc_skip_reuses_unchanged_entries() {
     }
 }
 
-// --- chains persistence: binary format, legacy migration, skip-on-clean -----------------
+// --- chains persistence: sharded format, legacy monolith migration, skip-on-clean --------
+
+fn shard_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root.join(".kvc/chains"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
 
 #[test]
-fn chains_binary_format_and_legacy_json_migration() {
+fn chains_sharded_format_and_legacy_monolith_migration() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     repo::Repo::init(root).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
     let h = r.store_stream("file:x", b"some data").unwrap();
     r.save().unwrap();
-    assert!(root.join(".kvc/chains.bin").is_file());
-    assert!(!root.join(".kvc/chains.json").exists());
+    // Fresh repos write per-file shards, never a monolith.
+    assert_eq!(shard_files(root).len(), 1);
+    assert!(!root.join(".kvc/chains.bin").exists());
 
-    // Simulate a repo from before the binary format: chains as JSON, no chains.bin.
-    let json = serde_json::to_vec(&r.chains).unwrap();
-    std::fs::write(root.join(".kvc/chains.json"), &json).unwrap();
-    std::fs::remove_file(root.join(".kvc/chains.bin")).unwrap();
+    // Simulate a pre-sharding repo: all chains in one monolithic chains.bin, no shards.
+    let all = r.chains.export_all();
+    let monolith = zstd::encode_all(&bincode::serialize(&all).unwrap()[..], 1).unwrap();
+    std::fs::write(root.join(".kvc/chains.bin"), &monolith).unwrap();
+    std::fs::remove_dir_all(root.join(".kvc/chains")).unwrap();
 
+    // Opens read the monolith transparently...
     let mut r2 = repo::Repo::open(root).unwrap();
     assert_eq!(r2.reconstruct("file:x", &h).unwrap(), b"some data");
 
-    // The next stream commit + save migrates to chains.bin and retires the JSON file.
+    // ...and the next save splits it into shards and retires it.
     r2.store_stream("file:y", b"more").unwrap();
     r2.save().unwrap();
-    assert!(root.join(".kvc/chains.bin").is_file());
-    assert!(!root.join(".kvc/chains.json").exists());
+    assert_eq!(shard_files(root).len(), 2, "one shard per tracked file");
+    assert!(!root.join(".kvc/chains.bin").exists());
     let r3 = repo::Repo::open(root).unwrap();
-    assert!(r3.chains.0.contains_key("file:x") && r3.chains.0.contains_key("file:y"));
+    assert!(r3.chains.chain("file:x").is_some() && r3.chains.chain("file:y").is_some());
     assert_eq!(r3.reconstruct("file:x", &h).unwrap(), b"some data");
+
+    // The oldest format (chains.json) migrates the same way.
+    let json = serde_json::to_vec(&all).unwrap();
+    std::fs::write(root.join(".kvc/chains.json"), &json).unwrap();
+    std::fs::remove_dir_all(root.join(".kvc/chains")).unwrap();
+    let mut r4 = repo::Repo::open(root).unwrap();
+    assert_eq!(r4.reconstruct("file:x", &h).unwrap(), b"some data");
+    r4.store_stream("file:x", b"newer data").unwrap();
+    r4.save().unwrap();
+    assert!(!root.join(".kvc/chains.json").exists());
+    assert!(!shard_files(root).is_empty());
 }
 
 #[test]
-fn switch_skips_chains_rewrite_commit_does_not() {
+fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
@@ -1141,25 +1227,230 @@ fn switch_skips_chains_rewrite_commit_does_not() {
     std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
-    // Sentinel: replace chains.bin on disk; a switch (no new stream versions) must not
-    // rewrite it, so the sentinel survives.
-    let chains_path = root.join(".kvc/chains.bin");
-    let committed = std::fs::read(&chains_path).unwrap();
-    std::fs::write(&chains_path, b"SENTINEL").unwrap();
+    // Sentinel every shard on disk; a switch (no new stream versions) must rewrite none.
+    let originals: Vec<(std::path::PathBuf, Vec<u8>)> = shard_files(root)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            std::fs::write(&p, b"SENTINEL").unwrap();
+            (p, bytes)
+        })
+        .collect();
+    assert_eq!(originals.len(), 2, "one shard per seeded file");
     branch::switch_branch(&mut r, "main").unwrap();
-    assert_eq!(
-        std::fs::read(&chains_path).unwrap(),
-        b"SENTINEL",
-        "switch must not rewrite the chains file"
-    );
-    std::fs::write(&chains_path, &committed).unwrap();
+    for (p, _) in &originals {
+        assert_eq!(
+            std::fs::read(p).unwrap(),
+            b"SENTINEL",
+            "switch must not rewrite any chain shard"
+        );
+    }
+    for (p, bytes) in &originals {
+        std::fs::write(p, bytes).unwrap();
+    }
 
-    // A commit stores new stream versions and must rewrite it.
+    // A commit to a.txt rewrites exactly a.txt's shard; b.txt's shard is untouched.
+    let before: std::collections::HashMap<_, _> = shard_files(root)
+        .into_iter()
+        .map(|p| (p.clone(), std::fs::read(&p).unwrap()))
+        .collect();
     std::fs::write(root.join("a.txt"), b"main-a2").unwrap();
     commit::commit_snapshot(&mut r, "on main", "t").unwrap();
-    assert_ne!(std::fs::read(&chains_path).unwrap(), b"SENTINEL");
+    let changed = shard_files(root)
+        .into_iter()
+        .filter(|p| std::fs::read(p).unwrap() != before[p])
+        .count();
+    assert_eq!(changed, 1, "only the committed file's shard is rewritten");
+
     let r2 = repo::Repo::open(root).unwrap();
-    assert_eq!(r2.chains.0.len(), r.chains.0.len());
+    assert_eq!(
+        r2.chains.export_all().0.len(),
+        r.chains.export_all().0.len()
+    );
+}
+
+// --- garbage collection -------------------------------------------------------------------
+
+/// GC after undo + branch-delete must reclaim storage while every remaining commit's every
+/// file still reconstructs byte-for-byte — including patch chains whose bases must survive.
+#[test]
+fn gc_reclaims_orphans_and_preserves_reachable_history() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let mk = |tile: &[u8], extra: &[u8]| {
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&[(0, 0, tile)])),
+            ("img/extra.bin", extra.to_vec()),
+        ])
+    };
+    // Three commits on main (so the patch-chaining generic file has history), then a branch
+    // with its own commit, then: undo one commit + delete the branch = two orphan sets.
+    std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"x1")).unwrap();
+    // A large-ish text file so its versions bsdiff-chain (>64KB, incompressible-ish text).
+    let big1: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("notes.bin"), &big1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+
+    let mut big2 = big1.clone();
+    big2.extend_from_slice(b"more");
+    std::fs::write(root.join("notes.bin"), &big2).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileBBBB", b"x1")).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+
+    // Branch with a divergent edit, then go back to main.
+    branch::create_branch(&mut r, "scrap", None).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileSCRAP", b"x2")).unwrap();
+    commit::commit_snapshot(&mut r, "scrap edit", "t").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+
+    // Another main commit, then undo it (its edits resurface as pending and get re-committed
+    // — dedup makes that cheap), and delete scrap: the stranded branch history is the garbage.
+    std::fs::write(root.join("art.kra"), mk(b"tileCCCC", b"x3")).unwrap();
+    commit::commit_snapshot(&mut r, "c3", "t").unwrap();
+    commit::undo_last_commit(&mut r).unwrap();
+    commit::commit_snapshot(&mut r, "c3 again", "t").unwrap();
+    branch::delete_branch(&mut r, "scrap").unwrap();
+
+    let objs_before = count_objects(root);
+
+    // Dry run reports without deleting.
+    let dry = gc::collect_garbage(&mut r, true).unwrap();
+    assert!(dry.dry_run && dry.bytes_reclaimed > 0 && dry.versions_removed > 0);
+    assert_eq!(count_objects(root), objs_before, "dry run must not delete");
+
+    let report = gc::collect_garbage(&mut r, false).unwrap();
+    assert!(!report.dry_run);
+    // The undone commit already left the log (undo removes it; only its objects orphan);
+    // the deleted branch's commit is dropped here.
+    assert_eq!(report.commits_removed, 1, "the stranded branch commit");
+    assert!(report.bytes_reclaimed > 0);
+    assert!(count_objects(root) < objs_before);
+
+    // Everything reachable reconstructs byte-for-byte, in this session and after reopen.
+    for repo_ref in [&r, &repo::Repo::open(root).unwrap()] {
+        for (cid, tile, extra, big) in [
+            (&c1.id, b"tileAAAA".as_slice(), b"x1".as_slice(), &big1),
+            (&c2.id, b"tileBBBB".as_slice(), b"x1".as_slice(), &big2),
+        ] {
+            let kra_bytes = commit::file_at_commit(repo_ref, "art.kra", cid).unwrap();
+            let l =
+                tiles::parse(&kra::read_entry(&kra_bytes, "img/layers/layer1").unwrap()).unwrap();
+            assert_eq!(l.tiles[0].data, tile);
+            assert_eq!(kra::read_entry(&kra_bytes, "img/extra.bin").unwrap(), extra);
+            assert_eq!(
+                &commit::file_at_commit(repo_ref, "notes.bin", cid).unwrap(),
+                big
+            );
+        }
+    }
+
+    // The tree is still clean and a fresh commit works after GC.
+    assert!(scan::scan(&r).unwrap().is_empty());
+    std::fs::write(root.join("art.kra"), mk(b"tileDDDD", b"x4")).unwrap();
+    commit::commit_snapshot(&mut r, "post-gc", "t").unwrap();
+    assert!(scan::scan(&r).unwrap().is_empty());
+}
+
+// --- objects layout: sharded writes, flat legacy reads -----------------------------------
+
+#[test]
+fn objects_sharded_layout_with_flat_read_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let data = b"object payload".to_vec();
+    let h = r.store_stream("file:x", &data).unwrap();
+    let objects = root.join(".kvc/objects");
+    let sharded = objects.join(&h[..2]).join(format!("{h}.full"));
+    assert!(sharded.is_file(), "new objects land in objects/<xx>/");
+
+    // Simulate a pre-sharding repo: the same object at the flat path only.
+    let flat = objects.join(format!("{h}.full"));
+    std::fs::rename(&sharded, &flat).unwrap();
+    assert_eq!(
+        r.reconstruct("file:x", &h).unwrap(),
+        data,
+        "flat legacy objects stay readable"
+    );
+
+    // Re-storing identical content dedups against the flat copy (no sharded duplicate).
+    let h2 = r.store_stream("file:y", &data).unwrap();
+    assert_eq!(h2, h);
+    assert!(
+        !sharded.exists(),
+        "existing flat object must not be rewritten"
+    );
+}
+
+/// A commit with many changed tiles writes ONE pack file instead of thousands of loose
+/// objects (per-file create cost dominated large first commits on Windows), and everything
+/// reconstructs from the pack byte-for-byte — including after a fresh open.
+#[test]
+fn large_commit_packs_objects_and_reconstructs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // 40 tiles (> PACK_MIN_OBJECTS) with distinct contents.
+    let tiles_v1: Vec<(i64, i64, Vec<u8>)> = (0..40i64)
+        .map(|i| (i * 64, 0, vec![i as u8; 300 + i as usize]))
+        .collect();
+    let refs: Vec<(i64, i64, &[u8])> = tiles_v1
+        .iter()
+        .map(|(x, y, d)| (*x, *y, d.as_slice()))
+        .collect();
+    let kra = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&refs)),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    // The tile batch became one pack; only the manifest & small entries are loose.
+    let packs: Vec<_> = std::fs::read_dir(root.join(".kvc/objects/pack"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+        .collect();
+    assert_eq!(packs.len(), 1, "one pack per large batch");
+    let loose = count_objects(root) - packs.len();
+    assert!(
+        loose < 10,
+        "tiles must be packed, not loose (found {loose} loose objects)"
+    );
+
+    // Same-session restore and fresh-open restore both round-trip from the pack.
+    let restored = commit::file_at_commit(&r, "art.kra", &c1.id).unwrap();
+    let l = tiles::parse(&kra::read_entry(&restored, "img/layers/layer1").unwrap()).unwrap();
+    assert_eq!(l.tiles.len(), 40);
+    assert_eq!(l.tiles[7].data, tiles_v1[7].2);
+
+    let r2 = repo::Repo::open(root).unwrap();
+    let restored2 = commit::file_at_commit(&r2, "art.kra", &c1.id).unwrap();
+    assert_eq!(restored, restored2);
+
+    // Re-committing identical content dedups against packed objects (no new pack, no loose).
+    drop(r2);
+    std::fs::remove_file(root.join("art.kra")).unwrap();
+    std::fs::write(root.join("art.kra"), &kra).unwrap();
+    let before = count_objects(root);
+    // Deleting + rewriting identical bytes leaves content identical to the tip — a clean scan
+    // (mtime changed but hash matches) means nothing to commit.
+    assert!(matches!(
+        commit::commit_snapshot(&mut r, "again", "t"),
+        Err(KvcError::Nothing)
+    ));
+    assert_eq!(count_objects(root), before);
 }
 
 // --- incremental .kra materialization on switch ------------------------------------------

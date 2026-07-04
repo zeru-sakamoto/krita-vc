@@ -43,15 +43,33 @@ interface RepositoryValue {
   mergeBranch: (source: string) => Promise<void>;
   /** Remove a branch label (its versions stay in history). */
   deleteBranch: (name: string) => Promise<void>;
+  /**
+   * Reclaim storage unreachable from any branch (leftovers of undo / deleted branches).
+   * `dryRun` reports what a real pass would free without touching anything. Null in a
+   * plain browser or with no repository selected.
+   */
+  cleanupRepository: (dryRun: boolean) => Promise<CleanupReport | null>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
   /** True while a commit is being written — locks staging, drives the StatusBar progress bar. */
   saving: boolean;
   setSaving: (v: boolean) => void;
+  /** Non-null while a write op is in flight — drives the full-screen BusyOverlay. */
+  busyMessage: string | null;
+  setBusyMessage: (msg: string | null) => void;
   /** True while the working tree is being rescanned — spins the refresh button. */
   scanning: boolean;
   setScanning: (v: boolean) => void;
+}
+
+/** Shape returned by the `cleanup_repository` Tauri command (serde camelCase). */
+export interface CleanupReport {
+  dryRun: boolean;
+  commitsRemoved: number;
+  versionsRemoved: number;
+  objectsDeleted: number;
+  bytesReclaimed: number;
 }
 
 function joinPath(parent: string, name: string): string {
@@ -104,6 +122,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   const [refreshNonce, setRefreshNonce] = useState(0);
   const refresh = useCallback(() => setRefreshNonce((n) => n + 1), []);
   const [saving, setSaving] = useState(false);
+  const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
 
   const setCurrent = useCallback((id: string) => setCurrentId(id), []);
@@ -157,11 +176,13 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     async (commitId: string) => {
       if (!inTauri() || !current) return;
       setSaving(true);
+      setBusyMessage("Restoring version — please wait…");
       try {
         await invoke("rollback_to_commit", { path: current.path, commitId, author: "You" });
         refresh();
       } finally {
         setSaving(false);
+        setBusyMessage(null);
       }
     },
     [current, refresh]
@@ -170,26 +191,31 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   const undoLastCommit = useCallback(async () => {
     if (!inTauri() || !current) return;
     setSaving(true);
+    setBusyMessage("Undoing last version — please wait…");
     try {
       await invoke("undo_last_commit", { path: current.path });
       refresh();
     } finally {
       setSaving(false);
+      setBusyMessage(null);
     }
   }, [current, refresh]);
 
   // Branch mutations share one shape: invoke + refresh with the saving flag held (locks
-  // staging, drives the StatusBar progress bar). Errors rethrow so panels can show friendly
-  // messages (e.g. the dirty-tree save-first prompt). No-ops without a backend/repository.
+  // staging, drives the StatusBar progress bar, and the full-screen BusyOverlay via `label`).
+  // Errors rethrow so panels can show friendly messages (e.g. the dirty-tree save-first
+  // prompt). No-ops without a backend/repository.
   const branchMutation = useCallback(
-    async (command: string, args: Record<string, string>) => {
+    async (command: string, args: Record<string, string>, label: string) => {
       if (!inTauri() || !current) return;
       setSaving(true);
+      setBusyMessage(label);
       try {
         await invoke(command, { path: current.path, ...args });
         refresh();
       } finally {
         setSaving(false);
+        setBusyMessage(null);
       }
     },
     [current, refresh]
@@ -197,20 +223,46 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
 
   const createBranch = useCallback(
     (name: string, base?: string) =>
-      branchMutation("create_branch", base ? { name, base } : { name }),
+      branchMutation(
+        "create_branch",
+        base ? { name, base } : { name },
+        "Creating branch — please wait…"
+      ),
     [branchMutation]
   );
   const switchBranch = useCallback(
-    (name: string) => branchMutation("switch_branch", { name }),
+    (name: string) =>
+      branchMutation("switch_branch", { name }, "Switching branches — please wait…"),
     [branchMutation]
   );
   const mergeBranch = useCallback(
-    (source: string) => branchMutation("merge_branch", { source, author: "You" }),
+    (source: string) =>
+      branchMutation("merge_branch", { source, author: "You" }, "Merging branches — please wait…"),
     [branchMutation]
   );
   const deleteBranch = useCallback(
-    (name: string) => branchMutation("delete_branch", { name }),
+    (name: string) => branchMutation("delete_branch", { name }, "Deleting branch — please wait…"),
     [branchMutation]
+  );
+
+  const cleanupRepository = useCallback(
+    async (dryRun: boolean): Promise<CleanupReport | null> => {
+      if (!inTauri() || !current) return null;
+      setSaving(true);
+      if (!dryRun) setBusyMessage("Cleaning up storage — please wait…");
+      try {
+        const report = await invoke<CleanupReport>("cleanup_repository", {
+          path: current.path,
+          dryRun,
+        });
+        if (!dryRun) refresh();
+        return report;
+      } finally {
+        setSaving(false);
+        if (!dryRun) setBusyMessage(null);
+      }
+    },
+    [current, refresh]
   );
 
   const value = useMemo<RepositoryValue>(
@@ -228,10 +280,13 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       switchBranch,
       mergeBranch,
       deleteBranch,
+      cleanupRepository,
       refreshNonce,
       refresh,
       saving,
       setSaving,
+      busyMessage,
+      setBusyMessage,
       scanning,
       setScanning,
     }),
@@ -249,9 +304,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       switchBranch,
       mergeBranch,
       deleteBranch,
+      cleanupRepository,
       refreshNonce,
       refresh,
       saving,
+      busyMessage,
       scanning,
     ]
   );

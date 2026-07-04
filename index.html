@@ -5,10 +5,41 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Krita VCS</title>
+    <style>
+      /* Themed background + spinner shown before React mounts (avoids a white/black
+         startup flash). Static markup only — main.tsx's render() replaces #root's
+         contents wholesale, so this disappears on its own, no cleanup JS needed. */
+      html,
+      body {
+        margin: 0;
+        background: #131210;
+      }
+      #boot-spinner {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+      }
+      #boot-spinner div {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 3px solid #2d2b28;
+        border-top-color: #e07b39;
+        animation: boot-spin 0.7s linear infinite;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot-spinner"><div></div></div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

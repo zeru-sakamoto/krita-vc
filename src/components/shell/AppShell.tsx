@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { FolderOpen, PaintBrush, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
+import { BusyOverlay } from "./BusyOverlay";
 import { Sidebar } from "./Sidebar";
 import { Inspector } from "./Inspector";
 import { StatusBar } from "./StatusBar";
@@ -22,7 +23,12 @@ import type { Repository } from "../../types";
  */
 export function AppShell() {
   const { current } = useRepository();
-  return current ? <RepoShell repo={current} /> : <WelcomeShell />;
+  return (
+    <>
+      {current ? <RepoShell repo={current} /> : <WelcomeShell />}
+      <BusyOverlay />
+    </>
+  );
 }
 
 /** Fresh install / empty list: just the top bar and a pointer to it. */
@@ -80,7 +86,7 @@ function RepoShell({ repo }: { repo: Repository }) {
   // In the Changes view, a clicked file shows its working-tree diff; otherwise the selected
   // commit's diff. Both hooks run (the inactive one gets a null id and stays empty).
   const showWorking = activeView === "changes" && focusedFile != null;
-  const commitDiff = useCommitDiff(repo.path, selectedId, refreshNonce);
+  const commitDiff = useCommitDiff(repo.path, selectedId);
   const workingDiff = useWorkingDiff(repo.path, showWorking ? focusedFile : null, refreshNonce);
   const {
     entries: diff,

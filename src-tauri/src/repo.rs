@@ -3,20 +3,22 @@
 //! Layout:
 //! ```text
 //! .kvc/
-//!   config.json    engine config (delta-chain threshold, tile size)
+//!   config.json    engine config (delta-chain threshold, tile size, cache budget)
 //!   index.json     committed head per tracked file (drives the scanner)
-//!   chains.bin     every stored version of every delta stream (drives storage/restore);
-//!                  zstd-compressed bincode — repos from before this format carry a legacy
-//!                  chains.json instead, migrated on the next commit
+//!   chains/        delta-stream versions, one shard per tracked file (drives storage/restore);
+//!                  zstd-compressed bincode per shard. Repos from before sharding carry a
+//!                  monolithic chains.bin (or older chains.json) instead — split on first save
 //!   commits.json   commit log
 //!   branches.json  branch name -> tip commit id, plus the current branch
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
+//!   cache/         capped raster PNGs (bounded, see `raster::cache_prune`)
 //! ```
 
 use crate::error::{io_at, KvcError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const KVC_DIR: &str = ".kvc";
@@ -32,6 +34,10 @@ pub fn objects_dir(root: &Path) -> PathBuf {
 pub fn cache_dir(root: &Path) -> PathBuf {
     kvc_dir(root).join("cache")
 }
+/// Per-file chain shards (see [`ChainStore`]).
+pub fn chains_dir(root: &Path) -> PathBuf {
+    kvc_dir(root).join("chains")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +46,15 @@ pub struct Config {
     /// Max consecutive bsdiff patches before a fresh full snapshot is forced.
     pub delta_chain_max: usize,
     pub tile_size: u32,
+    /// Size budget for the capped-raster cache (`.kvc/cache/`). Oldest entries beyond it are
+    /// pruned opportunistically after layer streaming (`raster::cache_prune_throttled`).
+    /// `#[serde(default)]` so configs from before the knob existed keep deserializing.
+    #[serde(default = "default_cache_max_bytes")]
+    pub cache_max_bytes: u64,
+}
+
+fn default_cache_max_bytes() -> u64 {
+    512 * 1024 * 1024
 }
 
 impl Default for Config {
@@ -48,6 +63,7 @@ impl Default for Config {
             version: 1,
             delta_chain_max: 20,
             tile_size: 64,
+            cache_max_bytes: default_cache_max_bytes(),
         }
     }
 }
@@ -89,9 +105,210 @@ pub struct Version {
     pub chain_len: usize,
 }
 
-/// streamKey -> ordered versions (head = last).
+/// streamKey -> ordered versions (head = last). The serialized form of one chain shard
+/// (and of the pre-sharding monolithic chains file).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chains(pub BTreeMap<String, Vec<Version>>);
+
+/// Shard identity for a stream key. Every key embeds the tracked file's relpath
+/// (`file:{rel}`, `kra:{rel}:manifest`, `kra:{rel}:entry:{name}`, `kra:{rel}:tile:{e}:{x},{y}`),
+/// and all of one file's keys must land in one shard so a commit rewrites exactly the shards
+/// of the files it touched. The parse is forgiving: a pathological relpath containing a marker
+/// still maps *consistently* (same bucket for every key of that file), which is all sharding
+/// needs — a shard is a bucket, not an identity.
+fn shard_of(key: &str) -> &str {
+    if let Some(rest) = key.strip_prefix("file:") {
+        return rest;
+    }
+    if let Some(rest) = key.strip_prefix("kra:") {
+        for marker in [":tile:", ":entry:"] {
+            if let Some(pos) = rest.find(marker) {
+                return &rest[..pos];
+            }
+        }
+        if let Some(pre) = rest.strip_suffix(":manifest") {
+            return pre;
+        }
+        return rest;
+    }
+    key
+}
+
+fn shard_file(dir: &Path, shard: &str) -> PathBuf {
+    dir.join(format!(
+        "{}.bin",
+        &blake3::hash(shard.as_bytes()).to_hex()[..16]
+    ))
+}
+
+/// Per-file-sharded delta chains, loaded lazily. The monolithic predecessor (`chains.bin`) held
+/// every version of every tile stream ever committed, was rewritten in full on every commit and
+/// parsed in full on every open — the one cost that grew with *total repo history* instead of
+/// with the change at hand. Shards make both proportional to the files actually touched.
+///
+/// Interior mutability (`RwLock`) lets read paths fault shards in from behind `&Repo` (rayon
+/// `par_iter` reconstructs included); pushes come only from the serial commit folds.
+pub struct ChainStore {
+    dir: PathBuf,
+    /// Loaded shards by shard name (the relpath bucket). `Arc` so readers can hold a shard
+    /// without keeping the map locked.
+    shards: RwLock<HashMap<String, Arc<Chains>>>,
+    dirty: Mutex<HashSet<String>>,
+    /// Set when this store was populated from a legacy monolithic chains file: the next
+    /// [`ChainStore::flush`] writes every shard, then deletes the monolith. Until that delete,
+    /// the monolith remains the source of truth on open — a crash mid-split just re-runs it.
+    retire_monolith: bool,
+}
+
+impl ChainStore {
+    fn empty(dir: PathBuf) -> ChainStore {
+        ChainStore {
+            dir,
+            shards: RwLock::new(HashMap::new()),
+            dirty: Mutex::new(HashSet::new()),
+            retire_monolith: false,
+        }
+    }
+
+    /// Partition a legacy monolithic chains map into all-dirty shards (split persists on the
+    /// next save).
+    fn from_legacy(dir: PathBuf, legacy: Chains) -> ChainStore {
+        let mut map: HashMap<String, Chains> = HashMap::new();
+        for (key, versions) in legacy.0 {
+            map.entry(shard_of(&key).to_string())
+                .or_default()
+                .0
+                .insert(key, versions);
+        }
+        let dirty: HashSet<String> = map.keys().cloned().collect();
+        let shards = map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        ChainStore {
+            dir,
+            shards: RwLock::new(shards),
+            dirty: Mutex::new(dirty),
+            retire_monolith: true,
+        }
+    }
+
+    /// The loaded shard for `name`, faulting it in from disk (missing file = empty shard,
+    /// negative-cached so repeat misses don't re-stat).
+    fn load(&self, name: &str) -> Arc<Chains> {
+        if let Some(s) = self.shards.read().unwrap().get(name) {
+            return s.clone();
+        }
+        let mut w = self.shards.write().unwrap();
+        if let Some(s) = w.get(name) {
+            return s.clone();
+        }
+        let loaded = read_chains_file(&shard_file(&self.dir, name)).unwrap_or_default();
+        let arc = Arc::new(loaded);
+        w.insert(name.to_string(), arc.clone());
+        arc
+    }
+
+    /// The version chain for `key` (cloned — chains are short by design: at most
+    /// `delta_chain_max`+1 per snapshot run).
+    pub fn chain(&self, key: &str) -> Option<Vec<Version>> {
+        self.load(shard_of(key)).0.get(key).cloned()
+    }
+
+    /// Append a version to `key`'s chain and mark its shard dirty.
+    pub(crate) fn push(&self, key: String, version: Version) {
+        let name = shard_of(&key).to_string();
+        self.load(&name); // fault in before mutating, so we never clobber an unread shard
+        let mut w = self.shards.write().unwrap();
+        let entry = w.get_mut(&name).expect("shard just loaded");
+        Arc::make_mut(entry).0.entry(key).or_default().push(version);
+        self.dirty.lock().unwrap().insert(name);
+    }
+
+    /// Write every dirty shard (atomic each), then retire a legacy monolith if one is pending.
+    /// A failed write leaves its dirty mark in place for the next save.
+    fn flush(&mut self, kvc: &Path) -> Result<()> {
+        let dirty: Vec<String> = self.dirty.lock().unwrap().iter().cloned().collect();
+        if dirty.is_empty() && !self.retire_monolith {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| io_at(&self.dir, e))?;
+        {
+            let shards = self.shards.read().unwrap();
+            for name in &dirty {
+                if let Some(chains) = shards.get(name) {
+                    write_chains_file(&shard_file(&self.dir, name), chains)?;
+                }
+            }
+        }
+        self.dirty.lock().unwrap().clear();
+        if self.retire_monolith {
+            let _ = std::fs::remove_file(kvc.join("chains.bin"));
+            let _ = std::fs::remove_file(kvc.join("chains.json"));
+            self.retire_monolith = false;
+        }
+        Ok(())
+    }
+
+    fn has_dirty(&self) -> bool {
+        self.retire_monolith || !self.dirty.lock().unwrap().is_empty()
+    }
+
+    /// Replace the whole store with `new` (GC sweep): partition into shards, write every
+    /// non-empty shard, then delete shard files whose bucket no longer exists. Writes happen
+    /// before deletes and each write is atomic, so there is no window without valid chains.
+    pub fn rewrite_all(&mut self, kvc: &Path, new: Chains) -> Result<()> {
+        let mut map: HashMap<String, Chains> = HashMap::new();
+        for (key, versions) in new.0 {
+            map.entry(shard_of(&key).to_string())
+                .or_default()
+                .0
+                .insert(key, versions);
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| io_at(&self.dir, e))?;
+        let keep: HashSet<PathBuf> = map
+            .iter()
+            .map(|(name, chains)| {
+                let path = shard_file(&self.dir, name);
+                write_chains_file(&path, chains).map(|_| path)
+            })
+            .collect::<Result<_>>()?;
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "bin") && !keep.contains(&p) {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        // In-memory state now mirrors disk; a pending legacy monolith is finally retired too.
+        self.shards = RwLock::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect());
+        self.dirty = Mutex::new(HashSet::new());
+        if self.retire_monolith {
+            let _ = std::fs::remove_file(kvc.join("chains.bin"));
+            let _ = std::fs::remove_file(kvc.join("chains.json"));
+            self.retire_monolith = false;
+        }
+        Ok(())
+    }
+
+    /// Every chain across every shard, on-disk and in-memory merged (in-memory wins — it is
+    /// never older). Loads the whole store: tests and GC only, never a hot path.
+    pub fn export_all(&self) -> Chains {
+        let mut all = Chains::default();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                if e.path().extension().is_some_and(|x| x == "bin") {
+                    if let Some(c) = read_chains_file(&e.path()) {
+                        all.0.extend(c.0);
+                    }
+                }
+            }
+        }
+        for shard in self.shards.read().unwrap().values() {
+            all.0
+                .extend(shard.0.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        all
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,13 +396,13 @@ pub struct Repo {
     pub root: PathBuf,
     pub config: Config,
     pub index: Index,
-    pub chains: Chains,
+    /// Delta chains, sharded per tracked file and loaded lazily — see [`ChainStore`].
+    pub chains: ChainStore,
+    /// Lazily-indexed object packs (large commits write one pack instead of thousands of
+    /// loose files) — see [`crate::delta::Packs`].
+    pub(crate) packs: crate::delta::Packs,
     pub commits: Vec<Commit>,
     pub branches: Branches,
-    /// True once a new stream version has been committed (`Repo::commit_prepared` — the only
-    /// chain mutation). [`Repo::save`] skips rewriting the chains file (the largest state file)
-    /// when clean, so switch/merge/undo never pay for it.
-    pub(crate) chains_dirty: bool,
 }
 
 impl Repo {
@@ -201,9 +418,9 @@ impl Repo {
         }
         std::fs::create_dir_all(objects_dir(root)).map_err(|e| io_at(&kvc, e))?;
         std::fs::create_dir_all(cache_dir(root)).map_err(|e| io_at(&kvc, e))?;
+        std::fs::create_dir_all(chains_dir(root)).map_err(|e| io_at(&kvc, e))?;
         write_json(&kvc.join("config.json"), &Config::default())?;
         write_json(&kvc.join("index.json"), &Index::default())?;
-        write_chains(&kvc, &Chains::default())?;
         write_json(&kvc.join("commits.json"), &Vec::<Commit>::new())?;
         write_json(&kvc.join("branches.json"), &Branches::default())?;
         Ok(())
@@ -218,7 +435,9 @@ impl Repo {
         std::fs::remove_dir_all(root).map_err(|e| io_at(root, e))
     }
 
-    /// Validate `.kvc/` and load its state.
+    /// Validate `.kvc/` and load its state. Chains load lazily per shard; only a repo still
+    /// carrying the pre-sharding monolithic chains file pays a one-time full parse here (the
+    /// split persists on the next save).
     pub fn open(root: &Path) -> Result<Repo> {
         if !Self::is_repo(root) {
             return Err(KvcError::NotARepo(root.to_path_buf()));
@@ -226,20 +445,26 @@ impl Repo {
         let kvc = kvc_dir(root);
         let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
         let branches = read_branches(&kvc, &commits)?;
+        let chains = if kvc.join("chains.bin").is_file() || kvc.join("chains.json").is_file() {
+            ChainStore::from_legacy(chains_dir(root), read_chains(&kvc)?)
+        } else {
+            ChainStore::empty(chains_dir(root))
+        };
         Ok(Repo {
             root: root.to_path_buf(),
             config: read_json(&kvc.join("config.json"))?,
             index: read_json(&kvc.join("index.json"))?,
-            chains: read_chains(&kvc)?,
+            chains,
+            packs: crate::delta::Packs::default(),
             commits,
             branches,
-            chains_dirty: false,
         })
     }
 
-    /// Like [`Repo::open`] but skips the chains file — by far the largest state file (every
-    /// version of every tile stream). For read paths that never touch storage (scan, log).
-    /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo.
+    /// Like [`Repo::open`] but never touches chains — even the legacy-monolith parse is
+    /// skipped. For read paths that never reconstruct or store (scan, log).
+    /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo
+    /// (on a legacy repo the store would come up empty).
     pub fn open_light(root: &Path) -> Result<Repo> {
         if !Self::is_repo(root) {
             return Err(KvcError::NotARepo(root.to_path_buf()));
@@ -251,10 +476,10 @@ impl Repo {
             root: root.to_path_buf(),
             config: read_json(&kvc.join("config.json"))?,
             index: read_json(&kvc.join("index.json"))?,
-            chains: Chains::default(),
+            chains: ChainStore::empty(chains_dir(root)),
+            packs: crate::delta::Packs::default(),
             commits,
             branches,
-            chains_dirty: false,
         })
     }
 
@@ -266,15 +491,14 @@ impl Repo {
         cache_dir(&self.root)
     }
 
-    /// Flush mutated state atomically. The chains file — the largest, every version of every
-    /// tile stream — is only rewritten when a new stream version was actually committed
-    /// (`chains_dirty`); switch/merge/undo mutate only index/commits/branches.
+    /// Flush mutated state atomically. Chains rewrite only their dirty shards — the shards of
+    /// files this commit actually touched; switch/merge/undo mutate only index/commits/branches
+    /// and skip chains entirely ([`ChainStore::has_dirty`]).
     pub fn save(&mut self) -> Result<()> {
         let kvc = kvc_dir(&self.root);
         write_json(&kvc.join("index.json"), &self.index)?;
-        if self.chains_dirty {
-            write_chains(&kvc, &self.chains)?;
-            self.chains_dirty = false;
+        if self.chains.has_dirty() {
+            self.chains.flush(&kvc)?;
         }
         write_json(&kvc.join("commits.json"), &self.commits)?;
         write_json(&kvc.join("branches.json"), &self.branches)?;
@@ -304,24 +528,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
-/// `chains.bin`: zstd-compressed bincode. Chains are rewritten in full on every commit and
-/// parsed on every `Repo::open`, and dwarf the other state files (one entry per version of
-/// every tile stream ever committed) — JSON there dominated commit/switch time *and* disk.
-/// zstd level 1: the stream keys are highly repetitive, so even the fastest level compresses
-/// them several-fold. A successful write retires a legacy `chains.json`.
-fn write_chains(kvc: &Path, chains: &Chains) -> Result<()> {
+/// One chain shard on disk: zstd-compressed bincode. zstd level 1 — the stream keys are highly
+/// repetitive, so even the fastest level compresses them several-fold.
+fn write_chains_file(path: &Path, chains: &Chains) -> Result<()> {
     let plain = bincode::serialize(chains).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     let bytes = zstd::encode_all(&plain[..], 1).map_err(KvcError::Io)?;
-    write_atomic(&kvc.join("chains.bin"), &bytes)?;
-    let legacy = kvc.join("chains.json");
-    if legacy.exists() {
-        let _ = std::fs::remove_file(legacy);
-    }
-    Ok(())
+    write_atomic(path, &bytes)
 }
 
-/// Load chains, preferring `chains.bin`; repos from before the binary format fall back to
-/// their legacy `chains.json` (migrated by the next [`write_chains`]).
+/// Read one chain shard; `None` on missing/unreadable (a missing shard is an empty one).
+fn read_chains_file(path: &Path) -> Option<Chains> {
+    let raw = std::fs::read(path).ok()?;
+    let plain = zstd::decode_all(&raw[..]).ok()?;
+    bincode::deserialize(&plain).ok()
+}
+
+/// Load a pre-sharding monolithic chains file: `chains.bin` (zstd bincode), else the even
+/// older `chains.json`. Retired by the first save after opening (see [`ChainStore::flush`]).
 fn read_chains(kvc: &Path) -> Result<Chains> {
     let bin = kvc.join("chains.bin");
     if bin.is_file() {

@@ -36,7 +36,7 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
-| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. |
+| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also hosts "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
@@ -45,6 +45,12 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 
 The center toolbar (in `AppShell`) also holds the **Artist view** toggle (paintbrush) and the
 inspector show/hide button. See [Artist Mode](#artist-mode).
+
+[`BusyOverlay`](../src/components/shell/BusyOverlay.tsx) renders alongside `RepoShell`/
+`WelcomeShell` (a sibling in `AppShell`, not inside either zone): a full-screen,
+non-dismissible block shown whenever `busyMessage` on the repository context is set — every
+write op (commit, branch create/switch/merge/delete, rollback, undo, cleanup) sets a
+human-readable label before the call and clears it in a `finally`. Renders nothing when idle.
 
 [`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable panel container (24px title
 bar + scroll area) used by the Sidebar and Inspector.
@@ -60,20 +66,24 @@ State lives in `RepoShell` and flows down via props:
 | `inspectorOpen` | Inspector visibility. |
 
 Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) — `useCommits`
-(branch-scoped history), `useBranches` (local branches + current + tips), `useCommitDiff` /
-`useWorkingDiff` (visual diffs), `useArtLayers` (streamed per-layer rasters) — all keyed by the
-selected repository path and the shared `refreshNonce`. Derived per render: `currentBranch`
-(from `useBranches`), `selectedCommit`, and `diff`.
+(branch-scoped history), `useBranches` (local branches + current + tips), `useWorkingDiff`
+(working-tree visual diffs), `useArtLayers` (streamed per-layer rasters) — all keyed by the
+selected repository path and the shared `refreshNonce`. `useCommitDiff` (committed visual
+diffs) keys only on path + commit id: a commit's diff is immutable once made, so it never needs
+a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLayers` do, since the
+working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
+`selectedCommit`, and `diff`.
 
 Two pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
 ([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)) and the
 selected repository ([`src/lib/repository.tsx`](../src/lib/repository.tsx) — list + `currentId`,
 persisted to `localStorage`; the `TopBar` switcher reads it). The repository context also owns
-`refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `scanning`
-busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a commit,
-`scanning` spins the Changes refresh button. Both providers are mounted in
-[`App.tsx`](../src/App.tsx).
+`refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `busyMessage` /
+`scanning` busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a
+commit, `busyMessage` (a human-readable label, or `null` when idle) drives the full-screen
+`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. Both providers
+are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
 (`Sidebar`), the art-diff canvas height (`ArtDiffView`), per-file staging toggles (`ChangesPanel`),
@@ -97,11 +107,13 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   (`branchColorMap` — accent for the current branch, then `info`/`success`/`warning` tokens, a
   deliberate functional exception to the single-accent rule), and branch tips get a `BranchBadge`
   on their commit card. Selection drives the main panel.
-- **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): working-tree changes
-  (from `scan_repository`) grouped Staged / Unstaged, with per-file
+- **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): a "Saving to
+  `<BranchBadge>`" header (the current branch — a commit always lands on it), then working-tree
+  changes (from `scan_repository`) grouped Staged / Unstaged, with per-file
   and **Stage all / Unstage all** toggles. Staging is cosmetic — `commit_snapshot` captures the
   whole working tree. While a commit is in flight the staging controls lock, the commit button
-  shows a spinner, and the `StatusBar` shows an indeterminate progress bar (shared `saving` flag).
+  shows a spinner, the `StatusBar` shows an indeterminate progress bar (shared `saving` flag),
+  and `BusyOverlay` blocks the app (`busyMessage`).
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
   list with **real actions** — click a branch to switch, hover (or keyboard-focus) a row for
   "Merge into current" and "Delete" (both behind plain-language confirm modals), "New branch"
@@ -159,7 +171,7 @@ concepts, not jargon.
 
 ```
 AppShell (→ WelcomeShell with no repository, else RepoShell)
-├─ TopBar ─ Menu (repository switcher)
+├─ TopBar ─ Menu (repository switcher) + CleanupModal ("Clean up storage…")
 ├─ ActivityBar
 ├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
@@ -172,6 +184,8 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 │                                    └─ DiffFileBlock     (Artist Mode off)
 ├─ Inspector ─ DockerPanel ─ FileStatusChip
 └─ StatusBar
+
+BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is set)
 ```
 
 The whole tree is wrapped in `RepositoryProvider` → `ArtistModeProvider` (both mounted in

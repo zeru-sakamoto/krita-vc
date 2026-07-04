@@ -21,6 +21,17 @@ pub enum Prepared {
     },
 }
 
+impl Prepared {
+    /// Content hash of the prepared version — known before the serial fold, so callers can
+    /// build references (e.g. manifest tile refs) while still preparing in parallel.
+    pub fn hash(&self) -> &str {
+        match self {
+            Prepared::Dedup(h) => h,
+            Prepared::New { version, .. } => &version.hash,
+        }
+    }
+}
+
 impl Repo {
     /// Store `bytes` as the next version of `key`. Returns the content hash. Identical
     /// content already in the chain is deduplicated (no new object, no new version).
@@ -37,7 +48,7 @@ impl Repo {
         let hash = hash_bytes(bytes);
         let max = self.config.delta_chain_max;
 
-        let (dedup, head) = match self.chains.0.get(key) {
+        let (dedup, head) = match self.chains.chain(key) {
             Some(v) => (v.iter().any(|x| x.hash == hash), v.last().cloned()),
             None => (false, None),
         };
@@ -115,24 +126,46 @@ impl Repo {
         match prepared {
             Prepared::Dedup(hash) => Ok(hash),
             Prepared::New { version, object } => {
-                let objects = self.objects_dir();
-                write_object(&objects, &object.0, &object.1)?;
+                if !self.object_exists(&object.0) {
+                    write_loose(&self.objects_dir(), &object.0, &object.1)?;
+                }
                 Ok(self.push_version(key.to_string(), version))
             }
         }
     }
 
-    /// Apply many [`Prepared`] versions at once: all new objects are written **in parallel**
-    /// (content-addressed writes are independent and idempotent — on Windows especially,
-    /// thousands of serial small-file creates were a dominant commit cost), then the chain
-    /// pushes fold serially. Returns the content hashes in input order.
+    /// Apply many [`Prepared`] versions at once, then fold the chain pushes serially. Returns
+    /// the content hashes in input order.
+    ///
+    /// Large batches (≥ [`PACK_MIN_OBJECTS`] distinct new objects — the whole-document first
+    /// commit, a many-tile edit) write **one pack file** instead of one file per object:
+    /// Windows charges every file *create* a per-file screening cost (Defender real-time
+    /// scanning, worse for low-reputation binaries like a freshly installed app), which
+    /// measured ~28s of a 33s initial large-canvas commit — parallelism doesn't help because
+    /// the cost is in the create itself. Small batches keep loose per-object files (simple,
+    /// and per-object dedup semantics stay byte-for-byte observable).
     pub fn commit_prepared_batch(&mut self, items: Vec<(String, Prepared)>) -> Result<Vec<String>> {
         use rayon::prelude::*;
         let objects = self.objects_dir();
-        items.par_iter().try_for_each(|(_, p)| match p {
-            Prepared::New { object, .. } => write_object(&objects, &object.0, &object.1),
-            Prepared::Dedup(_) => Ok(()),
-        })?;
+        // Distinct new objects not already stored (loose or packed) — identical content under
+        // two stream keys shares one object name, and re-commits dedup against disk.
+        let mut seen = std::collections::HashSet::new();
+        let new_objs: Vec<&(String, Vec<u8>)> = items
+            .iter()
+            .filter_map(|(_, p)| match p {
+                Prepared::New { object, .. } => Some(object),
+                Prepared::Dedup(_) => None,
+            })
+            .filter(|o| seen.insert(o.0.as_str()) && !self.object_exists(&o.0))
+            .collect();
+
+        if new_objs.len() >= PACK_MIN_OBJECTS {
+            self.packs.write_pack(&objects, &new_objs)?;
+        } else {
+            new_objs
+                .par_iter()
+                .try_for_each(|o| write_loose(&objects, &o.0, &o.1))?;
+        }
         Ok(items
             .into_iter()
             .map(|(key, p)| match p {
@@ -142,10 +175,26 @@ impl Repo {
             .collect())
     }
 
+    /// Whether `name` already exists in the store, loose (sharded or legacy flat) or packed.
+    fn object_exists(&self, name: &str) -> bool {
+        let objects = self.objects_dir();
+        objects.join(&name[..2]).join(name).exists()
+            || objects.join(name).exists()
+            || self.packs.contains(&objects, name)
+    }
+
+    /// Read an object's raw bytes: loose sharded, legacy flat, then packs.
+    fn read_object_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let objects = self.objects_dir();
+        match read_loose(&objects, name) {
+            Err(KvcError::MissingObject(_)) => self.packs.read(&objects, name),
+            other => other,
+        }
+    }
+
     fn push_version(&mut self, key: String, version: Version) -> String {
-        self.chains_dirty = true;
         let hash = version.hash.clone();
-        self.chains.0.entry(key).or_default().push(version);
+        self.chains.push(key, version);
         hash
     }
 
@@ -156,16 +205,14 @@ impl Repo {
     pub fn reconstruct(&self, key: &str, hash: &str) -> Result<Vec<u8>> {
         let chain = self
             .chains
-            .0
-            .get(key)
+            .chain(key)
             .ok_or_else(|| KvcError::NotTracked(key.to_string()))?;
         let v = chain
             .iter()
             .find(|x| x.hash == hash)
             .ok_or_else(|| KvcError::MissingObject(format!("{key}@{hash}")))?;
 
-        let objects = self.objects_dir();
-        let raw = read_object(&objects, &v.object)?;
+        let raw = self.read_object_bytes(&v.object)?;
         let bytes = match &v.base {
             None => zstd::decode_all(&raw[..])?,
             Some(base) => {
@@ -216,22 +263,209 @@ pub(crate) fn looks_compressed(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
 }
 
-/// Content-addressed write: object names are hashes, so an existing file is identical — skip it.
-fn write_object(objects: &Path, name: &str, data: &[u8]) -> Result<()> {
-    let path = objects.join(name);
-    if path.exists() {
+/// Content-addressed loose write into a 256-way sharded layout (`objects/<hash[..2]>/<name>`) —
+/// a flat directory with 100k+ tiny files degrades NTFS lookups and amplifies Defender scans.
+/// Names are hashes, so an existing file (sharded or legacy flat) is identical — skip it.
+pub(crate) fn write_loose(objects: &Path, name: &str, data: &[u8]) -> Result<()> {
+    let dir = objects.join(&name[..2]);
+    let path = dir.join(name);
+    if path.exists() || objects.join(name).exists() {
         return Ok(());
     }
+    std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
     std::fs::write(&path, data).map_err(|e| io_at(&path, e))
 }
 
-fn read_object(objects: &Path, name: &str) -> Result<Vec<u8>> {
-    let path = objects.join(name);
-    std::fs::read(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            KvcError::MissingObject(name.to_string())
-        } else {
-            io_at(&path, e)
+/// Read a loose object, preferring the sharded path; repos from before sharding keep their flat
+/// objects readable forever (no migration needed — content-addressed files never change).
+fn read_loose(objects: &Path, name: &str) -> Result<Vec<u8>> {
+    let sharded = objects.join(&name[..2]).join(name);
+    match std::fs::read(&sharded) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let flat = objects.join(name);
+            std::fs::read(&flat).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    KvcError::MissingObject(name.to_string())
+                } else {
+                    io_at(&flat, e)
+                }
+            })
         }
-    })
+        Err(e) => Err(io_at(&sharded, e)),
+    }
+}
+
+// --- pack files ---------------------------------------------------------------------------
+// One commit's new objects, batched into a single file. Format:
+// `KVCP1` | u32-LE index length | zstd(bincode(Vec<(name, rel_offset, len)>)) | payloads.
+// Offsets are relative to the end of the index; the file is named by the blake3 of its index
+// (which names every contained object), written temp-then-rename.
+
+/// Batches below this stay loose — dedup behavior stays file-observable for small commits and
+/// tests, and a pack of three tiles wouldn't pay for its indirection.
+pub const PACK_MIN_OBJECTS: usize = 32;
+
+const PACK_MAGIC: &[u8; 5] = b"KVCP1";
+
+pub(crate) fn pack_dir(objects: &Path) -> std::path::PathBuf {
+    objects.join("pack")
+}
+
+type PackIndex = std::collections::HashMap<String, (std::path::PathBuf, u64, u32)>;
+
+/// Lazily-loaded index over every pack file: object name -> (pack path, absolute offset, len).
+/// Interior mutability so reconstruct paths can fault it in from behind `&Repo` (rayon included).
+pub struct Packs(std::sync::Mutex<Option<PackIndex>>);
+
+impl Default for Packs {
+    fn default() -> Self {
+        Packs(std::sync::Mutex::new(None))
+    }
+}
+
+impl Packs {
+    fn with_index<T>(&self, objects: &Path, f: impl FnOnce(&mut PackIndex) -> T) -> T {
+        let mut guard = self.0.lock().unwrap();
+        let index = guard.get_or_insert_with(|| load_pack_indexes(objects));
+        f(index)
+    }
+
+    pub(crate) fn contains(&self, objects: &Path, name: &str) -> bool {
+        self.with_index(objects, |idx| idx.contains_key(name))
+    }
+
+    /// Drop the loaded index (packs changed on disk — GC rewrites); rebuilt on next use.
+    pub(crate) fn invalidate(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    pub(crate) fn read(&self, objects: &Path, name: &str) -> Result<Vec<u8>> {
+        let (path, off, len) = self
+            .with_index(objects, |idx| idx.get(name).cloned())
+            .ok_or_else(|| KvcError::MissingObject(name.to_string()))?;
+        read_exact_at(&path, off, len as usize)
+    }
+
+    /// Write `objs` as one pack file and register its entries in the loaded index.
+    pub(crate) fn write_pack(&self, objects: &Path, objs: &[&(String, Vec<u8>)]) -> Result<()> {
+        use std::io::Write;
+        let index: Vec<(String, u64, u32)> = {
+            let mut off = 0u64;
+            objs.iter()
+                .map(|(name, data)| {
+                    let e = (name.clone(), off, data.len() as u32);
+                    off += data.len() as u64;
+                    e
+                })
+                .collect()
+        };
+        let idx_plain =
+            bincode::serialize(&index).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+        let idx_bytes = zstd::encode_all(&idx_plain[..], 1)?;
+        let pack_name = crate::repo::hash_bytes(&idx_bytes);
+
+        let dir = pack_dir(objects);
+        std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
+        let path = dir.join(format!("{pack_name}.pack"));
+        if !path.exists() {
+            let tmp = path.with_extension("tmp");
+            {
+                let file = std::fs::File::create(&tmp).map_err(|e| io_at(&tmp, e))?;
+                let mut w = std::io::BufWriter::new(file);
+                w.write_all(PACK_MAGIC)?;
+                w.write_all(&(idx_bytes.len() as u32).to_le_bytes())?;
+                w.write_all(&idx_bytes)?;
+                for (_, data) in objs {
+                    w.write_all(data)?;
+                }
+                w.into_inner().map_err(|e| KvcError::Io(e.into_error()))?;
+            }
+            std::fs::rename(&tmp, &path).map_err(|e| io_at(&path, e))?;
+        }
+
+        // Keep the in-memory index coherent for reads later in this session.
+        let payload_base = (PACK_MAGIC.len() + 4 + idx_bytes.len()) as u64;
+        self.with_index(objects, |idx| {
+            for (name, off, len) in index {
+                idx.insert(name, (path.clone(), payload_base + off, len));
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Scan `objects/pack/*.pack` headers into one name -> location map. Corrupt or truncated
+/// packs are skipped (their objects then read as missing, surfacing as `MissingObject`).
+fn load_pack_indexes(objects: &Path) -> PackIndex {
+    let mut map = PackIndex::new();
+    let Ok(rd) = std::fs::read_dir(pack_dir(objects)) else {
+        return map;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "pack") {
+            continue;
+        }
+        let Some(entries) = read_pack_header(&path) else {
+            continue;
+        };
+        for (name, off, len) in entries {
+            map.insert(name, (path.clone(), off, len));
+        }
+    }
+    map
+}
+
+/// Parse one pack's header, returning entries with **absolute** file offsets.
+pub(crate) fn read_pack_header(path: &Path) -> Option<Vec<(String, u64, u32)>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 9];
+    f.read_exact(&mut head).ok()?;
+    if &head[..5] != PACK_MAGIC {
+        return None;
+    }
+    let idx_len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
+    let mut idx_bytes = vec![0u8; idx_len];
+    f.read_exact(&mut idx_bytes).ok()?;
+    let plain = zstd::decode_all(&idx_bytes[..]).ok()?;
+    let entries: Vec<(String, u64, u32)> = bincode::deserialize(&plain).ok()?;
+    let base = (9 + idx_len) as u64;
+    Some(
+        entries
+            .into_iter()
+            .map(|(n, off, len)| (n, base + off, len))
+            .collect(),
+    )
+}
+
+/// Positional read of exactly `len` bytes at `off` — thread-safe (no shared seek cursor), so
+/// parallel tile reconstructs can hit one pack concurrently.
+pub(crate) fn read_exact_at(path: &Path, off: u64, len: usize) -> Result<Vec<u8>> {
+    let f = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
+    let mut buf = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            f.seek_read(&mut buf[read..], off + read as u64)
+                .map_err(|e| io_at(path, e))?
+        };
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            f.read_at(&mut buf[read..], off + read as u64)
+                .map_err(|e| io_at(path, e))?
+        };
+        if n == 0 {
+            return Err(KvcError::MissingObject(format!(
+                "{} truncated at {off}+{read}",
+                path.display()
+            )));
+        }
+        read += n;
+    }
+    Ok(buf)
 }

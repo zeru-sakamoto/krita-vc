@@ -206,13 +206,16 @@ pub fn cap_png(png_bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 
 // --- persistent raster cache (.kvc/cache/) ----------------------------------------------
 // Final capped PNGs keyed by a content hash of everything that produced them, so entries are
-// immutable and never need invalidation. Both helpers are best-effort: a cold or unwritable
-// cache must never fail a diff. ponytail: no eviction — capped PNGs are small; add LRU pruning
-// if .kvc/cache ever matters.
+// immutable and never need invalidation. All helpers are best-effort: a cold or unwritable
+// cache must never fail a diff — and a pruned entry is just a regeneration, never an error.
 
-/// Read a cached capped PNG, or `None` on miss/any error.
+/// Read a cached capped PNG, or `None` on miss/any error. A hit refreshes the file's mtime so
+/// LRU pruning treats recently-served entries as hot.
 pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
-    std::fs::read(cache_dir.join(format!("{key}.png"))).ok()
+    let path = cache_dir.join(format!("{key}.png"));
+    let bytes = std::fs::read(&path).ok()?;
+    touch(&path);
+    Some(bytes)
 }
 
 /// Write a capped PNG into the cache (creating the dir for pre-cache repos).
@@ -221,9 +224,116 @@ pub fn cache_write(cache_dir: &std::path::Path, key: &str, png: &[u8]) {
     let _ = std::fs::write(cache_dir.join(format!("{key}.png")), png);
 }
 
+/// Best-effort mtime refresh (LRU signal). Failure is fine — the entry just ages normally.
+fn touch(path: &std::path::Path) {
+    if let Ok(f) = std::fs::File::options().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Delete the oldest cache PNGs (by mtime) until the cache fits `max_bytes`. Keeps the cache
+/// bounded — before this it grew for the life of the repo, one capped PNG per unique layer
+/// state ever viewed, which for large canvases is the biggest `.kvc/` append-only cost.
+/// Returns the number of bytes deleted.
+pub fn cache_prune(cache_dir: &std::path::Path, max_bytes: u64) -> u64 {
+    let Ok(rd) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((e.path(), m.modified().ok()?, m.len()))
+        })
+        .collect();
+    let mut total: u64 = entries.iter().map(|(_, _, len)| len).sum();
+    if total <= max_bytes {
+        return 0;
+    }
+    entries.sort_by_key(|(_, mtime, _)| *mtime);
+    let mut deleted = 0;
+    for (path, _, len) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            deleted += len;
+        }
+    }
+    deleted
+}
+
+/// How often a prune is allowed to actually scan the cache dir.
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// [`cache_prune`] rate-limited via a marker file's mtime, so the post-stream trigger doesn't
+/// re-stat the whole cache dir on every diff view.
+pub fn cache_prune_throttled(cache_dir: &std::path::Path, max_bytes: u64) {
+    let marker = cache_dir.join(".last-prune");
+    if let Ok(m) = std::fs::metadata(&marker) {
+        let recent = m
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|e| e < PRUNE_INTERVAL);
+        if recent {
+            return;
+        }
+    }
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(&marker, b"");
+    cache_prune(cache_dir, max_bytes);
+}
+
 /// Wrap already-encoded PNG bytes (e.g. mergedimage.png) in a `data:` URL.
 pub fn png_bytes_to_data_url(png: &[u8]) -> String {
     format!("data:image/png;base64,{}", base64(png))
+}
+
+// --- raster delivery ---------------------------------------------------------------------
+// With the desktop shell's `kvcimg` URI scheme registered (lib.rs), cached rasters are served
+// as plain PNG URLs the webview fetches directly: no base64 re-encode per view, no multi-MB
+// strings over IPC, and the browser cache handles repeat views (keys are content-addressed and
+// immutable). Outside the shell (tests, cache-write failure) everything falls back to the
+// data-URL path, which is always correct.
+
+static IMG_PROTOCOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from `lib.rs` after registering the `kvcimg` URI scheme.
+pub fn enable_img_protocol() {
+    IMG_PROTOCOL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn img_protocol_enabled() -> bool {
+    IMG_PROTOCOL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// URL for a cached raster PNG: a `kvcimg` URL when the scheme is live and the cache file is
+/// really on disk (the handler serves exactly that file), else an inline data URL.
+/// The repo root rides in the URL hex-encoded; the handler only serves roots that commands
+/// have registered (`commands::register_served_repo`), so the scheme can't read arbitrary paths.
+pub fn raster_url(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    key: &str,
+    png: &[u8],
+) -> String {
+    if img_protocol_enabled() && cache_dir.join(format!("{key}.png")).is_file() {
+        let root_hex = hex(root.to_string_lossy().as_bytes());
+        // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
+        // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
+        #[cfg(windows)]
+        return format!("http://kvcimg.localhost/{root_hex}/{key}.png");
+        #[cfg(not(windows))]
+        return format!("kvcimg://localhost/{root_hex}/{key}.png");
+    }
+    png_bytes_to_data_url(png)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Minimal standard base64 encoder (no padding omitted). ponytail: ~15 lines beats a dep.
@@ -325,6 +435,44 @@ mod tests {
             .unwrap();
         let info = reader.info();
         assert_eq!(info.width.max(info.height), MAX_RASTER_DIM);
+    }
+
+    #[test]
+    fn cache_prune_deletes_oldest_until_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        // 5 entries x 100 bytes with strictly increasing mtimes.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for i in 0..5u32 {
+            let p = cache.join(format!("entry{i}.png"));
+            std::fs::write(&p, [0u8; 100]).unwrap();
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(i as u64 * 60))
+                .unwrap();
+        }
+        // Budget for 2 entries -> the 3 oldest go, the 2 newest survive.
+        let deleted = cache_prune(cache, 250);
+        assert_eq!(deleted, 300);
+        assert!(!cache.join("entry0.png").exists());
+        assert!(!cache.join("entry1.png").exists());
+        assert!(!cache.join("entry2.png").exists());
+        assert!(cache.join("entry3.png").exists());
+        assert!(cache.join("entry4.png").exists());
+        // Under budget -> untouched.
+        assert_eq!(cache_prune(cache, 250), 0);
+        // A cache_read hit refreshes mtime, protecting the entry from the next prune.
+        std::fs::write(cache.join("old.png"), [0u8; 100]).unwrap();
+        let f = std::fs::File::options()
+            .write(true)
+            .open(cache.join("old.png"))
+            .unwrap();
+        f.set_modified(base).unwrap();
+        assert!(cache_read(cache, "old").is_some());
+        cache_prune(cache, 250);
+        assert!(
+            cache.join("old.png").exists(),
+            "a just-read entry must be treated as hot"
+        );
     }
 
     #[test]

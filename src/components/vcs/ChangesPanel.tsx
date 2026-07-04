@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { CircleNotch, Minus, Plus } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
-import type { WorkingChange } from "../../types";
+import type { Branch, WorkingChange } from "../../types";
+import { BranchBadge } from "./BranchBadge";
 import { FileStatusChip } from "./FileStatusChip";
 import { useRepository } from "../../lib/repository";
 import { inTauri } from "../../lib/tauri";
@@ -90,13 +91,16 @@ function Section({
  * state — this VCS commits the whole working tree, not a staging area.
  */
 export function ChangesPanel({
+  currentBranch,
   focusedFile,
   onFocusFile,
 }: {
+  currentBranch: Branch;
   focusedFile: string | null;
   onFocusFile: (path: string) => void;
 }) {
-  const { current, refreshNonce, refresh, saving, setSaving, setScanning } = useRepository();
+  const { current, refreshNonce, refresh, saving, setSaving, setBusyMessage, setScanning } =
+    useRepository();
   const [items, setItems] = useState<WorkingChange[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -139,6 +143,7 @@ export function ChangesPanel({
   const commit = async () => {
     if (!message.trim() || saving || !path) return;
     setSaving(true);
+    setBusyMessage("Committing changes — please wait…");
     setError(null);
     try {
       await invoke("commit_snapshot", {
@@ -152,6 +157,7 @@ export function ChangesPanel({
       setError(String(e));
     } finally {
       setSaving(false);
+      setBusyMessage(null);
     }
   };
 
@@ -166,6 +172,10 @@ export function ChangesPanel({
 
   return (
     <div className="flex flex-col">
+      <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-3 text-[11px] text-text-muted">
+        Saving to
+        <BranchBadge branch={currentBranch} />
+      </div>
       <Section
         title="Staged"
         items={staged}

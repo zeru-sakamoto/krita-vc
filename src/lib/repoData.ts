@@ -123,13 +123,14 @@ export interface DiffResult {
  */
 /**
  * Session cache of `commit_diff` results, so re-clicking a commit renders instantly instead of
- * re-running the backend diff. Commits are immutable, so entries only invalidate via `nonce`
- * (bumped after any mutating command). Same LRU pattern/cap as `layerCache` below.
+ * re-running the backend diff. Commits are immutable by id (and so is their parent tree), so
+ * entries never invalidate — mutations don't touch the key, and a commit removed by undo just
+ * ages out of the LRU. Same LRU pattern/cap as `layerCache` below.
  */
 const diffCache = new Map<string, DiffEntry[]>();
 const DIFF_CACHE_MAX = 20;
 
-export function useCommitDiff(path: string, commitId: string | null, nonce = 0): DiffResult {
+export function useCommitDiff(path: string, commitId: string | null): DiffResult {
   const [result, setResult] = useState<DiffResult>({ entries: [], error: null, loading: false });
 
   useEffect(() => {
@@ -141,7 +142,7 @@ export function useCommitDiff(path: string, commitId: string | null, nonce = 0):
       setResult({ entries: [], error: null, loading: false });
       return;
     }
-    const key = `${path}|${commitId}|${nonce}`;
+    const key = `${path}|${commitId}`;
     const cached = diffCache.get(key);
     if (cached) {
       diffCache.delete(key);
@@ -165,7 +166,7 @@ export function useCommitDiff(path: string, commitId: string | null, nonce = 0):
     return () => {
       cancelled = true;
     };
-  }, [path, commitId, nonce]);
+  }, [path, commitId]);
 
   return result;
 }
@@ -210,8 +211,9 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
  */
 /**
  * Loaded layer rasters keyed by request identity, so revisiting a commit/file doesn't
- * re-rasterize on the backend. `nonce` in the key invalidates after any mutating command
- * (commit/rollback/undo). Capped small — entries are multi-MB data-URL payloads.
+ * re-rasterize on the backend. Committed layers are immutable by commit id, so their keys
+ * ignore `nonce` and survive mutations; only the *working* side keys on `nonce`, since the
+ * working copy genuinely changes. Capped small — entries are multi-MB data-URL payloads.
  */
 const layerCache = new Map<string, Map<string, ArtLayer>>();
 const LAYER_CACHE_MAX = 20;
@@ -232,7 +234,7 @@ export function useArtLayers(
       setState({ layers: null, loading: false });
       return;
     }
-    const key = `${path}|${file}|${working ? "working" : commitId}|${nonce}`;
+    const key = working ? `${path}|${file}|working|${nonce}` : `${path}|${file}|${commitId}`;
     const cached = layerCache.get(key);
     if (cached) {
       // Refresh insertion order so hot entries survive eviction (Map iterates oldest-first).

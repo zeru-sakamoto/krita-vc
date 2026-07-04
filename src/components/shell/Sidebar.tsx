@@ -181,7 +181,13 @@ export function Sidebar({
           </>
         )}
 
-        {view === "changes" && <ChangesPanel focusedFile={focusedFile} onFocusFile={onFocusFile} />}
+        {view === "changes" && (
+          <ChangesPanel
+            currentBranch={currentBranch}
+            focusedFile={focusedFile}
+            onFocusFile={onFocusFile}
+          />
+        )}
 
         {view === "branches" && <BranchesPanel branches={branches} onShowChanges={onShowChanges} />}
       </DockerPanel>

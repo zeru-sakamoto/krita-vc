@@ -93,8 +93,19 @@ pub fn commit_kra(
         .map(|m| m.entries.iter().map(|e| (e.path(), e)).collect())
         .unwrap_or_default();
     let mut zip = ZipArchive::new(Cursor::new(file_bytes)).map_err(zip_err)?;
-    let mut entries = Vec::new();
 
+    // Pass 1 (serial — the zip reader is): collect each entry as either a verbatim reuse of the
+    // previous manifest or its inflated bytes for processing below.
+    enum EntryWork {
+        Reuse(KraEntry),
+        Fresh {
+            name: String,
+            crc32: u32,
+            size: u64,
+            buf: Vec<u8>,
+        },
+    }
+    let mut work = Vec::new();
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
         if f.is_dir() {
@@ -108,7 +119,7 @@ pub fn commit_kra(
         if size > 0 {
             if let Some(pe) = prev_by_name.get(name.as_str()) {
                 if pe.crc_size() == (crc32, size) {
-                    entries.push((*pe).clone());
+                    work.push(EntryWork::Reuse((*pe).clone()));
                     drop(f);
                     continue;
                 }
@@ -116,54 +127,95 @@ pub fn commit_kra(
         }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        drop(f);
-
-        if tiles::is_tiled(&buf) {
-            let block = tiles::parse(&buf)?;
-            // Prepare every tile in parallel (the CPU cost: reconstruct base + bsdiff + verify, or
-            // zstd for a fresh tile), then batch-commit: object writes run in parallel too, only
-            // the chain pushes fold serially. Each tile is a distinct stream key, so nothing races.
-            let repo_ref: &Repo = repo;
-            let items: Vec<(String, crate::delta::Prepared)> = block
-                .tiles
-                .par_iter()
-                .map(|t| {
-                    let key = tile_key(relpath, &name, t.x, t.y);
-                    let p = repo_ref.prepare_stream(&key, &t.data)?;
-                    Ok((key, p))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let hashes = repo.commit_prepared_batch(items)?;
-            let refs = block
-                .tiles
-                .iter()
-                .zip(hashes)
-                .map(|(t, hash)| TileRef {
-                    x: t.x,
-                    y: t.y,
-                    compression: t.compression.clone(),
-                    hash,
-                })
-                .collect();
-            entries.push(KraEntry::Tiled {
-                path: name,
-                header: block.header,
-                tiles: refs,
-                crc32,
-                size,
-            });
-        } else {
-            let stored = name == "mimetype";
-            let hash = repo.store_stream(&entry_key(relpath, &name), &buf)?;
-            entries.push(KraEntry::Raw {
-                path: name,
-                blob: hash,
-                stored,
-                crc32,
-                size,
-            });
-        }
+        work.push(EntryWork::Fresh {
+            name,
+            crc32,
+            size,
+            buf,
+        });
     }
+
+    // Pass 2 (parallel): prepare every changed entry — all layers' tiles AND raw entries
+    // (mergedimage.png's zstd is the big one) — in a single rayon pass, so a multi-layer edit
+    // costs ~max(layer) instead of sum(layers). `prepare_stream` is `&self` and every stream
+    // key appears once per commit, so parallel prepare can't race; only the fold needs `&mut`.
+    let repo_ref: &Repo = repo;
+    let prepared: Vec<(KraEntry, Vec<(String, crate::delta::Prepared)>)> = work
+        .into_par_iter()
+        .map(
+            |w| -> Result<(KraEntry, Vec<(String, crate::delta::Prepared)>)> {
+                match w {
+                    EntryWork::Reuse(e) => Ok((e, Vec::new())),
+                    EntryWork::Fresh {
+                        name,
+                        crc32,
+                        size,
+                        buf,
+                    } => {
+                        if tiles::is_tiled(&buf) {
+                            let block = tiles::parse(&buf)?;
+                            drop(buf); // tiles own their bytes now — don't hold both copies
+                            let items: Vec<(String, crate::delta::Prepared)> = block
+                                .tiles
+                                .par_iter()
+                                .map(|t| {
+                                    let key = tile_key(relpath, &name, t.x, t.y);
+                                    let p = repo_ref.prepare_stream(&key, &t.data)?;
+                                    Ok((key, p))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let refs = block
+                                .tiles
+                                .iter()
+                                .zip(&items)
+                                .map(|(t, (_, p))| TileRef {
+                                    x: t.x,
+                                    y: t.y,
+                                    compression: t.compression.clone(),
+                                    hash: p.hash().to_string(),
+                                })
+                                .collect();
+                            Ok((
+                                KraEntry::Tiled {
+                                    path: name,
+                                    header: block.header,
+                                    tiles: refs,
+                                    crc32,
+                                    size,
+                                },
+                                items,
+                            ))
+                        } else {
+                            let stored = name == "mimetype";
+                            let key = entry_key(relpath, &name);
+                            let p = repo_ref.prepare_stream(&key, &buf)?;
+                            let blob = p.hash().to_string();
+                            Ok((
+                                KraEntry::Raw {
+                                    path: name,
+                                    blob,
+                                    stored,
+                                    crc32,
+                                    size,
+                                },
+                                vec![(key, p)],
+                            ))
+                        }
+                    }
+                }
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    // Pass 3 (serial fold): one batch commit for everything — object writes parallel inside,
+    // chain pushes serial. Entries keep their original zip order.
+    let mut entries = Vec::with_capacity(prepared.len());
+    let mut items = Vec::new();
+    for (entry, mut its) in prepared {
+        entries.push(entry);
+        items.append(&mut its);
+    }
+    repo.commit_prepared_batch(items)?;
 
     let manifest = serde_json::to_vec(&KraManifest { entries })
         .map_err(|e| KvcError::BadIndex(e.to_string()))?;
@@ -693,7 +745,9 @@ pub fn layer_raster(
         refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
     let key = raster_cache_key(&entry_path, &mut key_tiles, width, height);
     if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
+        return Ok(Some(crate::raster::raster_url(
+            &repo.root, &cache_dir, &key, &png,
+        )));
     }
     // Reconstruct + LZF-decode tiles in parallel (nested rayon inside the per-layer par_iter is
     // fine — one work-stealing pool), then blit serially into the shared canvas.
@@ -720,7 +774,9 @@ pub fn layer_raster(
     let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
     let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
     crate::raster::cache_write(&cache_dir, &key, &png);
-    Ok(Some(crate::raster::png_bytes_to_data_url(&png)))
+    Ok(Some(crate::raster::raster_url(
+        &repo.root, &cache_dir, &key, &png,
+    )))
 }
 
 /// Reconstruct a single non-tiled archive entry's raw bytes from a manifest (cheap — avoids
@@ -977,8 +1033,17 @@ impl WorkingKra {
             .map(|(t, h)| (t.x, t.y, h.as_str()))
             .collect();
         let key = raster_cache_key(entry_path, &mut key_tiles, width, height);
+        // The repo root is two levels up from `.kvc/cache` — derived here so the
+        // test-facing signature (cache_dir only) stays unchanged.
+        let root = cache_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(cache_dir)
+            .to_path_buf();
         if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
-            return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
+            return Ok(Some(crate::raster::raster_url(
+                &root, cache_dir, &key, &png,
+            )));
         }
         // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
         let decoded: Vec<(i64, i64, Vec<u8>)> = tiles
@@ -995,7 +1060,9 @@ impl WorkingKra {
         let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
         let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
         crate::raster::cache_write(cache_dir, &key, &png);
-        Ok(Some(crate::raster::png_bytes_to_data_url(&png)))
+        Ok(Some(crate::raster::raster_url(
+            &root, cache_dir, &key, &png,
+        )))
     }
 }
 
@@ -1063,6 +1130,31 @@ impl KraSource<'_> {
             }
         }
     }
+}
+
+/// Every `(stream key, content hash)` a manifest version references — the GC mark set for one
+/// committed `.kra`: its raw entry blobs and every tile. The manifest's own stream is the
+/// caller's to add (it knows the manifest hash).
+pub fn referenced_streams(relpath: &str, m: &KraManifest) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for e in &m.entries {
+        match e {
+            KraEntry::Raw { path, blob, .. } => {
+                out.push((entry_key(relpath, path), blob.clone()));
+            }
+            KraEntry::Tiled { path, tiles, .. } => {
+                for t in tiles {
+                    out.push((tile_key(relpath, path, t.x, t.y), t.hash.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The manifest stream's key for a `.kra` path (public for GC marking).
+pub fn manifest_stream_key(relpath: &str) -> String {
+    manifest_key(relpath)
 }
 
 // --- helpers ---------------------------------------------------------------------------

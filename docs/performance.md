@@ -30,10 +30,13 @@ Independent per-layer/per-tile work is farmed across cores instead of running se
 
 - **Layer rasterization** — `art_diff_dto` rasterizes all of a document's layers with
   `par_iter()` (`commands.rs`); order is preserved via indexed collect.
-- **Tile preparation on commit** — `commit_kra` (`kra.rs`) runs `prepare_stream` (the CPU-heavy
-  reconstruct+bsdiff+verify/zstd) over every tile with `par_iter()`, then folds the results into
-  the repo serially with `commit_prepared` — each tile is a distinct chain key, so parallel
-  prepare can't race, only the final write needs `&mut`.
+- **Whole-commit preparation** — `commit_kra` (`kra.rs`) runs in three passes: a serial zip walk
+  (the reader is inherently serial; unchanged entries skip via crc32+size), then **one** rayon
+  pass over every changed entry — all layers' tiles *and* raw entries like `mergedimage.png` —
+  through `prepare_stream` (the CPU-heavy reconstruct+bsdiff+verify/zstd), then a single serial
+  fold (`commit_prepared_batch`). A multi-layer edit costs ~max(layer) instead of sum(layers);
+  each stream key appears once per commit, so parallel prepare can't race — only the fold needs
+  `&mut`.
 - **`.kra` reconstruction** — `reconstruct_kra` (`kra.rs`) resolves every manifest entry's bytes
   (tile-chain replay included) with `par_iter()` before writing the zip serially in manifest
   order; branch switch/rollback normally take the cheaper incremental path (`materialize_kra`,
@@ -58,6 +61,15 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Scanner fast path** (`scan.rs`) — a tracked file whose size+mtime still match the index
   (`TrackedFile.size`/`mtime`, `repo::size_mtime`, nanosecond resolution) is assumed unchanged and
   never read or hashed. Big `.kra` files are the case this matters for.
+- **Scan→commit hash handoff** (`scan::scan_detailed`) — the scan already read and blake3-hashed
+  every changed file; `commit_snapshot` reuses that hash (plus size/mtime) for the index entry
+  instead of re-reading and re-hashing, dropping a second full read + multi-core hash per big
+  `.kra` per commit. (`scan()` stays as a thin `(path, status)` mapper for the status paths.)
+- **Rollback without re-commit** (`commit::rollback_to_commit`) — a rollback used to materialize
+  the target tree, then run a full `commit_snapshot` (re-scan, re-read, re-decompose every
+  restored `.kra`) purely to rediscover content hashes already recorded in the target tree. The
+  commit is now synthesized directly from the target-vs-current tree diff — no scan, no `.kra`
+  decompose, zero object writes — roughly halving rollback time.
 - **Delta-chain heuristic** (`delta.rs::looks_compressed` + a 64 KB floor) — `bsdiff` is skipped
   for small streams (a chain-walk reconstruct + suffix-sort to save a few KB isn't worth it) and
   for already-compressed payloads (PNG/zip/zstd magic — a patch against compressed bytes comes out
@@ -80,9 +92,10 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   working `.kra` straight from an in-memory `ZipArchive`; no `bsdiff`, no chain reconstruct, no
   object writes. Older code staged the working file into the object store just to reuse the
   rasterizer — viewing a diff should never write.
-- **`Repo::open_light`** — skips loading the chains file (by far the largest state file — every
-  version of every tile stream ever committed) for read paths that never touch storage
-  (`scan_repository`, `list_commits`).
+- **`Repo::open_light`** — skips chains entirely (even the legacy-monolith parse a pre-sharding
+  repo would pay) for read paths that never touch storage (`scan_repository`, `list_commits`).
+  With sharded chains a full `Repo::open` is nearly as cheap — shards load on first touch — but
+  light opens keep the invariant explicit.
 - **Incremental `.kra` materialization on switch/merge/rollback** — `kra::materialize_kra`
   rebuilds the target version *out of the working file*: entries identical between the current
   and target manifests are `raw_copy_file`d from the on-disk zip (no store reads, no
@@ -90,9 +103,9 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   changed tiled entry lifts its unchanged tiles from the working copy in memory — only tiles
   whose content differs replay from the object store. Switch cost tracks the diff between
   branches, not document size. Any mismatch or error falls back to the full `reconstruct_kra`.
-- **Chains skipped when clean** — `Repo::save` only rewrites the chains file when a new stream
-  version was actually committed (`chains_dirty`); switch, merge, and undo mutate only
-  index/commits/branches, so they no longer pay an O(history) state rewrite.
+- **Chains skipped when clean** — `Repo::save` only rewrites chain shards a commit actually
+  dirtied (`ChainStore` per-shard dirty tracking); switch, merge, and undo mutate only
+  index/commits/branches, so they never pay a chains rewrite at all.
 - **Read-path integrity check dropped** — `reconstruct` no longer re-hashes rebuilt bytes; every
   patch is already round-trip-verified when it's *written* (`prepare_stream`), and objects are
   content-addressed, so a second hash on every read was pure redundancy on the hottest loop in the
@@ -115,6 +128,32 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   deflates) any entry whose bytes already look compressed (`delta::looks_compressed`), since
   deflating a PNG/zstd/zip payload a second time buys nothing.
 
+## Raster delivery (`kvcimg` URI scheme)
+
+Cached diff rasters used to ship as base64 data-URLs: every layer view — even a full disk-cache
+hit — paid a file read → base64 re-encode (+33% size) → a multi-MB string over Tauri IPC → V8
+heap retention in the frontend caches. The desktop shell now registers a `kvcimg` URI scheme
+(`lib.rs`; handler `commands::serve_raster`), and `raster::raster_url` emits plain URLs the
+webview fetches directly from `.kvc/cache/` — no base64, no IPC payload, and since keys are
+content-addressed and immutable the response carries `Cache-Control: immutable`, so repeat
+views are browser-cache hits with zero backend work. The handler serves nothing but
+`<registered repo root>/.kvc/cache/<hex key>.png` for roots the diff commands have registered
+(`register_served_repo`) — it cannot be steered at arbitrary paths. Outside the shell (tests,
+a failed cache write) everything falls back to the data-URL path, which is always correct.
+Frontend session caches now hold tiny URL strings instead of multi-MB base64 payloads.
+
+## Storage reclamation (`gc.rs`)
+
+Nothing on the hot path ever deletes stored data (undo and branch-delete orphan objects by
+design — content-addressed orphans are harmless), so a long-lived repo only grows. The
+user-facing "Clean up storage" action (`cleanup_repository`, mark-and-sweep in `gc.rs`)
+reclaims everything unreachable from any branch tip: unreachable commits leave the log, dead
+chain versions leave their shards, dead loose objects are deleted, and packs are dropped
+(fully dead) or rewritten with survivors only. Patch **bases are closed over** — a live patch
+keeps its whole chain back to the full snapshot. State files are rewritten **before** any
+object is deleted, so a crash mid-sweep leaves only re-collectable orphans, never a dangling
+reference. A dry-run mode powers the confirmation dialog ("about N MB can be freed").
+
 ## Caching across requests
 
 - **Content-addressed disk cache** (`.kvc/cache/`, `raster::cache_read`/`cache_write`) — every
@@ -124,20 +163,46 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   the committed/working diff paths, and a repeat view — even after an app restart — skips
   reconstruct/decode/encode entirely.
 - **Frontend session caches** (`repoData.ts`) — `diffCache` (commit-diff results) and
-  `layerCache` (streamed layer sets) are small LRU maps (cap 20) keyed by request identity
-  including `nonce`, so re-visiting a commit renders instantly without re-invoking the backend.
+  `layerCache` (streamed layer sets) are small LRU maps (cap 20) keyed by request identity.
+  Committed entries key on `path|commitId` only — commits are immutable by id, so a mutation
+  (commit/rollback/undo) no longer cold-starts every previously viewed diff; only the *working*
+  layer key includes the refresh `nonce`, since the working copy genuinely changes.
   Cancelled/partial layer requests are never cached (a torn-down effect's `received` map may be
   incomplete — caching it would poison the key for later visits).
+- **Bounded raster cache** (`raster::cache_prune`) — `.kvc/cache/` was append-only for the life
+  of the repo; it now holds a size budget (`Config.cacheMaxBytes`, default 512 MB). Reads touch
+  the entry's mtime so hot entries survive, and an oldest-first prune runs after layer streaming,
+  rate-limited by a marker file (`cache_prune_throttled`). A pruned entry is a regeneration,
+  never an error.
 
 ## State-file writes
 
 - **Compact JSON** (`repo.rs::write_json`) — `.kvc/*.json` is machine state, not something a human
   reads; `serde_json::to_vec` instead of `to_vec_pretty`.
-- **Binary chains file** (`repo.rs::write_chains`/`read_chains`) — chains are rewritten in full on
-  every commit and parsed on every `Repo::open`, and dwarf the other state files, so they moved
-  from JSON to zstd-compressed bincode (`chains.bin`): an order of magnitude faster to
-  parse/serialize *and* several times smaller on disk. Legacy `chains.json` repos are read
-  transparently and migrated by the next commit's save.
+- **Per-file chain shards, loaded lazily** (`repo.rs::ChainStore`) — the chains store (every
+  version of every delta stream) was one monolithic file, rewritten in full on every commit and
+  parsed in full on every `Repo::open`: the one cost that grew with *total repo history* instead
+  of with the change at hand. It is now sharded one file per tracked file
+  (`.kvc/chains/<blake3(relpath)[..16]>.bin`, same zstd-bincode encoding), faulted in on first
+  touch and flushed per-dirty-shard — a commit rewrites exactly the shards of the files it
+  touched, and opens parse nothing up front. Repos still carrying a monolithic `chains.bin` (or
+  the older `chains.json`) are read transparently and split on their next save, which then
+  retires the monolith; until that delete the monolith stays the source of truth, so a crash
+  mid-split just re-runs it.
+- **Sharded objects directory** (`delta.rs::write_loose`/`read_loose`) — loose objects land in
+  `objects/<hash[..2]>/` (256-way fan-out) instead of one flat directory: 100k+ tiny files in a
+  single folder degrade NTFS lookups and amplify Defender scans. Reads fall back to the flat
+  path, so pre-sharding repos never migrate.
+- **Pack-per-commit object writes** (`delta.rs::Packs`, `commit_prepared_batch`) — a batch of
+  ≥32 distinct new objects (the whole-document first commit, a many-tile edit) is written as
+  **one** `objects/pack/<hash>.pack` file (header + compressed index + concatenated payloads)
+  instead of one file per object. Measured on Windows: the per-file *create* cost (Defender
+  real-time screening, worst for low-reputation binaries like a freshly installed app) was ~28s
+  of a 33s initial large-canvas commit, and parallelism can't hide it because the cost is in
+  the create itself. Reads try loose (sharded, then legacy flat), then a lazily-built in-memory
+  index over all pack headers with thread-safe positional reads — parallel tile reconstructs
+  hit one pack concurrently. Small batches stay loose, so per-object dedup stays observable
+  and tiny commits pay no pack indirection.
 
 ## Build configuration
 
@@ -150,6 +215,7 @@ opt-level = 1
 opt-level = 3
 [profile.release]
 lto = "thin"
+codegen-units = 1
 ```
 
 `tauri dev` runs the same image/compression hot loops as a release build. Fully unoptimized
@@ -172,6 +238,8 @@ Marked inline where they occur — noted here as a single index:
   changed entry); upgrade path is hashing the compressed bytes instead.
 - Delta patch/snapshot thresholds (64 KB, chain length 20) are untuned constants — revisit if
   storage size ever matters more than it does now.
-- `.kvc/cache/` has no eviction — capped PNGs are small; add LRU pruning if that stops being true.
 - Raster downscaling is nearest-neighbour, not a box filter — cheap and adequate for a scaled-down
   preview; revisit if a diff ever needs pixel-accurate zoom.
+- Packs are append-only per commit and never consolidated; a long history of medium commits
+  accumulates many small packs (each a header parse on first read). Upgrade path: a repack step
+  in GC.

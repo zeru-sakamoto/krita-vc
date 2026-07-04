@@ -36,6 +36,80 @@ where
         .map_err(|e| e.to_string())
 }
 
+// --- kvcimg raster delivery ---------------------------------------------------------------
+// Roots the `kvcimg` URI scheme is allowed to serve from. Only diff commands register here,
+// so the scheme can never be steered at an arbitrary path — and even for registered roots it
+// serves nothing but `<root>/.kvc/cache/<hex key>.png`.
+
+static SERVED_REPOS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn register_served_repo(path: &str) {
+    SERVED_REPOS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_string());
+}
+
+fn is_served_repo(path: &str) -> bool {
+    SERVED_REPOS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .contains(path)
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || s.is_empty() {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Serve one cached raster for the `kvcimg` scheme: path shape `/<hex repo root>/<key>.png`,
+/// where `key` is a hex content hash. Anything malformed, unregistered, or missing is a 404.
+pub fn serve_raster(uri: &tauri::http::Uri) -> tauri::http::Response<Vec<u8>> {
+    let not_found = || {
+        tauri::http::Response::builder()
+            .status(404)
+            .body(Vec::new())
+            .expect("static 404 response")
+    };
+    let path = uri.path();
+    let mut parts = path.trim_start_matches('/').splitn(2, '/');
+    let (Some(root_hex), Some(file)) = (parts.next(), parts.next()) else {
+        return not_found();
+    };
+    let Some(key) = file.strip_suffix(".png") else {
+        return not_found();
+    };
+    if key.is_empty() || key.len() > 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return not_found();
+    }
+    let Some(root) = hex_decode(root_hex).and_then(|b| String::from_utf8(b).ok()) else {
+        return not_found();
+    };
+    if !is_served_repo(&root) {
+        return not_found();
+    }
+    let cache_dir = crate::repo::cache_dir(Path::new(&root));
+    // cache_read also refreshes the entry's mtime, protecting served images from pruning.
+    let Some(png) = crate::raster::cache_read(&cache_dir, key) else {
+        return not_found();
+    };
+    tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", "image/png")
+        // Keys are content-addressed and immutable — let the browser cache do the rest.
+        .header("Cache-Control", "public, max-age=31536000, immutable")
+        .body(png)
+        .unwrap_or_else(|_| not_found())
+}
+
 #[tauri::command]
 pub async fn init_repository(path: String) -> std::result::Result<(), String> {
     run(move || Repo::init(Path::new(&path))).await
@@ -56,6 +130,21 @@ pub async fn open_repository(path: String) -> std::result::Result<(), String> {
 #[tauri::command]
 pub async fn delete_repository(path: String) -> std::result::Result<(), String> {
     run(move || Repo::delete(Path::new(&path))).await
+}
+
+/// Reclaim storage unreachable from any branch tip (orphans from undo, deleted branches).
+/// `dry_run` computes the report without touching anything — the UI shows it before asking
+/// the user to confirm the real pass.
+#[tauri::command]
+pub async fn cleanup_repository(
+    path: String,
+    dry_run: bool,
+) -> std::result::Result<crate::gc::GcReport, String> {
+    run(move || {
+        let mut repo = Repo::open(Path::new(&path))?;
+        crate::gc::collect_garbage(&mut repo, dry_run)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -373,13 +462,18 @@ fn composite_data_url(
     let key = content_hash.map(|h| kra::composite_cache_key(&h));
     if let Some(k) = &key {
         if let Some(png) = crate::raster::cache_read(&cache_dir, k) {
-            return Ok(Some(crate::raster::png_bytes_to_data_url(&png)));
+            return Ok(Some(crate::raster::raster_url(
+                &repo.root, &cache_dir, k, &png,
+            )));
         }
     }
     let Some(b) = bytes()? else { return Ok(None) };
     let capped = crate::raster::cap_png(&b);
     if let Some(k) = &key {
         crate::raster::cache_write(&cache_dir, k, &capped);
+        return Ok(Some(crate::raster::raster_url(
+            &repo.root, &cache_dir, k, &capped,
+        )));
     }
     Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
 }
@@ -641,6 +735,7 @@ pub async fn commit_diff(
     commit_id: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run(move || {
+        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
         let commit = repo
             .commits
@@ -676,6 +771,7 @@ pub async fn commit_layers(
     on_layer: tauri::ipc::Channel<LayerDto>,
 ) -> std::result::Result<(), String> {
     run(move || {
+        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
         let commit = repo
             .commits
@@ -703,6 +799,8 @@ pub async fn commit_layers(
                 let _ = on_layer.send(dto);
             }),
         )?;
+        // Off the UI's critical path (all layers already streamed) and rate-limited inside.
+        crate::raster::cache_prune_throttled(&repo.cache_dir(), repo.config.cache_max_bytes);
         Ok(())
     })
     .await
@@ -752,6 +850,7 @@ pub async fn working_diff(
     file: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run(move || {
+        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
         if !file.to_lowercase().ends_with(".kra") {
             let old = last_committed(&repo, &file);
@@ -794,6 +893,7 @@ pub async fn working_layers(
         if !file.to_lowercase().ends_with(".kra") {
             return Ok(());
         }
+        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
         working_art_dto(
             &repo,
@@ -803,6 +903,8 @@ pub async fn working_layers(
                 let _ = on_layer.send(dto);
             }),
         )?;
+        // Off the UI's critical path (all layers already streamed) and rate-limited inside.
+        crate::raster::cache_prune_throttled(&repo.cache_dir(), repo.config.cache_max_bytes);
         Ok(())
     })
     .await
