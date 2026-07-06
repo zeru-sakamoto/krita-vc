@@ -87,25 +87,44 @@ Renders one state's composited SVG over a **checkerboard matte** (so layer trans
 The SVG is built inline (`dangerouslySetInnerHTML`) rather than via `<img>` so blend modes and
 filters composite correctly. `ArtCanvas` is `React.memo`'d so the slider divider drag / zoom-pan
 re-renders of its parent don't re-enter it when props are unchanged. When `overlay` is set, it
-appends a change-highlight overlay **in the same viewBox** (so it aligns with the art):
+appends a change-highlight overlay **in the same viewBox** (so it aligns with the art).
 
-- **pixels mode** (default) — the backend's changed-pixel mask (`ArtDiff.diffImage`, an `<image>`
-  sized to the viewBox): transparent except where the before/after composites differ. Rendered three
-  ways for legibility on busy artwork (`pixelOverlay`): a flat accent tint of the changed pixels, a
-  diagonal **hatch pattern** masked to those same pixels (the alternating stripes give contrast a
-  flat tint can't against arbitrary underlying color), and a **dashed outline** that hugs the changed
-  pixels' silhouette. The outline is a vector path (`ArtDiff.diffOutline`, normalized 0..1) traced in
-  Rust (`raster::outline_from_grid`, marching the changed/unchanged cell boundary of a downsampled
-  grid into closed loops) — *not* a bounding box; the frontend scales it to the viewBox and strokes
-  it dashed with `non-scaling-stroke` (constant on-screen dash size at any zoom). All plain
+The overlay data (`diffImage`/`diffOutline`/`regions`) is passed as **explicit props**, not read
+off `diff` — `ArtDiffView` chooses the source from the current selection: the whole-file composite
+highlight for the **Composite** view, or the **selected layer's own** highlight when a single layer
+is focused (see "Per-layer highlights" below). A layer with no highlight of its own (unchanged,
+added, removed, or still streaming) yields empty props → the overlay simply doesn't draw. Only
+`diff.width`/`diff.height` (the viewBox) still come from `diff`.
+
+- **pixels mode** (default) — the changed-pixel mask (`diffImage`, an `<image>` sized to the
+  viewBox): transparent except where before/after differ. Rendered three ways for legibility on busy
+  artwork (`pixelOverlay`): a flat accent tint of the changed pixels, a diagonal **hatch pattern**
+  masked to those same pixels (the alternating stripes give contrast a flat tint can't against
+  arbitrary underlying color), and a **dashed outline** that hugs the changed pixels' silhouette. The
+  outline is a vector path (`diffOutline`, normalized 0..1) traced in Rust
+  (`raster::outline_from_grid`, marching the changed/unchanged cell boundary of a downsampled grid
+  into closed loops) — *not* a bounding box; the frontend scales it to the viewBox and strokes it
+  dashed with `non-scaling-stroke` (constant on-screen dash size at any zoom). All plain
   fills/patterns/masks/paths — GPU-composited, no filters, rebuilt only when the memoized SVG changes
-  (never on zoom/pan). Because both mask and outline ride on the first `commit_diff` (computed off the
-  composite), they appear immediately — no wait for the per-layer stream. On a cache hit the outline
-  is re-traced from the cached mask PNG (`raster::outline_from_mask_png`), so no sibling cache file.
-- **box mode** — a subtle filled rect + **bold corner brackets** per `ArtDiff.regions` entry (+
-  optional labels), a coarse tile-bbox fallback. Strokes use `vector-effect="non-scaling-stroke"`
-  so they stay legible in screen pixels even when a large canvas is shown fit-to-pane (plain
-  document-space dashes would otherwise go sub-pixel and disappear).
+  (never on zoom/pan). On a cache hit the outline is re-traced from the cached mask PNG
+  (`raster::outline_from_mask_png`), so no sibling cache file.
+- **box mode** — a subtle filled rect + **bold corner brackets** per `regions` entry (+ optional
+  labels), a coarse bbox fallback. Region coords are **normalized 0..1** of the viewBox (both the
+  composite's tile-bbox and a layer's own changed-pixel bbox) — `boxOverlay` scales them by
+  width/height, so a region must never be pre-scaled to pixels (doing so overflows past the
+  bottom-right of the canvas). Strokes use `vector-effect="non-scaling-stroke"` so they stay legible
+  in screen pixels even when a large canvas is shown fit-to-pane (plain document-space dashes would
+  otherwise go sub-pixel and disappear).
+
+**Per-layer highlights.** The composite's highlight (`ArtDiff.diffImage`/`diffOutline`/`regions`)
+ships with the first `commit_diff` and drives the **Composite** view. Each **modified** layer
+additionally carries its *own* `diffImage`/`diffOutline`/`regions` on `ArtLayer`, diffed in Rust
+from that layer's before/after rasters (`commands::layer_diff_overlay` → `raster::diff_overlay_full`,
+one changed-pixel grid → mask + outline + normalized bbox), so selecting a layer shows only *its*
+changed pixels rather than the whole-file silhouette painted on every layer. These are computed
+during the per-layer stream (reusing pixels already decoded for the layer raster — no extra decode)
+and the mask PNG is cached content-addressed by both layer raster keys. Added/removed/unchanged
+layers carry none.
 
 ### `CompareSlider` (`src/components/vcs/CompareSlider.tsx`)
 
@@ -155,8 +174,11 @@ stages** so the panel appears immediately instead of blocking on every layer's r
    ≤`MAX_RASTER_DIM` via an **area-average box filter** — `raster::cap_rgba`/`box_downscale`, in
    premultiplied-alpha space so transparent edges don't bleed dark; sharper than the old
    nearest-neighbour under zoom), PNG-encoded) and arrive as **SVG `<image href="data:image/png;base64,…">`
-   markup** in `ArtLayer.before`/`after`, so `layersBody`/`wrapSvg`/`ArtCanvas`/`CompareSlider`
-   composite them with **zero rendering changes** (blend modes, checkerboard, overlays all still
+   markup** in `ArtLayer.before`/`after`. A **modified** layer also carries its own
+   `diffImage`/`diffOutline`/`regions` in the same `LayerDto` (diffed from the before/after rasters
+   the stream already decoded), so the highlight follows the selected layer. `layersBody`/`wrapSvg`/
+   `ArtCanvas`/`CompareSlider` composite it all with **zero rendering changes** (blend modes,
+   checkerboard, overlays all still
    apply). Layers pop in one by one; not-yet-arrived layers show a spinner thumb in the navigator
    (and a canvas spinner if selected), with the "Loading layers…" header indicator until the
    whole set lands.

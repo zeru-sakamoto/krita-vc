@@ -111,6 +111,13 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   twice.
 - **Unchanged-layer raster reuse** — `art_diff_dto` clones the `after` raster into `before` for
   layers marked `unchanged` instead of decoding/encoding the identical pixels twice.
+- **Per-layer change highlight rides the layer stream** — a modified layer's own mask + outline +
+  region (`layer_diff_overlay` → `raster::diff_overlay_full`) is diffed from the before/after capped
+  PNGs the raster path already produced (`kra::LayerRaster` now returns the PNG bytes + cache key
+  alongside the URL), so it adds one capped-resolution pixel compare + a ~200px outline trace per
+  modified layer — negligible next to the tile reconstruction + PNG encode already paid, and it runs
+  inside the same rayon `par_iter`. The mask PNG is cached content-addressed by both layer raster
+  keys (`kra::diff_cache_key`), so repeat views skip the diff.
 - **Working-tree diffs never touch the store** — `parse_working`/`WorkingKra` (`kra.rs`) decode a
   working `.kra` straight from an in-memory `ZipArchive`; no `bsdiff`, no chain reconstruct, no
   object writes. Older code staged the working file into the object store just to reuse the

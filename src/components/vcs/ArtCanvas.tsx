@@ -1,5 +1,5 @@
 import { memo, useMemo } from "react";
-import type { ArtDiff, ArtLayer, DiffState } from "../../types";
+import type { ArtDiff, ArtLayer, ChangeRegion, DiffState } from "../../types";
 import { layersBody, wrapSvg } from "../../lib/svgArt";
 
 const ACCENT = "#e07b39";
@@ -14,6 +14,15 @@ interface ArtCanvasProps {
   /** Draw the change-highlight overlay on top of this canvas. */
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  /**
+   * The change-highlight source, chosen by the caller from the current selection: the composite's
+   * `diffImage`/`diffOutline`/`regions` for the Composite view, or the selected layer's own. When
+   * these are absent (e.g. an unchanged/added/removed layer), the overlay simply doesn't draw —
+   * the composite's highlight is never reused for a single layer.
+   */
+  diffImage?: string | null;
+  diffOutline?: string | null;
+  regions?: ChangeRegion[];
   /**
    * Shared zoom/pan CSS transform (e.g. "translate(10px,4px) scale(2)"). Applied to the
    * SVG-wrapping div only, so the memoized SVG string and its DOM stay untouched during
@@ -30,9 +39,9 @@ interface ArtCanvasProps {
  * brackets stay legible at any zoom-out. Arm length is a fraction of the region (capped vs the
  * canvas) so brackets read as corners on both tiny and near-full-canvas regions.
  */
-function boxOverlay(diff: ArtDiff): string {
+function boxOverlay(diff: ArtDiff, regions: ChangeRegion[]): string {
   const { width: W, height: H } = diff;
-  return diff.regions
+  return regions
     .map((r) => {
       const x = r.x * W;
       const y = r.y * H;
@@ -71,8 +80,12 @@ function boxOverlay(diff: ArtDiff): string {
  * memoized SVG string changes — never on zoom/pan (that's a CSS transform on the wrapper). The
  * hatch tile is sized relative to the canvas so it doesn't go sub-pixel on a large canvas at fit view.
  */
-function pixelOverlay(diff: ArtDiff): string {
-  const img = diff.diffImage;
+function pixelOverlay(
+  diff: ArtDiff,
+  diffImage?: string | null,
+  diffOutline?: string | null
+): string {
+  const img = diffImage;
   if (!img) return "";
   const { width: W, height: H } = diff;
   // Unique ids per file so two inline SVGs on screen don't cross-reference each other's defs.
@@ -90,8 +103,8 @@ function pixelOverlay(diff: ArtDiff): string {
     `</defs>`;
   // Outline path is normalized 0..1 → scale it to the viewBox. non-scaling-stroke keeps the dashes
   // a constant on-screen size despite the scale (and any zoom transform on the wrapper).
-  const outline = diff.diffOutline
-    ? `<g transform="scale(${W} ${H})"><path d="${diff.diffOutline}" fill="none" ` +
+  const outline = diffOutline
+    ? `<g transform="scale(${W} ${H})"><path d="${diffOutline}" fill="none" ` +
       `stroke="${ACCENT}" stroke-width="1.5" stroke-dasharray="5 4" stroke-linejoin="round" ` +
       `vector-effect="non-scaling-stroke"/></g>`
     : "";
@@ -116,18 +129,26 @@ export const ArtCanvas = memo(function ArtCanvas({
   state,
   overlay = false,
   highlightMode = "pixels",
+  diffImage,
+  diffOutline,
+  regions,
   transform,
   className = "",
 }: ArtCanvasProps) {
   const svg = useMemo(() => {
     let body = layersBody(layers, state);
     if (overlay) {
-      // "pixels": the backend changed-pixel mask, tinted + hatched + framed for legibility on
-      // busy artwork. "box": coarse region rectangles with corner brackets.
-      body += highlightMode === "pixels" ? pixelOverlay(diff) : boxOverlay(diff);
+      // "pixels": the changed-pixel mask, tinted + hatched + framed for legibility on busy
+      // artwork. "box": coarse region rectangles with corner brackets. Both draw from the
+      // caller-supplied overlay data (composite or the selected layer's own), so a single layer
+      // never shows the whole-file composite highlight.
+      body +=
+        highlightMode === "pixels"
+          ? pixelOverlay(diff, diffImage, diffOutline)
+          : boxOverlay(diff, regions ?? []);
     }
     return wrapSvg(body, diff.width, diff.height);
-  }, [layers, state, overlay, highlightMode, diff]);
+  }, [layers, state, overlay, highlightMode, diff, diffImage, diffOutline, regions]);
 
   return (
     <div

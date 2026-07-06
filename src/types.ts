@@ -89,6 +89,15 @@ export interface ArtLayer {
   /** Inner SVG markup for the layer at each state. null = layer absent in that state. */
   before: string | null; // null when change === "added"
   after: string | null; // null when change === "removed"
+  /**
+   * This layer's **own** change-highlight, diffed from its before/after rasters — mirrors the
+   * composite-level `diffImage`/`diffOutline`/`regions` on `ArtDiff` but scoped to this layer, so
+   * selecting a layer shows only *its* changed pixels (not the whole-file composite outline). Only
+   * present for `change === "modified"` layers; absent/empty for added/removed/unchanged.
+   */
+  diffImage?: string | null;
+  diffOutline?: string | null;
+  regions?: ChangeRegion[];
 }
 
 /** Visual diff for an art (.kra) file: a layer stack + before/after imagery. */

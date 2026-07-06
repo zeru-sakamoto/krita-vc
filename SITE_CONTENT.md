@@ -32,7 +32,9 @@ uploads, and zero git jargon.
 
 ### Visual layer diffs
 Compare any two versions of a painting layer by layer. Toggle side-by-side or swipe-slider
-comparison, and highlight exactly what changed with a soft glow around the edited pixels.
+comparison, zoom and pan to inspect details — perfectly synced between both views — and see
+exactly what changed via a highlighted overlay with a dashed outline tracing the edited pixels'
+silhouette. Focus a single layer and the highlight narrows to just that layer's changes.
 Composites load first so you're never staring at a blank panel; individual layers stream in
 right after.
 
@@ -76,8 +78,9 @@ Krita VCS is actively developed. A few things we're still improving:
 
 - **Smarter diffs for non-painting files** — text/config files in a project currently get a basic
   line view; a full visual diff for these is planned.
-- **Pixel-accurate zoom in the diff viewer** — comparison thumbnails currently downscale for
-  speed; a higher-fidelity zoom mode is on the way for pixel-level review.
+- **Deeper zoom for very large paintings** — comparisons render at a capped resolution to keep
+  cached previews small; a way to go past that cap for pixel-level review on huge canvases is
+  on the roadmap.
 
 Have a feature request? [Open an issue on GitHub →]
 

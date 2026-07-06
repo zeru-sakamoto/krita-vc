@@ -370,7 +370,7 @@ pub async fn restore_file(
 // DTOs mirror the frontend `DiffEntry` union in src/types.ts (serde camelCase). Art (.kra)
 // files carry real per-layer PNG rasters + a composite; other files get a minimal text entry.
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionDto {
     x: f64,
@@ -392,6 +392,16 @@ pub struct LayerDto {
     /// Inner SVG `<image>` markup for each state, or null when the layer is absent then.
     pub before: Option<String>,
     pub after: Option<String>,
+    /// This layer's own changed-pixel highlight, diffed from its before/after rasters — the
+    /// composite's overlay must not be reused per layer. Only populated for `change == "modified"`
+    /// layers (added/removed have no before/after pair); empty otherwise. Mirrors the composite
+    /// fields on `ArtDiffDto` but scoped to this layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_outline: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<RegionDto>,
 }
 
 #[derive(Serialize)]
@@ -519,6 +529,48 @@ fn diff_overlay_parts(
     Ok((Some(url), outline))
 }
 
+/// A single layer's changed-pixel highlight: diff its before/after capped rasters into a mask PNG
+/// URL, an outline path, and a region box. Mirrors [`diff_overlay_parts`] but scoped to one layer
+/// and keyed by both layer raster cache keys (so it's content-addressed and shared across
+/// working/committed views of identical pixels). The pixels are already in hand from building the
+/// layer URLs, so no re-decode of source tiles. The region box is **normalized 0..1** — the same
+/// convention as the composite's `changed_region` (the frontend's `boxOverlay` scales it to the
+/// viewBox), so it must NOT be pre-scaled to pixels or it overflows the canvas. Meant only for
+/// modified layers where both sides exist.
+fn layer_diff_overlay(
+    repo: &Repo,
+    before: &kra::LayerRaster,
+    after: &kra::LayerRaster,
+) -> (Option<String>, Option<String>, Vec<RegionDto>) {
+    let region = |bbox: Option<(f64, f64, f64, f64)>| -> Vec<RegionDto> {
+        match bbox {
+            Some((x, y, w, h)) => vec![RegionDto {
+                x,
+                y,
+                w,
+                h,
+                label: None,
+            }],
+            None => Vec::new(),
+        }
+    };
+    let cache_dir = repo.cache_dir();
+    let key = kra::diff_cache_key(&before.key, &after.key);
+    if let Some(mask) = crate::raster::cache_read(&cache_dir, &key) {
+        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+        let outline = crate::raster::outline_from_mask_png(&mask);
+        let regions = region(crate::raster::bbox_from_mask_png(&mask));
+        return (Some(url), outline, regions);
+    }
+    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full(&before.png, &after.png)
+    else {
+        return (None, None, Vec::new());
+    };
+    crate::raster::cache_write(&cache_dir, &key, &mask);
+    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+    (Some(url), outline, region(bbox))
+}
+
 /// Build the visual diff for one `.kra` file: layer metadata + composite, and (only when
 /// `with_rasters`) each layer's before/after PNG. The composite (mergedimage.png) and metadata
 /// are cheap; the per-layer rasters are the expensive part, so the default per-commit diff omits
@@ -599,31 +651,42 @@ pub fn art_diff_dto(
                     "unchanged"
                 }
             };
-            let (after, before) = if with_rasters {
-                let after = new_src
-                    .layer_raster(repo, path, &new_meta.name, &nl.filename, w, h, &tile_cache)?
-                    .map(img);
-                // An unchanged layer's pixels are identical on both sides — reuse the raster
-                // instead of decoding + encoding it twice.
-                let before = match (change, &old_manifest, &old_meta, ol) {
-                    ("added", ..) => None,
-                    ("unchanged", ..) => after.clone(),
-                    (_, Some(om_manifest), Some(om), Some(o)) => kra::layer_raster(
-                        repo,
-                        path,
-                        om_manifest,
-                        &om.name,
-                        &o.filename,
-                        w,
-                        h,
-                        &tile_cache,
-                    )?
-                    .map(img),
-                    _ => None,
-                };
-                (after, before)
+            // Keep the raster structs (URL + capped PNG + cache key) around: a modified layer's
+            // before/after pixels feed its own change highlight below without re-decoding.
+            let after_r = if with_rasters {
+                new_src.layer_raster(repo, path, &new_meta.name, &nl.filename, w, h, &tile_cache)?
             } else {
-                (None, None)
+                None
+            };
+            // An unchanged layer's pixels are identical on both sides — no separate before raster
+            // (its `before` markup reuses `after`, and no diff is needed).
+            let before_r = match (with_rasters, change, &old_manifest, &old_meta, ol) {
+                (true, "modified", Some(om_manifest), Some(om), Some(o)) => kra::layer_raster(
+                    repo,
+                    path,
+                    om_manifest,
+                    &om.name,
+                    &o.filename,
+                    w,
+                    h,
+                    &tile_cache,
+                )?,
+                _ => None,
+            };
+            let after = after_r.as_ref().map(|r| img(r.url.clone()));
+            let before = match change {
+                "added" => None,
+                "unchanged" => after.clone(),
+                _ => before_r.as_ref().map(|r| img(r.url.clone())),
+            };
+            // Per-layer change highlight — only modified layers with both sides present. Added/
+            // removed layers get none (no pair to diff; the row label conveys the change).
+            let (diff_image, diff_outline, regions) = match (&before_r, &after_r) {
+                (Some(b), Some(a)) if change == "modified" => {
+                    let (mask_url, outline, regions) = layer_diff_overlay(repo, b, a);
+                    (mask_url.map(&img), outline, regions)
+                }
+                _ => (None, None, Vec::new()),
             };
             let dto = LayerDto {
                 id: layer_id(nl),
@@ -633,6 +696,9 @@ pub fn art_diff_dto(
                 change: change.into(),
                 before,
                 after,
+                diff_image,
+                diff_outline,
+                regions,
             };
             if let Some(cb) = on_layer {
                 cb(dto.clone());
@@ -659,7 +725,7 @@ pub fn art_diff_dto(
                         h,
                         &tile_cache,
                     )?
-                    .map(img)
+                    .map(|r| img(r.url))
                 } else {
                     None
                 };
@@ -671,6 +737,9 @@ pub fn art_diff_dto(
                     change: "removed".into(),
                     before,
                     after: None,
+                    diff_image: None,
+                    diff_outline: None,
+                    regions: Vec::new(),
                 };
                 if let Some(cb) = on_layer {
                     cb(dto.clone());

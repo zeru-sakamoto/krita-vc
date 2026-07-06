@@ -52,6 +52,17 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
     let mut seen = HashSet::new();
     let mut retained = 0usize;
 
+    // Racy-clean guard (cf. git's index): the size+mtime fast path can't distinguish "unchanged"
+    // from "rewritten within the same filesystem mtime tick that the index was last written" — a
+    // quick re-save right after a commit keeps the same mtime and, if the byte size is unchanged
+    // too ("v1" -> "v2"), the edit would be silently skipped. The index file's own on-disk mtime is
+    // the threshold: a working file whose mtime is >= it might have been touched in that same tick,
+    // so it's re-hashed rather than trusted. Files committed in an earlier tick keep the fast path;
+    // an unreadable index (0) forces hashing everywhere — correct, just slower.
+    let index_mtime = std::fs::metadata(crate::repo::kvc_dir(&repo.root).join("index.json"))
+        .map(|m| crate::repo::size_mtime(&m).1)
+        .unwrap_or(0);
+
     let walker = WalkDir::new(&repo.root)
         .into_iter()
         .filter_entry(|e| e.file_name() != crate::repo::KVC_DIR);
@@ -68,14 +79,20 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
         let rel = rel_path(&repo.root, entry.path());
         seen.insert(rel.clone());
 
-        // Fast path: a tracked file with matching size+mtime is unchanged — don't read it.
+        // Fast path: a tracked file with matching size+mtime is unchanged — don't read it. Skipped
+        // only when the file's mtime predates the index write (`mtime < index_mtime`); a file in the
+        // index's own tick is racy (see above) and falls through to hashing.
         let tracked = repo.index.files.get(&rel);
         let (size, mtime) = entry
             .metadata()
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
         if let Some(tf) = tracked {
-            if size == tf.size && mtime == tf.mtime && (size, mtime) != (0, 0) {
+            if size == tf.size
+                && mtime == tf.mtime
+                && (size, mtime) != (0, 0)
+                && mtime < index_mtime
+            {
                 continue;
             }
         }

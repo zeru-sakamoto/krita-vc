@@ -155,7 +155,16 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   pixels' silhouette** (`ArtDiff.diffOutline`, a vector path traced by `raster::diff_overlay`/
   `outline_from_grid`), computed in Rust off the before/after composites so it ships with the first
   `commit_diff`; a coarse tile-bbox **region-box** mode (with corner brackets) remains as a fallback.
-  Palette (`.gpl`) files have
+  The highlight is **per-layer**: the composite fields drive the Composite view, and each **modified**
+  layer carries its *own* `diffImage`/`diffOutline`/`regions` on `LayerDto`/`ArtLayer` (Rust
+  `commands::layer_diff_overlay` → `raster::diff_overlay_full`, one changed-pixel grid → mask +
+  outline + normalized bbox, diffed from the before/after rasters the layer stream already decoded;
+  mask cached by both layer raster keys). `ArtDiffView` picks the overlay source from the selection
+  and passes `diffImage`/`diffOutline`/`regions` as explicit props into `ArtCanvas`/`CompareSlider`
+  (never read off `diff`), so a focused layer shows only its own change and unchanged/added/removed
+  layers show none. **Region boxes are normalized 0..1** of the viewBox (composite tile-bbox and
+  per-layer alike) — `boxOverlay` scales by width/height, so a region must not be pre-scaled to
+  pixels or it overflows past the canvas' bottom-right. Palette (`.gpl`) files have
   `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**

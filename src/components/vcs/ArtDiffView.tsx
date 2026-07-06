@@ -9,7 +9,7 @@ import {
   EyeSlash,
   Sparkle,
 } from "@phosphor-icons/react";
-import type { ArtDiff, DiffState, PaletteDiff } from "../../types";
+import type { ArtDiff, ChangeRegion, DiffState, PaletteDiff } from "../../types";
 import { IconButton } from "../ui/IconButton";
 import { FileStatusChip } from "./FileStatusChip";
 import { useArtistMode } from "../../lib/artistMode";
@@ -30,6 +30,9 @@ const Pane = memo(function Pane({
   state,
   overlay,
   highlightMode,
+  diffImage,
+  diffOutline,
+  regions,
   transform,
 }: {
   label: string;
@@ -38,6 +41,9 @@ const Pane = memo(function Pane({
   state: DiffState;
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  diffImage?: string | null;
+  diffOutline?: string | null;
+  regions?: ChangeRegion[];
   transform?: string;
 }) {
   return (
@@ -52,6 +58,9 @@ const Pane = memo(function Pane({
           state={state}
           overlay={overlay}
           highlightMode={highlightMode}
+          diffImage={diffImage}
+          diffOutline={diffOutline}
+          regions={regions}
           transform={transform}
         />
       </div>
@@ -141,6 +150,28 @@ export function ArtDiffView({
     }
     const found = effectiveDiff.layers.find((l) => l.id === selectedId);
     return found ? [found] : effectiveDiff.layers;
+  }, [effectiveDiff, selectedId]);
+
+  // The change-highlight source follows the selection: the whole-file composite highlight for the
+  // Composite view, or the selected layer's *own* highlight (so its outline hugs only that layer's
+  // changed pixels, not the composite's). A layer with no highlight (unchanged/added/removed, or
+  // still streaming) yields undefined fields → the overlay simply doesn't draw.
+  const overlay = useMemo(() => {
+    if (selectedId !== COMPOSITE_ID) {
+      const found = effectiveDiff.layers.find((l) => l.id === selectedId);
+      if (found) {
+        return {
+          diffImage: found.diffImage,
+          diffOutline: found.diffOutline,
+          regions: found.regions,
+        };
+      }
+    }
+    return {
+      diffImage: effectiveDiff.diffImage,
+      diffOutline: effectiveDiff.diffOutline,
+      regions: effectiveDiff.regions,
+    };
   }, [effectiveDiff, selectedId]);
 
   const showPalette = selectedId === PALETTE_ID && palette != null;
@@ -262,6 +293,9 @@ export function ArtDiffView({
                       state="after"
                       overlay={highlightOn}
                       highlightMode={highlightMode}
+                      diffImage={overlay.diffImage}
+                      diffOutline={overlay.diffOutline}
+                      regions={overlay.regions}
                       transform={zoom.transform}
                     />
                   </div>
@@ -271,6 +305,9 @@ export function ArtDiffView({
                     layers={layers}
                     overlay={highlightOn}
                     highlightMode={highlightMode}
+                    diffImage={overlay.diffImage}
+                    diffOutline={overlay.diffOutline}
+                    regions={overlay.regions}
                     transform={zoom.transform}
                   />
                 )}

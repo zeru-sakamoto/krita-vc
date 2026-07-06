@@ -590,10 +590,11 @@ fn kra_layer_raster_decodes_to_png() {
 
     // The layer decodes to a real PNG data URL.
     let cache = delta::TileCache::new();
-    let url = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 64, 64, &cache).unwrap();
-    let url = url.expect("layer1 should decode to a raster");
-    assert!(url.starts_with("data:image/png;base64,"));
-    assert!(url.len() > 100, "expected a non-trivial PNG payload");
+    let raster = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 64, 64, &cache)
+        .unwrap()
+        .expect("layer1 should decode to a raster");
+    assert!(raster.url.starts_with("data:image/png;base64,"));
+    assert!(raster.url.len() > 100, "expected a non-trivial PNG payload");
 
     // The composite entry is surfaced too.
     let comp = kra::entry_data_url(&r, "art.kra", &manifest, "mergedimage.png").unwrap();
@@ -716,6 +717,74 @@ fn art_diff_streams_every_layer_once() {
     }
 }
 
+/// A modified layer carries its **own** changed-pixel highlight (mask + outline + region box),
+/// diffed from that layer's before/after rasters — not the composite's. An unchanged layer carries
+/// none, so the viewer draws no overlay when it's selected.
+#[test]
+fn modified_layer_carries_its_own_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // Two layers on both sides; only layer1 (Base) changes between v1 and v2. layer2 (Top) is
+    // byte-identical, so it must come back "unchanged" with no per-layer overlay.
+    let mk = |base_tile: Vec<u8>| {
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            (
+                "maindoc.xml",
+                maindoc_layers(&[("Base", "base", "layer1"), ("Top", "top", "layer2")]),
+            ),
+            ("img/layers/layer1", tiled(&[(0, 0, &base_tile)])),
+            (
+                "img/layers/layer2",
+                tiled(&[(0, 0, &solid_rgba_tile(40, 50, 60, 255))]),
+            ),
+        ])
+    };
+    std::fs::write(root.join("art.kra"), mk(solid_rgba_tile(10, 20, 30, 255))).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    std::fs::write(root.join("art.kra"), mk(solid_rgba_tile(200, 20, 30, 255))).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let parent_tree = commit::tree_at_commit(&r.commits, &c1.id).unwrap();
+    let f = c2.files.iter().find(|f| f.path == "art.kra").unwrap();
+    let dto = commands::committed_art_dto(&r, f, parent_tree.get("art.kra"), true, None).unwrap();
+
+    let base = dto
+        .layers
+        .iter()
+        .find(|l| l.name == "Base")
+        .expect("Base layer present");
+    assert_eq!(base.change, "modified");
+    assert!(
+        base.diff_image.is_some() && base.diff_outline.is_some() && !base.regions.is_empty(),
+        "a modified layer must carry its own mask, outline, and region box"
+    );
+    // The region box must be normalized 0..1 (the frontend scales it to the viewBox). A
+    // pixel-scaled region overflows the canvas bottom/right — this pins that regression.
+    let region = &serde_json::to_value(base).unwrap()["regions"][0];
+    for k in ["x", "y", "w", "h"] {
+        let v = region[k].as_f64().unwrap();
+        assert!(
+            (0.0..=1.0).contains(&v),
+            "region {k}={v} must be normalized 0..1"
+        );
+    }
+
+    let top = dto
+        .layers
+        .iter()
+        .find(|l| l.name == "Top")
+        .expect("Top layer present");
+    assert_eq!(top.change, "unchanged");
+    assert!(
+        top.diff_image.is_none() && top.diff_outline.is_none() && top.regions.is_empty(),
+        "an unchanged layer must carry no per-layer overlay"
+    );
+}
+
 /// A second rasterization of identical content must come from `.kvc/cache/`, not a re-decode.
 #[test]
 fn layer_raster_reads_from_disk_cache() {
@@ -747,7 +816,8 @@ fn layer_raster_reads_from_disk_cache() {
         &delta::TileCache::new(),
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .url;
 
     // Exactly one cached PNG was written; replace its bytes to prove the next read uses it.
     let cache_dir = root.join(".kvc/cache");
@@ -769,7 +839,8 @@ fn layer_raster_reads_from_disk_cache() {
         &delta::TileCache::new(),
     )
     .unwrap()
-    .unwrap();
+    .unwrap()
+    .url;
     assert_eq!(second, raster::png_bytes_to_data_url(b"MARKER"));
     assert_ne!(first, second);
 
@@ -778,7 +849,8 @@ fn layer_raster_reads_from_disk_cache() {
     let from_working = working
         .layer_raster("img/layers/layer1", 64, 64, &cache_dir)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .url;
     assert_eq!(from_working, second);
 }
 

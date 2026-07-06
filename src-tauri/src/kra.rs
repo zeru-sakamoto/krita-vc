@@ -1049,6 +1049,15 @@ pub fn diff_cache_key(before_hash: &str, after_hash: &str) -> String {
     .to_string()
 }
 
+/// A reconstructed layer raster: the webview `kvcimg://`/data URL plus the capped PNG bytes and
+/// its content-addressed cache key. The bytes + key let callers diff two layer rasters (per-layer
+/// change highlight) without re-decoding — the pixels are already in hand from building the URL.
+pub struct LayerRaster {
+    pub url: String,
+    pub png: Vec<u8>,
+    pub key: String,
+}
+
 /// Reconstruct one paint layer's pixels as a full `width`x`height` PNG data URL, or `None` if
 /// the layer has no tile data / uses an unsupported colorspace.
 pub fn layer_raster(
@@ -1060,7 +1069,7 @@ pub fn layer_raster(
     width: i64,
     height: i64,
     cache: &crate::delta::TileCache,
-) -> Result<Option<String>> {
+) -> Result<Option<LayerRaster>> {
     if layer_filename.is_empty() || width <= 0 || height <= 0 {
         return Ok(None);
     }
@@ -1086,9 +1095,8 @@ pub fn layer_raster(
         refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
     let key = raster_cache_key(&entry_path, &mut key_tiles, width, height);
     if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        return Ok(Some(crate::raster::raster_url(
-            &repo.root, &cache_dir, &key, &png,
-        )));
+        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+        return Ok(Some(LayerRaster { url, png, key }));
     }
     // Reconstruct + LZF-decode tiles in parallel (nested rayon inside the per-layer par_iter is
     // fine — one work-stealing pool), then blit serially into the shared canvas.
@@ -1118,9 +1126,8 @@ pub fn layer_raster(
     let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
     let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
     crate::raster::cache_write(&cache_dir, &key, &png);
-    Ok(Some(crate::raster::raster_url(
-        &repo.root, &cache_dir, &key, &png,
-    )))
+    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+    Ok(Some(LayerRaster { url, png, key }))
 }
 
 /// Reconstruct a single non-tiled archive entry's raw bytes from a manifest (cheap — avoids
@@ -1438,7 +1445,7 @@ impl WorkingKra {
         width: i64,
         height: i64,
         cache_dir: &std::path::Path,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<LayerRaster>> {
         if width <= 0 || height <= 0 {
             return Ok(None);
         }
@@ -1471,9 +1478,8 @@ impl WorkingKra {
             .unwrap_or(cache_dir)
             .to_path_buf();
         if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
-            return Ok(Some(crate::raster::raster_url(
-                &root, cache_dir, &key, &png,
-            )));
+            let url = crate::raster::raster_url(&root, cache_dir, &key, &png);
+            return Ok(Some(LayerRaster { url, png, key }));
         }
         // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
         let decoded: Vec<(i64, i64, Vec<u8>)> = tiles
@@ -1490,9 +1496,8 @@ impl WorkingKra {
         let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
         let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
         crate::raster::cache_write(cache_dir, &key, &png);
-        Ok(Some(crate::raster::raster_url(
-            &root, cache_dir, &key, &png,
-        )))
+        let url = crate::raster::raster_url(&root, cache_dir, &key, &png);
+        Ok(Some(LayerRaster { url, png, key }))
     }
 }
 
@@ -1543,7 +1548,7 @@ impl KraSource<'_> {
         width: i64,
         height: i64,
         cache: &crate::delta::TileCache,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<LayerRaster>> {
         match self {
             KraSource::Committed(m) => layer_raster(
                 repo,

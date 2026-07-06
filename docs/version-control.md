@@ -77,13 +77,17 @@ file against `index.json`:
 
 Unchanged files produce nothing. The `.kvc/` directory and Krita lock/autosave files (`*.kra~`)
 are skipped. A file whose **size + mtime still match the index** (`TrackedFile.size`/`mtime`,
-nanosecond resolution) is assumed unchanged and skipped without being read or hashed — the win
-for big `.kra` files. Everything else is hashed and compared against the committed blake3, so a
-size-preserving edit or an mtime touch is still classified correctly. ponytail: this relies on
-the OS updating mtime on every save (Krita rewrites the file, so it does); the upgrade path for a
-mtime-preserving tool is git's "racy" rule (re-hash anything whose mtime isn't strictly older
-than the last index write). There is **no staging area** — the scanner reports the whole
-working-tree delta and a commit captures all of it (the frontend's stage toggles are cosmetic).
+nanosecond resolution) **and whose mtime is strictly older than the index file's own on-disk
+mtime** is assumed unchanged and skipped without being read or hashed — the win for big `.kra`
+files. Everything else is hashed and compared against the committed blake3, so a size-preserving
+edit or an mtime touch is still classified correctly. The mtime comparison is git's **"racy
+clean"** rule: a quick re-save right after a commit can land in the *same* filesystem mtime tick as
+the index write and, if the byte size is unchanged too (`"v1"` → `"v2"`), size+mtime alone can't
+tell it apart from "untouched". So any working file whose mtime is `>=` the index file's mtime
+(`.kvc/index.json`, statted once per scan) is treated as racy and re-hashed rather than trusted;
+files committed in an earlier tick keep the fast path. There is **no staging area** — the scanner
+reports the whole working-tree delta and a commit captures all of it (the frontend's stage toggles
+are cosmetic).
 
 ## Committing — `commit_snapshot`
 

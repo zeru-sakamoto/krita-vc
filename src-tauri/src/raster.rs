@@ -558,10 +558,52 @@ pub fn diff_mask_png(before_png: &[u8], after_png: &[u8]) -> Option<Vec<u8>> {
 /// Both halves of the changed-pixel highlight from one decode: the accent mask PNG and the SVG
 /// path outlining the changed pixels (normalized 0..1; `None` if not outline-able).
 pub fn diff_overlay(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<u8>, Option<String>)> {
+    let (mask, outline, _) = diff_overlay_full(before_png, after_png)?;
+    Some((mask, outline))
+}
+
+/// All three halves of the changed-pixel highlight from a single decode: the accent mask PNG, the
+/// SVG outline path, and the changed pixels' bounding box **normalized 0..1** (`(x, y, w, h)`,
+/// `None` when nothing changed) — the same convention as `changed_region`, so the region-box
+/// overlay consumes it directly (the frontend scales it to the viewBox). Used for both composite
+/// and per-layer highlights.
+pub fn diff_overlay_full(
+    before_png: &[u8],
+    after_png: &[u8],
+) -> Option<(Vec<u8>, Option<String>, Option<(f64, f64, f64, f64)>)> {
     let (grid, w, h) = changed_grid(before_png, after_png)?;
     let png = mask_png_from_grid(&grid, w, h)?;
     let outline = outline_from_grid(&grid, w, h);
-    Some((png, outline))
+    let bbox = bbox_from_grid(&grid, w, h);
+    Some((png, outline, bbox))
+}
+
+/// Tight bounding box of the changed cells, normalized to 0..1 of the grid. `None` if none changed.
+fn bbox_from_grid(grid: &[bool], w: usize, h: usize) -> Option<(f64, f64, f64, f64)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if grid[y * w + x] {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    any.then(|| {
+        (
+            min_x as f64 / w as f64,
+            min_y as f64 / h as f64,
+            (max_x - min_x + 1) as f64 / w as f64,
+            (max_y - min_y + 1) as f64 / h as f64,
+        )
+    })
 }
 
 /// Rebuild the change outline from an already-cached mask PNG (alpha > 0 = changed), so a cache
@@ -571,6 +613,15 @@ pub fn outline_from_mask_png(mask_png: &[u8]) -> Option<String> {
     let (w, h) = (w as usize, h as usize);
     let grid: Vec<bool> = (0..w * h).map(|i| rgba[i * 4 + 3] > 0).collect();
     outline_from_grid(&grid, w, h)
+}
+
+/// Rebuild the changed pixels' bounding box (normalized 0..1) from an already-cached mask PNG,
+/// so a per-layer region-box cache hit needs no source re-read. `None` if nothing is masked.
+pub fn bbox_from_mask_png(mask_png: &[u8]) -> Option<(f64, f64, f64, f64)> {
+    let (rgba, w, h) = decode_png_rgba(mask_png)?;
+    let (w, h) = (w as usize, h as usize);
+    let grid: Vec<bool> = (0..w * h).map(|i| rgba[i * 4 + 3] > 0).collect();
+    bbox_from_grid(&grid, w, h)
 }
 
 /// Encode an RGBA8 buffer as PNG bytes.

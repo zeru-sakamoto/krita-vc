@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import type { ArtDiff, ArtLayer } from "../../types";
+import type { ArtDiff, ArtLayer, ChangeRegion } from "../../types";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 
 interface CompareSliderProps {
@@ -7,6 +7,10 @@ interface CompareSliderProps {
   layers: ArtLayer[];
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  /** Change-highlight source for the "after" canvas (composite or the selected layer's own). */
+  diffImage?: string | null;
+  diffOutline?: string | null;
+  regions?: ChangeRegion[];
   /** Shared zoom/pan transform, applied identically to both stacked canvases. */
   transform?: string;
 }
@@ -24,6 +28,9 @@ export const CompareSlider = memo(function CompareSlider({
   layers,
   overlay,
   highlightMode,
+  diffImage,
+  diffOutline,
+  regions,
   transform,
 }: CompareSliderProps) {
   const [pos, setPos] = useState(50); // divider position, 0..100 (% from left)
@@ -91,6 +98,9 @@ export const CompareSlider = memo(function CompareSlider({
           state="after"
           overlay={overlay}
           highlightMode={highlightMode}
+          diffImage={diffImage}
+          diffOutline={diffOutline}
+          regions={regions}
           transform={transform}
         />
       </div>

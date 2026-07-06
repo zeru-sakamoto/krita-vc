@@ -26,8 +26,9 @@ files, where git's text-oriented delta model performs poorly.
   - **Side-by-side** and **swipe slider** compare modes.
   - **Synced zoom & pan** — wheel to zoom toward the cursor, space- or middle-mouse-drag to pan;
     applied identically across both modes so before/after and the slider divider stay aligned.
-  - **Changed-pixel highlighting** — a true per-pixel diff of the composites (toggle on/off), with a
-    coarse region-box mode as a fallback.
+  - **Changed-pixel highlighting** — a true per-pixel diff (toggle on/off), with a coarse
+    region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
+    only *that* layer's changed pixels, not the whole-file silhouette.
   - Click a layer to focus its diff, or view the composited artwork; palettes (`.gpl`) render as
     color swatches.
 - **Real local version control** — commit the whole working tree, browse history as a branch-aware
