@@ -27,6 +27,33 @@ pub struct GcReport {
     /// Loose object files + whole pack files deleted (rewritten packs count once).
     pub objects_deleted: usize,
     pub bytes_reclaimed: u64,
+    /// Raster-cache bytes freed (regenerable previews: over-budget entries pruned, plus a
+    /// full wipe when the cache's filter version is stale).
+    pub cache_bytes_reclaimed: u64,
+}
+
+/// Rewrite a partially-dead pack only when more than a quarter of it is dead — rewriting a
+/// pack rereads and rewrites every survivor, so reclaiming a few KB from a big pack costs
+/// far more IO than it frees. Kept dead bytes are excluded from the report (it must state
+/// what the run actually frees).
+fn worth_rewriting(dead_bytes: u64, total: u64) -> bool {
+    dead_bytes > 0 && dead_bytes * 4 > total
+}
+
+/// Consolidation targets: at least this many packs, each under this size, merge into one
+/// (every pack header is parsed on index load — many small packs from many mid-size commits
+/// accumulate parse cost and directory churn).
+const CONSOLIDATE_MIN_PACKS: usize = 8;
+const CONSOLIDATE_MAX_PACK_BYTES: u64 = 4 << 20;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rewrite_gate_over_quarter_dead() {
+        assert!(!super::worth_rewriting(0, 100));
+        assert!(!super::worth_rewriting(25, 100), "25% dead: keep the pack");
+        assert!(super::worth_rewriting(26, 100), ">25% dead: rewrite");
+    }
 }
 
 /// Collect everything unreachable from the current branch tips. With `dry_run` the report is
@@ -83,7 +110,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
             .collect();
         versions_removed += chain.len() - kept.len();
         for v in &kept {
-            live_objects.insert(v.object.clone());
+            live_objects.insert(v.object_name());
         }
         if !kept.is_empty() {
             new_chains.0.insert(key.clone(), kept);
@@ -156,21 +183,35 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         }
     }
 
+    // --- sweep plan: stale temp files (crash leftovers from atomic writes) ---------------
+    let stale_tmp = stale_tmp_files(repo);
+
     let mut report = GcReport {
         dry_run,
         commits_removed,
         versions_removed,
         objects_deleted: dead_loose.len(),
         bytes_reclaimed: dead_loose.iter().map(|(_, len)| len).sum(),
+        cache_bytes_reclaimed: 0,
     };
     for p in &pack_plans {
         if p.live == 0 {
             report.objects_deleted += 1;
             report.bytes_reclaimed += p.total;
-        } else if p.dead_bytes > 0 {
+        } else if worth_rewriting(p.dead_bytes, p.total) {
             report.bytes_reclaimed += p.dead_bytes;
         }
     }
+    report.bytes_reclaimed += stale_tmp.iter().map(|(_, len)| len).sum::<u64>();
+
+    // --- raster cache: stale filter version wipes everything, else prune to budget -------
+    let cache_dir = repo.cache_dir();
+    let cache_total = crate::raster::cache_total_bytes(&cache_dir);
+    report.cache_bytes_reclaimed = if crate::raster::cache_filter_stale(&cache_dir) {
+        cache_total
+    } else {
+        cache_total.saturating_sub(repo.config.cache_max_bytes)
+    };
 
     if dry_run {
         return Ok(report);
@@ -178,6 +219,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
 
     // --- write state FIRST (crash between = harmless re-collectable orphans) -------------
     repo.commits.retain(|c| reachable.contains(&c.id));
+    repo.note_commits_truncated(); // dropped commits must leave the log
     repo.chains.rewrite_all(&kvc_dir(&repo.root), new_chains)?;
     repo.save()?;
 
@@ -190,7 +232,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     for p in &pack_plans {
         if p.live == 0 {
             let _ = std::fs::remove_file(&p.path);
-        } else if p.dead_bytes > 0 {
+        } else if worth_rewriting(p.dead_bytes, p.total) {
             // Rewrite with survivors only; write the new pack (or loose files for a small
             // remainder) before deleting the old one, so a crash never loses live objects.
             let survivors: Vec<(String, Vec<u8>)> = p
@@ -215,5 +257,96 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     }
     repo.packs.invalidate();
 
+    // --- consolidate small surviving packs into one (fragmentation, not reclamation) -------
+    consolidate_small_packs(repo)?;
+
+    // --- stale temp files -------------------------------------------------------------------
+    for (path, _) in &stale_tmp {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- raster cache ------------------------------------------------------------------------
+    let mut cache_freed = crate::raster::cache_sync_filter_version(&cache_dir);
+    cache_freed += crate::raster::cache_prune(&cache_dir, repo.config.cache_max_bytes);
+    report.cache_bytes_reclaimed = cache_freed;
+
     Ok(report)
+}
+
+/// `*.tmp` leftovers of `write_atomic`/`write_pack` interrupted by a crash — never cleaned by
+/// anything else. Only files older than an hour qualify (paranoia margin; the app is
+/// single-process, so anything old is definitively dead).
+fn stale_tmp_files(repo: &Repo) -> Vec<(PathBuf, u64)> {
+    let kvc = kvc_dir(&repo.root);
+    let mut out = Vec::new();
+    for dir in [
+        kvc.clone(),
+        crate::repo::chains_dir(&repo.root),
+        crate::delta::pack_dir(&repo.objects_dir()),
+    ] {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_none_or(|x| x != "tmp") {
+                continue;
+            }
+            let Ok(m) = e.metadata() else { continue };
+            let old = m
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+            if old {
+                out.push((p, m.len()));
+            }
+        }
+    }
+    out
+}
+
+/// Merge many small live packs into one. Purely a fragmentation fix (no bytes reclaimed):
+/// every pack header is parsed when the index loads, so dozens of small packs from mid-size
+/// commits add up. Write-before-delete, then invalidate the in-memory index.
+fn consolidate_small_packs(repo: &mut Repo) -> Result<()> {
+    let objects = repo.objects_dir();
+    let pack_dir = crate::delta::pack_dir(&objects);
+    let mut small: Vec<(PathBuf, Vec<(String, u64, u32)>)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&pack_dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "pack") {
+                continue;
+            }
+            if e.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > CONSOLIDATE_MAX_PACK_BYTES {
+                continue;
+            }
+            if let Some(entries) = crate::delta::read_pack_header(&path) {
+                small.push((path, entries));
+            }
+        }
+    }
+    if small.len() < CONSOLIDATE_MIN_PACKS {
+        return Ok(());
+    }
+    let mut merged: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen = HashSet::new();
+    for (path, entries) in &small {
+        for (name, off, len) in entries {
+            if seen.insert(name.clone()) {
+                merged.push((
+                    name.clone(),
+                    crate::delta::read_exact_at(path, *off, *len as usize)?,
+                ));
+            }
+        }
+    }
+    let refs: Vec<&(String, Vec<u8>)> = merged.iter().collect();
+    repo.packs.write_pack(&objects, &refs)?;
+    for (path, _) in &small {
+        let _ = std::fs::remove_file(path);
+    }
+    repo.packs.invalidate();
+    Ok(())
 }

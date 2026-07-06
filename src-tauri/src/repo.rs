@@ -8,7 +8,9 @@
 //!   chains/        delta-stream versions, one shard per tracked file (drives storage/restore);
 //!                  zstd-compressed bincode per shard. Repos from before sharding carry a
 //!                  monolithic chains.bin (or older chains.json) instead — split on first save
-//!   commits.json   commit log
+//!   commits.log    commit log, JSON-lines, append-only (a commit appends one line instead of
+//!                  rewriting the whole history; undo/GC rewrite it). Legacy repos carry a
+//!                  commits.json instead — migrated to the log on first save
 //!   branches.json  branch name -> tip commit id, plus the current branch
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
 //!   cache/         capped raster PNGs (bounded, see `raster::cache_prune`)
@@ -51,21 +53,45 @@ pub struct Config {
     /// `#[serde(default)]` so configs from before the knob existed keep deserializing.
     #[serde(default = "default_cache_max_bytes")]
     pub cache_max_bytes: u64,
+    /// Opt-in (config.json knob, no UI): store decoded tile *pixels* — which bsdiff across
+    /// versions — instead of Krita's opaque LZF payloads. Shrinks heavily-revised layers
+    /// 2-10x at the cost of LZF decode on commit and re-encode on restore; off by default
+    /// because that CPU lands on the <10s commit/restore paths of low-end devices. Restores
+    /// always honor what the manifest says, so toggling never breaks existing history.
+    #[serde(default)]
+    pub tile_pixel_deltas: bool,
 }
 
 fn default_cache_max_bytes() -> u64 {
-    512 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            version: 1,
+            version: 2,
             delta_chain_max: 20,
             tile_size: 64,
             cache_max_bytes: default_cache_max_bytes(),
+            tile_pixel_deltas: false,
         }
     }
+}
+
+/// Read `config.json`, applying version migrations in-memory; `dirty` = the caller's `save()`
+/// should persist the migrated form. v1 → v2: the cache budget default dropped 512 → 256 MB,
+/// and 512 MB always meant "old default", never a user choice (there is no UI knob).
+fn read_config(kvc: &Path) -> Result<(Config, bool)> {
+    let mut config: Config = read_json(&kvc.join("config.json"))?;
+    let mut dirty = false;
+    if config.version < 2 {
+        if config.cache_max_bytes == 512 * 1024 * 1024 {
+            config.cache_max_bytes = default_cache_max_bytes();
+        }
+        config.version = 2;
+        dirty = true;
+    }
+    Ok((config, dirty))
 }
 
 /// Committed head of one tracked file — just enough for the scanner to spot changes.
@@ -92,17 +118,51 @@ pub struct Index {
 
 /// One stored version of a delta stream. A stream is any byte sequence we version
 /// (a generic file, a .kra manifest, a single layer entry, or a single tile).
+///
+/// The object file's name is fully derivable from `hash` + `base` ([`Version::object_name`]);
+/// pre-KVCC2 shards stored it redundantly per version — dropped because chains grow with
+/// total tile-version history, so every duplicated 64-hex hash was paid forever.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Version {
     /// blake3 of the *reconstructed* bytes — also the object file's base name.
     pub hash: String,
-    /// `<hash>.full` (zstd snapshot) or `<hash>.patch` (bsdiff against `base`).
-    pub object: String,
     /// hash of the version this patch applies onto; `None` for a full snapshot.
     pub base: Option<String>,
     /// patches back to the nearest full snapshot (0 = full).
     pub chain_len: usize,
+}
+
+impl Version {
+    /// The content-addressed object file holding this version's payload:
+    /// `<hash>.full` (zstd snapshot) or `<hash>.<base>.patch` (bsdiff against `base`).
+    pub fn object_name(&self) -> String {
+        match &self.base {
+            None => format!("{}.full", self.hash),
+            Some(b) => format!("{}.{b}.patch", self.hash),
+        }
+    }
+}
+
+/// Pre-KVCC2 on-disk `Version` (bincode is not self-describing — the exact old shape is
+/// needed to decode legacy shards/monoliths). `object` is dropped on conversion.
+#[derive(Deserialize)]
+struct VersionV1 {
+    hash: String,
+    #[allow(dead_code)]
+    object: String,
+    base: Option<String>,
+    chain_len: usize,
+}
+
+impl From<VersionV1> for Version {
+    fn from(v: VersionV1) -> Version {
+        Version {
+            hash: v.hash,
+            base: v.base,
+            chain_len: v.chain_len,
+        }
+    }
 }
 
 /// streamKey -> ordered versions (head = last). The serialized form of one chain shard
@@ -320,6 +380,12 @@ pub struct CommittedFile {
     /// `None` for deletions.
     pub content: Option<String>,
     pub is_kra: bool,
+    /// blake3 of the whole working-tree file as it sat on disk when this commit recorded it —
+    /// lets `undo` rewind the index without reconstructing the file just to hash it.
+    /// `None` on records from before the field existed (undo then falls back to reconstructing)
+    /// and on deletions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +469,14 @@ pub struct Repo {
     pub(crate) packs: crate::delta::Packs,
     pub commits: Vec<Commit>,
     pub branches: Branches,
+    /// How many of `commits` are already lines in `commits.log`; `save()` appends the rest.
+    commits_persisted: usize,
+    /// Force a full log rewrite on the next `save()`: set on legacy `commits.json` migration
+    /// and whenever `commits` was truncated (undo, GC) — see [`Repo::note_commits_truncated`].
+    commits_rewrite: bool,
+    /// `config` was migrated on load — the next `save()` persists it (saves otherwise never
+    /// touch `config.json`).
+    config_dirty: bool,
 }
 
 impl Repo {
@@ -421,7 +495,7 @@ impl Repo {
         std::fs::create_dir_all(chains_dir(root)).map_err(|e| io_at(&kvc, e))?;
         write_json(&kvc.join("config.json"), &Config::default())?;
         write_json(&kvc.join("index.json"), &Index::default())?;
-        write_json(&kvc.join("commits.json"), &Vec::<Commit>::new())?;
+        write_atomic(&kvc.join("commits.log"), b"")?;
         write_json(&kvc.join("branches.json"), &Branches::default())?;
         Ok(())
     }
@@ -443,21 +517,25 @@ impl Repo {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
         let kvc = kvc_dir(root);
-        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
+        let (commits, persisted, migrate) = read_commits(&kvc)?;
         let branches = read_branches(&kvc, &commits)?;
         let chains = if kvc.join("chains.bin").is_file() || kvc.join("chains.json").is_file() {
             ChainStore::from_legacy(chains_dir(root), read_chains(&kvc)?)
         } else {
             ChainStore::empty(chains_dir(root))
         };
+        let (config, config_dirty) = read_config(&kvc)?;
         Ok(Repo {
             root: root.to_path_buf(),
-            config: read_json(&kvc.join("config.json"))?,
+            config,
             index: read_json(&kvc.join("index.json"))?,
             chains,
             packs: crate::delta::Packs::default(),
             commits,
             branches,
+            commits_persisted: persisted,
+            commits_rewrite: migrate,
+            config_dirty,
         })
     }
 
@@ -470,16 +548,20 @@ impl Repo {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
         let kvc = kvc_dir(root);
-        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
+        let (commits, persisted, migrate) = read_commits(&kvc)?;
         let branches = read_branches(&kvc, &commits)?;
+        let (config, config_dirty) = read_config(&kvc)?;
         Ok(Repo {
             root: root.to_path_buf(),
-            config: read_json(&kvc.join("config.json"))?,
+            config,
             index: read_json(&kvc.join("index.json"))?,
             chains: ChainStore::empty(chains_dir(root)),
             packs: crate::delta::Packs::default(),
             commits,
             branches,
+            commits_persisted: persisted,
+            commits_rewrite: migrate,
+            config_dirty,
         })
     }
 
@@ -491,17 +573,53 @@ impl Repo {
         cache_dir(&self.root)
     }
 
+    /// Mark the in-memory commit list as truncated (undo popped a commit, GC dropped
+    /// unreachable ones) so the next [`Repo::save`] rewrites `commits.log` instead of appending.
+    pub fn note_commits_truncated(&mut self) {
+        self.commits_rewrite = true;
+    }
+
     /// Flush mutated state atomically. Chains rewrite only their dirty shards — the shards of
     /// files this commit actually touched; switch/merge/undo mutate only index/commits/branches
-    /// and skip chains entirely ([`ChainStore::has_dirty`]).
+    /// and skip chains entirely ([`ChainStore::has_dirty`]). The commit log normally takes one
+    /// O(1) append per new commit — never a rewrite that grows with total history. Write order
+    /// matters: `branches.json` (the tips) goes last, so a torn log append is always an
+    /// unreachable orphan record, never a dangling branch tip.
     pub fn save(&mut self) -> Result<()> {
         let kvc = kvc_dir(&self.root);
+        if self.config_dirty {
+            write_json(&kvc.join("config.json"), &self.config)?;
+            self.config_dirty = false;
+        }
         write_json(&kvc.join("index.json"), &self.index)?;
         if self.chains.has_dirty() {
             self.chains.flush(&kvc)?;
         }
-        write_json(&kvc.join("commits.json"), &self.commits)?;
+        self.flush_commits(&kvc)?;
         write_json(&kvc.join("branches.json"), &self.branches)?;
+        Ok(())
+    }
+
+    fn flush_commits(&mut self, kvc: &Path) -> Result<()> {
+        let log = kvc.join("commits.log");
+        if self.commits_rewrite {
+            write_atomic(&log, &commit_lines(&self.commits)?)?;
+            // Retire a legacy commits.json once the log is safely in place (mirror of the
+            // chains-monolith retirement).
+            let _ = std::fs::remove_file(kvc.join("commits.json"));
+            self.commits_rewrite = false;
+            self.commits_persisted = self.commits.len();
+        } else if self.commits.len() > self.commits_persisted {
+            use std::io::Write;
+            let lines = commit_lines(&self.commits[self.commits_persisted..])?;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .map_err(|e| io_at(&log, e))?;
+            f.write_all(&lines).map_err(|e| io_at(&log, e))?;
+            self.commits_persisted = self.commits.len();
+        }
         Ok(())
     }
 
@@ -528,29 +646,97 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
-/// One chain shard on disk: zstd-compressed bincode. zstd level 1 — the stream keys are highly
-/// repetitive, so even the fastest level compresses them several-fold.
+/// Chain shard format tag. Bincode is not self-describing, so dropping `Version.object`
+/// needed an explicit version: `KVCC2`-prefixed shards hold the slim `Version`; bare-zstd
+/// files are pre-KVCC2 and decode through [`VersionV1`]. Old shards convert lazily — each
+/// upgrades the next time its file is dirtied (or all at once in GC's `rewrite_all`).
+const CHAINS_MAGIC: &[u8; 5] = b"KVCC2";
+
+/// One chain shard on disk: `KVCC2` + zstd-compressed bincode. zstd level 1 — the stream keys
+/// are highly repetitive, so even the fastest level compresses them several-fold.
 fn write_chains_file(path: &Path, chains: &Chains) -> Result<()> {
     let plain = bincode::serialize(chains).map_err(|e| KvcError::BadIndex(e.to_string()))?;
-    let bytes = zstd::encode_all(&plain[..], 1).map_err(KvcError::Io)?;
+    let z = zstd::encode_all(&plain[..], 1).map_err(KvcError::Io)?;
+    let mut bytes = Vec::with_capacity(CHAINS_MAGIC.len() + z.len());
+    bytes.extend_from_slice(CHAINS_MAGIC);
+    bytes.extend_from_slice(&z);
     write_atomic(path, &bytes)
+}
+
+/// Decode a chains payload in either format; `None` on anything unreadable.
+fn decode_chains(raw: &[u8]) -> Option<Chains> {
+    if let Some(body) = raw.strip_prefix(CHAINS_MAGIC.as_slice()) {
+        let plain = zstd::decode_all(body).ok()?;
+        bincode::deserialize(&plain).ok()
+    } else {
+        // Pre-KVCC2: bare zstd(bincode) with the redundant `object` field per version.
+        let plain = zstd::decode_all(raw).ok()?;
+        let legacy: BTreeMap<String, Vec<VersionV1>> = bincode::deserialize(&plain).ok()?;
+        Some(Chains(
+            legacy
+                .into_iter()
+                .map(|(k, vs)| (k, vs.into_iter().map(Version::from).collect()))
+                .collect(),
+        ))
+    }
 }
 
 /// Read one chain shard; `None` on missing/unreadable (a missing shard is an empty one).
 fn read_chains_file(path: &Path) -> Option<Chains> {
-    let raw = std::fs::read(path).ok()?;
-    let plain = zstd::decode_all(&raw[..]).ok()?;
-    bincode::deserialize(&plain).ok()
+    decode_chains(&std::fs::read(path).ok()?)
 }
 
-/// Load a pre-sharding monolithic chains file: `chains.bin` (zstd bincode), else the even
-/// older `chains.json`. Retired by the first save after opening (see [`ChainStore::flush`]).
+/// Serialize commits as JSON-lines (one compact record + `\n` per commit).
+fn commit_lines(commits: &[Commit]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for c in commits {
+        serde_json::to_writer(&mut buf, c).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+        buf.push(b'\n');
+    }
+    Ok(buf)
+}
+
+/// Load the commit history: `(commits, lines persisted in the log, migrate-from-legacy)`.
+/// Prefers `commits.log` (JSON-lines). A torn trailing line — a crash mid-append — is dropped
+/// silently: `branches.json` is written after the log, so a torn record is never a branch tip.
+/// A repo from before the log carries `commits.json` instead; it's parsed here and the caller
+/// flags a rewrite so the next save writes the log and retires the legacy file.
+fn read_commits(kvc: &Path) -> Result<(Vec<Commit>, usize, bool)> {
+    let log = kvc.join("commits.log");
+    if log.is_file() {
+        let bytes = std::fs::read(&log).map_err(|e| io_at(&log, e))?;
+        let mut commits = Vec::new();
+        let mut torn = false;
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<Commit>(line) {
+                Ok(c) => commits.push(c),
+                Err(_) => {
+                    // Torn tail from a crash mid-append — an orphan record, drop it. Flag a
+                    // rewrite so the partial line is scrubbed rather than appended onto.
+                    torn = true;
+                    break;
+                }
+            }
+        }
+        let n = commits.len();
+        Ok((commits, n, torn))
+    } else {
+        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
+        Ok((commits, 0, true))
+    }
+}
+
+/// Load a pre-sharding monolithic chains file: `chains.bin` (zstd bincode, always pre-KVCC2),
+/// else the even older `chains.json` (self-describing JSON — its extra `object` field is
+/// simply ignored by serde). Retired by the first save after opening ([`ChainStore::flush`]).
 fn read_chains(kvc: &Path) -> Result<Chains> {
     let bin = kvc.join("chains.bin");
     if bin.is_file() {
         let raw = std::fs::read(&bin).map_err(|e| io_at(&bin, e))?;
-        let plain = zstd::decode_all(&raw[..]).map_err(KvcError::Io)?;
-        bincode::deserialize(&plain).map_err(|e| KvcError::BadIndex(e.to_string()))
+        decode_chains(&raw).ok_or_else(|| KvcError::BadIndex(bin.display().to_string()))
     } else {
         read_json(&kvc.join("chains.json"))
     }

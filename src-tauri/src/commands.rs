@@ -408,6 +408,14 @@ pub struct ArtDiffDto {
     pub before_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_image: Option<String>,
+    /// Changed-pixel mask as `<image>` markup: transparent except where the composites differ.
+    /// Drives the "pixels" highlight; computed off the composite so it ships with the first diff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_image: Option<String>,
+    /// SVG path data (normalized 0..1) outlining the changed pixels' silhouette — the frontend
+    /// scales it to the viewBox and strokes it dashed. Hugs the change, not a bounding box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_outline: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -478,6 +486,39 @@ fn composite_data_url(
     Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
 }
 
+/// The changed-pixel highlight for a diff: the accent mask as a capped PNG URL, plus the SVG path
+/// (normalized 0..1) that outlines the changed pixels' silhouette. Keyed by both composite content
+/// hashes, so a warm cache reads neither composite; on a miss both raw `mergedimage.png` bytes are
+/// pulled (each behind its own deferred closure, mirroring `composite_data_url`) and diffed. The
+/// outline is rebuilt from the cached mask on a hit (no source re-read, no sibling cache file).
+/// `(None, None)` when either side is missing (added/removed file) or can't be decoded.
+fn diff_overlay_parts(
+    repo: &Repo,
+    before_hash: Option<&str>,
+    after_hash: Option<&str>,
+    before_bytes: impl FnOnce() -> Result<Option<Vec<u8>>>,
+    after_bytes: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<(Option<String>, Option<String>)> {
+    let (Some(bh), Some(ah)) = (before_hash, after_hash) else {
+        return Ok((None, None));
+    };
+    let cache_dir = repo.cache_dir();
+    let key = kra::diff_cache_key(bh, ah);
+    if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
+        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+        return Ok((Some(url), crate::raster::outline_from_mask_png(&png)));
+    }
+    let (Some(before), Some(after)) = (before_bytes()?, after_bytes()?) else {
+        return Ok((None, None));
+    };
+    let Some((mask, outline)) = crate::raster::diff_overlay(&before, &after) else {
+        return Ok((None, None));
+    };
+    crate::raster::cache_write(&cache_dir, &key, &mask);
+    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+    Ok((Some(url), outline))
+}
+
 /// Build the visual diff for one `.kra` file: layer metadata + composite, and (only when
 /// `with_rasters`) each layer's before/after PNG. The composite (mergedimage.png) and metadata
 /// are cheap; the per-layer rasters are the expensive part, so the default per-commit diff omits
@@ -516,11 +557,14 @@ pub fn art_diff_dto(
         },
         None => None,
     };
-    let new_tiles = new_src.tile_index();
-    let old_tiles = old_manifest.as_ref().map(|m| m.tile_index());
-    let changed_entries = old_tiles
+    // One pass over borrowed tile indexes yields both the changed-layer set and the union
+    // region — no per-tile hash clones, no duplicate map builds.
+    let (changed_entries, changed_region) = old_manifest
         .as_ref()
-        .map(|ot| kra::changed_entry_paths(ot, &new_tiles))
+        .map(|m| {
+            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_src.tile_index_ref(), w, h);
+            (d.changed_paths, d.region)
+        })
         .unwrap_or_default();
 
     // "meet" (not "none"): rasters keep their own aspect ratio, letterboxed inside the document
@@ -648,17 +692,32 @@ pub fn art_diff_dto(
         .map(&img),
         None => None,
     };
+    // Changed-pixel highlight: diff the before/after composites. Rides on this first diff (no
+    // dependence on the per-layer raster stream), so the highlight appears with the composite.
+    let after_hash = new_src.entry_hash("mergedimage.png");
+    let before_hash = old_manifest
+        .as_ref()
+        .and_then(|m| m.entry_hash("mergedimage.png"));
+    let (mask_url, diff_outline) = diff_overlay_parts(
+        repo,
+        before_hash.as_deref(),
+        after_hash.as_deref(),
+        || match &old_manifest {
+            Some(m) => kra::entry_bytes(repo, path, m, "mergedimage.png"),
+            None => Ok(None),
+        },
+        || new_src.entry_bytes(repo, path, "mergedimage.png"),
+    )?;
+    let diff_image = mask_url.map(&img);
     let mut regions = Vec::new();
-    if let Some(ot) = &old_tiles {
-        if let Some((x, y, rw, rh)) = kra::changed_region(ot, &new_tiles, w, h) {
-            regions.push(RegionDto {
-                x,
-                y,
-                w: rw,
-                h: rh,
-                label: None,
-            });
-        }
+    if let Some((x, y, rw, rh)) = changed_region {
+        regions.push(RegionDto {
+            x,
+            y,
+            w: rw,
+            h: rh,
+            label: None,
+        });
     }
 
     Ok(ArtDiffDto {
@@ -670,6 +729,8 @@ pub fn art_diff_dto(
         regions,
         before_image,
         after_image,
+        diff_image,
+        diff_outline,
     })
 }
 
@@ -863,6 +924,7 @@ pub async fn working_diff(
                 },
                 content: None,
                 is_kra: false,
+                file_hash: None,
             })]);
         }
         let entry = working_art_dto(&repo, &file, false, None)
@@ -873,6 +935,7 @@ pub async fn working_diff(
                     status: "M".into(),
                     content: None,
                     is_kra: true,
+                    file_hash: None,
                 })
             });
         Ok(vec![entry])

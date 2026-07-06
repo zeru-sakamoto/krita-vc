@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 /**
  * Reusable pointer-drag resize hook with localStorage persistence. Generalizes
@@ -47,39 +47,43 @@ export function useResize(options: UseResizeOptions): UseResize {
   const draggingRef = useRef(false);
   const startPosRef = useRef(0);
   const startSizeRef = useRef(size);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(storageKey, String(size));
-    } catch {
-      // ignore (e.g. private mode) — state still works for the session
-    }
-  }, [size, storageKey]);
+  // Mirrors `size` so pointer-up can persist without re-creating its callback per frame.
+  const sizeRef = useRef(size);
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
       draggingRef.current = true;
       startPosRef.current = axis === "x" ? e.clientX : e.clientY;
-      startSizeRef.current = size;
+      startSizeRef.current = sizeRef.current;
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
     },
-    [axis, size]
+    [axis]
   );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
       if (!draggingRef.current) return;
       const pos = axis === "x" ? e.clientX : e.clientY;
-      const next = startSizeRef.current + (pos - startPosRef.current);
-      setSize(clamp(next, min, max));
+      const next = clamp(startSizeRef.current + (pos - startPosRef.current), min, max);
+      sizeRef.current = next;
+      setSize(next);
     },
     [axis, min, max]
   );
 
-  const onPointerUp = useCallback((e: React.PointerEvent) => {
-    draggingRef.current = false;
-    (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-  }, []);
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent) => {
+      draggingRef.current = false;
+      (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+      // Persist once per drag, not per pointermove frame — localStorage writes are synchronous.
+      try {
+        localStorage.setItem(storageKey, String(sizeRef.current));
+      } catch {
+        // ignore (e.g. private mode) — state still works for the session
+      }
+    },
+    [storageKey]
+  );
 
   return { size, onPointerDown, onPointerMove, onPointerUp };
 }

@@ -218,6 +218,16 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
 const layerCache = new Map<string, Map<string, ArtLayer>>();
 const LAYER_CACHE_MAX = 20;
 
+/**
+ * Drop the session diff/layer caches. Called on repository switch: keys embed the repo path
+ * (so stale hits are impossible), but on the base64 fallback each retained entry is multi-MB —
+ * without this a switch keeps the previous repo's payloads resident until LRU eviction.
+ */
+export function clearSessionCaches(): void {
+  diffCache.clear();
+  layerCache.clear();
+}
+
 export function useArtLayers(
   path: string,
   file: string,
@@ -246,13 +256,20 @@ export function useArtLayers(
     let cancelled = false;
     const received = new Map<string, ArtLayer>();
     setState({ layers: null, loading: true });
-    // Layers arrive one at a time as the backend finishes them; re-render on each so they
-    // pop in progressively instead of all at once when the slowest layer completes.
+    // Layers arrive one at a time as the backend finishes them. Fast layers can burst far
+    // above frame rate, and every setState re-renders the whole diff viewer — coalesce
+    // arrivals into one state flush per animation frame so they still pop in progressively
+    // without a re-render per message.
+    let frame: number | null = null;
+    const flush = () => {
+      frame = null;
+      if (!cancelled) setState({ layers: new Map(received), loading: true });
+    };
     const onLayer = new Channel<ArtLayer>();
     onLayer.onmessage = (layer) => {
       if (cancelled) return;
       received.set(layer.id, layer);
-      setState({ layers: new Map(received), loading: true });
+      if (frame == null) frame = requestAnimationFrame(flush);
     };
     const req = working
       ? invoke("working_layers", { path, file, onLayer })
@@ -263,6 +280,10 @@ export function useArtLayers(
         // dropped every streamed layer (see onmessage), so its `received` is empty/partial —
         // caching it would poison the key and make a later revisit render zero layers.
         if (cancelled) return;
+        if (frame != null) {
+          cancelAnimationFrame(frame);
+          frame = null;
+        }
         layerCache.set(key, received);
         while (layerCache.size > LAYER_CACHE_MAX) {
           layerCache.delete(layerCache.keys().next().value!);
@@ -274,6 +295,7 @@ export function useArtLayers(
       });
     return () => {
       cancelled = true;
+      if (frame != null) cancelAnimationFrame(frame);
     };
   }, [path, file, commitId, working, nonce]);
 

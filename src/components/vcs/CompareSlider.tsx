@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { ArtDiff, ArtLayer } from "../../types";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 
@@ -7,24 +7,56 @@ interface CompareSliderProps {
   layers: ArtLayer[];
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  /** Shared zoom/pan transform, applied identically to both stacked canvases. */
+  transform?: string;
 }
 
 /**
  * Swipe comparison: "after" fills the frame; "before" is clipped to the left of a
  * draggable divider. Pointer-capture drag mirrors the Sidebar resize handle pattern.
+ *
+ * Memoized + the divider drag is rAF-throttled: pointermove fires >100x/s, so a raw
+ * setPos per event would re-render both stacked canvases every event. We coalesce to
+ * at most one state update per animation frame.
  */
-export function CompareSlider({ diff, layers, overlay, highlightMode }: CompareSliderProps) {
+export const CompareSlider = memo(function CompareSlider({
+  diff,
+  layers,
+  overlay,
+  highlightMode,
+  transform,
+}: CompareSliderProps) {
   const [pos, setPos] = useState(50); // divider position, 0..100 (% from left)
   const frameRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
+  // rAF coalescing: latest pointer X, and the pending frame handle (0 = none scheduled).
+  const latestXRef = useRef(0);
+  const rafRef = useRef(0);
 
-  const moveTo = useCallback((clientX: number) => {
+  const flush = useCallback(() => {
+    rafRef.current = 0;
     const el = frameRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const pct = ((clientX - rect.left) / rect.width) * 100;
+    const pct = ((latestXRef.current - rect.left) / rect.width) * 100;
     setPos(Math.min(100, Math.max(0, pct)));
   }, []);
+
+  const moveTo = useCallback(
+    (clientX: number) => {
+      latestXRef.current = clientX;
+      if (rafRef.current === 0) rafRef.current = requestAnimationFrame(flush);
+    },
+    [flush]
+  );
+
+  // Cancel any pending frame on unmount so flush never runs after teardown.
+  useEffect(
+    () => () => {
+      if (rafRef.current !== 0) cancelAnimationFrame(rafRef.current);
+    },
+    []
+  );
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
@@ -42,6 +74,10 @@ export function CompareSlider({ diff, layers, overlay, highlightMode }: CompareS
   );
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     draggingRef.current = false;
+    if (rafRef.current !== 0) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = 0;
+    }
     (e.target as HTMLElement).releasePointerCapture(e.pointerId);
   }, []);
 
@@ -55,15 +91,19 @@ export function CompareSlider({ diff, layers, overlay, highlightMode }: CompareS
           state="after"
           overlay={overlay}
           highlightMode={highlightMode}
+          transform={transform}
         />
       </div>
 
-      {/* BEFORE — clipped to the left of the divider */}
+      {/* BEFORE — clipped to the left of the divider. The clip stays in frame screen
+          space (untransformed wrapper), so it cuts at a fixed vertical line at pos%.
+          Both canvases carry the *same* transform, so any image pixel lands at the same
+          screen coordinate in both — before/after stay registered under zoom+pan. */}
       <div
         className="absolute inset-0 overflow-hidden"
         style={{ clipPath: `inset(0 ${100 - pos}% 0 0)` }}
       >
-        <ArtCanvas diff={diff} layers={layers} state="before" />
+        <ArtCanvas diff={diff} layers={layers} state="before" transform={transform} />
       </div>
 
       {/* State labels */}
@@ -98,4 +138,4 @@ export function CompareSlider({ diff, layers, overlay, highlightMode }: CompareS
       </div>
     </div>
   );
-}
+});

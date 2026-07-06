@@ -32,6 +32,22 @@ impl Prepared {
     }
 }
 
+/// Per-stream storage knobs. `zstd_level` applies to full snapshots; `patch_floor` is the
+/// minimum byte size for bsdiff patching (streams below it always store as fulls).
+pub(crate) struct StoreOpts {
+    pub zstd_level: i32,
+    pub patch_floor: usize,
+}
+
+impl Default for StoreOpts {
+    fn default() -> Self {
+        StoreOpts {
+            zstd_level: 3,
+            patch_floor: 64 * 1024,
+        }
+    }
+}
+
 impl Repo {
     /// Store `bytes` as the next version of `key`. Returns the content hash. Identical
     /// content already in the chain is deduplicated (no new object, no new version).
@@ -45,6 +61,32 @@ impl Repo {
     /// against is read here, so callers must not commit versions to `key` between prepare and
     /// commit — safe for a single commit where each stream key appears once.
     pub fn prepare_stream(&self, key: &str, bytes: &[u8]) -> Result<Prepared> {
+        // Krita tiles are already LZF-compressed and raw entries that sniff as compressed
+        // (PNG/zip) barely shrink at any zstd level — but level 3 over thousands of tiles was
+        // the single largest CPU term of a whole-document commit. Level 1 costs ~nothing in
+        // size on such payloads; diff-friendly text (manifests, XML) keeps level 3.
+        let level = if looks_compressed(bytes) || key.contains(":tile:") {
+            1
+        } else {
+            3
+        };
+        self.prepare_stream_opts(
+            key,
+            bytes,
+            StoreOpts {
+                zstd_level: level,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Repo::prepare_stream`] with explicit storage knobs (compression level, patch floor).
+    pub(crate) fn prepare_stream_opts(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        opts: StoreOpts,
+    ) -> Result<Prepared> {
         let hash = hash_bytes(bytes);
         let max = self.config.delta_chain_max;
 
@@ -67,8 +109,8 @@ impl Repo {
             // couple of KB, and every later read walks the whole chain back; already-compressed
             // content (mergedimage.png etc.) yields patches near full size. Both go straight
             // to a 1-object zstd full: commits and reads become a single read + decode.
-            // ponytail: 64 KB gate + magic sniff — tune here if storage ever matters more.
-            _ if bytes.len() < 64 * 1024 || looks_compressed(bytes) => None,
+            // ponytail: patch-floor gate + magic sniff — tune here if storage ever matters more.
+            _ if bytes.len() < opts.patch_floor || looks_compressed(bytes) => None,
             // Patch against the current head while under the chain threshold.
             Some(h) if h.chain_len + 1 <= max => match self.reconstruct(key, &h.hash) {
                 Ok(base) => {
@@ -83,7 +125,6 @@ impl Repo {
                         Some((
                             Version {
                                 hash: hash.clone(),
-                                object: object.clone(),
                                 base: Some(h.hash.clone()),
                                 chain_len: h.chain_len + 1,
                             },
@@ -103,12 +144,11 @@ impl Repo {
             // First version, threshold reached, an unreconstructable head, or a non-round-tripping
             // patch -> fresh full snapshot (a full can never fail the integrity check).
             None => {
-                let compressed = zstd::encode_all(bytes, 3)?;
+                let compressed = zstd::encode_all(bytes, opts.zstd_level)?;
                 let object = format!("{hash}.full");
                 (
                     Version {
                         hash: hash.clone(),
-                        object: object.clone(),
                         base: None,
                         chain_len: 0,
                     },
@@ -150,13 +190,24 @@ impl Repo {
         // Distinct new objects not already stored (loose or packed) — identical content under
         // two stream keys shares one object name, and re-commits dedup against disk.
         let mut seen = std::collections::HashSet::new();
-        let new_objs: Vec<&(String, Vec<u8>)> = items
+        let candidates: Vec<&(String, Vec<u8>)> = items
             .iter()
             .filter_map(|(_, p)| match p {
                 Prepared::New { object, .. } => Some(object),
                 Prepared::Dedup(_) => None,
             })
-            .filter(|o| seen.insert(o.0.as_str()) && !self.object_exists(&o.0))
+            .filter(|o| seen.insert(o.0.as_str()))
+            .collect();
+        // Existence probes in parallel (thousands of serial stats hurt on cold HDDs), cheapest
+        // first: the in-memory pack index, then the sharded loose path, then the legacy flat one.
+        let pack_index = self.packs.index(&objects);
+        let new_objs: Vec<&(String, Vec<u8>)> = candidates
+            .into_par_iter()
+            .filter(|o| {
+                !pack_index.contains_key(&o.0)
+                    && !objects.join(&o.0[..2]).join(&o.0).exists()
+                    && !objects.join(&o.0).exists()
+            })
             .collect();
 
         if new_objs.len() >= PACK_MIN_OBJECTS {
@@ -212,7 +263,7 @@ impl Repo {
             .find(|x| x.hash == hash)
             .ok_or_else(|| KvcError::MissingObject(format!("{key}@{hash}")))?;
 
-        let raw = self.read_object_bytes(&v.object)?;
+        let raw = self.read_object_bytes(&v.object_name())?;
         let bytes = match &v.base {
             None => zstd::decode_all(&raw[..])?,
             Some(base) => {
@@ -316,7 +367,9 @@ type PackIndex = std::collections::HashMap<String, (std::path::PathBuf, u64, u32
 
 /// Lazily-loaded index over every pack file: object name -> (pack path, absolute offset, len).
 /// Interior mutability so reconstruct paths can fault it in from behind `&Repo` (rayon included).
-pub struct Packs(std::sync::Mutex<Option<PackIndex>>);
+/// The index is handed out as an `Arc` snapshot so parallel lookups (dedup filter, tile
+/// reconstructs) never hold the mutex during their probes.
+pub struct Packs(std::sync::Mutex<Option<std::sync::Arc<PackIndex>>>);
 
 impl Default for Packs {
     fn default() -> Self {
@@ -325,14 +378,16 @@ impl Default for Packs {
 }
 
 impl Packs {
-    fn with_index<T>(&self, objects: &Path, f: impl FnOnce(&mut PackIndex) -> T) -> T {
+    /// Snapshot of the loaded index (faulted in on first use). Lock held only for the clone.
+    pub(crate) fn index(&self, objects: &Path) -> std::sync::Arc<PackIndex> {
         let mut guard = self.0.lock().unwrap();
-        let index = guard.get_or_insert_with(|| load_pack_indexes(objects));
-        f(index)
+        guard
+            .get_or_insert_with(|| std::sync::Arc::new(load_pack_indexes(objects)))
+            .clone()
     }
 
     pub(crate) fn contains(&self, objects: &Path, name: &str) -> bool {
-        self.with_index(objects, |idx| idx.contains_key(name))
+        self.index(objects).contains_key(name)
     }
 
     /// Drop the loaded index (packs changed on disk — GC rewrites); rebuilt on next use.
@@ -342,7 +397,9 @@ impl Packs {
 
     pub(crate) fn read(&self, objects: &Path, name: &str) -> Result<Vec<u8>> {
         let (path, off, len) = self
-            .with_index(objects, |idx| idx.get(name).cloned())
+            .index(objects)
+            .get(name)
+            .cloned()
             .ok_or_else(|| KvcError::MissingObject(name.to_string()))?;
         read_exact_at(&path, off, len as usize)
     }
@@ -384,13 +441,18 @@ impl Packs {
             std::fs::rename(&tmp, &path).map_err(|e| io_at(&path, e))?;
         }
 
-        // Keep the in-memory index coherent for reads later in this session.
+        // Keep the in-memory index coherent for reads later in this session. `make_mut`
+        // copy-on-writes if a reader still holds a snapshot Arc (stale snapshots are safe:
+        // they just miss the objects this pack added, same as before it was written).
         let payload_base = (PACK_MAGIC.len() + 4 + idx_bytes.len()) as u64;
-        self.with_index(objects, |idx| {
+        {
+            let mut guard = self.0.lock().unwrap();
+            let arc = guard.get_or_insert_with(|| std::sync::Arc::new(load_pack_indexes(objects)));
+            let idx = std::sync::Arc::make_mut(arc);
             for (name, off, len) in index {
                 idx.insert(name, (path.clone(), payload_base + off, len));
             }
-        });
+        }
         Ok(())
     }
 }

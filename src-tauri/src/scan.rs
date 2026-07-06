@@ -22,7 +22,16 @@ pub struct ScanChange {
     /// them stale in the safe direction (mismatch -> the next scan re-hashes).
     pub size: u64,
     pub mtime: u64,
+    /// The file bytes the scan already read, when the caller asked to keep them
+    /// (`keep_bytes`) and the retention budget allowed — saves the commit path a second
+    /// full read of a big `.kra` (a page-cache miss is a whole extra HDD pass).
+    pub bytes: Option<Vec<u8>>,
 }
+
+/// Cumulative cap on bytes retained across one scan (`keep_bytes`). Past it, later changed
+/// files drop their buffers and the commit path re-reads them — bounds worst-case RAM when a
+/// first commit sweeps many large files at once.
+const RETAIN_BUDGET: usize = 512 << 20;
 
 /// Returns `(relativePath, status)` pairs for everything that differs from the index.
 /// A tracked file whose size+mtime still match the index is assumed unchanged and skipped
@@ -30,16 +39,18 @@ pub struct ScanChange {
 /// compared against the committed hash (so a size-preserving edit or an mtime touch is still
 /// classified correctly).
 pub fn scan(repo: &Repo) -> Result<Vec<(String, String)>> {
-    Ok(scan_detailed(repo)?
+    Ok(scan_detailed(repo, false)?
         .into_iter()
         .map(|c| (c.rel, c.status))
         .collect())
 }
 
 /// [`scan`] with the per-file hash/size/mtime kept, for [`crate::commit::commit_snapshot`].
-pub fn scan_detailed(repo: &Repo) -> Result<Vec<ScanChange>> {
+/// `keep_bytes` additionally hands back each changed file's bytes (under [`RETAIN_BUDGET`]).
+pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut retained = 0usize;
 
     let walker = WalkDir::new(&repo.root)
         .into_iter()
@@ -71,17 +82,26 @@ pub fn scan_detailed(repo: &Repo) -> Result<Vec<ScanChange>> {
 
         let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
         let hash = hash_bytes(&bytes);
-        let change = |status: &str| ScanChange {
-            rel: rel.clone(),
-            status: status.into(),
-            hash: hash.clone(),
-            size,
-            mtime,
+        let status = match tracked {
+            None => Some("U"),
+            Some(tf) if tf.hash != hash => Some("M"),
+            Some(_) => None,
         };
-        match tracked {
-            None => out.push(change("U")),
-            Some(tf) if tf.hash != hash => out.push(change("M")),
-            Some(_) => {}
+        if let Some(status) = status {
+            let kept = if keep_bytes && retained + bytes.len() <= RETAIN_BUDGET {
+                retained += bytes.len();
+                Some(bytes)
+            } else {
+                None
+            };
+            out.push(ScanChange {
+                rel: rel.clone(),
+                status: status.into(),
+                hash,
+                size,
+                mtime,
+                bytes: kept,
+            });
         }
     }
 
@@ -93,6 +113,7 @@ pub fn scan_detailed(repo: &Repo) -> Result<Vec<ScanChange>> {
                 hash: String::new(),
                 size: 0,
                 mtime: 0,
+                bytes: None,
             });
         }
     }

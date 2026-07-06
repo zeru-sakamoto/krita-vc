@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Repository } from "../types";
 import { inTauri } from "./tauri";
+import { clearSessionCaches } from "./repoData";
 
 /**
  * Selected local repository. The app is local-only (no remotes); a repository is a
@@ -70,6 +71,8 @@ export interface CleanupReport {
   versionsRemoved: number;
   objectsDeleted: number;
   bytesReclaimed: number;
+  /** Preview images freed (regenerable — pruned to budget / stale-filter wipe). */
+  cacheBytesReclaimed: number;
 }
 
 function joinPath(parent: string, name: string): string {
@@ -104,6 +107,9 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   useEffect(() => {
+    // The previous repo's cached diffs/layers can hold multi-MB base64 payloads (fallback
+    // path) — drop them on switch instead of waiting for LRU eviction.
+    clearSessionCaches();
     try {
       localStorage.setItem(STORAGE_KEY, currentId);
     } catch {

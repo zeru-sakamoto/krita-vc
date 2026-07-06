@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import {
+  ArrowsIn,
   ArrowsLeftRight,
   BoundingBox,
   CircleNotchIcon,
@@ -13,6 +14,7 @@ import { IconButton } from "../ui/IconButton";
 import { FileStatusChip } from "./FileStatusChip";
 import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
+import { useZoomPan } from "../../lib/useZoomPan";
 import { assetName } from "../../lib/friendly";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
@@ -21,13 +23,14 @@ import { PaletteDiffView } from "./PaletteDiffView";
 
 type ViewMode = "split" | "slider";
 
-function Pane({
+const Pane = memo(function Pane({
   label,
   diff,
   layers,
   state,
   overlay,
   highlightMode,
+  transform,
 }: {
   label: string;
   diff: ArtDiff;
@@ -35,6 +38,7 @@ function Pane({
   state: DiffState;
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  transform?: string;
 }) {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
@@ -48,11 +52,12 @@ function Pane({
           state={state}
           overlay={overlay}
           highlightMode={highlightMode}
+          transform={transform}
         />
       </div>
     </div>
   );
-}
+});
 
 /**
  * Visual diff for one art (.kra) file: a layer stack panel beside a before/after
@@ -84,7 +89,14 @@ export function ArtDiffView({
   const [selectedId, setSelectedId] = useState<string>(COMPOSITE_ID);
   const [viewMode, setViewMode] = useState<ViewMode>("split");
   const [highlightOn, setHighlightOn] = useState(true);
-  const [highlightMode, setHighlightMode] = useState<HighlightMode>("box");
+  const [highlightMode, setHighlightMode] = useState<HighlightMode>("pixels");
+
+  // Shared zoom/pan applied identically to both panes and the slider's stacked canvases.
+  const zoom = useZoomPan();
+  const switchView = (mode: ViewMode) => {
+    setViewMode(mode);
+    zoom.reset(); // split panes vs the slider frame differ in width — refit on switch
+  };
 
   // The per-commit diff ships layer *metadata* but not the heavy per-layer rasters; those stream
   // in one at a time (keyed by layer id) and merge over the metadata as they land. Until a
@@ -177,15 +189,26 @@ export function ArtDiffView({
                   label="Side-by-side"
                   size={18}
                   active={viewMode === "split"}
-                  onClick={() => setViewMode("split")}
+                  onClick={() => switchView("split")}
                 />
                 <IconButton
                   icon={ArrowsLeftRight}
                   label="Swipe slider"
                   size={18}
                   active={viewMode === "slider"}
-                  onClick={() => setViewMode("slider")}
+                  onClick={() => switchView("slider")}
                 />
+                <span className="mx-1 h-4 w-px bg-border" />
+                <IconButton
+                  icon={ArrowsIn}
+                  label="Reset zoom"
+                  size={18}
+                  disabled={zoom.scale === 1}
+                  onClick={zoom.reset}
+                />
+                <span className="text-[11px] tabular-nums text-text-muted w-9 text-center">
+                  {Math.round(zoom.scale * 100)}%
+                </span>
                 <span className="mx-1 h-4 w-px bg-border" />
                 <IconButton
                   icon={highlightOn ? Eye : EyeSlash}
@@ -195,6 +218,14 @@ export function ArtDiffView({
                   onClick={() => setHighlightOn((v) => !v)}
                 />
                 <IconButton
+                  icon={Sparkle}
+                  label="Highlight: changed pixels"
+                  size={18}
+                  active={highlightOn && highlightMode === "pixels"}
+                  disabled={!highlightOn}
+                  onClick={() => setHighlightMode("pixels")}
+                />
+                <IconButton
                   icon={BoundingBox}
                   label="Highlight: region boxes"
                   size={18}
@@ -202,22 +233,27 @@ export function ArtDiffView({
                   disabled={!highlightOn}
                   onClick={() => setHighlightMode("box")}
                 />
-                <IconButton
-                  icon={Sparkle}
-                  label="Highlight: precise mask"
-                  size={18}
-                  active={highlightOn && highlightMode === "mask"}
-                  disabled={!highlightOn}
-                  onClick={() => setHighlightMode("mask")}
-                />
               </div>
 
               {/* Canvas — overflow-hidden, never auto: the SVG scales to fit its pane, so
-                  scrolling could only ever crop the artwork. */}
-              <div className="relative min-h-0 flex-1 overflow-hidden">
+                  scrolling could only ever crop the artwork. Wheel zooms toward the cursor;
+                  middle-mouse or space-drag pans (plain left-drag stays for the slider). */}
+              <div
+                className={`relative min-h-0 flex-1 overflow-hidden ${zoom.panCursor}`}
+                onWheel={zoom.onWheel}
+                onPointerDown={zoom.onPointerDown}
+                onPointerMove={zoom.onPointerMove}
+                onPointerUp={zoom.onPointerUp}
+              >
                 {viewMode === "split" ? (
                   <div className="flex h-full">
-                    <Pane label="Before" diff={effectiveDiff} layers={layers} state="before" />
+                    <Pane
+                      label="Before"
+                      diff={effectiveDiff}
+                      layers={layers}
+                      state="before"
+                      transform={zoom.transform}
+                    />
                     <div className="w-px shrink-0 bg-border" />
                     <Pane
                       label="After"
@@ -226,6 +262,7 @@ export function ArtDiffView({
                       state="after"
                       overlay={highlightOn}
                       highlightMode={highlightMode}
+                      transform={zoom.transform}
                     />
                   </div>
                 ) : (
@@ -234,6 +271,7 @@ export function ArtDiffView({
                     layers={layers}
                     overlay={highlightOn}
                     highlightMode={highlightMode}
+                    transform={zoom.transform}
                   />
                 )}
                 {/* The selected layer's raster is still streaming in. */}

@@ -16,20 +16,28 @@ with no backend, the UI renders empty states).
 ```text
 .kvc/
   config.json    engine config: delta-chain threshold (default 20), tile size (64),
-                 raster cache byte budget (cacheMaxBytes, default 512 MB)
+                 raster cache byte budget (cacheMaxBytes, default 256 MB; a v1→v2 config
+                 migration lowers old 512 MB defaults), and the opt-in tilePixelDeltas flag
   index.json     committed head per tracked file — drives the scanner
   chains/        per-tracked-file shards, each every stored version of that file's delta
-                 streams (zstd-compressed bincode, <blake3(relpath)[..16]>.bin, faulted in
-                 on first touch); a legacy monolithic chains.bin (or older chains.json)
-                 is read transparently and split into shards on the next commit's save
-  commits.json   the commit log (oldest-first, append-order = topological order)
-  branches.json  branch name → tip commit id, plus the current branch
+                 streams (KVCC2-tagged zstd bincode, <blake3(relpath)[..16]>.bin, faulted in
+                 on first touch). Pre-KVCC2 shards (which stored each version's object name
+                 redundantly) decode transparently and upgrade when next dirtied; a legacy
+                 monolithic chains.bin (or older chains.json) is read transparently and
+                 split into shards on the next commit's save
+  commits.log    the commit log, JSON-lines (oldest-first, append-order = topological
+                 order): a commit appends one line — O(1) instead of rewriting the whole
+                 history; undo/GC rewrite it. Legacy commits.json migrates on first save
+  branches.json  branch name → tip commit id, plus the current branch (written after the
+                 log, so a torn log append is never a dangling tip)
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff),
                  sharded 256-way (objects/<hash[..2]>/, flat legacy paths still read); a
                  commit with ≥32 new objects writes them as one objects/pack/<hash>.pack
                  instead of one loose file each
   cache/         content-addressed capped PNG rasters for the diff viewer, served from disk
-                 (see Raster delivery below); size-budgeted with LRU pruning
+                 (see Raster delivery below); size-budgeted with LRU pruning, pruned by
+                 "Clean up storage" too (a .filter-version marker triggers a full wipe when
+                 the downscale filter changes)
 ```
 
 A repo from before branching existed (no `branches.json`) migrates on open: everything is
@@ -41,7 +49,10 @@ content-addressed and dedup on any re-commit). The user-facing **"Clean up stora
 (`cleanup_repository`, mark-and-sweep in [`gc.rs`](../src-tauri/src/gc.rs)) reclaims everything
 unreachable from any branch tip: unreachable commits leave the log, dead chain versions leave
 their shards, dead loose objects are deleted, and packs are dropped (fully dead) or rewritten
-with survivors only. A live patch's whole chain back to its full snapshot counts as reachable.
+with survivors only when >25% dead (below that, rewriting costs more IO than it frees). A live
+patch's whole chain back to its full snapshot counts as reachable. GC also prunes the raster
+cache to its budget (reported separately as `cacheBytesReclaimed` — regenerable previews),
+sweeps stale `*.tmp` crash leftovers, and consolidates ≥8 sub-4 MB live packs into one.
 State files are rewritten before any object is deleted, so a crash mid-sweep only leaves
 re-collectable orphans. A `dry_run` mode reports what a real pass would free without touching
 anything — the frontend runs it on modal open, then confirms before the real pass. See
@@ -83,19 +94,23 @@ working-tree delta and a commit captures all of it (the frontend's stage toggles
 - **anything else** → `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash.
 
 Each non-deleted file's blake3 (plus its size + mtime, for the scanner's fast path) is written
-back into the index, and a `Commit` is recorded with `parents` set to the **current branch tip**
-(first parent = mainline; a merge commit has two parents) and the branch name stamped on it
-(cosmetic — the frontend uses it for labels/colors). The branch tip then advances to the new
-commit. Returns `KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex
-chars of a blake3 over the timestamp + message + parents + per-file content hashes. State is
-flushed with `Repo::save`, which writes `index.json`/`commits.json`/`branches.json` as
-**compact** JSON and rewrites only the per-file chain shards a commit actually dirtied
-(`ChainStore` per-shard dirty tracking) as zstd-compressed bincode — a commit's chain-write cost
-scales with the files it touched, not total repo history. `save` skips shards entirely when no
-new stream version was committed there, so switch/merge/undo never rewrite chains at all. A
-batch of ≥32 distinct new objects is written as one pack file instead of one loose file each
-(see [performance.md](performance.md#state-file-writes) — per-file creates dominated large
-commits on Windows).
+back into the index (the scan hands its already-read bytes to the commit too, so a big `.kra`
+is read once per commit), and a `Commit` is recorded with `parents` set to the **current branch
+tip** (first parent = mainline; a merge commit has two parents), the branch name stamped on it
+(cosmetic — the frontend uses it for labels/colors), and each file's on-disk blake3 as
+`fileHash` (lets `undo` rewind the index without reconstructing files just to hash them; old
+records without it fall back). The branch tip then advances to the new commit. Returns
+`KvcError::Nothing` if the tree is clean. The commit id/hash is the first 12 hex chars of a
+blake3 over the timestamp + message + parents + per-file content hashes. State is flushed with
+`Repo::save`: `index.json`/`branches.json` as **compact** JSON, the commit as **one appended
+line** of `commits.log` (O(1) — never a rewrite that grows with history), and only the per-file
+chain shards a commit actually dirtied (`ChainStore` per-shard dirty tracking) as KVCC2-tagged
+zstd bincode — a commit's chain-write cost scales with the files it touched, not total repo
+history. `save` skips shards entirely when no new stream version was committed there, so
+switch/merge/undo never rewrite chains at all. A batch of ≥32 distinct new objects is written
+as one pack file instead of one loose file each (see
+[performance.md](performance.md#state-file-writes) — per-file creates dominated large commits
+on Windows).
 
 ### The first-parent-delta invariant
 
@@ -104,7 +119,7 @@ commit's tree against its first parent's tree** (merge commits are constructed t
 merged result's full diff vs their first parent). The effective tree at any commit is therefore
 a fold along the **first-parent chain** only (`tree_at_commit`), root → commit; second parents
 exist purely for graph drawing and reachability. This keeps tree computation correct and cheap
-(O(first-parent depth)) even though `commits.json` interleaves branches.
+(O(first-parent depth)) even though the commit log interleaves branches.
 
 ## Delta-chain storage
 
@@ -151,14 +166,28 @@ decompose it into streams so small edits stay small:
   reuses that manifest entry verbatim instead of inflating/re-storing it. Commit cost becomes
   proportional to the entries that actually changed. ponytail: crc32+size as the change detector
   (~2⁻³² false-match chance per changed entry); upgrade path is hashing the compressed bytes.
-- **Reconstruction is parallel** — `reconstruct_kra` resolves every entry's bytes (patch-chain
-  replay per tile) with `rayon`'s `par_iter`, then writes the zip serially in manifest order.
-  Entries that already look compressed (`delta::looks_compressed` — PNG/zip/zstd magic) are
-  stored instead of re-deflated, since recompressing already-compressed bytes buys nothing.
+- **The composite is block-tiled** (`KraEntry::CompositePng`) — `mergedimage.png` changes on
+  nearly every commit and, as an opaque PNG, used to add its full multi-MB self per commit
+  (the store's dominant cost). Eligible composites (8-bit RGB/RGBA, no ICC profile; an sRGB
+  chunk is recorded and re-emitted) are decoded once and stored as **256 px raw-pixel blocks**
+  in the tile keyspace: unchanged regions dedup across commits, changed blocks bsdiff at the
+  same position. Restore reassembles + re-encodes a valid PNG — **pixels exact, bytes not
+  Krita's original encoding**. Ineligible composites stay byte-exact `Raw`; `preview.png`
+  stays `Raw` deliberately (tens of KB). Old manifests reconstruct unchanged.
+- **Reconstruction is parallel and memory-bounded** — `reconstruct_kra` resolves entries'
+  bytes (patch-chain replay per tile) with `rayon`'s `par_iter` in 64 MB chunks, writing each
+  chunk serially in manifest order before the next builds (peak RAM = output + one chunk, not
+  the whole decompressed document). Rebuilt tile blocks and other non-compressed entries are
+  written **deflate-fast** (Krita deflates them too — Stored left restored files several×
+  larger); entries that already look compressed (`delta::looks_compressed` — PNG/zip/zstd
+  magic) stay stored, since recompressing buys nothing.
 
-ponytail: tiles are diffed as opaque LZF-compressed blobs — Krita's LZF is never decoded, so
-delta quality on already-compressed bytes is limited. Upgrade path: decode LZF and delta raw
-pixels if footprint ever demands it.
+Tiles are diffed as opaque LZF-compressed blobs by default. The opt-in **`tilePixelDeltas`**
+config flag stores decoded planar pixels instead — they bsdiff across versions (2-10× smaller
+for heavily-revised layers), restore re-encodes LZF (`raster::lzf_compress`), and the per-ref
+`raw` flag in the manifest means mixed histories work and turning the flag off never breaks
+existing commits. Off by default: the LZF decode/encode cost lands on the commit/restore paths
+of low-end devices.
 
 `maindoc.xml` is also parsed (`parse_maindoc`, via `roxmltree` with DTD allowed) so layer
 metadata changes — added / removed / opacity / blend / rename, matched by uuid then name — can be
@@ -218,7 +247,7 @@ deduplicates across branches for free.
   and its `files` is the merged result's diff vs the first parent — preserving the fold
   invariant. `NothingToMerge` when the source is already part of the current branch.
 - **Delete** (`delete_branch`) — removes the label only (refused for the current branch); its
-  commits stay in `commits.json` as harmless unreachable data.
+  commits stay in `commits.log` as harmless unreachable data.
 
 ## Raster delivery (`kvcimg` URI scheme)
 

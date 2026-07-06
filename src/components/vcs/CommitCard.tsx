@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import type { Branch, Commit } from "../../types";
 import { relativeTime } from "../../lib/format";
 import { versionLabel } from "../../lib/friendly";
@@ -15,11 +16,20 @@ interface CommitCardProps {
 }
 
 /**
- * Commit card for the history timeline.
+ * Commit card for the history timeline. Memoized — a selection change re-renders the whole
+ * list otherwise, and histories can run to hundreds of rows. (Artist Mode toggles still
+ * propagate: context updates bypass memo.)
  * (DESIGN.md → VCS Component Patterns → Commit Card)
  */
-export function CommitCard({ commit, version, selected, onSelect, tips }: CommitCardProps) {
+export const CommitCard = memo(function CommitCard({
+  commit,
+  version,
+  selected,
+  onSelect,
+  tips,
+}: CommitCardProps) {
   const { artistMode } = useArtistMode();
+  const rel = useMemo(() => relativeTime(commit.timestamp), [commit.timestamp]);
   return (
     <button
       type="button"
@@ -44,9 +54,7 @@ export function CommitCard({ commit, version, selected, onSelect, tips }: Commit
           {tips?.map((b) => (
             <BranchBadge key={b.name} branch={b} />
           ))}
-          <span className="shrink-0 text-[11px] text-text-muted">
-            {relativeTime(commit.timestamp)}
-          </span>
+          <span className="shrink-0 text-[11px] text-text-muted">{rel}</span>
         </span>
       </div>
       <p className="mt-1 line-clamp-2 text-[13px] leading-snug text-text">{commit.message}</p>
@@ -59,4 +67,4 @@ export function CommitCard({ commit, version, selected, onSelect, tips }: Commit
       </div>
     </button>
   );
-}
+});

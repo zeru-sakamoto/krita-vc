@@ -225,7 +225,7 @@ fn initial_commit_phases() {
     std::fs::write(root.join("art.kra"), &bytes).unwrap();
 
     let t = Instant::now();
-    let changes = krita_vc_lib::scan::scan_detailed(&r).unwrap();
+    let changes = krita_vc_lib::scan::scan_detailed(&r, false).unwrap();
     println!(
         "scan:            {:>8.2?} ({} changes)",
         t.elapsed(),
@@ -467,4 +467,92 @@ fn large_canvas_baseline() {
         chains_files
     );
     println!("total .kvc:          {:>8.1} MB", mb(kvc_bytes));
+}
+
+/// Composite (mergedimage.png) storage behavior at Krita scale: a full-canvas RGBA composite
+/// rides along with every commit, but only the blocks covering the edited region should cost
+/// storage. Prints per-round commit time and `.kvc` growth (the pre-tiling behavior added the
+/// entire multi-MB PNG per commit).
+#[test]
+#[ignore = "benchmark — run manually in release mode with --nocapture"]
+fn composite_commit_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    let mut rng = Rng(0xB105F00D);
+
+    let px = (TILE_GRID * 64) as u32; // 3200
+    let mut layer = full_grid(&mut rng);
+    let mut comp = rng.bytes((px * px * 4) as usize); // full-canvas RGBA composite
+
+    let build = |layer: &[(i64, i64, Vec<u8>)], comp: &[u8]| -> Vec<u8> {
+        let png = krita_vc_lib::raster::rgba_to_png(comp, px, px).unwrap();
+        let block = layer_block(layer);
+        let md = maindoc(1);
+        pack_kra(&[
+            ("mimetype", b"application/x-krita"),
+            ("maindoc.xml", &md),
+            ("img/layers/layer0", &block),
+            ("mergedimage.png", &png),
+        ])
+    };
+
+    std::fs::write(root.join("art.kra"), build(&layer, &comp)).unwrap();
+    let t = Instant::now();
+    commit::commit_snapshot(&mut r, "initial", "bench").unwrap();
+    let (mut prev_bytes, _) = dir_size(&root.join(".kvc"));
+    println!(
+        "initial commit (with {:.0} MB composite): {:>8.2?}  .kvc = {:.1} MB",
+        mb((px as u64 * px as u64 * 4) as u64),
+        t.elapsed(),
+        mb(prev_bytes)
+    );
+
+    // Each round: edit ~EDIT_TILES tiles on the layer AND the matching composite pixels
+    // (localized change — the realistic case).
+    for round in 0..5 {
+        for k in 0..EDIT_TILES {
+            let idx = (round * 37 + k * 101) % layer.len();
+            let (x, y, _) = layer[idx];
+            layer[idx] = (x, y, random_tile(&mut rng));
+            // Refresh the same 64x64 region of the composite.
+            for row in 0..64u32 {
+                let start = (((y as u32 + row) * px + x as u32) * 4) as usize;
+                let fresh = rng.bytes(64 * 4);
+                comp[start..start + 64 * 4].copy_from_slice(&fresh);
+            }
+        }
+        std::fs::write(root.join("art.kra"), build(&layer, &comp)).unwrap();
+        let t = Instant::now();
+        commit::commit_snapshot(&mut r, &format!("edit {round}"), "bench").unwrap();
+        let el = t.elapsed();
+        let (now_bytes, _) = dir_size(&root.join(".kvc"));
+        println!(
+            "round {round}: commit {:>8.2?}  .kvc +{:.1} MB",
+            el,
+            mb(now_bytes.saturating_sub(prev_bytes))
+        );
+        prev_bytes = now_bytes;
+    }
+
+    // A full restore including the composite re-encode.
+    let h = r
+        .commits
+        .last()
+        .unwrap()
+        .files
+        .iter()
+        .find(|f| f.path == "art.kra")
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+    let t = Instant::now();
+    let rebuilt = kra::reconstruct_kra(&r, "art.kra", &h).unwrap();
+    println!(
+        "full reconstruct:    {:>8.2?}  ({:.1} MB)",
+        t.elapsed(),
+        mb(rebuilt.len() as u64)
+    );
 }

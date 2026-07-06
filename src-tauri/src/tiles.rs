@@ -3,9 +3,10 @@
 //! descriptor line `x,y,compression,len\n` followed by `len` bytes of (already compressed)
 //! tile data.
 //!
-//! ponytail: tiles are diffed as opaque LZF-compressed blobs — we never decode Krita's LZF.
-//! Delta quality on already-compressed bytes is limited; upgrade path is to decode LZF and
-//! delta the raw pixels if storage footprint ever demands it.
+//! By default tiles are diffed as opaque LZF-compressed blobs. The opt-in
+//! `Config.tile_pixel_deltas` flag instead stores decoded planar pixels (which bsdiff across
+//! versions — see `kra.rs` and `raster::lzf_compress`); it stays off by default because the
+//! LZF decode/encode cost lands on the commit/restore paths of low-end devices.
 
 use crate::error::{KvcError, Result};
 

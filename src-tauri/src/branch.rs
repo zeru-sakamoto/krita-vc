@@ -160,6 +160,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                 },
                 content: sf.content.clone(),
                 is_kra: sf.is_kra,
+                file_hash: sf.file_hash.clone(),
             }),
             (None, Some(cf)) => {
                 if conflicted {
@@ -170,6 +171,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                         status: "C".into(),
                         content: cf.content.clone(),
                         is_kra: cf.is_kra,
+                        file_hash: cf.file_hash.clone(),
                     });
                 } else {
                     files.push(CommittedFile {
@@ -177,6 +179,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                         status: "D".into(),
                         content: None,
                         is_kra: cf.is_kra,
+                        file_hash: None,
                     });
                 }
             }
@@ -213,6 +216,18 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
         }
     }
     materialize_tree(repo, &cur_tree, &target)?;
+
+    // Materialize rewrote the changed files (re-zipped bytes for a .kra) and recorded their
+    // fresh on-disk hashes in the index — carry those into the commit record so a later
+    // `undo` of this merge rewinds the index to hashes that match reality.
+    let mut commit = commit;
+    for f in &mut commit.files {
+        if f.content.is_some() {
+            if let Some(tf) = repo.index.files.get(&f.path) {
+                f.file_hash = Some(tf.hash.clone());
+            }
+        }
+    }
 
     repo.commits.push(commit.clone());
     repo.branches.set_tip(&id);

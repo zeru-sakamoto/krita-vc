@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { GraphRow } from "../../lib/graph";
 
 const LANE_W = 16;
@@ -15,8 +16,10 @@ function laneX(lane: number): number {
  * The graph rail for one commit row: vertical lane lines + branch/merge
  * diagonals (an SVG that stretches to the row height, with a non-scaling stroke
  * so line weight stays constant), plus the node dot centered on its lane.
+ * Memoized — rows are stable (buildGraph is useMemo'd) so a selection change
+ * only re-renders the two affected rails, not every SVG in the list.
  */
-export function CommitGraphRail({
+export const CommitGraphRail = memo(function CommitGraphRail({
   row,
   laneCount,
   selected,
@@ -77,4 +80,4 @@ export function CommitGraphRail({
       )}
     </div>
   );
-}
+});

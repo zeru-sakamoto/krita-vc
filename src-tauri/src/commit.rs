@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
-    let changes = scan::scan_detailed(repo)?;
+    // `keep_bytes`: changed files hand their just-read buffers straight to the commit below
+    // (budgeted — see `scan::RETAIN_BUDGET`), so a big .kra isn't read twice per commit.
+    let changes = scan::scan_detailed(repo, true)?;
     if changes.is_empty() {
         return Err(KvcError::Nothing);
     }
@@ -20,22 +22,32 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
 
     let mut files = Vec::new();
     for change in changes {
-        let rel = change.rel;
-        if change.status == "D" {
+        let scan::ScanChange {
+            rel,
+            status,
+            hash,
+            size,
+            mtime,
+            bytes,
+        } = change;
+        if status == "D" {
             repo.index.files.remove(&rel);
             files.push(CommittedFile {
                 path: rel,
                 status: "D".into(),
                 content: None,
                 is_kra: false,
+                file_hash: None,
             });
             continue;
         }
 
-        // The scan already read + hashed this file; re-reading here is a page-cache hit, and
-        // reusing its hash/size/mtime drops the second full blake3 pass a big .kra used to pay.
+        // Reuse the scan's buffer when it kept one; only over-budget files pay a re-read.
         let abs = repo.root.join(&rel);
-        let bytes = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
+        let bytes = match bytes {
+            Some(b) => b,
+            None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
+        };
         let is_kra = rel.to_lowercase().ends_with(".kra");
 
         let content = if is_kra {
@@ -48,26 +60,28 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
         } else {
             repo.store_stream(&format!("file:{rel}"), &bytes)?
         };
+        drop(bytes);
 
         repo.index.files.insert(
             rel.clone(),
             TrackedFile {
-                hash: change.hash,
+                hash: hash.clone(),
                 is_kra,
-                size: change.size,
-                mtime: change.mtime,
+                size,
+                mtime,
             },
         );
 
         files.push(CommittedFile {
             path: rel,
-            status: if change.status == "U" {
+            status: if status == "U" {
                 "A".into()
             } else {
                 "M".into()
             },
             content: Some(content),
             is_kra,
+            file_hash: Some(hash),
         });
     }
 
@@ -176,16 +190,21 @@ pub fn current_tree(repo: &Repo) -> BTreeMap<String, CommittedFile> {
         .unwrap_or_default()
 }
 
-/// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob).
-fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
+/// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob),
+/// plus the blake3 of those bytes for the index. A generic blob's stream hash *is* blake3 of
+/// its exact bytes (write-time verified), so only a rebuilt `.kra` pays a hash pass.
+fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
     let content = f
         .content
         .as_deref()
         .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))?;
     if f.is_kra {
-        kra::reconstruct_kra(repo, &f.path, content)
+        let bytes = kra::reconstruct_kra(repo, &f.path, content)?;
+        let hash = hash_bytes(&bytes);
+        Ok((bytes, hash))
     } else {
-        repo.reconstruct(&format!("file:{}", f.path), content)
+        let bytes = repo.reconstruct(&format!("file:{}", f.path), content)?;
+        Ok((bytes, content.to_string()))
     }
 }
 
@@ -197,7 +216,7 @@ fn restore_bytes(
     repo: &Repo,
     target: &CommittedFile,
     current: Option<&CommittedFile>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, String)> {
     if target.is_kra {
         if let (Some(th), Some(ch)) = (
             target.content.as_deref(),
@@ -207,7 +226,8 @@ fn restore_bytes(
         ) {
             if let Ok(working) = std::fs::read(repo.root.join(&target.path)) {
                 if let Ok(bytes) = kra::materialize_kra(repo, &target.path, th, ch, &working) {
-                    return Ok(bytes);
+                    let hash = hash_bytes(&bytes);
+                    return Ok((bytes, hash));
                 }
             }
         }
@@ -228,7 +248,7 @@ pub fn materialize_tree(
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let bytes = restore_bytes(repo, f, current.get(path))?;
+        let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
         let abs = repo.root.join(path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
@@ -240,7 +260,7 @@ pub fn materialize_tree(
         repo.index.files.insert(
             path.clone(),
             TrackedFile {
-                hash: hash_bytes(&bytes),
+                hash,
                 is_kra: f.is_kra,
                 size,
                 mtime,
@@ -281,7 +301,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let bytes = restore_bytes(repo, f, current.get(path))?;
+        let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
         let abs = repo.root.join(path);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
@@ -293,7 +313,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         repo.index.files.insert(
             path.clone(),
             TrackedFile {
-                hash: hash_bytes(&bytes),
+                hash: hash.clone(),
                 is_kra: f.is_kra,
                 size,
                 mtime,
@@ -308,6 +328,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
             },
             content: f.content.clone(),
             is_kra: f.is_kra,
+            file_hash: Some(hash),
         });
     }
     // Remove currently-tracked files that didn't exist at the target commit.
@@ -328,6 +349,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
                 status: "D".into(),
                 content: None,
                 is_kra: cf.is_kra,
+                file_hash: None,
             });
         }
     }
@@ -412,6 +434,7 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
         ));
     }
     let last = repo.commits.remove(pos);
+    repo.note_commits_truncated(); // the popped commit must leave the log on the next save
     repo.branches
         .set_tip(last.parents.first().map(String::as_str).unwrap_or(""));
 
@@ -430,13 +453,22 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
         repo.index.files.remove(&path);
     }
     for pf in restores {
-        let bytes = bytes_of(repo, &pf)?;
+        // The hash the index needs is blake3 of the file as it sat on disk at the new tip:
+        // recorded in `file_hash` since that field existed; a non-kra's `content` is already
+        // that hash; only old .kra records pay the full reconstruct-to-hash fallback.
+        let hash = if let Some(h) = &pf.file_hash {
+            h.clone()
+        } else if !pf.is_kra {
+            pf.content.clone().expect("restores keep content")
+        } else {
+            bytes_of(repo, &pf)?.1
+        };
         // size/mtime left 0: the working-tree file is untouched by a soft undo, so its real mtime
         // is unknown here — 0 never matches, forcing the next scan to re-hash (correct, conservative).
         repo.index.files.insert(
             pf.path.clone(),
             TrackedFile {
-                hash: hash_bytes(&bytes),
+                hash,
                 is_kra: pf.is_kra,
                 size: 0,
                 mtime: 0,

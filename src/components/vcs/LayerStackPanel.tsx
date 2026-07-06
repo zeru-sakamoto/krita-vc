@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
 import { compositeSvg } from "../../lib/svgArt";
@@ -72,6 +73,52 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * One layer row. Memoized because rebuilding the thumb's SVG re-serializes the layer's
+ * raster markup (multi-MB on the base64 fallback) — with N layers and one parent render per
+ * zoom/pan frame or streamed-layer message, unmemoized rows turn into O(N²) string churn.
+ */
+const LayerRow = memo(function LayerRow({
+  layer,
+  width,
+  height,
+  selected,
+  pending,
+  onSelect,
+}: {
+  layer: ArtLayer;
+  width: number;
+  height: number;
+  selected: boolean;
+  pending: boolean;
+  onSelect: (id: string) => void;
+}) {
+  const state = layer.after != null ? "after" : "before";
+  const status = CHANGE_STATUS[layer.change];
+  const svg = useMemo(
+    () => compositeSvg([layer], state, width, height),
+    [layer, state, width, height]
+  );
+  return (
+    <Row selected={selected} onClick={() => onSelect(layer.id)}>
+      {pending ? (
+        <div className="grid h-7 w-9 shrink-0 place-items-center rounded-badge border border-border bg-surface-2">
+          <CircleNotchIcon size={12} className="animate-spin text-text-muted" />
+        </div>
+      ) : (
+        <Thumb svg={svg} />
+      )}
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-[12px] text-text">{layer.name}</span>
+        <span className="truncate font-mono text-[10px] text-text-muted">
+          {layer.opacity}% · {layer.blendMode}
+        </span>
+      </span>
+      {status && <FileStatusChip status={status} />}
+    </Row>
+  );
+});
+
 interface LayerStackPanelProps {
   diff: ArtDiff;
   /** Optional palette diff — renders a "Color Palette" section below the layer list. */
@@ -87,8 +134,11 @@ interface LayerStackPanelProps {
  *   1. Layers — Composite row + individual layers (bottom→top reversed to top-first).
  *   2. Color Palette — single selectable row per palette (when palette prop is provided).
  * (DESIGN.md → Layout & App Shell → Docker / Panel System)
+ *
+ * Memoized: the parent re-renders on every zoom/pan frame, but the navigator's props only
+ * change when layers stream in or the selection moves.
  */
-export function LayerStackPanel({
+export const LayerStackPanel = memo(function LayerStackPanel({
   diff,
   palette,
   selectedId,
@@ -98,6 +148,25 @@ export function LayerStackPanel({
   // Derive an overall palette change status: prefer M > A > D over unchanged swatches.
   const paletteStatus: FileStatus | null = palette ? (palette.status ?? null) : null;
 
+  // Prefer the backend's real composite (mergedimage.png) for the thumb — one small image
+  // instead of concatenating every layer's raster markup (mirrors the canvas's preference).
+  const compositeThumb = useMemo(() => {
+    const img = diff.afterImage ?? diff.beforeImage;
+    if (img != null) {
+      const composite: ArtLayer = {
+        id: COMPOSITE_ID,
+        name: "Composite",
+        opacity: 100,
+        blendMode: "normal",
+        change: "modified",
+        before: null,
+        after: img,
+      };
+      return compositeSvg([composite], "after", diff.width, diff.height);
+    }
+    return compositeSvg(diff.layers, "after", diff.width, diff.height);
+  }, [diff.afterImage, diff.beforeImage, diff.layers, diff.width, diff.height]);
+
   return (
     <div className="flex w-50 shrink-0 flex-col border-r border-border bg-surface">
       <div className="min-h-0 flex-1 overflow-auto">
@@ -106,35 +175,24 @@ export function LayerStackPanel({
 
         {/* Composite */}
         <Row selected={selectedId === COMPOSITE_ID} onClick={() => onSelect(COMPOSITE_ID)}>
-          <Thumb svg={compositeSvg(diff.layers, "after", diff.width, diff.height)} />
+          <Thumb svg={compositeThumb} />
           <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-text">
             Composite
           </span>
         </Row>
 
         {/* Layers, top-first */}
-        {[...diff.layers].reverse().map((l) => {
-          const state = l.after != null ? "after" : "before";
-          const status = CHANGE_STATUS[l.change];
-          return (
-            <Row key={l.id} selected={selectedId === l.id} onClick={() => onSelect(l.id)}>
-              {pendingIds?.has(l.id) ? (
-                <div className="grid h-7 w-9 shrink-0 place-items-center rounded-badge border border-border bg-surface-2">
-                  <CircleNotchIcon size={12} className="animate-spin text-text-muted" />
-                </div>
-              ) : (
-                <Thumb svg={compositeSvg([l], state, diff.width, diff.height)} />
-              )}
-              <span className="flex min-w-0 flex-1 flex-col">
-                <span className="truncate text-[12px] text-text">{l.name}</span>
-                <span className="truncate font-mono text-[10px] text-text-muted">
-                  {l.opacity}% · {l.blendMode}
-                </span>
-              </span>
-              {status && <FileStatusChip status={status} />}
-            </Row>
-          );
-        })}
+        {[...diff.layers].reverse().map((l) => (
+          <LayerRow
+            key={l.id}
+            layer={l}
+            width={diff.width}
+            height={diff.height}
+            selected={selectedId === l.id}
+            pending={pendingIds?.has(l.id) ?? false}
+            onSelect={onSelect}
+          />
+        ))}
 
         {/* ── Color Palette (optional) ── */}
         {palette && (
@@ -155,4 +213,4 @@ export function LayerStackPanel({
       </div>
     </div>
   );
-}
+});

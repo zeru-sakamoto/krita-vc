@@ -1187,8 +1187,33 @@ fn chains_sharded_format_and_legacy_monolith_migration() {
     assert!(!root.join(".kvc/chains.bin").exists());
 
     // Simulate a pre-sharding repo: all chains in one monolithic chains.bin, no shards.
+    // Real monoliths predate KVCC2, so they carry the old 4-field Version (with `object`).
+    #[derive(serde::Serialize)]
+    struct V1 {
+        hash: String,
+        object: String,
+        base: Option<String>,
+        chain_len: usize,
+    }
     let all = r.chains.export_all();
-    let monolith = zstd::encode_all(&bincode::serialize(&all).unwrap()[..], 1).unwrap();
+    let legacy: std::collections::BTreeMap<String, Vec<V1>> = all
+        .0
+        .iter()
+        .map(|(k, vs)| {
+            (
+                k.clone(),
+                vs.iter()
+                    .map(|v| V1 {
+                        hash: v.hash.clone(),
+                        object: v.object_name(),
+                        base: v.base.clone(),
+                        chain_len: v.chain_len,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let monolith = zstd::encode_all(&bincode::serialize(&legacy).unwrap()[..], 1).unwrap();
     std::fs::write(root.join(".kvc/chains.bin"), &monolith).unwrap();
     std::fs::remove_dir_all(root.join(".kvc/chains")).unwrap();
 
@@ -1531,4 +1556,539 @@ fn kra_switch_materializes_incrementally() {
     );
     assert_eq!(kra::read_entry(&on_idea, "img/layers/layer2").unwrap(), t2b);
     assert!(scan::scan(&r).unwrap().is_empty());
+}
+
+// --- commits.log: append-only history, legacy migration, torn-tail tolerance -------------
+
+#[test]
+fn commits_log_appends_and_migrates_legacy() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    let log = root.join(".kvc/commits.log");
+    assert!(log.is_file(), "init writes the log");
+    assert!(!root.join(".kvc/commits.json").exists());
+
+    std::fs::write(root.join("a.txt"), b"one").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    std::fs::write(root.join("a.txt"), b"two").unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.lines().count(), 2, "one JSON line per commit");
+
+    // Legacy migration: fabricate a commits.json-era repo from the same history.
+    let commits = r.commits.clone();
+    drop(r);
+    std::fs::write(
+        root.join(".kvc/commits.json"),
+        serde_json::to_vec(&commits).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(&log).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.commits.len(), 2, "legacy commits.json readable");
+    std::fs::write(root.join("a.txt"), b"three").unwrap();
+    commit::commit_snapshot(&mut r, "c3", "t").unwrap();
+    assert!(log.is_file(), "first save writes the log");
+    assert!(
+        !root.join(".kvc/commits.json").exists(),
+        "legacy file retired after the log is in place"
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+
+    // Torn tail: a crash mid-append leaves a partial line — dropped on read, scrubbed on the
+    // next save (branches.json is written after the log, so the torn record was never a tip).
+    drop(r);
+    let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    f.write_all(b"{\"id\":\"torn").unwrap();
+    drop(f);
+    let mut r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.commits.len(), 3, "torn tail dropped, history intact");
+
+    // Undo rewrites the log without the popped commit (and scrubs the torn tail with it).
+    commit::undo_last_commit(&mut r).unwrap();
+    assert_eq!(r.commits.len(), 2);
+    drop(r);
+    let r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.commits.len(), 2, "log rewritten after undo");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    assert!(!text.contains("torn"));
+}
+
+// --- undo rewinds the index from the recorded file hash (no reconstruct-to-hash) ---------
+
+#[test]
+fn undo_uses_recorded_file_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let doc1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, &[1u8; 64][..])])),
+    ]);
+    std::fs::write(root.join("art.kra"), &doc1).unwrap();
+    commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    let doc2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, &[2u8; 64][..])])),
+    ]);
+    std::fs::write(root.join("art.kra"), &doc2).unwrap();
+    commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    commit::undo_last_commit(&mut r).unwrap();
+    let tf = r.index.files.get("art.kra").unwrap();
+    assert_eq!(
+        tf.hash,
+        repo::hash_bytes(&doc1),
+        "index rewound to v1's exact on-disk file hash (recorded at commit time)"
+    );
+    // Soft undo leaves the v2 bytes on disk — the next scan must flag them as modified.
+    assert_eq!(
+        scan::scan(&r).unwrap(),
+        vec![("art.kra".to_string(), "M".to_string())]
+    );
+}
+
+// --- GC: raster-cache prune, stale-filter wipe, tmp sweep, pack consolidation ------------
+
+#[test]
+fn gc_prunes_cache_and_sweeps_stale_tmp() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    r.config.cache_max_bytes = 300; // in-memory only — tiny budget for the test
+
+    // 5 x 100-byte cache PNGs with strictly increasing mtimes.
+    let cache = root.join(".kvc/cache");
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for i in 0..5u32 {
+        let p = cache.join(format!("entry{i}.png"));
+        std::fs::write(&p, [0u8; 100]).unwrap();
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(base + std::time::Duration::from_secs(i as u64 * 60))
+            .unwrap();
+    }
+    // One stale .tmp (crash leftover, >1h old) and one fresh .tmp (in-flight, must survive).
+    let stale = root.join(".kvc/config.tmp");
+    std::fs::write(&stale, [0u8; 40]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .unwrap();
+    // (In the pack dir with a name no real atomic write uses — GC's own `repo.save()`
+    // legitimately creates and renames `.kvc/*.tmp` names mid-run.)
+    let fresh = root.join(".kvc/objects/pack/inflight.tmp");
+    std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+    std::fs::write(&fresh, [0u8; 40]).unwrap();
+
+    // Dry run: reports the over-budget cache bytes + the stale tmp, touches nothing.
+    let dry = gc::collect_garbage(&mut r, true).unwrap();
+    assert_eq!(
+        dry.cache_bytes_reclaimed, 200,
+        "500 bytes cached, 300 budget"
+    );
+    assert_eq!(dry.bytes_reclaimed, 40, "the stale tmp file");
+    assert!(cache.join("entry0.png").exists() && stale.exists());
+
+    // Real run: prunes oldest-first to budget, writes the filter marker, sweeps only the
+    // stale tmp.
+    let report = gc::collect_garbage(&mut r, false).unwrap();
+    assert_eq!(report.cache_bytes_reclaimed, 200);
+    assert!(!cache.join("entry0.png").exists() && !cache.join("entry1.png").exists());
+    assert!(cache.join("entry4.png").exists());
+    assert_eq!(
+        std::fs::read_to_string(cache.join(".filter-version")).unwrap(),
+        raster::FILTER_VERSION
+    );
+    assert!(!stale.exists(), "stale tmp swept");
+    assert!(fresh.exists(), "fresh tmp untouched");
+
+    // Stale filter marker: the whole cache is wiped regardless of budget.
+    std::fs::write(cache.join(".filter-version"), "box0").unwrap();
+    std::fs::write(cache.join("old-filter.png"), [0u8; 50]).unwrap();
+    let report = gc::collect_garbage(&mut r, false).unwrap();
+    assert!(report.cache_bytes_reclaimed >= 50, "stale-filter wipe");
+    assert!(!cache.join("old-filter.png").exists());
+    assert!(!cache.join("entry4.png").exists(), "wipe takes everything");
+    assert_eq!(
+        std::fs::read_to_string(cache.join(".filter-version")).unwrap(),
+        raster::FILTER_VERSION
+    );
+}
+
+#[test]
+fn gc_consolidates_small_packs() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // 9 commits, each rewriting 33 tiles with fresh content — every commit crosses
+    // PACK_MIN_OBJECTS and writes its own small pack.
+    let doc_of = |round: u8| {
+        // First byte = round, rest = tile index: unique content per (round, tile) so
+        // content-addressed dedup can't collapse tiles across rounds.
+        let datas: Vec<Vec<u8>> = (0..33u8)
+            .map(|i| {
+                let mut d = vec![i; 300];
+                d[0] = round;
+                d
+            })
+            .collect();
+        let items: Vec<(i64, i64, &[u8])> = datas
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as i64 * 64, 0i64, d.as_slice()))
+            .collect();
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&items)),
+        ])
+    };
+    let mut ids = Vec::new();
+    for round in 0..6u8 {
+        std::fs::write(root.join("art.kra"), doc_of(round)).unwrap();
+        ids.push(
+            commit::commit_snapshot(&mut r, &format!("r{round}"), "t")
+                .unwrap()
+                .id,
+        );
+    }
+    let packs = |root: &std::path::Path| -> usize {
+        std::fs::read_dir(root.join(".kvc/objects/pack"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    // Below the consolidation threshold: packs stay as-is.
+    let before = packs(root);
+    assert!(before >= 6, "one pack per large commit, got {before}");
+    gc::collect_garbage(&mut r, false).unwrap();
+    assert_eq!(packs(root), before, "under {} packs: no consolidation", 8);
+
+    for round in 6..9u8 {
+        std::fs::write(root.join("art.kra"), doc_of(round)).unwrap();
+        ids.push(
+            commit::commit_snapshot(&mut r, &format!("r{round}"), "t")
+                .unwrap()
+                .id,
+        );
+    }
+    assert!(packs(root) >= 8);
+    gc::collect_garbage(&mut r, false).unwrap();
+    assert_eq!(packs(root), 1, "small live packs merged into one");
+
+    // Every version still reconstructs from the consolidated pack — this session and reopened.
+    for repo_ref in [&r, &repo::Repo::open(root).unwrap()] {
+        for (round, id) in ids.iter().enumerate() {
+            let bytes = commit::file_at_commit(repo_ref, "art.kra", id).unwrap();
+            let block =
+                tiles::parse(&kra::read_entry(&bytes, "img/layers/layer1").unwrap()).unwrap();
+            assert_eq!(block.tiles.len(), 33);
+            let expected = {
+                let mut d = vec![0u8; 300];
+                d[0] = round as u8;
+                d
+            };
+            assert_eq!(block.tiles[0].data, expected);
+        }
+    }
+}
+
+// --- chains format: KVCC2 shards, legacy (object-carrying) shards stay readable -----------
+
+#[test]
+fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+
+    // Fabricate a pre-KVCC2 shard by hand: bare zstd(bincode) with the old 4-field Version
+    // (including the redundant `object`), plus its loose object, exactly as the old code
+    // laid them out.
+    #[derive(serde::Serialize)]
+    struct V1 {
+        hash: String,
+        object: String,
+        base: Option<String>,
+        chain_len: usize,
+    }
+    let content = b"hello legacy".to_vec();
+    let hash = repo::hash_bytes(&content);
+    let obj_dir = root.join(".kvc/objects").join(&hash[..2]);
+    std::fs::create_dir_all(&obj_dir).unwrap();
+    std::fs::write(
+        obj_dir.join(format!("{hash}.full")),
+        zstd::encode_all(&content[..], 3).unwrap(),
+    )
+    .unwrap();
+    let mut chains = std::collections::BTreeMap::new();
+    chains.insert(
+        "file:notes.txt".to_string(),
+        vec![V1 {
+            hash: hash.clone(),
+            object: format!("{hash}.full"),
+            base: None,
+            chain_len: 0,
+        }],
+    );
+    let plain = bincode::serialize(&chains).unwrap();
+    let shard = root.join(".kvc/chains").join(format!(
+        "{}.bin",
+        &blake3::hash(b"notes.txt").to_hex()[..16]
+    ));
+    std::fs::write(&shard, zstd::encode_all(&plain[..], 1).unwrap()).unwrap();
+
+    // The legacy shard reads transparently.
+    let mut r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.reconstruct("file:notes.txt", &hash).unwrap(), content);
+
+    // Dirtying the shard rewrites it in the new format; both versions still reconstruct.
+    let h2 = r
+        .store_stream("file:notes.txt", b"hello legacy v2")
+        .unwrap();
+    r.save().unwrap();
+    let bytes = std::fs::read(&shard).unwrap();
+    assert!(bytes.starts_with(b"KVCC2"), "dirtied shard upgraded");
+    let r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(r2.reconstruct("file:notes.txt", &hash).unwrap(), content);
+    assert_eq!(
+        r2.reconstruct("file:notes.txt", &h2).unwrap(),
+        b"hello legacy v2"
+    );
+
+    // A rotten shard still reads as empty (never a panic).
+    let bad = root.join(".kvc/chains").join("deadbeefdeadbeef.bin");
+    std::fs::write(&bad, b"not a shard").unwrap();
+    let r3 = repo::Repo::open(root).unwrap();
+    assert!(r3.chains.chain("file:whatever").is_none());
+}
+
+// --- composite tiling: mergedimage.png stored as deduped pixel blocks ---------------------
+
+/// Decode a PNG to interleaved RGBA (tests encode RGBA, so no expansion needed).
+fn decode_rgba_png(png_bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png_bytes))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    buf.truncate(info.buffer_size());
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    (buf, info.width, info.height)
+}
+
+/// Deterministic RGBA canvas.
+fn test_canvas(w: u32, h: u32, seed: u8) -> Vec<u8> {
+    (0..w as usize * h as usize * 4)
+        .map(|i| (i as u32).wrapping_mul(31).wrapping_add(seed as u32) as u8)
+        .collect()
+}
+
+fn kra_with_composite(composite_png: &[u8], tile: &[u8]) -> Vec<u8> {
+    pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, tile)])),
+        ("mergedimage.png", composite_png.to_vec()),
+    ])
+}
+
+#[test]
+fn composite_tiles_dedup_and_pixel_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // 1280x1280 = 5x5 composite blocks.
+    let (w, h) = (1280u32, 1280u32);
+    let px1 = test_canvas(w, h, 1);
+    let png1 = raster::rgba_to_png(&px1, w, h).unwrap();
+    std::fs::write(root.join("art.kra"), kra_with_composite(&png1, b"tile-v1")).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    // Edit a 50x50 region fully inside one block: only that block (+ the manifest) is new.
+    let mut px2 = px1.clone();
+    for y in 300..350usize {
+        for x in 300..350usize {
+            let i = (y * w as usize + x) * 4;
+            px2[i] = 255 - px2[i];
+        }
+    }
+    let png2 = raster::rgba_to_png(&px2, w, h).unwrap();
+    std::fs::write(root.join("art.kra"), kra_with_composite(&png2, b"tile-v1")).unwrap();
+    let before = count_objects(root);
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+    let added = count_objects(root) - before;
+    assert!(
+        added <= 3,
+        "a one-block composite edit must add ~2 objects (block + manifest), added {added}"
+    );
+
+    // Both versions reconstruct to pixel-exact composites (bytes are re-encoded, pixels not).
+    for (cid, px) in [(&c1.id, &px1), (&c2.id, &px2)] {
+        let bytes = commit::file_at_commit(&r, "art.kra", cid).unwrap();
+        let entry = kra::read_entry(&bytes, "mergedimage.png").unwrap();
+        let (got, gw, gh) = decode_rgba_png(&entry);
+        assert_eq!((gw, gh), (w, h));
+        assert_eq!(&got, px, "composite pixels must round-trip exactly");
+        // The rest of the archive is intact too.
+        assert_eq!(
+            kra::read_entry(&bytes, "mimetype").unwrap(),
+            b"application/x-krita"
+        );
+        let block = tiles::parse(&kra::read_entry(&bytes, "img/layers/layer1").unwrap()).unwrap();
+        assert_eq!(block.tiles[0].data, b"tile-v1");
+    }
+}
+
+#[test]
+fn composite_fallback_stays_raw_byte_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // A 16-bit grayscale PNG is ineligible for re-encoding — must stay Raw, byte-for-byte.
+    let mut gray16 = Vec::new();
+    {
+        let mut enc = png::Encoder::new(std::io::Cursor::new(&mut gray16), 64, 64);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Sixteen);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&vec![0x42u8; 64 * 64 * 2]).unwrap();
+    }
+    std::fs::write(root.join("art.kra"), kra_with_composite(&gray16, b"tile-x")).unwrap();
+    let c = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    let bytes = commit::file_at_commit(&r, "art.kra", &c.id).unwrap();
+    assert_eq!(
+        kra::read_entry(&bytes, "mergedimage.png").unwrap(),
+        gray16,
+        "ineligible composite must reconstruct byte-identical"
+    );
+}
+
+#[test]
+fn composite_materialize_across_branch_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let (w, h) = (600u32, 500u32); // non-multiple of 256: exercises partial edge blocks
+    let px_main = test_canvas(w, h, 7);
+    let png_main = raster::rgba_to_png(&px_main, w, h).unwrap();
+    std::fs::write(
+        root.join("art.kra"),
+        kra_with_composite(&png_main, b"t-main"),
+    )
+    .unwrap();
+    commit::commit_snapshot(&mut r, "main v1", "t").unwrap();
+
+    branch::create_branch(&mut r, "idea", None).unwrap();
+    let mut px_idea = px_main.clone();
+    for i in (0..px_idea.len()).step_by(97) {
+        px_idea[i] = px_idea[i].wrapping_add(13);
+    }
+    let png_idea = raster::rgba_to_png(&px_idea, w, h).unwrap();
+    std::fs::write(
+        root.join("art.kra"),
+        kra_with_composite(&png_idea, b"t-idea"),
+    )
+    .unwrap();
+    commit::commit_snapshot(&mut r, "idea v1", "t").unwrap();
+
+    // Bounce between branches; the restored composite is pixel-exact each time and the tree
+    // stays clean (index hash matches what was written).
+    for (branch_name, px) in [("main", &px_main), ("idea", &px_idea), ("main", &px_main)] {
+        branch::switch_branch(&mut r, branch_name).unwrap();
+        let on_disk = std::fs::read(root.join("art.kra")).unwrap();
+        let entry = kra::read_entry(&on_disk, "mergedimage.png").unwrap();
+        let (got, gw, gh) = decode_rgba_png(&entry);
+        assert_eq!((gw, gh), (w, h));
+        assert_eq!(&got, px, "restored composite pixels exact on {branch_name}");
+        assert!(scan::scan(&r).unwrap().is_empty(), "clean after switch");
+    }
+}
+
+// --- opt-in tile pixel deltas: mixed-flag history, patch-floor bypass ---------------------
+
+#[test]
+fn tile_pixel_deltas_flag_mixed_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let planar = |seed: u8| -> Vec<u8> {
+        (0..64 * 64 * 4u32)
+            .map(|i| ((i / 97) as u8).wrapping_add(seed))
+            .collect()
+    };
+    let doc = |p: &[u8]| {
+        let stored = raster::tile_from_planar(p); // Krita-style [flag][LZF] payload
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&[(0, 0, &stored)])),
+        ])
+    };
+
+    // v1: flag off — opaque tile stream (the default path).
+    let p1 = planar(1);
+    std::fs::write(root.join("art.kra"), doc(&p1)).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    // v2 + v3: flag on — planar streams; v3 must patch against v2 (the 64 KB floor is
+    // bypassed for pixel-delta tiles, or the whole feature stores fulls).
+    r.config.tile_pixel_deltas = true;
+    let p2 = planar(2);
+    std::fs::write(root.join("art.kra"), doc(&p2)).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+    let mut p3 = p2.clone();
+    for b in p3.iter_mut().take(500) {
+        *b = b.wrapping_add(9);
+    }
+    std::fs::write(root.join("art.kra"), doc(&p3)).unwrap();
+    let c3 = commit::commit_snapshot(&mut r, "v3", "t").unwrap();
+    let chain = r
+        .chains
+        .chain("kra:art.kra:tile:img/layers/layer1:0,0")
+        .unwrap();
+    assert!(
+        chain.last().unwrap().base.is_some(),
+        "a 16 KB planar tile edit must store as a patch, not a full"
+    );
+
+    // v4: flag off again — new commits go back to opaque; older raw refs stay readable.
+    r.config.tile_pixel_deltas = false;
+    let p4 = planar(4);
+    std::fs::write(root.join("art.kra"), doc(&p4)).unwrap();
+    let c4 = commit::commit_snapshot(&mut r, "v4", "t").unwrap();
+
+    // Every version reconstructs to a .kra whose tile payload is valid (LZF or raw) and
+    // decodes to the exact source pixels — across both storage modes in one history.
+    for (cid, p) in [(&c1.id, &p1), (&c2.id, &p2), (&c3.id, &p3), (&c4.id, &p4)] {
+        let bytes = commit::file_at_commit(&r, "art.kra", cid).unwrap();
+        let block = tiles::parse(&kra::read_entry(&bytes, "img/layers/layer1").unwrap()).unwrap();
+        let got = raster::tile_planar(&block.tiles[0].data, p.len()).unwrap();
+        assert_eq!(&got, p, "planar pixels exact for {cid}");
+    }
 }

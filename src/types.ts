@@ -110,6 +110,18 @@ export interface ArtDiff {
    */
   beforeImage?: string | null;
   afterImage?: string | null;
+  /**
+   * Changed-pixel mask markup (an `<image>` sized to the viewBox): transparent except where
+   * the before/after composites differ, tinted accent. Drives the "pixels" highlight mode.
+   * Computed by the backend off the composite, so it's present from the first `commit_diff`
+   * (before per-layer rasters stream in). null/absent for added/removed files.
+   */
+  diffImage?: string | null;
+  /**
+   * SVG path data (normalized 0..1) outlining the changed pixels' silhouette. Scaled to the
+   * viewBox and stroked dashed in the "pixels" highlight — hugs the change, not a bounding box.
+   */
+  diffOutline?: string | null;
 }
 
 export type SwatchChange = "added" | "removed" | "modified" | "unchanged";

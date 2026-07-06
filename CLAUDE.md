@@ -11,13 +11,24 @@ working-tree changes). Don't add remote-facing affordances unless the project sc
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
 `gc`; commands in `commands.rs`). Storage layout: chains are **sharded per tracked file**
-(`.kvc/chains/`, lazy-loaded; legacy monolithic `chains.bin`/`chains.json` migrate on first
-save), loose objects are sharded 256-way (`objects/<xx>/`, flat legacy stays readable), and a
+(`.kvc/chains/`, lazy-loaded, `KVCC2`-tagged bincode — pre-KVCC2 shards and legacy monolithic
+`chains.bin`/`chains.json` migrate transparently), the commit log is **append-only JSON-lines**
+(`.kvc/commits.log`; a commit appends one line, legacy `commits.json` migrates on first save),
+loose objects are sharded 256-way (`objects/<xx>/`, flat legacy stays readable), and a
 commit with ≥32 new objects writes **one pack file** (`objects/pack/*.pack`) instead of loose
-files — per-file creates dominated large commits on Windows. A user-facing **"Clean up
+files — per-file creates dominated large commits on Windows. The `.kra` composite
+(`mergedimage.png`) is stored as **content-addressed 256px pixel blocks**
+(`KraEntry::CompositePng`) instead of a full PNG per commit — the store's former dominant cost;
+restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
+byte-exact `Raw`). Restored `.kra` files write tile entries **deflate-fast** (Stored left them
+several× larger on disk), and restores are memory-bounded (64 MB build chunks). An opt-in
+`tilePixelDeltas` config flag (off by default, no UI) stores decoded tile pixels that bsdiff
+across versions — mixed histories are safe via a per-ref `raw` flag. A user-facing **"Clean up
 storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powered confirm
-modal in `TopBar`) reclaims history unreachable from any branch tip; the raster cache
-(`.kvc/cache/`) is size-budgeted (`Config.cacheMaxBytes`) with LRU pruning. **Branching is real**: `.kvc/branches.json` maps branch name → tip
+modal in `TopBar`) reclaims history unreachable from any branch tip **and** prunes the raster
+cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
+rewrites on >25% dead, and consolidates small packs; the raster cache (`.kvc/cache/`) is
+size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Branching is real**: `.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
@@ -128,8 +139,23 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   `working_layers`, one `Channel` message per finished layer (merged into `effectiveDiff` by id
   as each lands; pending layers show spinner thumbs plus the "Loading layers…" indicator). Each
   layer's raster comes as SVG `<image>` markup so the SVG-compositing viewer is unchanged, and
-  the Composite view uses the `.kra`'s `mergedimage.png` (downscaled to the raster cap). Capped
-  PNGs are cached content-addressed in `.kvc/cache/`, so repeat views skip rasterization. Palette (`.gpl`) files have
+  the Composite view uses the `.kra`'s `mergedimage.png` (downscaled to the raster cap via an
+  area-average box filter — `raster::box_downscale`, premultiplied-alpha; sharper than the old
+  nearest-neighbour under the viewer's zoom). Capped PNGs are cached content-addressed in
+  `.kvc/cache/` (keys carry a `box1` filter-version token), so repeat views skip rasterization.
+  The viewer has **shared zoom/pan** (`useZoomPan`, wheel-to-cursor zoom + space/middle-mouse pan)
+  applied identically to both side-by-side panes and the swipe slider so before/after and the
+  slider divider stay pixel-aligned; zoom/pan and the slider drag are rAF-coalesced (one state
+  flush per frame), the canvases and `LayerStackPanel`'s per-layer rows are `React.memo`'d with
+  per-layer `compositeSvg` memoization (rebuilding a thumb re-serializes its raster markup), the
+  canvas transform wrapper carries `will-change: transform`, and streamed-layer Channel messages
+  batch into one state flush per frame — together these keep interaction off the multi-MB
+  SVG-string rebuild path. The **change highlight** defaults to a true **changed-pixel** overlay — an accent
+  mask (`ArtDiff.diffImage`) plus a hatch pattern and a **dashed outline that hugs the changed
+  pixels' silhouette** (`ArtDiff.diffOutline`, a vector path traced by `raster::diff_overlay`/
+  `outline_from_grid`), computed in Rust off the before/after composites so it ships with the first
+  `commit_diff`; a coarse tile-bbox **region-box** mode (with corner brackets) remains as a fallback.
+  Palette (`.gpl`) files have
   `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**

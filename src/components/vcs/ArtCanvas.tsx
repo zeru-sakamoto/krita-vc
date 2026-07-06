@@ -1,10 +1,10 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import type { ArtDiff, ArtLayer, DiffState } from "../../types";
 import { layersBody, wrapSvg } from "../../lib/svgArt";
 
 const ACCENT = "#e07b39";
 
-export type HighlightMode = "box" | "mask";
+export type HighlightMode = "box" | "pixels";
 
 interface ArtCanvasProps {
   diff: ArtDiff;
@@ -14,10 +14,22 @@ interface ArtCanvasProps {
   /** Draw the change-highlight overlay on top of this canvas. */
   overlay?: boolean;
   highlightMode?: HighlightMode;
+  /**
+   * Shared zoom/pan CSS transform (e.g. "translate(10px,4px) scale(2)"). Applied to the
+   * SVG-wrapping div only, so the memoized SVG string and its DOM stay untouched during
+   * interaction — the compositor handles the transform off the main thread.
+   */
+  transform?: string;
   className?: string;
 }
 
-/** Translucent accent rectangles over each changed region. */
+/**
+ * Change-region markers: a subtle filled rect plus **bold corner brackets**. All strokes use
+ * `vector-effect="non-scaling-stroke"` so their width stays constant in *screen* pixels — on a
+ * large canvas shown fit-to-pane the plain document-space dashes go sub-pixel and vanish, but the
+ * brackets stay legible at any zoom-out. Arm length is a fraction of the region (capped vs the
+ * canvas) so brackets read as corners on both tiny and near-full-canvas regions.
+ */
 function boxOverlay(diff: ArtDiff): string {
   const { width: W, height: H } = diff;
   return diff.regions
@@ -26,47 +38,93 @@ function boxOverlay(diff: ArtDiff): string {
       const y = r.y * H;
       const w = r.w * W;
       const h = r.h * H;
+      const arm = Math.min(Math.min(w, h) * 0.3, Math.min(W, H) * 0.1);
+      const corners = [
+        `M${x} ${y + arm} L${x} ${y} L${x + arm} ${y}`, // top-left
+        `M${x + w - arm} ${y} L${x + w} ${y} L${x + w} ${y + arm}`, // top-right
+        `M${x + w} ${y + h - arm} L${x + w} ${y + h} L${x + w - arm} ${y + h}`, // bottom-right
+        `M${x + arm} ${y + h} L${x} ${y + h} L${x} ${y + h - arm}`, // bottom-left
+      ].join(" ");
       const label = r.label
         ? `<text x="${x + 4}" y="${y + 14}" font-family="sans-serif" font-size="11" fill="${ACCENT}">${r.label}</text>`
         : "";
-      return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${ACCENT}" fill-opacity="0.16" stroke="${ACCENT}" stroke-width="2" stroke-dasharray="6 4" rx="3"/>${label}`;
+      return (
+        `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${ACCENT}" fill-opacity="0.12" ` +
+        `stroke="${ACCENT}" stroke-width="1.5" stroke-dasharray="6 4" rx="3" vector-effect="non-scaling-stroke"/>` +
+        `<path d="${corners}" fill="none" stroke="${ACCENT}" stroke-width="3" stroke-linecap="round" ` +
+        `stroke-linejoin="round" vector-effect="non-scaling-stroke"/>${label}`
+      );
     })
     .join("");
 }
 
-/** Recolor the changed layers' silhouettes to accent + glow (precise mask). */
-function maskOverlay(diff: ArtDiff): string {
-  const changed = diff.layers.filter((l) => l.change !== "unchanged");
-  const body = changed
-    .map((l) => l.after ?? l.before ?? "")
-    .filter(Boolean)
-    .join("");
-  if (!body) return "";
-  const filter = `<filter id="tint" x="-20%" y="-20%" width="140%" height="140%">
-    <feFlood flood-color="${ACCENT}" result="flood"/>
-    <feComposite in="flood" in2="SourceAlpha" operator="in" result="tinted"/>
-    <feGaussianBlur in="tinted" stdDeviation="3" result="glow"/>
-    <feMerge><feMergeNode in="glow"/><feMergeNode in="tinted"/></feMerge>
-  </filter>`;
-  return `${filter}<g filter="url(#tint)" opacity="0.75">${body}</g>`;
+/**
+ * Changed-pixel overlay: the backend mask (`diff.diffImage`) painted three ways so the change
+ * reads on top of busy artwork without an expensive filter —
+ *  1. a flat accent tint of the changed pixels (area sense),
+ *  2. a diagonal **hatch pattern** masked to the same pixels — the alternating stripes give
+ *     high-frequency contrast that survives against any underlying color (a flat tint blends),
+ *  3. a **dashed outline** that hugs the changed pixels' silhouette (`diff.diffOutline`, a vector
+ *     path traced by the backend — not a bounding box), `non-scaling-stroke` so its width and dash
+ *     length stay constant on screen at any zoom.
+ * All of this is plain fills/patterns/masks/paths (GPU-composited) and only rebuilds when the
+ * memoized SVG string changes — never on zoom/pan (that's a CSS transform on the wrapper). The
+ * hatch tile is sized relative to the canvas so it doesn't go sub-pixel on a large canvas at fit view.
+ */
+function pixelOverlay(diff: ArtDiff): string {
+  const img = diff.diffImage;
+  if (!img) return "";
+  const { width: W, height: H } = diff;
+  // Unique ids per file so two inline SVGs on screen don't cross-reference each other's defs.
+  const uid = diff.path.replace(/[^a-zA-Z0-9]/g, "-");
+  const tile = Math.max(6, Math.min(W, H) * 0.014);
+  const defs =
+    `<defs>` +
+    `<pattern id="kvc-hatch-${uid}" width="${tile}" height="${tile}" ` +
+    `patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
+    `<rect width="${tile / 2}" height="${tile}" fill="${ACCENT}" fill-opacity="0.6"/>` +
+    `</pattern>` +
+    // mask-type:alpha → use the raster's alpha (it's accent-colored, so a luminance mask would
+    // read dim); the changed pixels become the mask, everything else is cut away.
+    `<mask id="kvc-diffmask-${uid}" style="mask-type:alpha">${img}</mask>` +
+    `</defs>`;
+  // Outline path is normalized 0..1 → scale it to the viewBox. non-scaling-stroke keeps the dashes
+  // a constant on-screen size despite the scale (and any zoom transform on the wrapper).
+  const outline = diff.diffOutline
+    ? `<g transform="scale(${W} ${H})"><path d="${diff.diffOutline}" fill="none" ` +
+      `stroke="${ACCENT}" stroke-width="1.5" stroke-dasharray="5 4" stroke-linejoin="round" ` +
+      `vector-effect="non-scaling-stroke"/></g>`
+    : "";
+  return (
+    defs +
+    img + // flat tint (area)
+    `<rect x="0" y="0" width="${W}" height="${H}" fill="url(#kvc-hatch-${uid})" ` +
+    `mask="url(#kvc-diffmask-${uid})"/>` +
+    outline
+  );
 }
 
 /**
  * Renders one artwork state as a self-contained SVG over a checkerboard matte
  * (so layer transparency reads true), with an optional change-highlight overlay.
+ * Memoized: the parent (slider divider drag / zoom-pan) re-renders often but props are
+ * stable, so memo keeps the two stacked canvases from re-entering their render bodies.
  */
-export function ArtCanvas({
+export const ArtCanvas = memo(function ArtCanvas({
   diff,
   layers,
   state,
   overlay = false,
-  highlightMode = "box",
+  highlightMode = "pixels",
+  transform,
   className = "",
 }: ArtCanvasProps) {
   const svg = useMemo(() => {
     let body = layersBody(layers, state);
     if (overlay) {
-      body += highlightMode === "box" ? boxOverlay(diff) : maskOverlay(diff);
+      // "pixels": the backend changed-pixel mask, tinted + hatched + framed for legibility on
+      // busy artwork. "box": coarse region rectangles with corner brackets.
+      body += highlightMode === "pixels" ? pixelOverlay(diff) : boxOverlay(diff);
     }
     return wrapSvg(body, diff.width, diff.height);
   }, [layers, state, overlay, highlightMode, diff]);
@@ -82,9 +140,14 @@ export function ArtCanvas({
     >
       <div
         className="h-full w-full [&>svg]:h-full [&>svg]:w-full [&>svg]:object-contain"
+        // willChange promotes the heavy inline-SVG subtree to its own compositor layer, so
+        // zoom/pan only moves a cached texture instead of repainting the SVG per frame.
+        style={
+          transform ? { transform, transformOrigin: "0 0", willChange: "transform" } : undefined
+        }
         // Inline SVG (not <img>) so blend modes + filters composite against the matte.
         dangerouslySetInnerHTML={{ __html: svg }}
       />
     </div>
   );
-}
+});

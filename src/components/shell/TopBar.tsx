@@ -205,7 +205,8 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const nothing = preview != null && preview.bytesReclaimed === 0;
+  const totalOf = (r: CleanupReport) => r.bytesReclaimed + r.cacheBytesReclaimed;
+  const nothing = preview != null && totalOf(preview) === 0;
 
   return (
     <Modal
@@ -230,7 +231,15 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
       {error && <p className="text-[12px] text-danger">{error}</p>}
       {!error && result ? (
         <p className="text-[13px] text-text">
-          Freed <span className="font-medium">{formatBytes(result.bytesReclaimed)}</span>.
+          Freed <span className="font-medium">{formatBytes(totalOf(result))}</span>
+          {result.cacheBytesReclaimed > 0 && (
+            <span className="text-text-muted">
+              {" "}
+              (including {formatBytes(result.cacheBytesReclaimed)} of preview images that can be
+              regenerated)
+            </span>
+          )}
+          .
         </p>
       ) : !error && preview == null ? (
         <p className="text-[12px] text-text-muted">Checking what can be cleaned…</p>
@@ -239,8 +248,13 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
       ) : (
         !error && (
           <p className="text-[13px] text-text">
-            About <span className="font-medium">{formatBytes(preview!.bytesReclaimed)}</span> can be
-            freed.
+            About <span className="font-medium">{formatBytes(totalOf(preview!))}</span> can be freed
+            {preview!.cacheBytesReclaimed > 0 && (
+              <span className="text-text-muted">
+                , including preview images that can be regenerated
+              </span>
+            )}
+            .
           </p>
         )
       )}
