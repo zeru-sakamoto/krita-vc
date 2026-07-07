@@ -30,13 +30,17 @@ files, where git's text-oriented delta model performs poorly.
     region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
     only *that* layer's changed pixels, not the whole-file silhouette.
   - Click a layer to focus its diff, or view the composited artwork; palettes (`.gpl`) render as
-    color swatches.
+    color swatches. The inspector shows the selected layer's details (type, visibility, opacity,
+    blend, painted bounds) or the composite's size, resolution, and color space.
 - **Real local version control** — commit the whole working tree, browse history as a branch-aware
   graph, and roll back / undo commits.
 - **Branching & merging** — create, switch, merge (fast-forward or two-parent), and delete local
   branches, all backed by real tree materialization.
 - **Storage housekeeping** — a "Clean up storage" action reclaims history unreachable from any
   branch tip (mark-and-sweep GC), and the raster preview cache is size-budgeted with LRU pruning.
+- **Settings** (activity-bar gear) — one place for user preferences: the Artist Mode toggle, the
+  **author name** signed on your versions, and per-repository **preview-cache size** and
+  **compact-storage** options, plus "Clean up storage".
 - **Artist Mode** — a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).
@@ -94,14 +98,14 @@ cargo test --release --test bench -- --ignored --nocapture   # performance basel
 ```
 src/
 ├─ components/
-│  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, Sidebar,
-│  │            Inspector, StatusBar, BusyOverlay
+│  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, SettingsModal,
+│  │            Sidebar, Inspector, StatusBar, BusyOverlay
 │  ├─ vcs/     — diff viewer (DiffView, ArtDiffView, ArtCanvas, CompareSlider,
 │  │            LayerStackPanel, PaletteDiffView), commit graph, branch/changes panels
 │  ├─ ui/      — IconButton, Button, Menu, Modal
 │  └─ MainPanel.tsx
-├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode
-│  │            contexts, shell detection (tauri.ts), SVG compositing, zoom/pan + resize hooks
+├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode +
+│  │            author-name contexts, shell detection (tauri.ts), SVG compositing, zoom/pan + resize hooks
 ├─ styles/     — global.css (Tailwind v4 @theme tokens from DESIGN.md)
 └─ types.ts    — domain types (the frontend ↔ backend contract)
 

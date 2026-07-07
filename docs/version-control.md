@@ -17,7 +17,9 @@ with no backend, the UI renders empty states).
 .kvc/
   config.json    engine config: delta-chain threshold (default 20), tile size (64),
                  raster cache byte budget (cacheMaxBytes, default 256 MB; a v1→v2 config
-                 migration lowers old 512 MB defaults), and the opt-in tilePixelDeltas flag
+                 migration lowers old 512 MB defaults), and the opt-in tilePixelDeltas flag.
+                 cacheMaxBytes + tilePixelDeltas are user-editable in the Settings modal
+                 (get_repo_config/set_repo_config)
   index.json     committed head per tracked file — drives the scanner
   chains/        per-tracked-file shards, each every stored version of that file's delta
                  streams (KVCC2-tagged zstd bincode, <blake3(relpath)[..16]>.bin, faulted in
@@ -195,7 +197,12 @@ of low-end devices.
 
 `maindoc.xml` is also parsed (`parse_maindoc`, via `roxmltree` with DTD allowed) so layer
 metadata changes — added / removed / opacity / blend / rename, matched by uuid then name — can be
-reported between two commits (`diff_maindoc`).
+reported between two commits (`diff_maindoc`). `parse_image_meta` additionally reads the image's
+**DPI** (`x-res`), **color model** (`colorspacename`) and **ICC profile**, plus each layer's
+**visibility** (`visible`) and **nodetype** (`kind`, e.g. `paintlayer`/`grouplayer`); a layer's
+tile-granular **painted-area bounding box** comes from `kra::layer_bounds` (union of its tile
+coords, no pixel decode). These ride out on `ArtDiffDto`/`LayerDto` and surface in the frontend
+Inspector's "Selected" section.
 
 ## Restoring, rollback & undo
 
@@ -250,8 +257,9 @@ deduplicates across branches for free.
   surfaces the flag as "Needs review"). The merge commit has `parents: [current_tip, source_tip]`
   and its `files` is the merged result's diff vs the first parent — preserving the fold
   invariant. `NothingToMerge` when the source is already part of the current branch.
-- **Delete** (`delete_branch`) — removes the label only (refused for the current branch); its
-  commits stay in `commits.log` as harmless unreachable data.
+- **Delete** (`delete_branch`) — removes the label only (refused for the current branch and for
+  `main`, `DeleteMain`); its commits stay in `commits.log` as harmless unreachable data. The
+  Branches panel also hides the delete affordance on `main`.
 
 ## Raster delivery (`kvcimg` URI scheme)
 
@@ -286,8 +294,10 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `create_branch(path, name, base?)` | Create + switch to a branch. No `base` (or `base` = current): instant, at the current tip. Different `base`: materializes that branch's tree first (refused on unsaved changes). Returns the branch list. |
 | `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
-| `delete_branch(path, name)` | Remove a branch label (not the current one). Returns the branch list. |
+| `delete_branch(path, name)` | Remove a branch label (not the current one, and never `main`). Returns the branch list. |
 | `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip. `dryRun` reports what would be freed without deleting anything. |
+| `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`) for the Settings modal. Uses `Repo::open_light`. |
+| `set_repo_config(path, cacheMaxBytes, tilePixelDeltas)` | Persist those two knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |

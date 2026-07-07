@@ -924,6 +924,12 @@ pub struct ImageMeta {
     pub name: String,
     pub width: i64,
     pub height: i64,
+    /// Canvas resolution (`x-res`), in dots-per-inch. 0 when absent.
+    pub dpi: f64,
+    /// Color space name from `<IMAGE colorspacename>` (e.g. "RGBA"). Empty when absent.
+    pub color_model: String,
+    /// ICC profile name from `<IMAGE profile>`. Empty when absent.
+    pub color_profile: String,
     /// Paint layers in document order (Krita writes top-first).
     pub layers: Vec<LayerNode>,
 }
@@ -934,6 +940,10 @@ pub struct LayerNode {
     pub uuid: String,
     pub opacity: i64,
     pub blend: String,
+    /// `<layer visible>` — Krita hides a layer with `visible="0"`. Defaults to visible.
+    pub visible: bool,
+    /// `<layer nodetype>` (e.g. "paintlayer", "grouplayer", "filterlayer"). Empty when absent.
+    pub kind: String,
     /// The `layers/<filename>` data file; empty for group/non-paint layers.
     pub filename: String,
 }
@@ -965,6 +975,9 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(255),
             blend: n.attribute("compositeop").unwrap_or("normal").to_string(),
+            // Krita writes `visible="0"` for a hidden layer; anything else (incl. absent) = shown.
+            visible: n.attribute("visible") != Some("0"),
+            kind: n.attribute("nodetype").unwrap_or("").to_string(),
             filename: n.attribute("filename").unwrap_or("").to_string(),
         })
         .collect();
@@ -972,6 +985,12 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
         name: image.attribute("name").unwrap_or("").to_string(),
         width: num(&image, "width"),
         height: num(&image, "height"),
+        dpi: image
+            .attribute("x-res")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        color_model: image.attribute("colorspacename").unwrap_or("").to_string(),
+        color_profile: image.attribute("profile").unwrap_or("").to_string(),
         layers,
     })
 }
@@ -1224,6 +1243,33 @@ pub fn diff_tile_indexes(
         changed_paths,
         region,
     }
+}
+
+/// Union bounding box (in image pixels) of one layer-data entry's tiles — the layer's painted
+/// area. Cheap: reads tile grid coords already in the manifest, no pixel decode; tile-granular,
+/// so it slightly over-reports vs. pixel-exact content. `None` when the entry has no tiles or
+/// clamps to nothing.
+pub fn layer_bounds(
+    index: &TileIndexRef,
+    entry_path: &str,
+    width: i64,
+    height: i64,
+) -> Option<(i64, i64, i64, i64)> {
+    let (tw, th, tiles) = index.get(entry_path)?;
+    if tiles.is_empty() {
+        return None;
+    }
+    let mut min = (i64::MAX, i64::MAX);
+    let mut max = (i64::MIN, i64::MIN);
+    for (x, y, _h) in tiles {
+        min = (min.0.min(*x), min.1.min(*y));
+        max = (max.0.max(x + tw), max.1.max(y + th));
+    }
+    let x = min.0.max(0);
+    let y = min.1.max(0);
+    let w = (max.0.min(width) - x).max(0);
+    let h = (max.1.min(height) - y).max(0);
+    (w > 0 && h > 0).then_some((x, y, w, h))
 }
 
 /// Borrow an owned [`TileIndex`] for [`diff_tile_indexes`] (tests/back-compat wrappers).

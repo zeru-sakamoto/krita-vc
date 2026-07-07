@@ -36,15 +36,15 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
-| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also hosts "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). |
+| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, author name, and (per repo) preview cache size, compact-storage toggle, and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
-| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable; selected commit's version/hash, author, date, message, changed files. |
+| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable; selected commit's version/hash, author, date, message, changed files, plus a **Selected** section that mirrors the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
 | Status bar | [`StatusBar`](../src/components/shell/StatusBar.tsx) | Active file, branch, commit/version count. |
 
-The center toolbar (in `AppShell`) also holds the **Artist view** toggle (paintbrush) and the
-inspector show/hide button. See [Artist Mode](#artist-mode).
+The center toolbar (in `AppShell`) holds the inspector show/hide button. The **Artist view**
+toggle now lives in the Settings modal (gear in the activity bar). See [Artist Mode](#artist-mode).
 
 [`BusyOverlay`](../src/components/shell/BusyOverlay.tsx) renders alongside `RepoShell`/
 `WelcomeShell` (a sibling in `AppShell`, not inside either zone): a full-screen,
@@ -64,6 +64,7 @@ State lives in `RepoShell` and flows down via props:
 | `activeView` | Which sidebar panel renders; the active activity-bar icon. |
 | `selectedId` | Selected commit → main-panel diff + inspector. |
 | `inspectorOpen` | Inspector visibility. |
+| `focus` | The diff navigator's layer/composite pick (`{ path, id }`), reported up by `ArtDiffView`'s `onFocus` → the Inspector's **Selected** section. |
 
 Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) — `useCommits`
 (branch-scoped history), `useBranches` (local branches + current + tips), `useWorkingDiff`
@@ -74,15 +75,18 @@ a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLaye
 working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
 `selectedCommit`, and `diff`.
 
-Two pieces of state live **outside** `AppShell`, each in a React context so any component can read
+Three pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
-([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)) and the
+([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)), the
+author name ([`src/lib/authorName.tsx`](../src/lib/authorName.tsx) — persisted to `localStorage`,
+sent as the `author` on new commits/merges/rollbacks, falling back to `"You"` when unset; also
+readable outside React via `readAuthorName()` for `repository.tsx`'s callbacks), and the
 selected repository ([`src/lib/repository.tsx`](../src/lib/repository.tsx) — list + `currentId`,
 persisted to `localStorage`; the `TopBar` switcher reads it). The repository context also owns
 `refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `busyMessage` /
 `scanning` busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a
 commit, `busyMessage` (a human-readable label, or `null` when idle) drives the full-screen
-`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. Both providers
+`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All three providers
 are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
@@ -153,8 +157,8 @@ A single global toggle aimed at the app's audience (artists, not developers). Wh
 default), the whole UI swaps technical strings for plain-language labels; when **off**, the original
 technical view is shown verbatim. State is persisted to `localStorage`
 (`krita-vc:artist-mode`) by the provider in [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx);
-read it with `useArtistMode()`. Label helpers live in
-[`src/lib/friendly.ts`](../src/lib/friendly.ts).
+read it with `useArtistMode()`. The toggle lives in the Settings modal (activity-bar gear).
+Label helpers live in [`src/lib/friendly.ts`](../src/lib/friendly.ts).
 
 | Surface | Artist Mode on | Artist Mode off |
 |---------|----------------|-----------------|
@@ -171,8 +175,8 @@ concepts, not jargon.
 
 ```
 AppShell (→ WelcomeShell with no repository, else RepoShell)
-├─ TopBar ─ Menu (repository switcher) + CleanupModal ("Clean up storage…")
-├─ ActivityBar
+├─ TopBar ─ Menu (repository switcher)
+├─ ActivityBar ─ SettingsModal (gear) ─ CleanupModal ("Clean up storage…")
 ├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
 │                         └─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
@@ -204,5 +208,6 @@ mutating actions: commit/rollback/undo, branch create/switch/merge/delete),
 [`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
 [`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
 [`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `assetKind`,
-`statusVerb`, `parsePaletteDiff`, `rgbToHex`, `versionNumbers`/`versionLabel`),
+`statusVerb`, `layerTypeLabel`, `layerChangeLabel`, `parsePaletteDiff`, `rgbToHex`,
+`versionNumbers`/`versionLabel`),
 [`src/lib/format.ts`](../src/lib/format.ts) (timestamps).

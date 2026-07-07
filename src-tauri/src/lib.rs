@@ -47,6 +47,8 @@ pub fn run() {
             commands::working_diff,
             commands::working_layers,
             commands::cleanup_repository,
+            commands::get_repo_config,
+            commands::set_repo_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

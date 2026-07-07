@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { FolderOpen, PaintBrush, SidebarSimple } from "@phosphor-icons/react";
+import { FolderOpen, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { BusyOverlay } from "./BusyOverlay";
 import { Sidebar } from "./Sidebar";
@@ -51,7 +51,7 @@ function WelcomeShell() {
 }
 
 function RepoShell({ repo }: { repo: Repository }) {
-  const { artistMode, toggle: toggleArtistMode } = useArtistMode();
+  const { artistMode } = useArtistMode();
   const { refreshNonce } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
   const branches = useBranches(repo.path, refreshNonce);
@@ -59,6 +59,8 @@ function RepoShell({ repo }: { repo: Repository }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  // Which layer/composite the diff navigator has selected — mirrored into the Inspector.
+  const [focus, setFocus] = useState<{ path: string; id: string } | null>(null);
 
   // Keep a valid selection as history loads/changes (default to the newest commit).
   useEffect(() => {
@@ -154,21 +156,6 @@ function RepoShell({ repo }: { repo: Repository }) {
                   {artistMode ? "No version selected" : "No commit selected"}
                 </span>
               )}
-              <button
-                type="button"
-                onClick={toggleArtistMode}
-                title="Toggle between artist-friendly labels and the full technical view"
-                aria-pressed={artistMode}
-                className={[
-                  "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] transition-colors",
-                  artistMode
-                    ? "bg-accent/15 text-accent"
-                    : "text-text-muted hover:bg-white/5 hover:text-text",
-                ].join(" ")}
-              >
-                <PaintBrush size={14} weight={artistMode ? "fill" : "regular"} />
-                Artist view
-              </button>
               <IconButton
                 icon={SidebarSimple}
                 label={inspectorOpen ? "Hide inspector" : "Show inspector"}
@@ -188,11 +175,14 @@ function RepoShell({ repo }: { repo: Repository }) {
                 commitId={showWorking ? null : selectedId}
                 working={showWorking}
                 nonce={refreshNonce}
+                onFocus={setFocus}
               />
               {inspectorOpen && (
                 <Inspector
                   commit={selectedCommit}
                   version={selectedVersion}
+                  entries={diff}
+                  focus={focus}
                   onClose={() => setInspectorOpen(false)}
                 />
               )}

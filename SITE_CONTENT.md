@@ -21,8 +21,8 @@ uploads, and zero git jargon.
   of your painting every time you hit save.
 - **See what changed, visually.** No line numbers, no diffs full of symbols — just your layers,
   before and after, side by side or on a swipe slider.
-- **Explore without fear.** Try a new color direction or a redesign on a branch, keep painting on
-  your original at the same time, and merge the two back together whenever you're ready.
+- **Explore without fear.** Try a new color direction or a redesign on a branch, switch back to
+  your original whenever you like, and merge the two back together when you're ready.
 - **Built for real Krita files.** Performance-tuned so commits, comparisons, and restores stay
   fast even on large, layer-heavy paintings — not just toy test files.
 
@@ -36,7 +36,8 @@ comparison, zoom and pan to inspect details — perfectly synced between both vi
 exactly what changed via a highlighted overlay with a dashed outline tracing the edited pixels'
 silhouette. Focus a single layer and the highlight narrows to just that layer's changes.
 Composites load first so you're never staring at a blank panel; individual layers stream in
-right after.
+right after. Click any layer to see its details — type, visibility, opacity, blend mode, and
+painted area — or the whole canvas's size, resolution, and color space.
 
 ![Screenshot placeholder — layer stack panel + swipe slider diff](placeholder)
 
@@ -69,6 +70,14 @@ version control reads like a tool for artists, not developers. Prefer the techni
 off any time.
 
 ![Screenshot placeholder — Artist Mode toggle showing before/after labeling](placeholder)
+
+### Sign your work, tune it to your machine
+Everything lives in one Settings panel. Put your name on every version you save, so a shared
+project reads like a record of who did what. Set how much disk the preview images may use, or
+turn on compact storage to shrink the history of heavily-revised paintings — all optional, all
+changeable any time.
+
+![Screenshot placeholder — Settings panel with name field and storage options](placeholder)
 
 ---
 

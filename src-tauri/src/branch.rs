@@ -238,6 +238,9 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
 /// Remove the branch label. Its commits stay in history (harmless unreachable data,
 /// content-addressed objects tolerate orphans; no vacuum).
 pub fn delete_branch(repo: &mut Repo, name: &str) -> Result<()> {
+    if name == "main" {
+        return Err(KvcError::DeleteMain);
+    }
     if name == repo.branches.current {
         return Err(KvcError::DeleteCurrent);
     }

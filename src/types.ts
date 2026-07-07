@@ -86,6 +86,12 @@ export interface ArtLayer {
   opacity: number;
   blendMode: BlendMode;
   change: LayerChange;
+  /** `<layer visible>` — false for a Krita-hidden layer. */
+  visible?: boolean;
+  /** Krita nodetype (e.g. "paintlayer", "grouplayer"); see `layerTypeLabel`. */
+  layerType?: string;
+  /** The layer's painted-area bounding box in image pixels (tile-granular). */
+  bounds?: { x: number; y: number; w: number; h: number };
   /** Inner SVG markup for the layer at each state. null = layer absent in that state. */
   before: string | null; // null when change === "added"
   after: string | null; // null when change === "removed"
@@ -108,6 +114,11 @@ export interface ArtDiff {
   /** Artwork pixel dims → SVG viewBox. */
   width: number;
   height: number;
+  /** Canvas resolution (DPI); absent/0 when unknown. */
+  dpi?: number;
+  /** Color space name (e.g. "RGBA") and ICC profile from maindoc.xml. */
+  colorModel?: string;
+  colorProfile?: string;
   /** Ordered bottom→top (stacking order). */
   layers: ArtLayer[];
   /** Changed-region boxes for the highlight overlay. */

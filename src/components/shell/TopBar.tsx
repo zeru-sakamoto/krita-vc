@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
-import { Broom, CaretDown, FolderOpen, FolderPlus, Plus, Trash, X } from "@phosphor-icons/react";
+import { useState } from "react";
+import { CaretDown, FolderOpen, FolderPlus, Plus, Trash, X } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
-import { useRepository, type CleanupReport } from "../../lib/repository";
+import { useRepository } from "../../lib/repository";
 import { inTauri } from "../../lib/tauri";
 import type { Repository } from "../../types";
 
@@ -16,7 +16,7 @@ import type { Repository } from "../../types";
 export function TopBar() {
   const { repositories, current, currentId, setCurrent, browseRepository } = useRepository();
   const [modal, setModal] = useState<
-    { kind: "create" } | { kind: "remove"; repo: Repository } | { kind: "cleanup" } | null
+    { kind: "create" } | { kind: "remove"; repo: Repository } | null
   >(null);
 
   const items: MenuItem[] = repositories.map((repo) => ({
@@ -55,16 +55,6 @@ export function TopBar() {
       icon: <Plus size={15} weight="regular" />,
       onSelect: browseRepository,
     },
-    ...(current
-      ? [
-          {
-            id: "cleanup-repository",
-            label: "Clean up storage…",
-            icon: <Broom size={15} weight="regular" />,
-            onSelect: () => setModal({ kind: "cleanup" }),
-          } satisfies MenuItem,
-        ]
-      : []),
   ];
 
   return (
@@ -80,7 +70,6 @@ export function TopBar() {
       {modal?.kind === "remove" && (
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
-      {modal?.kind === "cleanup" && <CleanupModal onClose={() => setModal(null)} />}
     </header>
   );
 }
@@ -154,109 +143,6 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
         <p className="mt-2 truncate font-mono text-[11px] text-text-muted">
           Creates: {parent}/{name.trim()}
         </p>
-      )}
-    </Modal>
-  );
-}
-
-function formatBytes(n: number): string {
-  if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
-  return `${n} B`;
-}
-
-/**
- * "Clean up storage": a dry run on open shows what a real pass would free (space held by
- * versions no branch can reach — leftovers of undo and deleted branches), then one confirm
- * runs it for real. Cleaning never touches current artwork or any version still in history.
- */
-function CleanupModal({ onClose }: { onClose: () => void }) {
-  const { cleanupRepository } = useRepository();
-  const [preview, setPreview] = useState<CleanupReport | null>(null);
-  const [result, setResult] = useState<CleanupReport | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    cleanupRepository(true)
-      .then((r) => {
-        if (!cancelled) setPreview(r);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [cleanupRepository]);
-
-  const clean = async () => {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      setResult(await cleanupRepository(false));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const totalOf = (r: CleanupReport) => r.bytesReclaimed + r.cacheBytesReclaimed;
-  const nothing = preview != null && totalOf(preview) === 0;
-
-  return (
-    <Modal
-      title="Clean up storage"
-      onClose={onClose}
-      footer={
-        <>
-          <Button onClick={onClose}>{result ? "Done" : "Cancel"}</Button>
-          {!result && (
-            <Button variant="primary" disabled={busy || preview == null || nothing} onClick={clean}>
-              {busy ? "Cleaning…" : "Clean up"}
-            </Button>
-          )}
-        </>
-      }
-    >
-      <p className="mb-2 text-[13px] text-text">
-        Frees space held by versions no longer part of any history — leftovers from undone saves and
-        deleted branches. Your current artwork and every version you can still see are never
-        touched.
-      </p>
-      {error && <p className="text-[12px] text-danger">{error}</p>}
-      {!error && result ? (
-        <p className="text-[13px] text-text">
-          Freed <span className="font-medium">{formatBytes(totalOf(result))}</span>
-          {result.cacheBytesReclaimed > 0 && (
-            <span className="text-text-muted">
-              {" "}
-              (including {formatBytes(result.cacheBytesReclaimed)} of preview images that can be
-              regenerated)
-            </span>
-          )}
-          .
-        </p>
-      ) : !error && preview == null ? (
-        <p className="text-[12px] text-text-muted">Checking what can be cleaned…</p>
-      ) : !error && nothing ? (
-        <p className="text-[12px] text-text-muted">Nothing to clean up — storage is tidy.</p>
-      ) : (
-        !error && (
-          <p className="text-[13px] text-text">
-            About <span className="font-medium">{formatBytes(totalOf(preview!))}</span> can be freed
-            {preview!.cacheBytesReclaimed > 0 && (
-              <span className="text-text-muted">
-                , including preview images that can be regenerated
-              </span>
-            )}
-            .
-          </p>
-        )
       )}
     </Modal>
   );

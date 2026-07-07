@@ -588,6 +588,11 @@ fn kra_layer_raster_decodes_to_png() {
     );
     assert_eq!(meta.layers[0].filename, "layer1");
 
+    // Painted-area bounds come from the tile grid (one 64×64 tile at origin, no decode).
+    let bounds = kra::layer_bounds(&manifest.tile_index_ref(), "img/layers/layer1", 64, 64)
+        .expect("layer1 has a tile → bounds");
+    assert_eq!(bounds, (0, 0, 64, 64));
+
     // The layer decodes to a real PNG data URL.
     let cache = delta::TileCache::new();
     let raster = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 64, 64, &cache)
@@ -599,6 +604,23 @@ fn kra_layer_raster_decodes_to_png() {
     // The composite entry is surfaced too.
     let comp = kra::entry_data_url(&r, "art.kra", &manifest, "mergedimage.png").unwrap();
     assert!(comp.unwrap().starts_with("data:image/png;base64,"));
+}
+
+#[test]
+fn parse_image_meta_reads_richer_fields() {
+    let xml = br#"<!DOCTYPE DOC>
+<DOC><IMAGE name="img" width="64" height="64" x-res="300" y-res="300" colorspacename="RGBA" profile="sRGB-elle-V2-srgbtrc.icc"><layers>
+<layer name="Base" uuid="base" opacity="255" compositeop="normal" nodetype="paintlayer" filename="layer1" visible="1"/>
+<layer name="Hidden" uuid="hid" opacity="128" compositeop="multiply" nodetype="grouplayer" filename="" visible="0"/>
+</layers></IMAGE></DOC>"#;
+    let meta = kra::parse_image_meta(xml).unwrap();
+    assert_eq!(meta.dpi, 300.0);
+    assert_eq!(meta.color_model, "RGBA");
+    assert_eq!(meta.color_profile, "sRGB-elle-V2-srgbtrc.icc");
+    assert!(meta.layers[0].visible);
+    assert_eq!(meta.layers[0].kind, "paintlayer");
+    assert!(!meta.layers[1].visible);
+    assert_eq!(meta.layers[1].kind, "grouplayer");
 }
 
 #[test]
@@ -2163,4 +2185,29 @@ fn tile_pixel_deltas_flag_mixed_history() {
         let got = raster::tile_planar(&block.tiles[0].data, p.len()).unwrap();
         assert_eq!(&got, p, "planar pixels exact for {cid}");
     }
+}
+
+// --- settings: config persists across a fresh open (get_repo_config/set_repo_config path) --
+
+#[test]
+fn repo_config_round_trips_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+
+    let mut r = repo::Repo::open_light(root).unwrap();
+    assert_eq!(
+        r.config.cache_max_bytes,
+        256 * 1024 * 1024,
+        "default budget"
+    );
+    assert!(!r.config.tile_pixel_deltas, "default off");
+
+    r.config.cache_max_bytes = 512 * 1024 * 1024;
+    r.config.tile_pixel_deltas = true;
+    r.save_config().unwrap();
+
+    let reopened = repo::Repo::open_light(root).unwrap();
+    assert_eq!(reopened.config.cache_max_bytes, 512 * 1024 * 1024);
+    assert!(reopened.config.tile_pixel_deltas);
 }

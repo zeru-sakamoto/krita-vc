@@ -200,7 +200,8 @@ reconstructing unchanged — the manifest is self-describing per entry.
 
 ## Storage: opt-in tile pixel deltas (`Config.tilePixelDeltas`)
 
-A `config.json` knob (no UI, off by default): when set, new commits store each tile's
+A `config.json` knob (off by default; surfaced in the Settings modal as **"Compact storage for
+heavily-revised art"**): when set, new commits store each tile's
 **decoded planar pixels** (which bsdiff across versions — `patch_floor: 0` bypasses the 64 KB
 gate for them) instead of Krita's opaque LZF payload, and restores re-encode LZF
 (`raster::lzf_compress`, a hand-rolled liblzf encoder — any valid LZF stream decodes
@@ -250,8 +251,8 @@ is parsed on index load, so dozens of small packs from mid-size commits add up).
   incomplete — caching it would poison the key for later visits).
 - **Bounded raster cache** (`raster::cache_prune`) — `.kvc/cache/` was append-only for the life
   of the repo; it now holds a size budget (`Config.cacheMaxBytes`, default 256 MB — a config v1→v2
-  migration lowers old 512 MB defaults, which were never a user choice since there is no UI
-  knob). Reads touch the entry's mtime so hot entries survive, and an oldest-first prune runs
+  migration lowers old 512 MB defaults; the Settings modal exposes it as a **"Preview cache size"**
+  preset, 128 MB–2 GB). Reads touch the entry's mtime so hot entries survive, and an oldest-first prune runs
   after layer streaming, rate-limited by a marker file (`cache_prune_throttled`); "Clean up
   storage" prunes unconditionally (see Storage reclamation). A pruned entry is a regeneration,
   never an error.

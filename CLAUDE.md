@@ -22,13 +22,18 @@ files — per-file creates dominated large commits on Windows. The `.kra` compos
 restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
 byte-exact `Raw`). Restored `.kra` files write tile entries **deflate-fast** (Stored left them
 several× larger on disk), and restores are memory-bounded (64 MB build chunks). An opt-in
-`tilePixelDeltas` config flag (off by default, no UI) stores decoded tile pixels that bsdiff
+`tilePixelDeltas` config flag (off by default) stores decoded tile pixels that bsdiff
 across versions — mixed histories are safe via a per-ref `raw` flag. A user-facing **"Clean up
 storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powered confirm
-modal in `TopBar`) reclaims history unreachable from any branch tip **and** prunes the raster
+modal in the **Settings modal**) reclaims history unreachable from any branch tip **and** prunes the raster
 cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
 rewrites on >25% dead, and consolidates small packs; the raster cache (`.kvc/cache/`) is
-size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Branching is real**: `.kvc/branches.json` maps branch name → tip
+size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Settings** (activity-bar
+gear → `SettingsModal`) is the single home for user prefs: Artist-view toggle, an **author name**
+(`authorName.tsx`, persisted to `localStorage`, sent as the `author` on new commits/merges/
+rollbacks, falling back to `"You"`), and per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs
+(`get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only write) plus "Clean up
+storage". **Branching is real**: `.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
@@ -98,7 +103,7 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
 - **Shell** (`src/components/shell/`): `AppShell.tsx` splits on the selected repository — a
   welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
   and wires a top bar plus four zones — `TopBar` (repository switcher) above `ActivityBar`
-  (changes/history/branches) | `Sidebar` (resizable, content switches on the active view) |
+  (changes/history/branches, plus a gear opening `SettingsModal`) | `Sidebar` (resizable, content switches on the active view) |
   `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`. `BusyOverlay.tsx` is a
   full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
   during any write op (commit, branch switch/merge/create/delete, rollback, undo, cleanup),
@@ -119,7 +124,8 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   staging is cosmetic since `commit_snapshot` captures the whole tree; while a commit is in flight
   the staging controls lock, the commit button spins, and the `StatusBar` shows a progress bar, via
   the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
-  branches with **real actions**: click to switch, hover-row merge/delete with confirm modals, a
+  branches with **real actions**: click to switch, hover-row merge/delete with confirm modals
+  (the delete affordance is hidden on `main` — the backend also refuses it with `DeleteMain`), a
   "New branch" modal; shared dialogs live in `BranchDialogs.tsx`, and the backend's dirty-tree
   error — matched on its stable `"unsaved changes"` prefix — becomes a friendly save-first prompt
   with a jump to the Changes view. The History sidebar has a live branch-switcher `Menu` (with a

@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   ArrowsIn,
   ArrowsLeftRight,
@@ -84,6 +84,8 @@ interface ArtDiffViewProps {
   commitId?: string | null;
   working?: boolean;
   nonce?: number;
+  /** Reports the navigator selection up to the Inspector (which file + which layer/composite). */
+  onFocus?: (f: { path: string; id: string }) => void;
 }
 
 export function ArtDiffView({
@@ -93,9 +95,16 @@ export function ArtDiffView({
   commitId,
   working,
   nonce,
+  onFocus,
 }: ArtDiffViewProps) {
   const { artistMode } = useArtistMode();
   const [selectedId, setSelectedId] = useState<string>(COMPOSITE_ID);
+
+  // Mirror the navigator selection into the Inspector. Fires on mount (default composite) and on
+  // every selection change; `onFocus` (a stable setState) makes this a no-churn dependency.
+  useEffect(() => {
+    onFocus?.({ path: diff.path, id: selectedId });
+  }, [onFocus, diff.path, selectedId]);
   const [viewMode, setViewMode] = useState<ViewMode>("split");
   const [highlightOn, setHighlightOn] = useState(true);
   const [highlightMode, setHighlightMode] = useState<HighlightMode>("pixels");

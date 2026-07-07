@@ -104,6 +104,39 @@ export function Sidebar({
     storageKey: "krita-vc:sidebar-width",
   });
 
+  // Shared "panel options" menu (history + changes). Currently just the undo action.
+  const panelOptions = (
+    <Menu
+      align="right"
+      minWidth={200}
+      trigger={(open) => (
+        <span
+          title="Panel options"
+          aria-label="Panel options"
+          className={[
+            "grid h-8 w-8 place-items-center rounded-button text-text-muted",
+            "transition-colors hover:bg-white/5 hover:text-text",
+            open ? "bg-white/5 text-text" : "",
+          ].join(" ")}
+        >
+          <DotsThreeVertical size={16} />
+        </span>
+      )}
+      items={[
+        {
+          id: "undo",
+          label: artistMode ? "Undo the last version" : "Undo the last commit",
+          icon: <ArrowUUpLeft size={14} />,
+          disabled: commits.length === 0 || saving,
+          onSelect: () => {
+            setUndoError(null);
+            setConfirmUndo(true);
+          },
+        },
+      ]}
+    />
+  );
+
   return (
     <div className="relative flex shrink-0" style={{ width }}>
       <DockerPanel
@@ -111,17 +144,20 @@ export function Sidebar({
         className="flex-1"
         actions={
           view === "changes" ? (
-            <IconButton
-              icon={ArrowsClockwise}
-              label="Rescan for changes"
-              size={16}
-              spinning={scanning}
-              disabled={scanning}
-              onClick={refresh}
-            />
-          ) : (
-            <IconButton icon={DotsThreeVertical} label="Panel options" size={16} />
-          )
+            <>
+              <IconButton
+                icon={ArrowsClockwise}
+                label="Rescan for changes"
+                size={16}
+                spinning={scanning}
+                disabled={scanning}
+                onClick={refresh}
+              />
+              {panelOptions}
+            </>
+          ) : view === "history" ? (
+            panelOptions
+          ) : null
         }
       >
         {view === "history" && (
@@ -153,21 +189,9 @@ export function Sidebar({
                   },
                 ]}
               />
-              <div className="flex items-center gap-1">
-                <span className="text-[11px] text-text-muted">
-                  {commits.length} {artistMode ? "versions" : "commits"}
-                </span>
-                <IconButton
-                  icon={ArrowUUpLeft}
-                  label={artistMode ? "Undo the last version" : "Undo the last commit"}
-                  size={15}
-                  disabled={commits.length === 0 || saving}
-                  onClick={() => {
-                    setUndoError(null);
-                    setConfirmUndo(true);
-                  }}
-                />
-              </div>
+              <span className="text-[11px] text-text-muted">
+                {commits.length} {artistMode ? "versions" : "commits"}
+              </span>
             </div>
 
             {switchError && <p className="px-3 pt-2 text-[12px] text-danger">{switchError}</p>}

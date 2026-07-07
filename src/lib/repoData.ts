@@ -228,6 +228,58 @@ export function clearSessionCaches(): void {
   layerCache.clear();
 }
 
+/** The settings knobs this repo's `.kvc/config.json` exposes (see `get_repo_config`). */
+export interface RepoConfig {
+  cacheMaxBytes: number;
+  tilePixelDeltas: boolean;
+}
+
+/**
+ * Per-repo settings via `get_repo_config`/`set_repo_config`, fetched once on mount (the
+ * Settings modal only mounts this hook while open, so that's "fetch on open"). `null` while
+ * loading or in a plain browser (no backend).
+ */
+export function useRepoConfig(path: string): {
+  config: RepoConfig | null;
+  error: string | null;
+  update: (next: RepoConfig) => Promise<void>;
+} {
+  const [config, setConfig] = useState<RepoConfig | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    invoke<RepoConfig>("get_repo_config", { path })
+      .then((c) => {
+        if (!cancelled) setConfig(c);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+
+  const update = async (next: RepoConfig) => {
+    if (!inTauri()) return;
+    setError(null);
+    try {
+      await invoke("set_repo_config", {
+        path,
+        cacheMaxBytes: next.cacheMaxBytes,
+        tilePixelDeltas: next.tilePixelDeltas,
+      });
+      setConfig(next);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return { config, error, update };
+}
+
 export function useArtLayers(
   path: string,
   file: string,

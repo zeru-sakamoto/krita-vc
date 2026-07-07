@@ -4,9 +4,16 @@ import { IconButton } from "../ui/IconButton";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
 import { FileStatusChip } from "../vcs/FileStatusChip";
-import type { Commit } from "../../types";
+import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
+import type { ArtDiff, ArtLayer, Commit, DiffEntry } from "../../types";
 import { fullTimestamp } from "../../lib/format";
-import { assetName, versionLabel } from "../../lib/friendly";
+import {
+  assetName,
+  layerChangeLabel,
+  layerTypeLabel,
+  statusVerb,
+  versionLabel,
+} from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
 
@@ -14,6 +21,10 @@ interface InspectorProps {
   commit: Commit | null;
   /** Version number for the selected commit (used in Artist Mode). */
   version: number;
+  /** Current diff entries — the Inspector resolves `focus` against these. */
+  entries: DiffEntry[];
+  /** The diff navigator's selection (which art file + which layer/composite), or null. */
+  focus: { path: string; id: string } | null;
   onClose: () => void;
 }
 
@@ -26,15 +37,74 @@ function MetaRow({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
+/** The "Selected" section: details for the layer or composite picked in the diff navigator. */
+function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null }) {
+  if (layer) {
+    return (
+      <div className="border-t border-border px-3 py-2">
+        <h3 className="mb-1.5 text-[11px] font-medium uppercase text-text-muted">Selected layer</h3>
+        <div className="flex flex-col">
+          <MetaRow label="Name">{layer.name}</MetaRow>
+          {layer.layerType && <MetaRow label="Type">{layerTypeLabel(layer.layerType)}</MetaRow>}
+          <MetaRow label="Visible">{layer.visible === false ? "Hidden" : "Visible"}</MetaRow>
+          <MetaRow label="Opacity">{layer.opacity}%</MetaRow>
+          <MetaRow label="Blend">{layer.blendMode}</MetaRow>
+          <MetaRow label="Change">{layerChangeLabel(layer.change)}</MetaRow>
+          {layer.bounds && (
+            <MetaRow label="Bounds">
+              {layer.bounds.w} × {layer.bounds.h} at ({layer.bounds.x}, {layer.bounds.y})
+            </MetaRow>
+          )}
+        </div>
+      </div>
+    );
+  }
+  const changed = art.layers.filter((l) => l.change !== "unchanged").length;
+  return (
+    <div className="border-t border-border px-3 py-2">
+      <h3 className="mb-1.5 text-[11px] font-medium uppercase text-text-muted">Composite</h3>
+      <div className="flex flex-col">
+        <MetaRow label="Size">
+          {art.width} × {art.height}
+        </MetaRow>
+        {art.dpi != null && art.dpi > 0 && <MetaRow label="Res">{Math.round(art.dpi)} DPI</MetaRow>}
+        {art.colorModel && (
+          <MetaRow label="Color">
+            {art.colorModel}
+            {art.colorProfile ? ` · ${art.colorProfile}` : ""}
+          </MetaRow>
+        )}
+        <MetaRow label="Layers">{art.layers.length}</MetaRow>
+        <MetaRow label="Changed">{changed}</MetaRow>
+        <MetaRow label="Status">{statusVerb(art.status)}</MetaRow>
+      </div>
+    </div>
+  );
+}
+
 /**
- * 280px toggleable inspector showing the selected commit's metadata.
+ * 280px toggleable inspector showing the selected commit's metadata, plus a "Selected" section
+ * mirroring the diff navigator's layer/composite selection.
  * (DESIGN.md → Layout & App Shell → Inspector panel)
  */
-export function Inspector({ commit, version, onClose }: InspectorProps) {
+export function Inspector({ commit, version, entries, focus, onClose }: InspectorProps) {
   const { artistMode } = useArtistMode();
   const { rollbackToCommit, saving } = useRepository();
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Resolve the navigator selection against the current diff. A stale focus (e.g. the next
+  // commit is text-only, or a palette is selected) resolves to nothing and the section hides —
+  // no reset logic needed.
+  const focusedArt =
+    focus != null
+      ? (entries.find((e): e is ArtDiff => e.kind === "art" && e.path === focus.path) ?? null)
+      : null;
+  const focusedLayer =
+    focusedArt && focus && focus.id !== COMPOSITE_ID && focus.id !== PALETTE_ID
+      ? (focusedArt.layers.find((l) => l.id === focus.id) ?? null)
+      : null;
+  const showSelected = focusedArt != null && focus?.id !== PALETTE_ID;
 
   const restoreLabel = artistMode ? `Version ${version}` : (commit?.hash ?? "");
 
@@ -108,6 +178,10 @@ export function Inspector({ commit, version, onClose }: InspectorProps) {
                 ))}
               </ul>
             </div>
+
+            {showSelected && focusedArt && (
+              <SelectedDetails art={focusedArt} layer={focusedLayer} />
+            )}
           </div>
         )}
       </div>

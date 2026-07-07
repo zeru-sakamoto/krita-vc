@@ -15,6 +15,8 @@ interface MainPanelProps {
   commitId?: string | null;
   working?: boolean;
   nonce?: number;
+  /** Forwarded to the diff viewer so the navigator selection reaches the Inspector. */
+  onFocus?: (f: { path: string; id: string }) => void;
 }
 
 /**
@@ -31,6 +33,7 @@ export function MainPanel({
   commitId,
   working,
   nonce,
+  onFocus,
 }: MainPanelProps) {
   if (diff.length > 0) {
     return (
@@ -41,6 +44,7 @@ export function MainPanel({
           commitId={commitId}
           working={working}
           nonce={nonce}
+          onFocus={onFocus}
         />
       </main>
     );

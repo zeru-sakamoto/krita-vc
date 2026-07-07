@@ -103,13 +103,15 @@ export function BranchesPanel({
                       disabled={saving || !b.tip}
                       onClick={() => setMergeTarget(b.name)}
                     />
-                    <IconButton
-                      icon={Trash}
-                      label={artistMode ? "Remove this version line" : "Delete branch"}
-                      size={14}
-                      disabled={saving}
-                      onClick={() => setDeleteTarget(b.name)}
-                    />
+                    {b.name !== "main" && (
+                      <IconButton
+                        icon={Trash}
+                        label={artistMode ? "Remove this version line" : "Delete branch"}
+                        size={14}
+                        disabled={saving}
+                        onClick={() => setDeleteTarget(b.name)}
+                      />
+                    )}
                   </span>
                 )}
               </li>

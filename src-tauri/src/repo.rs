@@ -600,6 +600,14 @@ impl Repo {
         Ok(())
     }
 
+    /// Persist `config` alone — for settings edits, which never touch index/chains/commits/
+    /// branches and shouldn't pay for `save()`'s full flush.
+    pub fn save_config(&mut self) -> Result<()> {
+        write_json(&kvc_dir(&self.root).join("config.json"), &self.config)?;
+        self.config_dirty = false;
+        Ok(())
+    }
+
     fn flush_commits(&mut self, kvc: &Path) -> Result<()> {
         let log = kvc.join("commits.log");
         if self.commits_rewrite {

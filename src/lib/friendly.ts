@@ -3,7 +3,7 @@
 // plain-language labels. See src/lib/artistMode.tsx.
 
 import { FileImage, Image, Palette, GearSix, type Icon } from "@phosphor-icons/react";
-import type { Commit, DiffLine, FileStatus } from "../types";
+import type { ArtLayer, Commit, DiffLine, FileStatus } from "../types";
 
 /** Title-case a slug/word: "skin-tones" → "Skin Tones", "hero" → "Hero". */
 function titleCase(input: string): string {
@@ -61,6 +61,47 @@ export function statusVerb(status: FileStatus): string {
       return "Needs review";
     case "U":
       return "New";
+  }
+}
+
+/** Krita layer `nodetype` → a short friendly label. */
+export function layerTypeLabel(kind: string): string {
+  switch (kind) {
+    case "paintlayer":
+      return "Paint";
+    case "grouplayer":
+      return "Group";
+    case "filterlayer":
+    case "adjustmentlayer":
+      return "Filter";
+    case "clonelayer":
+      return "Clone";
+    case "shapelayer":
+    case "vectorlayer":
+      return "Vector";
+    case "filelayer":
+      return "File";
+    case "transparencymask":
+    case "transformmask":
+    case "selectionmask":
+    case "filtermask":
+      return "Mask";
+    default:
+      return kind ? titleCase(kind.replace(/layer$/, "")) : "Layer";
+  }
+}
+
+/** Plain-language label for a layer's change state. */
+export function layerChangeLabel(change: ArtLayer["change"]): string {
+  switch (change) {
+    case "added":
+      return "Added";
+    case "removed":
+      return "Removed";
+    case "modified":
+      return "Modified";
+    case "unchanged":
+      return "Unchanged";
   }
 }
 

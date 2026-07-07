@@ -5,6 +5,7 @@ import type { Branch, WorkingChange } from "../../types";
 import { BranchBadge } from "./BranchBadge";
 import { FileStatusChip } from "./FileStatusChip";
 import { useRepository } from "../../lib/repository";
+import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
 import { inTauri } from "../../lib/tauri";
 
 function Section({
@@ -101,6 +102,7 @@ export function ChangesPanel({
 }) {
   const { current, refreshNonce, refresh, saving, setSaving, setBusyMessage, setScanning } =
     useRepository();
+  const { authorName } = useAuthorName();
   const [items, setItems] = useState<WorkingChange[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -149,7 +151,7 @@ export function ChangesPanel({
       await invoke("commit_snapshot", {
         path,
         message: message.trim(),
-        author: "You",
+        author: resolvedAuthor(authorName),
       });
       setMessage("");
       refresh(); // refetch changes (now clean) + history

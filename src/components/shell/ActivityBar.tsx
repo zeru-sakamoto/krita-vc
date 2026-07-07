@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { ClockCounterClockwise, GitBranch, Stack, GearSix } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
+import { SettingsModal } from "./SettingsModal";
 
 export type ActivityView = "changes" | "history" | "branches";
 
@@ -19,6 +21,7 @@ const ITEMS: { view: ActivityView; icon: typeof Stack; label: string }[] = [
  * (DESIGN.md → Layout & App Shell → Activity bar)
  */
 export function ActivityBar({ active, onChange }: ActivityBarProps) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   return (
     <nav className="flex w-12 shrink-0 flex-col items-center border-r border-border bg-surface py-1.5">
       <div className="flex flex-col items-center gap-0.5">
@@ -34,8 +37,14 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
         ))}
       </div>
       <div className="mt-auto flex flex-col items-center gap-0.5">
-        <IconButton icon={GearSix} label="Settings (mock)" size={24} />
+        <IconButton
+          icon={GearSix}
+          label="Settings"
+          size={24}
+          onClick={() => setSettingsOpen(true)}
+        />
       </div>
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </nav>
   );
 }

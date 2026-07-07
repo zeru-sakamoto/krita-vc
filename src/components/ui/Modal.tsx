@@ -6,13 +6,21 @@ interface ModalProps {
   children: React.ReactNode;
   /** Action row pinned to the bottom (e.g. Cancel / Confirm buttons). */
   footer?: React.ReactNode;
+  /** Panel width class. Defaults to the compact dialog width most modals want. */
+  maxWidthClassName?: string;
 }
 
 /**
  * Minimal themed modal: backdrop + centered surface-2 panel. Closes on Esc or
  * backdrop click. Mirrors Menu's outside-click/Esc pattern — no new dependency.
  */
-export function Modal({ title, onClose, children, footer }: ModalProps) {
+export function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+  maxWidthClassName = "max-w-md",
+}: ModalProps) {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -31,7 +39,7 @@ export function Modal({ title, onClose, children, footer }: ModalProps) {
         aria-modal="true"
         aria-label={title}
         onPointerDown={(e) => e.stopPropagation()}
-        className="w-full max-w-md overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)"
+        className={`w-full ${maxWidthClassName} overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)`}
       >
         <h2 className="border-b border-border px-4 py-3 text-[14px] font-medium text-text">
           {title}

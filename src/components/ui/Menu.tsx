@@ -11,6 +11,8 @@ export interface MenuItem {
   selected?: boolean;
   /** Optional trailing action (e.g. a remove button), revealed on row hover. */
   action?: React.ReactNode;
+  /** Greys out the row and blocks selection. */
+  disabled?: boolean;
   onSelect: () => void;
 }
 
@@ -22,6 +24,8 @@ interface MenuProps {
   footer?: MenuItem[];
   /** Min width of the popover. */
   minWidth?: number;
+  /** Which edge of the trigger the popover aligns to. Default "left". */
+  align?: "left" | "right";
 }
 
 /**
@@ -29,7 +33,7 @@ interface MenuProps {
  * Closes on outside click or Escape. Themed per DESIGN.md (surface-2 popover,
  * hairline border, panel radius, float shadow).
  */
-export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
+export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }: MenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
@@ -55,6 +59,7 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
       <button
         type="button"
         role="menuitem"
+        disabled={item.disabled}
         onClick={() => {
           item.onSelect();
           setOpen(false);
@@ -62,14 +67,21 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
         className={[
           "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
           "transition-colors hover:bg-white/5",
+          "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent",
           item.selected ? "text-accent" : "text-text",
         ].join(" ")}
       >
-        <span aria-hidden className="w-3 shrink-0 text-accent">
-          {item.selected && "✓"}
-        </span>
+        {align !== "right" && (
+          <span aria-hidden className="w-3 shrink-0 text-accent">
+            {item.selected && "✓"}
+          </span>
+        )}
         {item.icon && <span className="shrink-0 text-text-muted">{item.icon}</span>}
-        <span className="flex min-w-0 flex-1 flex-col">
+        <span
+          className={["flex min-w-0 flex-1 flex-col", align === "right" && "text-right"]
+            .filter(Boolean)
+            .join(" ")}
+        >
           <span className="truncate">{item.label}</span>
           {item.detail && (
             <span className="truncate font-mono text-[10px] text-text-muted">{item.detail}</span>
@@ -101,7 +113,10 @@ export function Menu({ trigger, items, footer, minWidth = 200 }: MenuProps) {
           id={menuId}
           role="menu"
           style={{ minWidth }}
-          className="absolute left-0 top-[calc(100%+4px)] z-(--z-modal) overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)"
+          className={[
+            "absolute top-[calc(100%+4px)] z-(--z-modal) overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)",
+            align === "right" ? "right-0" : "left-0",
+          ].join(" ")}
         >
           <div className="max-h-72 overflow-auto py-1">{items.map(renderItem)}</div>
           {footer && footer.length > 0 && (

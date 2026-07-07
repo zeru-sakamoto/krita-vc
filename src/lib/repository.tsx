@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { Repository } from "../types";
 import { inTauri } from "./tauri";
 import { clearSessionCaches } from "./repoData";
+import { readAuthorName, resolvedAuthor } from "./authorName";
 
 /**
  * Selected local repository. The app is local-only (no remotes); a repository is a
@@ -184,7 +185,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       setSaving(true);
       setBusyMessage("Restoring version — please wait…");
       try {
-        await invoke("rollback_to_commit", { path: current.path, commitId, author: "You" });
+        await invoke("rollback_to_commit", {
+          path: current.path,
+          commitId,
+          author: resolvedAuthor(readAuthorName()),
+        });
         refresh();
       } finally {
         setSaving(false);
@@ -243,7 +248,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
   const mergeBranch = useCallback(
     (source: string) =>
-      branchMutation("merge_branch", { source, author: "You" }, "Merging branches — please wait…"),
+      branchMutation(
+        "merge_branch",
+        { source, author: resolvedAuthor(readAuthorName()) },
+        "Merging branches — please wait…"
+      ),
     [branchMutation]
   );
   const deleteBranch = useCallback(

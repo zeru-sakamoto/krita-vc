@@ -4,7 +4,7 @@
 
 use crate::error::{KvcError, Result};
 use crate::kra::{self, LayerDiff, LayerNode};
-use crate::repo::{Commit, CommittedFile, Repo};
+use crate::repo::{Commit, CommittedFile, Config, Repo};
 use crate::{commit, scan};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -143,6 +143,27 @@ pub async fn cleanup_repository(
     run(move || {
         let mut repo = Repo::open(Path::new(&path))?;
         crate::gc::collect_garbage(&mut repo, dry_run)
+    })
+    .await
+}
+
+/// Settings knobs a user can see/edit for this repo (cache budget, tile pixel deltas).
+#[tauri::command]
+pub async fn get_repo_config(path: String) -> std::result::Result<Config, String> {
+    run(move || Ok(Repo::open_light(Path::new(&path))?.config)).await
+}
+
+#[tauri::command]
+pub async fn set_repo_config(
+    path: String,
+    cache_max_bytes: u64,
+    tile_pixel_deltas: bool,
+) -> std::result::Result<(), String> {
+    run(move || {
+        let mut repo = Repo::open_light(Path::new(&path))?;
+        repo.config.cache_max_bytes = cache_max_bytes;
+        repo.config.tile_pixel_deltas = tile_pixel_deltas;
+        repo.save_config()
     })
     .await
 }
@@ -383,12 +404,28 @@ pub struct RegionDto {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct BoundsDto {
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct LayerDto {
     pub id: String,
     pub name: String,
     pub opacity: i64,
     pub blend_mode: String,
     pub change: String,
+    /// `<layer visible>` — false for a Krita-hidden layer.
+    pub visible: bool,
+    /// Krita nodetype (e.g. "paintlayer", "grouplayer"); the UI maps it to a friendly label.
+    pub layer_type: String,
+    /// The layer's painted-area bounding box in image pixels (tile-granular), if it has tiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<BoundsDto>,
     /// Inner SVG `<image>` markup for each state, or null when the layer is absent then.
     pub before: Option<String>,
     pub after: Option<String>,
@@ -411,6 +448,14 @@ pub struct ArtDiffDto {
     pub status: String,
     pub width: u32,
     pub height: u32,
+    /// Canvas resolution (DPI); omitted when unknown (0).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dpi: f64,
+    /// Color space name (e.g. "RGBA") and ICC profile from maindoc.xml; empty when absent.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub color_model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub color_profile: String,
     pub layers: Vec<LayerDto>,
     pub regions: Vec<RegionDto>,
     /// Composite (mergedimage.png) for each state as `<image>` markup — the reliable composite.
@@ -446,6 +491,11 @@ pub enum DiffEntryDto {
 /// Krita opacity (0..255) → the UI's 0..100 scale.
 fn to_percent(op: i64) -> i64 {
     ((op as f64) * 100.0 / 255.0).round() as i64
+}
+
+/// serde skip predicate for an omit-when-zero DPI.
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Krita compositeop → the UI's BlendMode union (unknown ops fall back to "normal").
@@ -609,12 +659,15 @@ pub fn art_diff_dto(
         },
         None => None,
     };
+    // Borrow the new side's tile grid once — feeds both the change detection below and each
+    // layer's painted-area bounds (kra::layer_bounds) in the loop.
+    let new_index = new_src.tile_index_ref();
     // One pass over borrowed tile indexes yields both the changed-layer set and the union
     // region — no per-tile hash clones, no duplicate map builds.
     let (changed_entries, changed_region) = old_manifest
         .as_ref()
         .map(|m| {
-            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_src.tile_index_ref(), w, h);
+            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_index, w, h);
             (d.changed_paths, d.region)
         })
         .unwrap_or_default();
@@ -694,6 +747,10 @@ pub fn art_diff_dto(
                 opacity: to_percent(nl.opacity),
                 blend_mode: blend_mode(&nl.blend),
                 change: change.into(),
+                visible: nl.visible,
+                layer_type: nl.kind.clone(),
+                bounds: kra::layer_bounds(&new_index, &entry_path, w, h)
+                    .map(|(x, y, bw, bh)| BoundsDto { x, y, w: bw, h: bh }),
                 before,
                 after,
                 diff_image,
@@ -708,12 +765,14 @@ pub fn art_diff_dto(
         .collect::<Result<Vec<_>>>()?;
     // Layers removed since the parent commit.
     if let (Some(om), Some(om_manifest)) = (&old_meta, &old_manifest) {
+        let old_index = om_manifest.tile_index_ref();
         for ol in &om.layers {
             if !new_meta
                 .layers
                 .iter()
                 .any(|nl| layer_id(nl) == layer_id(ol))
             {
+                let entry_path = format!("{}/layers/{}", om.name, ol.filename);
                 let before = if with_rasters {
                     kra::layer_raster(
                         repo,
@@ -735,6 +794,10 @@ pub fn art_diff_dto(
                     opacity: to_percent(ol.opacity),
                     blend_mode: blend_mode(&ol.blend),
                     change: "removed".into(),
+                    visible: ol.visible,
+                    layer_type: ol.kind.clone(),
+                    bounds: kra::layer_bounds(&old_index, &entry_path, w, h)
+                        .map(|(x, y, bw, bh)| BoundsDto { x, y, w: bw, h: bh }),
                     before,
                     after: None,
                     diff_image: None,
@@ -794,6 +857,9 @@ pub fn art_diff_dto(
         status: status.to_string(),
         width: w.max(0) as u32,
         height: h.max(0) as u32,
+        dpi: new_meta.dpi,
+        color_model: new_meta.color_model.clone(),
+        color_profile: new_meta.color_profile.clone(),
         layers,
         regions,
         before_image,

@@ -56,6 +56,9 @@ pub enum KvcError {
     #[error("cannot delete the branch you are working on")]
     DeleteCurrent,
 
+    #[error("cannot delete the main branch")]
+    DeleteMain,
+
     #[error("cannot undo: {0}")]
     CannotUndo(String),
 

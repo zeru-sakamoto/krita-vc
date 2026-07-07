@@ -144,9 +144,11 @@ interface DiffViewProps {
   commitId?: string | null;
   working?: boolean;
   nonce?: number;
+  /** Forwarded to art views so the navigator selection reaches the Inspector. */
+  onFocus?: (f: { path: string; id: string }) => void;
 }
 
-export function DiffView({ entries, repoPath, commitId, working, nonce }: DiffViewProps) {
+export function DiffView({ entries, repoPath, commitId, working, nonce, onFocus }: DiffViewProps) {
   const { artistMode } = useArtistMode();
 
   // Partition entries by kind so we can attach the first palette to the first art diff's navigator.
@@ -171,6 +173,7 @@ export function DiffView({ entries, repoPath, commitId, working, nonce }: DiffVi
           commitId={commitId}
           working={working}
           nonce={nonce}
+          onFocus={onFocus}
         />
       ))}
 
