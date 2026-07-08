@@ -92,6 +92,111 @@
 }
 
 /* ============================================================
+ * Color themes — each overrides the @theme `--color-*` vars the
+ * Tailwind utilities read via var(). Charcoal is the default and
+ * lives in @theme above (no block here). Dark themes override only
+ * the identity tokens; status/diff cascade from :root. Studio Light
+ * overrides those too and flips color-scheme.
+ * `data-theme` is stamped on <html> by lib/theme.tsx.
+ * ============================================================ */
+html[data-theme="krita-blue"] {
+  --color-bg: #1e1e24;
+  --color-surface: #26262e;
+  --color-surface-2: #2e2f39;
+  --color-surface-3: #383a45;
+  --color-border: #34353f;
+  --color-accent: #2e86de;
+  --color-text: #f5f6fa;
+  --color-text-muted: #a0a0b0;
+  --color-danger: #ff6b6b;
+}
+
+html[data-theme="electric-cyan"] {
+  --color-bg: #1a1d24;
+  --color-surface: #22262f;
+  --color-surface-2: #2a2f39;
+  --color-surface-3: #333944;
+  --color-border: #2f353f;
+  --color-accent: #00d2d3;
+  --color-text: #eef6f7;
+  --color-text-muted: #8b98a0;
+  --color-danger: #ff6b6b;
+}
+
+html[data-theme="sunset-coral"] {
+  --color-bg: #201e22;
+  --color-surface: #2a2529;
+  --color-surface-2: #322c31;
+  --color-surface-3: #3a333a;
+  --color-border: #383036;
+  --color-accent: #ff6b6b;
+  --color-text: #f5f0ee;
+  --color-text-muted: #a89a97;
+  --color-danger: #c84b31;
+}
+
+html[data-theme="tokyo-night"] {
+  --color-bg: #1a1b26;
+  --color-surface: #1f2335;
+  --color-surface-2: #24283b;
+  --color-surface-3: #2f344d;
+  --color-border: #2c3049;
+  --color-accent: #7aa2f7;
+  --color-text: #c0caf5;
+  --color-text-muted: #8891bd;
+  --color-danger: #f7768e;
+}
+
+html[data-theme="charcoal-light"] {
+  color-scheme: light;
+  --color-bg: #f4f1ea;
+  --color-surface: #ffffff;
+  --color-surface-2: #eae4d9;
+  --color-surface-3: #ddd6c8;
+  --color-border: #d6cfc0;
+  --color-accent: #a8511a;
+  --color-text: #221f1b;
+  --color-text-muted: #6b6157;
+  --color-danger: #b23a22;
+  --color-success: #d8f0dd;
+  --color-success-fg: #1f7a3a;
+  --color-warning: #f6ecc9;
+  --color-warning-fg: #8a6d10;
+  --color-info: #d6e8f7;
+  --color-info-fg: #1d5f96;
+  --color-diff-add: #d9f0e2;
+  --color-diff-add-fg: #1f7a3a;
+  --color-diff-del: #f7dcdc;
+  --color-diff-del-fg: #b3261e;
+  /* ponytail: see studio-light note — diff overlays tuned for dark. */
+}
+
+html[data-theme="studio-light"] {
+  color-scheme: light;
+  --color-bg: #f5f6fa;
+  --color-surface: #ffffff;
+  --color-surface-2: #eceef4;
+  --color-surface-3: #e2e5ee;
+  --color-border: #d4d7e2;
+  --color-accent: #2e86de;
+  --color-text: #1e1e24;
+  --color-text-muted: #5a5e6b;
+  --color-danger: #c8322f;
+  --color-success: #d8f0dd;
+  --color-success-fg: #1f7a3a;
+  --color-warning: #f6ecc9;
+  --color-warning-fg: #8a6d10;
+  --color-info: #d6e8f7;
+  --color-info-fg: #1d5f96;
+  --color-diff-add: #d9f0e2;
+  --color-diff-add-fg: #1f7a3a;
+  --color-diff-del: #f7dcdc;
+  --color-diff-del-fg: #b3261e;
+  /* ponytail: diff-viewer changed-pixel mask/hatch overlays were tuned for
+     dark; functional here but not re-tuned. Refine if it reads poorly. */
+}
+
+/* ============================================================
  * Base / reset
  * ============================================================ */
 html,

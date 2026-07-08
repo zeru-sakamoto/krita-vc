@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { Broom } from "@phosphor-icons/react";
+import { Broom, CaretDown } from "@phosphor-icons/react";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
+import { Menu } from "../ui/Menu";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
+import { THEMES, useTheme } from "../../lib/theme";
 import { useRepository, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig } from "../../lib/repoData";
 
@@ -50,6 +52,19 @@ function ToggleRow({
   );
 }
 
+/** Small swatch: theme background with its accent dot — used in the trigger and each option. */
+function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
+  return (
+    <span
+      aria-hidden
+      className="flex size-4 shrink-0 items-center justify-center rounded-[3px] ring-1 ring-inset ring-black/25"
+      style={{ backgroundColor: bg }}
+    >
+      <span className="size-1.5 rounded-full" style={{ backgroundColor: accent }} />
+    </span>
+  );
+}
+
 function SectionHeading({ children }: { children: React.ReactNode }) {
   return (
     <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-text-muted">
@@ -62,6 +77,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { current } = useRepository();
   const { artistMode, toggle: toggleArtistMode } = useArtistMode();
   const { authorName, setAuthorName } = useAuthorName();
+  const { theme, setTheme } = useTheme();
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
   const [showCleanup, setShowCleanup] = useState(false);
 
@@ -93,6 +109,34 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               Shown as the author of new versions.
             </span>
           </label>
+          <div className="mt-3">
+            <span className="mb-1 block text-[12px] text-text-muted">Theme</span>
+            <Menu
+              minWidth={200}
+              items={THEMES.map((t) => ({
+                id: t.id,
+                label: t.label,
+                icon: <ThemeChip bg={t.bg} accent={t.accent} />,
+                selected: t.id === theme,
+                onSelect: () => setTheme(t.id),
+              }))}
+              trigger={(open) => {
+                const cur = THEMES.find((t) => t.id === theme) ?? THEMES[0];
+                return (
+                  <span
+                    className={[
+                      "flex min-w-[200px] items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
+                      open ? "border-accent" : "border-border",
+                    ].join(" ")}
+                  >
+                    <ThemeChip bg={cur.bg} accent={cur.accent} />
+                    <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
+                    <CaretDown size={12} weight="bold" className="shrink-0 text-text-muted" />
+                  </span>
+                );
+              }}
+            />
+          </div>
         </section>
 
         {current && (
