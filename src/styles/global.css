@@ -147,6 +147,18 @@ html[data-theme="tokyo-night"] {
   --color-danger: #f7768e;
 }
 
+html[data-theme="true-black"] {
+  --color-bg: #000000;
+  --color-surface: #0d0d0d;
+  --color-surface-2: #161616;
+  --color-surface-3: #202020;
+  --color-border: #262626;
+  --color-accent: #8b5cf6;
+  --color-text: #f2f2f2;
+  --color-text-muted: #8a8a8a;
+  --color-danger: #ff5c5c;
+}
+
 html[data-theme="charcoal-light"] {
   color-scheme: light;
   --color-bg: #f4f1ea;
@@ -219,6 +231,11 @@ body {
   /* App chrome should not feel like a web document */
   user-select: none;
   cursor: default;
+}
+
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
 }
 
 /* Re-enable selection for content the user actually reads */

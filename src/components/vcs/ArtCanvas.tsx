@@ -2,7 +2,8 @@ import { memo, useMemo } from "react";
 import type { ArtDiff, ArtLayer, ChangeRegion, DiffState } from "../../types";
 import { layersBody, wrapSvg } from "../../lib/svgArt";
 
-const ACCENT = "#e07b39";
+// Theme-reactive: reads the active theme's `--color-accent` (global.css), not a fixed hex.
+const ACCENT = "var(--color-accent)";
 
 export type HighlightMode = "box" | "pixels";
 
@@ -68,8 +69,9 @@ function boxOverlay(diff: ArtDiff, regions: ChangeRegion[]): string {
 }
 
 /**
- * Changed-pixel overlay: the backend mask (`diff.diffImage`) painted three ways so the change
- * reads on top of busy artwork without an expensive filter —
+ * Changed-pixel overlay: the backend mask (`diff.diffImage`) supplies the *shape* (its alpha
+ * channel only — its baked-in RGB is never shown), recolored with the active theme's accent and
+ * painted three ways so the change reads on top of busy artwork without an expensive filter —
  *  1. a flat accent tint of the changed pixels (area sense),
  *  2. a diagonal **hatch pattern** masked to the same pixels — the alternating stripes give
  *     high-frequency contrast that survives against any underlying color (a flat tint blends),
@@ -97,8 +99,9 @@ function pixelOverlay(
     `patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
     `<rect width="${tile / 2}" height="${tile}" fill="${ACCENT}" fill-opacity="0.6"/>` +
     `</pattern>` +
-    // mask-type:alpha → use the raster's alpha (it's accent-colored, so a luminance mask would
-    // read dim); the changed pixels become the mask, everything else is cut away.
+    // mask-type:alpha → use only the raster's alpha (its baked-in RGB is ignored so the overlay
+    // stays theme-reactive instead of the backend's fixed mask color); changed pixels become the
+    // mask, everything else is cut away.
     `<mask id="kvc-diffmask-${uid}" style="mask-type:alpha">${img}</mask>` +
     `</defs>`;
   // Outline path is normalized 0..1 → scale it to the viewBox. non-scaling-stroke keeps the dashes
@@ -110,7 +113,8 @@ function pixelOverlay(
     : "";
   return (
     defs +
-    img + // flat tint (area)
+    // flat tint (area) — same mask as the hatch, so ACCENT (not the backend's baked color) shows.
+    `<rect x="0" y="0" width="${W}" height="${H}" fill="${ACCENT}" mask="url(#kvc-diffmask-${uid})"/>` +
     `<rect x="0" y="0" width="${W}" height="${H}" fill="url(#kvc-hatch-${uid})" ` +
     `mask="url(#kvc-diffmask-${uid})"/>` +
     outline

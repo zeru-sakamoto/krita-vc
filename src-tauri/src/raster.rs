@@ -380,7 +380,9 @@ pub fn encode_composite_png(
     Ok(out)
 }
 
-/// Accent color of the change highlight — mirrors `ACCENT` in `ArtCanvas.tsx`.
+/// Placeholder color for the change-highlight mask. Only the alpha channel (128 = 50%) is ever
+/// read — the frontend (`ArtCanvas.tsx`) uses this raster purely as an alpha mask and recolors it
+/// with the active theme's `--color-accent`, so the RGB here is otherwise unused.
 const HIGHLIGHT_RGBA: [u8; 4] = [0xE0, 0x7B, 0x39, 128];
 /// Per-channel delta (0..255) above which a pixel counts as changed. Small enough to catch real
 /// edits, large enough to ignore encode/rounding noise.

@@ -96,6 +96,7 @@ export function Sidebar({
     onPointerDown,
     onPointerMove,
     onPointerUp,
+    cursorClass,
   } = useResize({
     axis: "x",
     min: 240,
@@ -223,7 +224,7 @@ export function Sidebar({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        className="absolute right-0 top-0 z-(--z-panel) h-full w-1 translate-x-1/2 cursor-col-resize bg-border transition-colors hover:bg-accent"
+        className={`absolute right-0 top-0 z-(--z-panel) h-full w-1 translate-x-1/2 ${cursorClass} bg-border transition-colors hover:bg-accent`}
       />
 
       {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}

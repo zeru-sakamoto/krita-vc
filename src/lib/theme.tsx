@@ -17,7 +17,8 @@ export type ThemeId =
   | "studio-light"
   | "electric-cyan"
   | "sunset-coral"
-  | "tokyo-night";
+  | "tokyo-night"
+  | "true-black";
 
 /** Swatch metadata for the picker. `bg`/`accent` mirror global.css — kept in
  *  sync by hand (two small values), not worth deriving from CSS at runtime. */
@@ -28,6 +29,7 @@ export const THEMES: { id: ThemeId; label: string; bg: string; accent: string }[
   { id: "electric-cyan", label: "Electric Cyan", bg: "#1a1d24", accent: "#00d2d3" },
   { id: "sunset-coral", label: "Sunset Coral", bg: "#201e22", accent: "#ff6b6b" },
   { id: "tokyo-night", label: "Tokyo Night", bg: "#1a1b26", accent: "#7aa2f7" },
+  { id: "true-black", label: "True Black", bg: "#000000", accent: "#8b5cf6" },
   { id: "charcoal-light", label: "Charcoal Light", bg: "#f4f1ea", accent: "#a8511a" },
   { id: "studio-light", label: "Studio Light", bg: "#f5f6fa", accent: "#2e86de" },
 ];

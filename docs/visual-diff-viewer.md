@@ -97,10 +97,14 @@ added, removed, or still streaming) yields empty props → the overlay simply do
 `diff.width`/`diff.height` (the viewBox) still come from `diff`.
 
 - **pixels mode** (default) — the changed-pixel mask (`diffImage`, an `<image>` sized to the
-  viewBox): transparent except where before/after differ. Rendered three ways for legibility on busy
-  artwork (`pixelOverlay`): a flat accent tint of the changed pixels, a diagonal **hatch pattern**
-  masked to those same pixels (the alternating stripes give contrast a flat tint can't against
-  arbitrary underlying color), and a **dashed outline** that hugs the changed pixels' silhouette. The
+  viewBox): transparent except where before/after differ. The backend bakes a placeholder color
+  into that raster, but the frontend (`pixelOverlay`) only ever reads its **alpha** channel
+  (`mask-type:alpha`) and repaints with `var(--color-accent)` — so the highlight always matches the
+  active theme, and switching themes never needs the cached raster to be regenerated. Rendered
+  three ways for legibility on busy artwork: a flat accent tint of the changed pixels, a diagonal
+  **hatch pattern** masked to those same pixels (the alternating stripes give contrast a flat tint
+  can't against arbitrary underlying color), and a **dashed outline** that hugs the changed pixels'
+  silhouette (also stroked with `var(--color-accent)`). The
   outline is a vector path (`diffOutline`, normalized 0..1) traced in Rust
   (`raster::outline_from_grid`, marching the changed/unchanged cell boundary of a downsampled grid
   into closed loops) — *not* a bounding box; the frontend scales it to the viewBox and strokes it
@@ -160,10 +164,11 @@ stages** so the panel appears immediately instead of blocking on every layer's r
      the default view is correct the instant the diff loads.
    - **Changed-pixel mask + outline** — `ArtDiff.diffImage` and `ArtDiff.diffOutline`: the
      before/after composites diffed pixel-for-pixel in Rust (`raster::diff_overlay`, threshold
-     ~16/channel). The mask is a transparent-except-changed accent PNG, capped + cached
-     (`kra::diff_cache_key`) + served over `kvcimg://`; the outline is a vector path tracing the
-     changed pixels' silhouette. Together they drive the default "pixels" highlight; keyed off the
-     composite so they need no layer stream.
+     ~16/channel). The mask is a transparent-except-changed PNG (its RGB is a fixed placeholder —
+     only the alpha channel is meaningful, since the frontend repaints with the active theme's
+     `--color-accent`), capped + cached (`kra::diff_cache_key`) + served over `kvcimg://`; the
+     outline is a vector path tracing the changed pixels' silhouette. Together they drive the
+     default "pixels" highlight; keyed off the composite so they need no layer stream.
    - **Change regions** — one normalized bounding box over the tiles that differ between the two
      commits (no pixel decode; just tile-hash comparison), feeding the coarse box-highlight overlay.
 2. **`commit_layers`** (or `working_layers`) is then fetched lazily by

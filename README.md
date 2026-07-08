@@ -28,7 +28,8 @@ files, where git's text-oriented delta model performs poorly.
     applied identically across both modes so before/after and the slider divider stay aligned.
   - **Changed-pixel highlighting** — a true per-pixel diff (toggle on/off), with a coarse
     region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
-    only *that* layer's changed pixels, not the whole-file silhouette.
+    only *that* layer's changed pixels, not the whole-file silhouette. Its color always matches
+    the active **theme's accent** (see Settings below).
   - Click a layer to focus its diff, or view the composited artwork; palettes (`.gpl`) render as
     color swatches. The inspector shows the selected layer's details (type, visibility, opacity,
     blend, painted bounds) or the composite's size, resolution, and color space.
@@ -38,9 +39,11 @@ files, where git's text-oriented delta model performs poorly.
   branches, all backed by real tree materialization.
 - **Storage housekeeping** — a "Clean up storage" action reclaims history unreachable from any
   branch tip (mark-and-sweep GC), and the raster preview cache is size-budgeted with LRU pruning.
-- **Settings** (activity-bar gear) — one place for user preferences: the Artist Mode toggle, the
-  **author name** signed on your versions, and per-repository **preview-cache size** and
-  **compact-storage** options, plus "Clean up storage".
+- **Settings** (activity-bar gear) — one place for user preferences: the Artist Mode toggle, a
+  **theme selector** (8 color themes, including a true-black option, applied instantly via CSS —
+  the visual-diff highlight color follows the chosen theme's accent), the **author name** signed
+  on your versions, and per-repository **preview-cache size** and **compact-storage** options,
+  plus "Clean up storage".
 - **Artist Mode** — a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).

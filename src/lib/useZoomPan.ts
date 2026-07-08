@@ -45,6 +45,7 @@ function clamp(v: number, lo: number, hi: number): number {
 
 export function useZoomPan(): UseZoomPan {
   const [z, setZ] = useState<ZoomState>(IDENTITY);
+  const [panning, setPanning] = useState(false);
 
   // Space-to-pan flag (tracked globally while the diff is mounted).
   const [spaceHeld, setSpaceHeld] = useState(false);
@@ -132,6 +133,7 @@ export function useZoomPan(): UseZoomPan {
       if (!panButton) return; // leave plain left-drag for the slider divider
       e.preventDefault();
       panningRef.current = true;
+      setPanning(true);
       lastRef.current = { x: e.clientX, y: e.clientY };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     },
@@ -153,6 +155,7 @@ export function useZoomPan(): UseZoomPan {
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     if (!panningRef.current) return;
     panningRef.current = false;
+    setPanning(false);
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
@@ -177,7 +180,7 @@ export function useZoomPan(): UseZoomPan {
     onPointerDown,
     onPointerMove,
     onPointerUp,
-    panCursor: spaceHeld ? "cursor-grab active:cursor-grabbing" : "",
+    panCursor: panning ? "cursor-grabbing" : spaceHeld ? "cursor-grab" : "",
     reset,
   };
 }

@@ -15,6 +15,10 @@ and the status bar shows a "Browser preview" badge — the browser build is for 
 - Non-utility tokens (easing curves, durations, z-index scale) live in `:root` and are referenced
   as `z-(--z-sticky)`, `duration-(--dur-normal)`, etc.
 - Fonts (Inter, JetBrains Mono) are self-hosted via `@fontsource` for offline use.
+- **Color themes** — the `@theme` block's `--color-*` values are Charcoal (the default, no
+  override needed); every other theme is an `html[data-theme="…"] { --color-* : … }` block further
+  down `global.css` that overrides just the identity tokens (dark themes) or the identity + status/
+  diff tokens and `color-scheme` (light themes). See [Theme selector](#theme-selector).
 
 ## App shell — the four zones
 
@@ -37,7 +41,7 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
 | Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, author name, and (per repo) preview cache size, compact-storage toggle, and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable; selected commit's version/hash, author, date, message, changed files, plus a **Selected** section that mirrors the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
@@ -75,10 +79,12 @@ a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLaye
 working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
 `selectedCommit`, and `diff`.
 
-Three pieces of state live **outside** `AppShell`, each in a React context so any component can read
+Four pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
 ([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)), the
-author name ([`src/lib/authorName.tsx`](../src/lib/authorName.tsx) — persisted to `localStorage`,
+selected color theme ([`src/lib/theme.tsx`](../src/lib/theme.tsx), see
+[Theme selector](#theme-selector)), the author name
+([`src/lib/authorName.tsx`](../src/lib/authorName.tsx) — persisted to `localStorage`,
 sent as the `author` on new commits/merges/rollbacks, falling back to `"You"` when unset; also
 readable outside React via `readAuthorName()` for `repository.tsx`'s callbacks), and the
 selected repository ([`src/lib/repository.tsx`](../src/lib/repository.tsx) — list + `currentId`,
@@ -86,7 +92,7 @@ persisted to `localStorage`; the `TopBar` switcher reads it). The repository con
 `refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `busyMessage` /
 `scanning` busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a
 commit, `busyMessage` (a human-readable label, or `null` when idle) drives the full-screen
-`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All three providers
+`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All four providers
 are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
@@ -171,6 +177,35 @@ Label helpers live in [`src/lib/friendly.ts`](../src/lib/friendly.ts).
 Layer opacity/blend mode in `LayerStackPanel` are kept as-is in both modes — they're genuine art
 concepts, not jargon.
 
+## Theme selector
+
+Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cyan`, `sunset-coral`,
+`tokyo-night`, `true-black`) and two light (`charcoal-light`, `studio-light`) — are picked from a
+`Menu` in the Settings modal (gear in the activity bar), each option rendered as a `ThemeChip`
+(background swatch + accent dot). Themes are **pure CSS palettes**, not component variants:
+
+- [`src/lib/theme.tsx`](../src/lib/theme.tsx) defines the `ThemeId` union and the `THEMES` array
+  (id, label, and the `bg`/`accent` swatch colors shown in the picker — kept in sync by hand with
+  `global.css`, not derived at runtime). `ThemeProvider` tracks the selected id, persists it to
+  `localStorage` (`krita-vc:theme`), and stamps it as `data-theme` on `<html>` so the CSS cascade
+  does the rest; `readTheme()`/`applyTheme()` are also called directly (outside React) in
+  [`main.tsx`](../src/main.tsx) before first paint, so a saved non-default theme doesn't flash
+  Charcoal for a frame.
+- [`src/styles/global.css`](../src/styles/global.css) defines Charcoal's colors in the base
+  `@theme` block; every other theme is an `html[data-theme="…"]` block overriding the same
+  `--color-*` variables (dark themes override just the identity tokens — bg/surface/border/accent/
+  text/danger — and inherit status/diff colors from the base; light themes also override status/
+  diff colors and flip `color-scheme`). Because Tailwind utilities and the app's own CSS all read
+  colors via `var(--color-*)`, switching themes needs no re-render of anything — the browser
+  cascade repaints the whole UI instantly.
+- **The visual-diff change-highlight is theme-reactive too.** The backend (`raster.rs`) bakes a
+  placeholder color into the `diffImage` mask PNG, but only its *alpha* channel is ever used — the
+  frontend (`ArtCanvas.tsx`) treats that raster purely as an SVG mask shape and paints the flat
+  tint, hatch pattern, dashed outline, and the region-box fallback with `var(--color-accent)`, so
+  the diff highlight always matches the active theme's accent (no cache invalidation needed on
+  theme switch, since the cached raster's actual color is never displayed). See the `ArtCanvas`
+  section of [visual-diff-viewer.md](visual-diff-viewer.md).
+
 ## Component map
 
 ```
@@ -192,8 +227,8 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is set)
 ```
 
-The whole tree is wrapped in `RepositoryProvider` → `ArtistModeProvider` (both mounted in
-[`App.tsx`](../src/App.tsx)).
+The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `ArtistModeProvider` →
+`AuthorNameProvider` (all mounted in [`App.tsx`](../src/App.tsx)).
 
 Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (flat Krita-style),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:

@@ -25,6 +25,8 @@ export interface UseResize {
   onPointerDown: (e: React.PointerEvent) => void;
   onPointerMove: (e: React.PointerEvent) => void;
   onPointerUp: (e: React.PointerEvent) => void;
+  /** Tailwind cursor class for the drag handle, matching the resize axis. */
+  cursorClass: string;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -85,5 +87,11 @@ export function useResize(options: UseResizeOptions): UseResize {
     [storageKey]
   );
 
-  return { size, onPointerDown, onPointerMove, onPointerUp };
+  return {
+    size,
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    cursorClass: axis === "x" ? "cursor-col-resize" : "cursor-row-resize",
+  };
 }
