@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+# Two [[bin]] targets now exist (the Tauri app + the headless `kvc` CLI); tell bare
+# `cargo run` (what Tauri's dev/build commands invoke) which one to launch.
+default-run = "krita-vc"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,6 +16,12 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "krita_vc_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Headless companion CLI over the same engine, for out-of-process callers (the Krita
+# plugin) that don't want the Tauri runtime — see src/bin/kvc.rs.
+[[bin]]
+name = "kvc"
+path = "src/bin/kvc.rs"
 
 # Dev builds run the same image/compression hot loops as release — unoptimized they are
 # 10-50x slower and make `tauri dev` feel broken. Deps at full opt, our crate at 1.

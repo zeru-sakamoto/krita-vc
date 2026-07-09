@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=kritavc
+X-Python-2-Compatible=false
+X-Krita-Manual=
+Name=Krita VC
+Comment=Commit, checkpoint, and switch branches for this document's .kvc repository without leaving Krita.

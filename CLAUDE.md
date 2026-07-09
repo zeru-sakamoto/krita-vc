@@ -75,6 +75,8 @@ Rust side (run from `src-tauri/`):
 - `cargo test --release --test bench -- --ignored --nocapture` — performance baseline
   (`tests/bench.rs`, `#[ignore]`d by default): synthesizes a Krita-scale document and times
   commit/switch/rollback/diff against the <10s target
+- `cargo build --release --bin kvc` — build the headless `kvc` companion CLI (below); use
+  `--bin krita-vc` (or no flag, since `default-run = "krita-vc"`) for the desktop app itself
 
 ## Architecture
 
@@ -82,6 +84,8 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 
 - **Frontend** (`src/`): standard Vite + React 19 + TypeScript app. Entry point `src/main.tsx` mounts `App.tsx` into `index.html`. Built output goes to `dist/`, which `src-tauri/tauri.conf.json` (`build.frontendDist`) points at for packaged builds.
 - **Backend** (`src-tauri/`): Rust crate `krita_vc_lib`. `src-tauri/src/main.rs` is the binary entry point and just calls `krita_vc_lib::run()` defined in `src-tauri/src/lib.rs`, where the `tauri::Builder` is configured, plugins are registered, and Tauri commands are wired up via `invoke_handler(tauri::generate_handler![...])`.
+- **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Five subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`) taking `--repo <path>` plus scalars, each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit). Commit/switch/create-branch take an advisory `.kvc/kvc.lock` (create-exclusive, released on drop) so it can't race a concurrent desktop-app write — the engine itself has no locking. This is what the Krita plugin (below) shells out to. Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
+- **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, one-tap checkpoint, and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above. Deliberately does not do repo init, history browsing/restore, or anything remote — those stay desktop-app-only. See [`krita-plugin/README.md`](krita-plugin/README.md).
 - **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (e.g. `greet` in `lib.rs`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `lib.rs` (or a module it includes) and registered in `generate_handler!`.
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `opener:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.

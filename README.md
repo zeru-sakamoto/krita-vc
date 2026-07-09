@@ -120,12 +120,24 @@ src-tauri/src/ — Rust backend (crate krita_vc_lib)
 
 docs/          — developer documentation
 DESIGN.md      — visual + interaction spec
+krita-plugin/  — optional Krita docker plugin (see below)
 ```
+
+## Krita plugin
+
+A companion "Version Control" docker for Krita itself — commit, quick-checkpoint, and
+branch-switch without alt-tabbing to this app. It's a small Python (PyKrita) plugin that
+shells out to `kvc`, a headless CLI built from the same Rust engine
+(`src-tauri/src/bin/kvc.rs`, no Tauri dependency) — so the plugin and the desktop app
+always go through identical commit/branch code against the same `.kvc` store. See
+[`krita-plugin/README.md`](krita-plugin/README.md) for build + install steps.
 
 ## Documentation
 
 - [`docs/`](docs/README.md) — frontend architecture, the file-tracking / version-control backend,
   the visual diff viewer, and performance.
+- [`krita-plugin/README.md`](krita-plugin/README.md) — the in-Krita commit docker: install,
+  usage, and troubleshooting.
 - [`DESIGN.md`](DESIGN.md) — design tokens, components, and interaction spec.
 - [`CLAUDE.md`](CLAUDE.md) — repo guidance and commands.
 
