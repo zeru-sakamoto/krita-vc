@@ -69,7 +69,9 @@ fn require<'a>(flags: &'a HashMap<String, String>, name: &str) -> Result<&'a str
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else {
-        return fail("usage: kvc <status|commit|branches|switch|create-branch> --repo <path> [...]");
+        return fail(
+            "usage: kvc <status|commit|branches|switch|create-branch> --repo <path> [...]",
+        );
     };
     let flags = parse_flags(&args[1..]);
 

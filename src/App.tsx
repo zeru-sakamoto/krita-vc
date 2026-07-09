@@ -3,6 +3,7 @@ import { ArtistModeProvider } from "./lib/artistMode";
 import { AuthorNameProvider } from "./lib/authorName";
 import { ThemeProvider } from "./lib/theme";
 import { RepositoryProvider } from "./lib/repository";
+import { WindowChromeProvider } from "./lib/windowChrome";
 
 function App() {
   return (
@@ -10,7 +11,9 @@ function App() {
       <ThemeProvider>
         <ArtistModeProvider>
           <AuthorNameProvider>
-            <AppShell />
+            <WindowChromeProvider>
+              <AppShell />
+            </WindowChromeProvider>
           </AuthorNameProvider>
         </ArtistModeProvider>
       </ThemeProvider>

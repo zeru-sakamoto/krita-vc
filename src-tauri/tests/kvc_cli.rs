@@ -46,7 +46,10 @@ fn status_commit_roundtrip_and_lock() {
     assert_eq!(changes[0]["status"], "U");
 
     // Commit lands, and the working tree is clean afterward.
-    let (ok, commit) = kvc(root, &["commit", "--message", "first version", "--author", "Zeru"]);
+    let (ok, commit) = kvc(
+        root,
+        &["commit", "--message", "first version", "--author", "Zeru"],
+    );
     assert!(ok);
     let id = commit["id"].as_str().unwrap().to_string();
     assert!(!id.is_empty());
@@ -66,7 +69,10 @@ fn status_commit_roundtrip_and_lock() {
     // A held lock blocks a concurrent commit with a clear error (checked before the tree
     // is even scanned, so the working tree stays clean for the branch ops below).
     std::fs::write(root.join(".kvc/kvc.lock"), b"").unwrap();
-    let (ok, err) = kvc(root, &["commit", "--message", "blocked", "--author", "Zeru"]);
+    let (ok, err) = kvc(
+        root,
+        &["commit", "--message", "blocked", "--author", "Zeru"],
+    );
     assert!(!ok);
     assert!(err["error"].as_str().unwrap().contains("busy"));
     std::fs::remove_file(root.join(".kvc/kvc.lock")).unwrap();

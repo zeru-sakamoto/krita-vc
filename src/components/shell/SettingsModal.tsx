@@ -8,6 +8,7 @@ import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme } from "../../lib/theme";
 import { useRepository, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig } from "../../lib/repoData";
+import { useWindowChrome } from "../../lib/windowChrome";
 
 const CACHE_PRESETS_MB = [128, 256, 512, 1024, 2048];
 
@@ -57,7 +58,7 @@ function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
   return (
     <span
       aria-hidden
-      className="flex size-4 shrink-0 items-center justify-center rounded-[3px] ring-1 ring-inset ring-black/25"
+      className="flex size-4 shrink-0 items-center justify-center rounded-button ring-1 ring-inset ring-black/25"
       style={{ backgroundColor: bg }}
     >
       <span className="size-1.5 rounded-full" style={{ backgroundColor: accent }} />
@@ -76,6 +77,7 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { current } = useRepository();
   const { artistMode, toggle: toggleArtistMode } = useArtistMode();
+  const { customTitleBar, toggle: toggleWindowChrome } = useWindowChrome();
   const { authorName, setAuthorName } = useAuthorName();
   const { theme, setTheme } = useTheme();
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
@@ -96,6 +98,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             detail="Plain-language labels and version numbers instead of the technical view."
             active={artistMode}
             onToggle={toggleArtistMode}
+          />
+          <ToggleRow
+            label="Custom title bar"
+            detail="Use krita-vc's own title bar instead of your operating system's native window frame."
+            active={customTitleBar}
+            onToggle={toggleWindowChrome}
           />
           <label className="mt-2 block">
             <span className="mb-1 block text-[12px] text-text-muted">Your name</span>
@@ -125,7 +133,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 return (
                   <span
                     className={[
-                      "flex min-w-[200px] items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
+                      "flex min-w-50 items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
                       open ? "border-accent" : "border-border",
                     ].join(" ")}
                   >

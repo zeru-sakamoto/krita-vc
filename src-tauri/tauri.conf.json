@@ -15,7 +15,8 @@
         "title": "krita-vc",
         "width": 1440,
         "height": 900,
-        "backgroundColor": "#131210"
+        "backgroundColor": "#131210",
+        "decorations": false
       }
     ],
     "security": {

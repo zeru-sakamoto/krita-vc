@@ -29,7 +29,11 @@ modal in the **Settings modal**) reclaims history unreachable from any branch ti
 cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
 rewrites on >25% dead, and consolidates small packs; the raster cache (`.kvc/cache/`) is
 size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Settings** (activity-bar
-gear → `SettingsModal`) is the single home for user prefs: Artist-view toggle, an **author name**
+gear → `SettingsModal`) is the single home for user prefs: Artist-view toggle, a **custom title
+bar** toggle (`windowChrome.tsx`, default **on** — the window boots with no OS-native chrome;
+`TopBar` doubles as the draggable title bar with its own minimize/maximize/close controls via
+`@tauri-apps/api/window`, and the preference is applied live through `setDecorations`, no
+restart needed — see the Shell section below), an **author name**
 (`authorName.tsx`, persisted to `localStorage`, sent as the `author` on new commits/merges/
 rollbacks, falling back to `"You"`), and per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs
 (`get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only write) plus "Clean up
@@ -112,6 +116,13 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
   during any write op (commit, branch switch/merge/create/delete, rollback, undo, cleanup),
   driven by `busyMessage` on the repository context — stops a stray click racing a file rewrite.
+  `TopBar` doubles as a **custom title bar** (`src-tauri/tauri.conf.json`'s window has
+  `decorations: false` by default): when the Settings "Custom title bar" toggle
+  (`lib/windowChrome.tsx`, `WindowChromeProvider`/`useWindowChrome`, default on) is active and
+  the app is running in the Tauri shell, `TopBar` carries `data-tauri-drag-region` and
+  right-aligned minimize/maximize/close buttons (`@tauri-apps/api/window`'s `getCurrentWindow()`);
+  toggling the preference calls `setDecorations` live, so switching back to the OS-native frame
+  needs no restart. Off, or in browser preview, `TopBar` renders exactly as before.
 - **Repositories** (`src/lib/repository.tsx`): a local repository is a folder the user designates
   (local-only — no remotes). The `TopBar` switcher selects among them; the list + selected id
   persist to `localStorage` (`current` is null until the user adds one). In the desktop shell,

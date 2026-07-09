@@ -1,10 +1,21 @@
 import { useState } from "react";
-import { CaretDown, FolderOpen, FolderPlus, Plus, Trash, X } from "@phosphor-icons/react";
+import {
+  CaretDown,
+  FolderOpen,
+  FolderPlus,
+  Minus,
+  Plus,
+  Square,
+  Trash,
+  X,
+} from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { useRepository } from "../../lib/repository";
+import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
 import type { Repository } from "../../types";
 
@@ -15,9 +26,11 @@ import type { Repository } from "../../types";
  */
 export function TopBar() {
   const { repositories, current, currentId, setCurrent, browseRepository } = useRepository();
+  const { customTitleBar } = useWindowChrome();
   const [modal, setModal] = useState<
     { kind: "create" } | { kind: "remove"; repo: Repository } | null
   >(null);
+  const showWindowControls = customTitleBar && inTauri();
 
   const items: MenuItem[] = repositories.map((repo) => ({
     id: repo.id,
@@ -58,7 +71,10 @@ export function TopBar() {
   ];
 
   return (
-    <header className="flex h-9 shrink-0 items-center border-b border-border bg-surface px-2">
+    <header
+      className="flex h-9 shrink-0 items-center border-b border-border bg-surface px-2"
+      {...(showWindowControls ? { "data-tauri-drag-region": true } : {})}
+    >
       <Menu
         trigger={() => <RepoTrigger name={current?.name ?? "Open a repository…"} />}
         items={items}
@@ -66,11 +82,49 @@ export function TopBar() {
         minWidth={240}
       />
 
+      {showWindowControls && <WindowControls />}
+
       {modal?.kind === "create" && <CreateRepoModal onClose={() => setModal(null)} />}
       {modal?.kind === "remove" && (
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
     </header>
+  );
+}
+
+/** Minimize/maximize/close buttons for the custom title bar (Settings → "Custom title bar"). */
+function WindowControls() {
+  const win = getCurrentWindow();
+  return (
+    <div className="ml-auto flex items-center gap-0.5">
+      <button
+        type="button"
+        title="Minimize"
+        aria-label="Minimize"
+        onClick={() => win.minimize()}
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-white/5 hover:text-text"
+      >
+        <Minus size={13} />
+      </button>
+      <button
+        type="button"
+        title="Maximize"
+        aria-label="Maximize"
+        onClick={() => win.toggleMaximize()}
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-white/5 hover:text-text"
+      >
+        <Square size={11} />
+      </button>
+      <button
+        type="button"
+        title="Close"
+        aria-label="Close"
+        onClick={() => win.close()}
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-danger hover:text-white"
+      >
+        <X size={13} />
+      </button>
+    </div>
   );
 }
 

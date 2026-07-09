@@ -40,8 +40,8 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
-| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
+| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable; selected commit's version/hash, author, date, message, changed files, plus a **Selected** section that mirrors the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
@@ -79,9 +79,11 @@ a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLaye
 working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
 `selectedCommit`, and `diff`.
 
-Four pieces of state live **outside** `AppShell`, each in a React context so any component can read
+Five pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
 ([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)), the
+custom title bar flag ([`src/lib/windowChrome.tsx`](../src/lib/windowChrome.tsx), see
+[Custom title bar](#custom-title-bar)), the
 selected color theme ([`src/lib/theme.tsx`](../src/lib/theme.tsx), see
 [Theme selector](#theme-selector)), the author name
 ([`src/lib/authorName.tsx`](../src/lib/authorName.tsx) — persisted to `localStorage`,
@@ -92,7 +94,7 @@ persisted to `localStorage`; the `TopBar` switcher reads it). The repository con
 `refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `busyMessage` /
 `scanning` busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a
 commit, `busyMessage` (a human-readable label, or `null` when idle) drives the full-screen
-`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All four providers
+`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All five providers
 are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
@@ -177,6 +179,30 @@ Label helpers live in [`src/lib/friendly.ts`](../src/lib/friendly.ts).
 Layer opacity/blend mode in `LayerStackPanel` are kept as-is in both modes — they're genuine art
 concepts, not jargon.
 
+## Custom title bar
+
+The window boots with **no OS-native title bar by default** (`src-tauri/tauri.conf.json`'s
+single window sets `decorations: false`). Instead [`TopBar`](../src/components/shell/TopBar.tsx)
+doubles as the title bar: when the "Custom title bar" toggle is on and the app is running in the
+Tauri shell (`inTauri()`), the `<header>` carries `data-tauri-drag-region` (native drag, no JS
+`startDragging()` call needed) and renders right-aligned minimize/maximize/close buttons built on
+`@tauri-apps/api/window`'s `getCurrentWindow()`. In browser preview, or with the toggle off,
+`TopBar` renders exactly as it does with no window controls at all.
+
+The preference is [`src/lib/windowChrome.tsx`](../src/lib/windowChrome.tsx)
+(`WindowChromeProvider`/`useWindowChrome()`), the same localStorage-context shape as Artist Mode
+and the theme selector — `krita-vc:custom-titlebar`, default **on**. Unlike those two, flipping it
+also drives one live side effect: its effect calls `getCurrentWindow().setDecorations(!customTitleBar)`
+whenever the value changes (including on mount, which is what re-applies a previously-saved
+"native chrome" choice at boot, since the static Tauri config always starts with decorations
+off) — so switching between custom and native chrome takes effect immediately, no restart. The
+toggle lives in the Settings modal (activity-bar gear), right under Artist view.
+
+The capabilities needed to drive this from the frontend
+(`src-tauri/capabilities/default.json`): `core:window:allow-start-dragging`,
+`core:window:allow-minimize`, `core:window:allow-toggle-maximize`, `core:window:allow-close`,
+`core:window:allow-set-decorations`.
+
 ## Theme selector
 
 Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cyan`, `sunset-coral`,
@@ -228,7 +254,7 @@ BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is 
 ```
 
 The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `ArtistModeProvider` →
-`AuthorNameProvider` (all mounted in [`App.tsx`](../src/App.tsx)).
+`AuthorNameProvider` → `WindowChromeProvider` (all mounted in [`App.tsx`](../src/App.tsx)).
 
 Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (flat Krita-style),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:

@@ -77,6 +77,22 @@ project reads like a record of who did what. Set how much disk the preview image
 turn on compact storage to shrink the history of heavily-revised paintings — all optional, all
 changeable any time.
 
+### Pick a theme
+Choose from eight color themes right in Settings — six dark, two light — from the moody default
+Charcoal to Krita Blue, Tokyo Night, and True Black. Your pick is saved on your machine and
+applied instantly, no restart needed.
+
+| Theme | Background | Accent |
+| --- | --- | --- |
+| Charcoal (default) | `#131210` | `#e07b39` |
+| Krita Blue | `#1e1e24` | `#2e86de` |
+| Electric Cyan | `#1a1d24` | `#00d2d3` |
+| Sunset Coral | `#201e22` | `#ff6b6b` |
+| Tokyo Night | `#1a1b26` | `#7aa2f7` |
+| True Black | `#000000` | `#8b5cf6` |
+| Charcoal Light | `#f4f1ea` | `#a8511a` |
+| Studio Light | `#f5f6fa` | `#2e86de` |
+
 ![Screenshot placeholder — Settings panel with name field and storage options](placeholder)
 
 ---
