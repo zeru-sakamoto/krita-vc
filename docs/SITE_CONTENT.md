@@ -118,6 +118,9 @@ Krita VCS is actively developed. A few things we're still improving:
   losing your place, so you can hop between reviews without re-picking the same two versions.
 - **A guided first-launch tour** — a dynamic walkthrough of the app on first open, pointing out
   the repository switcher, Changes, History, and Settings so new users aren't left guessing.
+- **The Krita plugin** — an optional in-Krita "Version Control" panel (commit, quick-checkpoint,
+  branch switching, no window-switching) built on the same history as the main app. Available
+  today as a manual build; see the [Krita plugin install guide on GitHub →].
 
 Have a feature request? [Open an issue on GitHub →]
 
@@ -125,45 +128,12 @@ Have a feature request? [Open an issue on GitHub →]
 
 ## Documentation
 
-New to Krita VCS? Start here. This page walks through installing the app, saving your first
-version, and — if you want it — adding the optional Krita plugin so you can commit without ever
-leaving Krita.
+New to Krita VCS? A full walkthrough — installing, saving your first version, using every
+feature, and the guardrails that keep your work safe — lives on its own page.
+
+[Getting Started with Krita VCS →](SITE_CONTENT_GETTING_STARTED.md)
 
 [Read the full docs on GitHub →]
-
-### Getting started
-
-1. **Install and open Krita VCS.** [Download for free →] and launch it — no account, no sign-in.
-2. **Point it at a folder.** Use the repository switcher at the top and choose **Create** or
-   **Browse** to pick the folder your `.kra` files live in. Krita VCS creates a small hidden
-   history store inside that folder; your files themselves are never moved or renamed.
-3. **Save a version.** Open the **Changes** view, write a short note about what you did, and hit
-   **Commit**. That's a version you can always come back to.
-4. **Compare two versions.** Pick any two commits in the **History** view to see a visual,
-   layer-by-layer diff — no line numbers, no code.
-
-![Screenshot placeholder — first-run repository picker + first commit](placeholder)
-
-### Installing the Krita plugin (optional)
-
-Prefer to save versions without switching windows? The Krita plugin adds a small **Version
-Control** panel directly inside Krita, with a changelist, a commit button, a one-tap "Checkpoint"
-for quick milestones, and branch switching — all working against the exact same history as the
-main app.
-
-- Commit and Checkpoint only become active once you've saved in Krita (the plugin never saves
-  your file for you).
-- Everything it does is local, same as the main app — no new accounts, no new servers.
-- Setting up a repository, and browsing or restoring older versions, still happens in the main
-  Krita VCS app — the plugin is just a faster way to commit.
-
-Today, installing it means building one small command-line helper alongside the app and copying
-a folder into Krita's plugin directory — a five-minute, one-time setup. Full step-by-step
-instructions (with copy-pasteable commands) live in the plugin's own guide:
-
-[Krita plugin install guide on GitHub →]
-
-![Screenshot placeholder — Version Control docker inside Krita](placeholder)
 
 ---
 ## FAQ
