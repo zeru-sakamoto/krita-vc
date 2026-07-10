@@ -162,7 +162,7 @@ fn tile_storage_experiment() {
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
-    let working = kra::parse_working(&bytes).unwrap();
+    let working = kra::parse_working(&bytes, false).unwrap();
     let index = working.tile_index();
 
     let (mut n, mut lzf, mut cur, mut raw_z) = (0u64, 0u64, 0u64, 0u64);

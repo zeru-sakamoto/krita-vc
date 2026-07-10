@@ -19,11 +19,59 @@
 use crate::error::{io_at, KvcError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const KVC_DIR: &str = ".kvc";
+
+/// Join a repo-relative path onto `root`, refusing anything that could escape the repository.
+/// Committed file paths live in `commits.log` (plain JSON that travels with a shared `.kvc/`
+/// store) and `file` args arrive from the frontend, so both are untrusted: `Path::join` with an
+/// absolute path silently replaces `root`, and `..` walks out of it. Only `Normal` components are
+/// allowed — this rejects absolute paths, drive/UNC prefixes, root, and `..`.
+pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() {
+        return Err(KvcError::BadPath(rel.to_string()));
+    }
+    let mut out = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(seg) => out.push(seg),
+            _ => return Err(KvcError::BadPath(rel.to_string())),
+        }
+    }
+    Ok(out)
+}
+
+/// Advisory, best-effort exclusive lock over one `.kvc/` store (`.kvc/kvc.lock`, create-new).
+/// The engine has no internal locking, so every mutating entry point — the desktop app's Tauri
+/// commands and the `kvc` CLI alike — takes this so a plugin commit can't interleave with a
+/// desktop commit/switch/GC into a torn write. A crash leaves a stale lock; GC's stale-`*.tmp`
+/// style cleanup is the recovery path (the file is removed on drop in the normal case).
+// ponytail: advisory create-new lock; upgrade to fs2 flock only if a stale lock ever bites.
+pub struct RepoLock(PathBuf);
+
+impl RepoLock {
+    pub fn acquire(root: &Path) -> Result<Self> {
+        let path = kvc_dir(root).join("kvc.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(RepoLock(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(KvcError::Locked),
+            Err(e) => Err(io_at(&path, e)),
+        }
+    }
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 pub fn kvc_dir(root: &Path) -> PathBuf {
     root.join(KVC_DIR)
@@ -60,6 +108,12 @@ pub struct Config {
     /// always honor what the manifest says, so toggling never breaks existing history.
     #[serde(default)]
     pub tile_pixel_deltas: bool,
+    /// Opt-in: decode working-tree `.kra` diff entries on demand (re-inflating one archive entry
+    /// at a time) instead of holding the whole decompressed document in RAM. Trades a little CPU
+    /// for bounded peak memory on low-end devices. Off by default — the in-memory path is faster
+    /// for interactive diffs. Purely a diff-view knob; never affects stored data.
+    #[serde(default)]
+    pub low_memory_diff: bool,
 }
 
 fn default_cache_max_bytes() -> u64 {
@@ -74,6 +128,7 @@ impl Default for Config {
             tile_size: 64,
             cache_max_bytes: default_cache_max_bytes(),
             tile_pixel_deltas: false,
+            low_memory_diff: false,
         }
     }
 }
@@ -822,4 +877,54 @@ pub fn epoch_to_iso(secs: i64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_allows_normal_relative_paths() {
+        let root = Path::new("/repo");
+        assert_eq!(safe_join(root, "art.kra").unwrap(), root.join("art.kra"));
+        assert_eq!(
+            safe_join(root, "sub/dir/art.kra").unwrap(),
+            root.join("sub").join("dir").join("art.kra")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_escapes() {
+        let root = Path::new("/repo");
+        // Parent traversal, empty, and absolute/root paths are all refused.
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "a/../../evil",
+            "/etc/passwd",
+            "/abs/path",
+        ] {
+            assert!(
+                matches!(safe_join(root, bad), Err(KvcError::BadPath(_))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn safe_join_rejects_windows_drive_and_unc() {
+        let root = Path::new(r"C:\repo");
+        for bad in [
+            r"C:\Windows\System32\evil",
+            r"\\server\share\evil",
+            r"..\..\evil",
+        ] {
+            assert!(
+                matches!(safe_join(root, bad), Err(KvcError::BadPath(_))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
 }

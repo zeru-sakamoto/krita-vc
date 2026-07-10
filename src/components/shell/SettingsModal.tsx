@@ -185,6 +185,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               }
             />
 
+            <ToggleRow
+              label="Low-memory diffs"
+              detail="Loads each layer of a working-file preview one at a time instead of all at
+                once. Uses noticeably less memory on large files, in exchange for a little extra
+                time to open a preview. Helpful on low-end machines."
+              active={config?.lowMemoryDiff ?? false}
+              onToggle={() =>
+                config && updateConfig({ ...config, lowMemoryDiff: !config.lowMemoryDiff })
+              }
+            />
+
             <Button className="mt-3" onClick={() => setShowCleanup(true)}>
               <Broom size={14} />
               Clean up storage…

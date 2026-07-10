@@ -73,8 +73,9 @@ off any time.
 
 ### Sign your work, tune it to your machine
 Everything lives in one Settings panel. Put your name on every version you save, so a shared
-project reads like a record of who did what. Set how much disk the preview images may use, or
-turn on compact storage to shrink the history of heavily-revised paintings — all optional, all
+project reads like a record of who did what. Set how much disk the preview images may use, turn
+on compact storage to shrink the history of heavily-revised paintings, or switch on low-memory
+diffs to compare large files a layer at a time on a modest machine — all optional, all
 changeable any time.
 
 ### Pick a theme

@@ -8,41 +8,12 @@
 
 use krita_vc_lib::branch;
 use krita_vc_lib::commit;
-use krita_vc_lib::repo::Repo;
+use krita_vc_lib::repo::{Repo, RepoLock};
 use krita_vc_lib::scan;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-
-/// Advisory lock so a plugin commit/switch/create-branch can't race the desktop app
-/// (or another `kvc` invocation) into a torn write — the engine itself has no locking.
-// ponytail: lockfile is advisory + best-effort; a crash leaves a stale lock the desktop
-// app's cleanup can sweep — upgrade to fs2 flock only if that bites.
-struct RepoLock(PathBuf);
-
-impl RepoLock {
-    fn acquire(repo_root: &Path) -> Result<Self, String> {
-        let path = repo_root.join(".kvc").join("kvc.lock");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(RepoLock(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err("repository is busy (locked by another kvc process)".into())
-            }
-            Err(e) => Err(format!("failed to acquire repository lock: {e}")),
-        }
-    }
-}
-
-impl Drop for RepoLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 
 /// Hand-rolled `--flag value` parser — five subcommands, not worth a dependency.
 // ponytail: flat arg parse, adopt clap only if subcommands grow.
@@ -114,7 +85,7 @@ fn run_commit(flags: &HashMap<String, String>) -> Result<String, String> {
     let message = require(flags, "message")?;
     let author = require(flags, "author")?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root)?;
+    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     let c = commit::commit_snapshot(&mut repo, message, author).map_err(|e| e.to_string())?;
     Ok(json!({ "id": c.id, "message": c.message, "timestamp": c.timestamp }).to_string())
@@ -142,7 +113,7 @@ fn run_switch(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let name = require(flags, "branch")?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root)?;
+    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     branch::switch_branch(&mut repo, name).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "current": repo.branches.current }).to_string())
@@ -153,7 +124,7 @@ fn run_create_branch(flags: &HashMap<String, String>) -> Result<String, String> 
     let name = require(flags, "name")?;
     let base = flags.get("base").map(String::as_str);
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root)?;
+    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
     // Mirrors the Tauri command: a plain new-branch-at-tip only needs the light open;
     // basing on another branch materializes that branch's tree, which needs chains.
     let mut repo = if base.is_some() {

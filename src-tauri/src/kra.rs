@@ -25,6 +25,19 @@ pub fn load_manifest(repo: &Repo, relpath: &str, manifest_hash: &str) -> Result<
     serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))
 }
 
+/// [`load_manifest`] threading a caller-owned reconstruct memo (see [`Repo::reconstruct_cached`]),
+/// so loading many manifest versions of the same file in one pass (GC marking) stays linear
+/// instead of re-walking each version's patch chain from scratch.
+pub fn load_manifest_memo(
+    repo: &Repo,
+    relpath: &str,
+    manifest_hash: &str,
+    memo: &mut std::collections::HashMap<String, Vec<u8>>,
+) -> Result<KraManifest> {
+    let mbytes = repo.reconstruct_cached(&manifest_key(relpath), manifest_hash, memo)?;
+    serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum KraEntry {
@@ -140,18 +153,15 @@ pub fn commit_kra(
         .unwrap_or_default();
     let mut zip = ZipArchive::new(Cursor::new(file_bytes)).map_err(zip_err)?;
 
-    // Pass 1 (serial — the zip reader is): collect each entry as either a verbatim reuse of the
-    // previous manifest or its inflated bytes for processing below.
-    enum EntryWork {
-        Reuse(KraEntry),
-        Fresh {
-            name: String,
-            crc32: u32,
-            size: u64,
-            buf: Vec<u8>,
-        },
-    }
-    let mut work = Vec::new();
+    // Read entries from the zip and process them in size-budgeted chunks: a chunk accumulates
+    // inflated entry buffers until `RESTORE_CHUNK_BUDGET`, then prepares (parallel) + folds them
+    // and drops the buffers before the next chunk reads. Peak RAM is ~one chunk of decompressed
+    // entries instead of the whole document — the same bound the restore path already applies.
+    // Verbatim reuses carry no buffer, so they don't count toward the budget. Entries keep their
+    // original zip order across chunks (the manifest folds them in that order).
+    let mut entries: Vec<KraEntry> = Vec::new();
+    let mut chunk: Vec<EntryWork> = Vec::new();
+    let mut chunk_bytes: u64 = 0;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
         if f.is_dir() {
@@ -165,7 +175,7 @@ pub fn commit_kra(
         if size > 0 {
             if let Some(pe) = prev_by_name.get(name.as_str()) {
                 if pe.crc_size() == (crc32, size) {
-                    work.push(EntryWork::Reuse((*pe).clone()));
+                    chunk.push(EntryWork::Reuse((*pe).clone()));
                     drop(f);
                     continue;
                 }
@@ -173,126 +183,58 @@ pub fn commit_kra(
         }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        work.push(EntryWork::Fresh {
+        drop(f);
+        chunk_bytes += buf.len() as u64;
+        chunk.push(EntryWork::Fresh {
             name,
             crc32,
             size,
             buf,
         });
+        if chunk_bytes >= RESTORE_CHUNK_BUDGET {
+            entries.extend(flush_entry_chunk(
+                repo,
+                relpath,
+                std::mem::take(&mut chunk),
+            )?);
+            chunk_bytes = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        entries.extend(flush_entry_chunk(repo, relpath, chunk)?);
     }
 
-    // Pass 2 (parallel): prepare every changed entry — all layers' tiles AND raw entries
-    // (mergedimage.png's zstd is the big one) — in a single rayon pass, so a multi-layer edit
-    // costs ~max(layer) instead of sum(layers). `prepare_stream` is `&self` and every stream
-    // key appears once per commit, so parallel prepare can't race; only the fold needs `&mut`.
-    let repo_ref: &Repo = repo;
-    let prepared: Vec<(KraEntry, Vec<(String, crate::delta::Prepared)>)> = work
-        .into_par_iter()
-        .map(
-            |w| -> Result<(KraEntry, Vec<(String, crate::delta::Prepared)>)> {
-                match w {
-                    EntryWork::Reuse(e) => Ok((e, Vec::new())),
-                    EntryWork::Fresh {
-                        name,
-                        crc32,
-                        size,
-                        buf,
-                    } => {
-                        if tiles::is_tiled(&buf) {
-                            let block = tiles::parse(&buf)?;
-                            drop(buf); // tiles own their bytes now — don't hold both copies
-                                       // Opt-in pixel deltas: store the decoded planar pixels (which
-                                       // bsdiff across versions) instead of the opaque LZF payload.
-                                       // Per-tile fallback to opaque on any decode failure.
-                            let planar_len = {
-                                let (tw, th, ps) = tile_dims(&block.header);
-                                (tw > 0 && th > 0 && ps > 0).then(|| (tw * th) as usize * ps)
-                            };
-                            let pixel_deltas = repo_ref.config.tile_pixel_deltas;
-                            let items: Vec<(String, crate::delta::Prepared, bool)> = block
-                                .tiles
-                                .par_iter()
-                                .map(|t| {
-                                    let key = tile_key(relpath, &name, t.x, t.y);
-                                    if pixel_deltas {
-                                        if let Some(planar) = planar_len
-                                            .and_then(|n| crate::raster::tile_planar(&t.data, n))
-                                        {
-                                            // patch_floor 0: 16 KB planes sit under the
-                                            // default 64 KB gate but are the whole point —
-                                            // a small edit inside a tile becomes a patch.
-                                            let p = repo_ref.prepare_stream_opts(
-                                                &key,
-                                                &planar,
-                                                crate::delta::StoreOpts {
-                                                    zstd_level: 3,
-                                                    patch_floor: 0,
-                                                },
-                                            )?;
-                                            return Ok((key, p, true));
-                                        }
-                                    }
-                                    let p = repo_ref.prepare_stream(&key, &t.data)?;
-                                    Ok((key, p, false))
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            let refs = block
-                                .tiles
-                                .iter()
-                                .zip(&items)
-                                .map(|(t, (_, p, raw))| TileRef {
-                                    x: t.x,
-                                    y: t.y,
-                                    compression: t.compression.clone(),
-                                    hash: p.hash().to_string(),
-                                    raw: *raw,
-                                })
-                                .collect();
-                            let items = items.into_iter().map(|(k, p, _)| (k, p)).collect();
-                            Ok((
-                                KraEntry::Tiled {
-                                    path: name,
-                                    header: block.header,
-                                    tiles: refs,
-                                    crc32,
-                                    size,
-                                },
-                                items,
-                            ))
-                        } else {
-                            // The composite gets block-tiled when eligible (see
-                            // `prepare_composite`); anything else — and any composite we
-                            // can't safely re-encode — stays a whole-entry Raw stream.
-                            if name == COMPOSITE_ENTRY {
-                                if let Some(prepared) =
-                                    prepare_composite(repo_ref, relpath, &name, &buf, crc32, size)?
-                                {
-                                    return Ok(prepared);
-                                }
-                            }
-                            let stored = name == "mimetype";
-                            let key = entry_key(relpath, &name);
-                            let p = repo_ref.prepare_stream(&key, &buf)?;
-                            let blob = p.hash().to_string();
-                            Ok((
-                                KraEntry::Raw {
-                                    path: name,
-                                    blob,
-                                    stored,
-                                    crc32,
-                                    size,
-                                },
-                                vec![(key, p)],
-                            ))
-                        }
-                    }
-                }
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+    let manifest = serde_json::to_vec(&KraManifest { entries })
+        .map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    repo.store_stream(&manifest_key(relpath), &manifest)
+}
 
-    // Pass 3 (serial fold): one batch commit for everything — object writes parallel inside,
-    // chain pushes serial. Entries keep their original zip order.
+/// One zip entry queued for commit: a verbatim reuse of the previous manifest's entry, or a
+/// freshly inflated entry still to be decomposed into streams.
+enum EntryWork {
+    Reuse(KraEntry),
+    Fresh {
+        name: String,
+        crc32: u32,
+        size: u64,
+        buf: Vec<u8>,
+    },
+}
+
+/// Prepare + fold one chunk of [`EntryWork`]: decompose every changed entry into streams in a
+/// single parallel rayon pass (a multi-layer edit costs ~max(layer) instead of sum(layers) —
+/// `prepare_stream` is `&self` and each stream key appears once, so parallel prepare can't race),
+/// then commit the objects and push the chains serially. Returns the chunk's `KraEntry`s in order.
+fn flush_entry_chunk(
+    repo: &mut Repo,
+    relpath: &str,
+    chunk: Vec<EntryWork>,
+) -> Result<Vec<KraEntry>> {
+    let repo_ref: &Repo = repo;
+    let prepared: Vec<(KraEntry, Vec<(String, crate::delta::Prepared)>)> = chunk
+        .into_par_iter()
+        .map(|w| prepare_entry_work(repo_ref, relpath, w))
+        .collect::<Result<Vec<_>>>()?;
     let mut entries = Vec::with_capacity(prepared.len());
     let mut items = Vec::new();
     for (entry, mut its) in prepared {
@@ -300,10 +242,114 @@ pub fn commit_kra(
         items.append(&mut its);
     }
     repo.commit_prepared_batch(items)?;
+    Ok(entries)
+}
 
-    let manifest = serde_json::to_vec(&KraManifest { entries })
-        .map_err(|e| KvcError::BadIndex(e.to_string()))?;
-    repo.store_stream(&manifest_key(relpath), &manifest)
+/// Decompose one queued entry into its [`KraEntry`] manifest record plus the `(stream key,
+/// Prepared)` pairs its content produced (tiles for a tiled layer, blocks for the composite, one
+/// blob otherwise). Read-only against the repo, so it runs inside the parallel chunk pass.
+fn prepare_entry_work(
+    repo_ref: &Repo,
+    relpath: &str,
+    w: EntryWork,
+) -> Result<(KraEntry, Vec<(String, crate::delta::Prepared)>)> {
+    match w {
+        EntryWork::Reuse(e) => Ok((e, Vec::new())),
+        EntryWork::Fresh {
+            name,
+            crc32,
+            size,
+            buf,
+        } => {
+            if tiles::is_tiled(&buf) {
+                let block = tiles::parse(&buf)?;
+                drop(buf); // tiles own their bytes now — don't hold both copies
+                           // Opt-in pixel deltas: store the decoded planar pixels (which
+                           // bsdiff across versions) instead of the opaque LZF payload.
+                           // Per-tile fallback to opaque on any decode failure.
+                let planar_len = {
+                    let (tw, th, ps) = tile_dims(&block.header);
+                    (tw > 0 && th > 0 && ps > 0).then(|| (tw * th) as usize * ps)
+                };
+                let pixel_deltas = repo_ref.config.tile_pixel_deltas;
+                let items: Vec<(String, crate::delta::Prepared, bool)> = block
+                    .tiles
+                    .par_iter()
+                    .map(|t| {
+                        let key = tile_key(relpath, &name, t.x, t.y);
+                        if pixel_deltas {
+                            if let Some(planar) =
+                                planar_len.and_then(|n| crate::raster::tile_planar(&t.data, n))
+                            {
+                                // patch_floor 0: 16 KB planes sit under the default 64 KB gate
+                                // but are the whole point — a small edit inside a tile becomes
+                                // a patch.
+                                let p = repo_ref.prepare_stream_opts(
+                                    &key,
+                                    &planar,
+                                    crate::delta::StoreOpts {
+                                        zstd_level: 3,
+                                        patch_floor: 0,
+                                    },
+                                )?;
+                                return Ok((key, p, true));
+                            }
+                        }
+                        let p = repo_ref.prepare_stream(&key, &t.data)?;
+                        Ok((key, p, false))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let refs = block
+                    .tiles
+                    .iter()
+                    .zip(&items)
+                    .map(|(t, (_, p, raw))| TileRef {
+                        x: t.x,
+                        y: t.y,
+                        compression: t.compression.clone(),
+                        hash: p.hash().to_string(),
+                        raw: *raw,
+                    })
+                    .collect();
+                let items = items.into_iter().map(|(k, p, _)| (k, p)).collect();
+                Ok((
+                    KraEntry::Tiled {
+                        path: name,
+                        header: block.header,
+                        tiles: refs,
+                        crc32,
+                        size,
+                    },
+                    items,
+                ))
+            } else {
+                // The composite gets block-tiled when eligible (see `prepare_composite`);
+                // anything else — and any composite we can't safely re-encode — stays a
+                // whole-entry Raw stream.
+                if name == COMPOSITE_ENTRY {
+                    if let Some(prepared) =
+                        prepare_composite(repo_ref, relpath, &name, &buf, crc32, size)?
+                    {
+                        return Ok(prepared);
+                    }
+                }
+                let stored = name == "mimetype";
+                let key = entry_key(relpath, &name);
+                let p = repo_ref.prepare_stream(&key, &buf)?;
+                let blob = p.hash().to_string();
+                Ok((
+                    KraEntry::Raw {
+                        path: name,
+                        blob,
+                        stored,
+                        crc32,
+                        size,
+                    },
+                    vec![(key, p)],
+                ))
+            }
+        }
+    }
 }
 
 /// Block origins covering a `w`×`h` canvas on the [`COMPOSITE_TILE`] grid.
@@ -948,6 +994,12 @@ pub struct LayerNode {
     pub filename: String,
 }
 
+/// Upper bound on a parsed canvas dimension. Canvas dims come from maindoc.xml unchecked and
+/// drive full `width*height*4` raster allocations; a corrupt or hostile file requesting absurd
+/// dimensions would otherwise attempt an enormous allocation (Rust aborts on OOM). Krita's own
+/// maximum canvas is far below this, so a real document never trips it.
+const MAX_CANVAS_DIM: i64 = 32_768;
+
 /// Parse the `<IMAGE>` element (dimensions + name) and its paint layers' data-file names.
 pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
     let text =
@@ -964,6 +1016,12 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
         .ok_or_else(|| KvcError::CorruptZip("maindoc: no <IMAGE>".into()))?;
     let num =
         |n: &roxmltree::Node, k: &str| n.attribute(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let (width, height) = (num(&image, "width"), num(&image, "height"));
+    if width > MAX_CANVAS_DIM || height > MAX_CANVAS_DIM {
+        return Err(KvcError::CorruptZip(format!(
+            "maindoc: canvas {width}x{height} exceeds the {MAX_CANVAS_DIM}px limit"
+        )));
+    }
     let layers = doc
         .descendants()
         .filter(|n| n.has_tag_name("layer"))
@@ -983,8 +1041,8 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
         .collect();
     Ok(ImageMeta {
         name: image.attribute("name").unwrap_or("").to_string(),
-        width: num(&image, "width"),
-        height: num(&image, "height"),
+        width,
+        height,
         dpi: image
             .attribute("x-res")
             .and_then(|v| v.parse().ok())
@@ -1366,18 +1424,28 @@ pub fn changed_region(
 /// store: tiles keep their raw bytes (rasters decode straight from RAM — no chain
 /// reconstruct, no bsdiff, no object writes) and per-tile content hashes are computed up
 /// front for change detection against a committed manifest.
+///
+/// In **low-memory mode** (`Config.low_memory_diff`) the bulk payloads (tile data, raw entry
+/// bytes) are dropped after hashing and `source` retains the compressed archive instead; each
+/// entry is re-inflated on demand from `source`, so peak RAM is the compressed document plus one
+/// decoded entry rather than the whole decompressed document. Metadata (headers, per-tile
+/// coords + content hashes) is always retained, so change detection is identical either way.
 pub struct WorkingKra {
     entries: Vec<WorkingEntry>,
+    /// Compressed archive bytes, present only in low-memory mode (drives on-demand entry decode).
+    source: Option<Vec<u8>>,
 }
 
 enum WorkingEntry {
     Raw {
         path: String,
+        /// Empty in low-memory mode — re-read from [`WorkingKra::source`] on demand.
         bytes: Vec<u8>,
     },
     Tiled {
         path: String,
         header: String,
+        /// Per-tile data is empty in low-memory mode; `x`/`y`/`compression` are always kept.
         tiles: Vec<Tile>,
         /// content hash per tile, parallel to `tiles`
         hashes: Vec<String>,
@@ -1385,7 +1453,8 @@ enum WorkingEntry {
 }
 
 /// Decompose `file_bytes` (a .kra) in memory — the read-only counterpart of [`commit_kra`].
-pub fn parse_working(file_bytes: &[u8]) -> Result<WorkingKra> {
+/// With `low_memory`, entry payloads are dropped after hashing and re-inflated on demand.
+pub fn parse_working(file_bytes: &[u8], low_memory: bool) -> Result<WorkingKra> {
     let mut zip = ZipArchive::new(Cursor::new(file_bytes)).map_err(zip_err)?;
     let mut entries = Vec::new();
     for i in 0..zip.len() {
@@ -1405,20 +1474,36 @@ pub fn parse_working(file_bytes: &[u8]) -> Result<WorkingKra> {
                 .par_iter()
                 .map(|t| crate::repo::hash_bytes(&t.data))
                 .collect();
+            // Low-memory: keep tile coords + hashes but drop the (compressed) tile bytes.
+            let tiles = if low_memory {
+                block
+                    .tiles
+                    .into_iter()
+                    .map(|t| Tile {
+                        data: Vec::new(),
+                        ..t
+                    })
+                    .collect()
+            } else {
+                block.tiles
+            };
             entries.push(WorkingEntry::Tiled {
                 path: name,
                 header: block.header,
-                tiles: block.tiles,
+                tiles,
                 hashes,
             });
         } else {
             entries.push(WorkingEntry::Raw {
                 path: name,
-                bytes: buf,
+                bytes: if low_memory { Vec::new() } else { buf },
             });
         }
     }
-    Ok(WorkingKra { entries })
+    Ok(WorkingKra {
+        entries,
+        source: low_memory.then(|| file_bytes.to_vec()),
+    })
 }
 
 impl WorkingKra {
@@ -1469,22 +1554,37 @@ impl WorkingKra {
             .collect()
     }
 
-    pub fn entry_bytes(&self, name: &str) -> Option<&[u8]> {
-        self.entries.iter().find_map(|e| match e {
-            WorkingEntry::Raw { path, bytes } if path == name => Some(bytes.as_slice()),
-            _ => None,
-        })
+    /// Raw bytes of a non-tiled entry: borrowed from RAM in normal mode, re-inflated from
+    /// `source` (owned) in low-memory mode. `None` if `name` isn't a non-tiled entry.
+    pub fn entry_bytes(&self, name: &str) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let is_raw = self
+            .entries
+            .iter()
+            .any(|e| matches!(e, WorkingEntry::Raw { path, .. } if path == name));
+        if !is_raw {
+            return None;
+        }
+        match &self.source {
+            Some(src) => read_entry(src, name).ok().map(std::borrow::Cow::Owned),
+            None => self.entries.iter().find_map(|e| match e {
+                WorkingEntry::Raw { path, bytes } if path == name => {
+                    Some(std::borrow::Cow::Borrowed(bytes.as_slice()))
+                }
+                _ => None,
+            }),
+        }
     }
 
     /// Content hash of a non-tiled entry, if present (working counterpart of
-    /// [`KraManifest::entry_hash`] — the bytes are already in RAM, so hash them directly).
+    /// [`KraManifest::entry_hash`]).
     pub fn entry_hash(&self, name: &str) -> Option<String> {
-        self.entry_bytes(name).map(crate::repo::hash_bytes)
+        self.entry_bytes(name).map(|b| crate::repo::hash_bytes(&b))
     }
 
-    /// Same output as [`layer_raster`] but decoded straight from the in-memory tiles.
-    /// `cache_dir` is the repo's `.kvc/cache/` — keys are content-derived, so working and
-    /// committed rasters of identical pixels share entries.
+    /// Same output as [`layer_raster`] but decoded from the in-memory tiles (normal mode) or by
+    /// re-inflating this one layer entry from `source` (low-memory mode). `cache_dir` is the
+    /// repo's `.kvc/cache/` — keys are content-derived, so working and committed rasters of
+    /// identical pixels share entries.
     pub fn layer_raster(
         &self,
         entry_path: &str,
@@ -1495,27 +1595,17 @@ impl WorkingKra {
         if width <= 0 || height <= 0 {
             return Ok(None);
         }
-        let Some((header, tiles, hashes)) = self.entries.iter().find_map(|e| match e {
+        let Some((header, hashes)) = self.entries.iter().find_map(|e| match e {
             WorkingEntry::Tiled {
                 path,
                 header,
-                tiles,
                 hashes,
-            } if path == entry_path => Some((header, tiles, hashes)),
+                ..
+            } if path == entry_path => Some((header.clone(), hashes.clone())),
             _ => None,
         }) else {
             return Ok(None);
         };
-        let (tw, th, ps) = tile_dims(header);
-        if tw <= 0 || th <= 0 || ps != 4 {
-            return Ok(None); // ponytail: RGBA8 tiles only.
-        }
-        let mut key_tiles: Vec<(i64, i64, &str)> = tiles
-            .iter()
-            .zip(hashes)
-            .map(|(t, h)| (t.x, t.y, h.as_str()))
-            .collect();
-        let key = raster_cache_key(entry_path, &mut key_tiles, width, height);
         // The repo root is two levels up from `.kvc/cache` — derived here so the
         // test-facing signature (cache_dir only) stays unchanged.
         let root = cache_dir
@@ -1523,28 +1613,91 @@ impl WorkingKra {
             .and_then(|p| p.parent())
             .unwrap_or(cache_dir)
             .to_path_buf();
-        if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
-            let url = crate::raster::raster_url(&root, cache_dir, &key, &png);
-            return Ok(Some(LayerRaster { url, png, key }));
+        match &self.source {
+            // Normal mode: tiles carry their data — rasterize straight from RAM.
+            None => {
+                let tiles = self
+                    .entries
+                    .iter()
+                    .find_map(|e| match e {
+                        WorkingEntry::Tiled { path, tiles, .. } if path == entry_path => {
+                            Some(tiles)
+                        }
+                        _ => None,
+                    })
+                    .expect("tiled entry located above");
+                rasterize_working_tiles(
+                    entry_path, &header, tiles, &hashes, width, height, cache_dir, &root,
+                )
+            }
+            // Low-memory mode: re-inflate just this layer entry, then rasterize it.
+            Some(src) => {
+                let buf = read_entry(src, entry_path)?;
+                if !tiles::is_tiled(&buf) {
+                    return Ok(None);
+                }
+                let block = tiles::parse(&buf)?;
+                rasterize_working_tiles(
+                    entry_path,
+                    &header,
+                    &block.tiles,
+                    &hashes,
+                    width,
+                    height,
+                    cache_dir,
+                    &root,
+                )
+            }
         }
-        // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
-        let decoded: Vec<(i64, i64, Vec<u8>)> = tiles
-            .par_iter()
-            .filter_map(|t| {
-                crate::raster::tile_to_rgba(&t.data, tw as usize, th as usize, ps)
-                    .map(|px| (t.x, t.y, px))
-            })
-            .collect();
-        let mut canvas = vec![0u8; (width * height * 4) as usize];
-        for (x, y, px) in decoded {
-            crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
-        }
-        let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
-        let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
-        crate::raster::cache_write(cache_dir, &key, &png);
-        let url = crate::raster::raster_url(&root, cache_dir, &key, &png);
-        Ok(Some(LayerRaster { url, png, key }))
     }
+}
+
+/// Rasterize one working layer's tiles into a capped PNG (cache-aware). `tiles` carry their
+/// decoded/compressed data; `hashes` are the parallel content hashes used only for the cache key
+/// (so a cache hit never touches `tiles`' data — which is why the low-memory path can leave it out
+/// until a miss forces a re-inflate).
+#[allow(clippy::too_many_arguments)]
+fn rasterize_working_tiles(
+    entry_path: &str,
+    header: &str,
+    tiles: &[Tile],
+    hashes: &[String],
+    width: i64,
+    height: i64,
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<Option<LayerRaster>> {
+    let (tw, th, ps) = tile_dims(header);
+    if tw <= 0 || th <= 0 || ps != 4 {
+        return Ok(None); // ponytail: RGBA8 tiles only.
+    }
+    let mut key_tiles: Vec<(i64, i64, &str)> = tiles
+        .iter()
+        .zip(hashes)
+        .map(|(t, h)| (t.x, t.y, h.as_str()))
+        .collect();
+    let key = raster_cache_key(entry_path, &mut key_tiles, width, height);
+    if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
+        let url = crate::raster::raster_url(root, cache_dir, &key, &png);
+        return Ok(Some(LayerRaster { url, png, key }));
+    }
+    // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
+    let decoded: Vec<(i64, i64, Vec<u8>)> = tiles
+        .par_iter()
+        .filter_map(|t| {
+            crate::raster::tile_to_rgba(&t.data, tw as usize, th as usize, ps)
+                .map(|px| (t.x, t.y, px))
+        })
+        .collect();
+    let mut canvas = vec![0u8; (width * height * 4) as usize];
+    for (x, y, px) in decoded {
+        crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
+    }
+    let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
+    let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
+    crate::raster::cache_write(cache_dir, &key, &png);
+    let url = crate::raster::raster_url(root, cache_dir, &key, &png);
+    Ok(Some(LayerRaster { url, png, key }))
 }
 
 /// The "new" side of an art diff: a committed manifest (tiles come from the object store) or

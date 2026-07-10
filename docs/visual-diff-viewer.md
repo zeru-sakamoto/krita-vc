@@ -164,7 +164,8 @@ stages** so the panel appears immediately instead of blocking on every layer's r
      the default view is correct the instant the diff loads.
    - **Changed-pixel mask + outline** — `ArtDiff.diffImage` and `ArtDiff.diffOutline`: the
      before/after composites diffed pixel-for-pixel in Rust (`raster::diff_overlay`, threshold
-     ~16/channel). The mask is a transparent-except-changed PNG (its RGB is a fixed placeholder —
+     ~16/channel; each side is capped to `MAX_RASTER_DIM` right after decode so the compare never
+     holds two full-resolution composites at once). The mask is a transparent-except-changed PNG (its RGB is a fixed placeholder —
      only the alpha channel is meaningful, since the frontend repaints with the active theme's
      `--color-accent`), capped + cached (`kra::diff_cache_key`) + served over `kvcimg://`; the
      outline is a vector path tracing the changed pixels' silhouette. Together they drive the

@@ -42,8 +42,8 @@ files, where git's text-oriented delta model performs poorly.
 - **Settings** (activity-bar gear) — one place for user preferences: the Artist Mode toggle, a
   **theme selector** (8 color themes, including a true-black option, applied instantly via CSS —
   the visual-diff highlight color follows the chosen theme's accent), the **author name** signed
-  on your versions, and per-repository **preview-cache size** and **compact-storage** options,
-  plus "Clean up storage".
+  on your versions, and per-repository **preview-cache size**, **compact-storage**, and
+  **low-memory diffs** options, plus "Clean up storage".
 - **Artist Mode** — a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).

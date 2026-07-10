@@ -397,8 +397,18 @@ const OUTLINE_EDGE_CAP: usize = 8000;
 /// Per-pixel "changed" grid of the after-composite (index-sampling the before when dims differ).
 /// `true` = the two composites differ at that pixel. Shared by the mask raster and the outline.
 fn changed_grid(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<bool>, usize, usize)> {
-    let (before, bw, bh) = decode_png_rgba(before_png)?;
-    let (after, aw, ah) = decode_png_rgba(after_png)?;
+    // Cap each side to MAX_RASTER_DIM right after decode: two full-resolution composite RGBA
+    // buffers held at once was a transient 2×(w·h·4) spike that stacked with per-layer streaming.
+    // The mask is capped to the same bound afterwards anyway, so comparing at capped resolution
+    // leaves the output unchanged while roughly halving peak memory.
+    let (before, bw, bh) = decode_png_rgba(before_png).map(|(px, w, h)| {
+        let (c, cw, ch) = cap_rgba(&px, w, h);
+        (c.into_owned(), cw, ch)
+    })?;
+    let (after, aw, ah) = decode_png_rgba(after_png).map(|(px, w, h)| {
+        let (c, cw, ch) = cap_rgba(&px, w, h);
+        (c.into_owned(), cw, ch)
+    })?;
     let (w, h) = (aw as usize, ah as usize);
     let (bwu, bhu) = (bw as usize, bh as usize);
     let same_dims = aw == bw && ah == bh;

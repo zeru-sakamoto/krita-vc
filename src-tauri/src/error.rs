@@ -62,6 +62,12 @@ pub enum KvcError {
     #[error("cannot undo: {0}")]
     CannotUndo(String),
 
+    #[error("unsafe path outside the repository: {0}")]
+    BadPath(String),
+
+    #[error("repository is busy (locked by another process)")]
+    Locked,
+
     #[error(transparent)]
     Io(#[from] io::Error),
 }

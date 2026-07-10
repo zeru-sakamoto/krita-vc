@@ -17,9 +17,12 @@ with no backend, the UI renders empty states).
 .kvc/
   config.json    engine config: delta-chain threshold (default 20), tile size (64),
                  raster cache byte budget (cacheMaxBytes, default 256 MB; a v1→v2 config
-                 migration lowers old 512 MB defaults), and the opt-in tilePixelDeltas flag.
-                 cacheMaxBytes + tilePixelDeltas are user-editable in the Settings modal
-                 (get_repo_config/set_repo_config)
+                 migration lowers old 512 MB defaults), the opt-in tilePixelDeltas flag, and
+                 the opt-in lowMemoryDiff flag (on-demand working-diff entry decode).
+                 cacheMaxBytes + tilePixelDeltas + lowMemoryDiff are user-editable in the
+                 Settings modal (get_repo_config/set_repo_config)
+  kvc.lock       advisory create-new lock file present only while a mutating operation runs
+                 (see Concurrency & locking); removed on completion
   index.json     committed head per tracked file — drives the scanner
   chains/        per-tracked-file shards, each every stored version of that file's delta
                  streams (KVCC2-tagged zstd bincode, <blake3(relpath)[..16]>.bin, faulted in
@@ -65,6 +68,28 @@ State is loaded into a `Repo` struct (`Repo::open`), mutated in memory, then flu
 target).
 Hashing is **blake3** throughout (`hash_bytes`); timestamps are ISO-8601 UTC computed without a
 date crate (`now_iso` / `epoch_to_iso`).
+
+### Concurrency & locking
+
+The engine has no internal locking, so every **mutating** entry point takes an advisory,
+create-new file lock (`RepoLock`, `repo.rs` → `.kvc/kvc.lock`, released on drop) before touching
+the store: the desktop app's mutating Tauri commands (commit, branch create/switch/merge/delete,
+rollback, undo, restore, real cleanup, config write, delete) **and** the `kvc` CLI the Krita
+plugin shells out to share the same lock, so a plugin commit can't interleave with a desktop
+commit/switch/GC into a torn write. A second writer gets `KvcError::Locked` ("repository is
+busy") rather than corrupting state. Read-only commands (scan, history, diffs, dry-run cleanup)
+don't lock. A crash leaves a stale lock, which GC's `*.tmp`-style cleanup can sweep. ponytail:
+advisory create-new lock; upgrade to an OS flock only if a stale lock ever bites.
+
+### Path safety
+
+Committed file paths live in `commits.log` (plain JSON that travels with a shared `.kvc/` store)
+and `file` arguments arrive from the frontend, so both are **untrusted input** whenever a repo the
+user didn't create is opened. Every working-tree write/delete/read joins the relative path through
+`repo::safe_join`, which rejects absolute paths, drive/UNC prefixes, root, and `..` components
+(`KvcError::BadPath`) — `Path::join` with an absolute path silently replaces the root and `..`
+walks out of it, so this closes an arbitrary-file-write/delete hole on materialize, rollback,
+restore, and the working-diff read.
 
 ## File tracking — the scanner
 
@@ -187,6 +212,17 @@ decompose it into streams so small edits stay small:
   written **deflate-fast** (Krita deflates them too — Stored left restored files several×
   larger); entries that already look compressed (`delta::looks_compressed` — PNG/zip/zstd
   magic) stay stored, since recompressing buys nothing.
+- **Commit is memory-bounded too** — `commit_kra` reads zip entries and prepares them in the
+  same `RESTORE_CHUNK_BUDGET` (64 MB uncompressed) chunks: a chunk accumulates inflated entries,
+  runs the parallel prepare + serial fold (`prepare_entry_work`/`flush_entry_chunk`), then drops
+  the buffers before the next chunk reads (verbatim reuses carry no buffer). Peak RAM is ~one
+  chunk instead of the whole decompressed document — previously a first commit or a big edit held
+  every decompressed entry at once.
+- **Untrusted-input guards** — dimensions and counts read from a `.kra` drive allocations, so the
+  parsers cap them: `parse_image_meta` rejects a canvas over `MAX_CANVAS_DIM` (32 768 px, far
+  above any real Krita document) before it can size a `width*height*4` raster, and the tile parser
+  clamps its `DATA <n>` preallocation to the block's byte length so a crafted count can't force a
+  giant up-front `Vec`.
 
 Tiles are diffed as opaque LZF-compressed blobs by default. The opt-in **`tilePixelDeltas`**
 config flag stores decoded planar pixels instead — they bsdiff across versions (2-10× smaller
@@ -194,6 +230,15 @@ for heavily-revised layers), restore re-encodes LZF (`raster::lzf_compress`), an
 `raw` flag in the manifest means mixed histories work and turning the flag off never breaks
 existing commits. Off by default: the LZF decode/encode cost lands on the commit/restore paths
 of low-end devices.
+
+A second opt-in flag, **`lowMemoryDiff`** (off by default, Settings modal), only affects the
+**working-tree diff view**, never stored data. Normally `parse_working` decodes a working `.kra`
+fully into memory (`WorkingKra`) so layer rasters decode straight from RAM. With the flag on, it
+keeps only the compressed archive plus per-entry metadata (headers, tile coords + content hashes)
+and re-inflates each entry on demand when its raster is requested — peak RAM becomes the
+compressed document plus one decoded entry instead of the whole decompressed document, trading a
+little CPU for bounded memory on low-end machines. Change detection is identical either way (the
+hashes are always retained).
 
 `maindoc.xml` is also parsed (`parse_maindoc`, via `roxmltree` with DTD allowed) so layer
 metadata changes — added / removed / opacity / blend / rename, matched by uuid then name — can be
@@ -269,9 +314,10 @@ registered URI scheme handler (`commands::serve_raster`, wired in [`lib.rs`](../
 — no base64 inflation, no multi-MB IPC payload, and content-addressed keys let the response
 carry `Cache-Control: immutable` so repeat views are browser-cache hits. The handler only ever
 serves `<registered repo root>/.kvc/cache/<hex key>.png` for roots a diff command has already
-registered (`register_served_repo` — the diff commands call it before opening the repo); it
-can't be steered at an arbitrary path. Outside the shell, or if a cache write fails, rasters
-fall back to base64 data URLs, which always work. See
+registered (`register_served_repo`, called only **after** the repo's `Repo::open` succeeds, so a
+failed open never adds a root to the allowlist); it can't be steered at an arbitrary path.
+Outside the shell, or if a cache write fails, rasters fall back to base64 data URLs, which always
+work. See
 [performance.md](performance.md#raster-delivery-kvcimg-uri-scheme) for the rationale.
 
 ## Tauri commands
@@ -296,8 +342,8 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one, and never `main`). Returns the branch list. |
 | `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip. `dryRun` reports what would be freed without deleting anything. |
-| `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`) for the Settings modal. Uses `Repo::open_light`. |
-| `set_repo_config(path, cacheMaxBytes, tilePixelDeltas)` | Persist those two knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
+| `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
+| `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |

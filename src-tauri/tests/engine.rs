@@ -281,7 +281,7 @@ fn working_kra_diff_is_read_only_and_detects_changes() {
             tiled(&[(0, 0, b"tileAAAA"), (0, 64, b"tileZZZZ")]),
         ),
     ]);
-    let working = kra::parse_working(&kra2).unwrap();
+    let working = kra::parse_working(&kra2, false).unwrap();
 
     // Change detection against the committed manifest flags exactly the edited layer.
     let manifest_hash = c1
@@ -300,7 +300,7 @@ fn working_kra_diff_is_read_only_and_detects_changes() {
     );
 
     // An untouched working copy reports no changed entries.
-    let same = kra::parse_working(&kra1).unwrap();
+    let same = kra::parse_working(&kra1, false).unwrap();
     assert!(kra::changed_entry_paths(&manifest.tile_index(), &same.tile_index()).is_empty());
 
     // Viewing a working diff writes nothing to the object store.
@@ -550,6 +550,67 @@ fn maindoc_raster() -> Vec<u8> {
 <layer name="Base" uuid="base" opacity="255" compositeop="normal" nodetype="paintlayer" filename="layer1"/>
 </layers></IMAGE></DOC>"#
         .to_vec()
+}
+
+#[test]
+fn parse_image_meta_rejects_oversize_canvas() {
+    // Canvas dimensions drive full width*height*4 raster allocations; an absurd size from a
+    // crafted maindoc must be refused up front rather than attempted.
+    let xml = br#"<!DOCTYPE DOC>
+<DOC><IMAGE name="img" width="999999" height="999999"><layers></layers></IMAGE></DOC>"#;
+    assert!(matches!(
+        kra::parse_image_meta(xml),
+        Err(KvcError::CorruptZip(_))
+    ));
+    // A normal canvas still parses.
+    assert!(kra::parse_image_meta(&maindoc_raster()).is_ok());
+}
+
+#[test]
+fn low_memory_working_diff_matches_full_path() {
+    // The opt-in low-memory diff path (re-inflating entries on demand) must produce byte-identical
+    // change detection and rasters to the default in-memory path.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let cache_dir = root.join(".kvc/cache");
+
+    let kra_bytes = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc_raster()),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(10, 20, 30, 255))]),
+        ),
+        ("mergedimage.png", b"\x89PNG\r\n\x1a\n merged".to_vec()),
+    ]);
+
+    let full = kra::parse_working(&kra_bytes, false).unwrap();
+    let lazy = kra::parse_working(&kra_bytes, true).unwrap();
+
+    // Metadata + change-detection inputs are identical.
+    assert_eq!(full.tile_index(), lazy.tile_index());
+    assert_eq!(
+        full.entry_hash("mergedimage.png"),
+        lazy.entry_hash("mergedimage.png")
+    );
+    assert_eq!(
+        lazy.entry_bytes("mergedimage.png").map(|b| b.into_owned()),
+        Some(b"\x89PNG\r\n\x1a\n merged".to_vec())
+    );
+
+    // Rasterize via the lazy path first (cache miss → on-demand re-inflate + decode), then the
+    // full path (cache hit): identical key and PNG bytes either way.
+    let via_lazy = lazy
+        .layer_raster("img/layers/layer1", 64, 64, &cache_dir)
+        .unwrap()
+        .unwrap();
+    let via_full = full
+        .layer_raster("img/layers/layer1", 64, 64, &cache_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(via_lazy.key, via_full.key);
+    assert_eq!(via_lazy.png, via_full.png);
 }
 
 #[test]
@@ -867,7 +928,7 @@ fn layer_raster_reads_from_disk_cache() {
     assert_ne!(first, second);
 
     // Same pixels via the in-memory working path share the cache entry.
-    let working = kra::parse_working(&kra_bytes).unwrap();
+    let working = kra::parse_working(&kra_bytes, false).unwrap();
     let from_working = working
         .layer_raster("img/layers/layer1", 64, 64, &cache_dir)
         .unwrap()
@@ -1234,8 +1295,8 @@ fn commit_crc_skip_reuses_unchanged_entries() {
 
     // The reconstructed v2 archive carries the same logical content as the working file.
     let rebuilt = kra::reconstruct_kra(&r, "art.kra", &h2).unwrap();
-    let rb = kra::parse_working(&rebuilt).unwrap();
-    let wk = kra::parse_working(&kra2).unwrap();
+    let rb = kra::parse_working(&rebuilt, false).unwrap();
+    let wk = kra::parse_working(&kra2, false).unwrap();
     assert_eq!(rb.tile_index(), wk.tile_index());
     assert_eq!(
         kra::read_entry(&rebuilt, "maindoc.xml").unwrap(),

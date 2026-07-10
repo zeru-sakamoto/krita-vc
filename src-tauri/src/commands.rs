@@ -4,7 +4,7 @@
 
 use crate::error::{KvcError, Result};
 use crate::kra::{self, LayerDiff, LayerNode};
-use crate::repo::{Commit, CommittedFile, Config, Repo};
+use crate::repo::{Commit, CommittedFile, Config, Repo, RepoLock};
 use crate::{commit, scan};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -129,7 +129,12 @@ pub async fn open_repository(path: String) -> std::result::Result<(), String> {
 /// Permanently delete a repository folder and everything in it (guarded by `is_repo`).
 #[tauri::command]
 pub async fn delete_repository(path: String) -> std::result::Result<(), String> {
-    run(move || Repo::delete(Path::new(&path))).await
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        Repo::delete(root)
+    })
+    .await
 }
 
 /// Reclaim storage unreachable from any branch tip (orphans from undo, deleted branches).
@@ -141,7 +146,14 @@ pub async fn cleanup_repository(
     dry_run: bool,
 ) -> std::result::Result<crate::gc::GcReport, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        // The real sweep deletes objects; a dry run only reads, so it needn't block writers.
+        let _lock = if dry_run {
+            None
+        } else {
+            Some(RepoLock::acquire(root)?)
+        };
+        let mut repo = Repo::open(root)?;
         crate::gc::collect_garbage(&mut repo, dry_run)
     })
     .await
@@ -158,11 +170,15 @@ pub async fn set_repo_config(
     path: String,
     cache_max_bytes: u64,
     tile_pixel_deltas: bool,
+    low_memory_diff: bool,
 ) -> std::result::Result<(), String> {
     run(move || {
-        let mut repo = Repo::open_light(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open_light(root)?;
         repo.config.cache_max_bytes = cache_max_bytes;
         repo.config.tile_pixel_deltas = tile_pixel_deltas;
+        repo.config.low_memory_diff = low_memory_diff;
         repo.save_config()
     })
     .await
@@ -190,7 +206,9 @@ pub async fn commit_snapshot(
     author: String,
 ) -> std::result::Result<Commit, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
         commit::commit_snapshot(&mut repo, &message, &author)
     })
     .await
@@ -257,10 +275,12 @@ pub async fn create_branch(
     base: Option<String>,
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
         let mut repo = if base.is_some() {
-            Repo::open(Path::new(&path))?
+            Repo::open(root)?
         } else {
-            Repo::open_light(Path::new(&path))?
+            Repo::open_light(root)?
         };
         crate::branch::create_branch(&mut repo, &name, base.as_deref())?;
         Ok(branch_dtos(&repo))
@@ -275,7 +295,9 @@ pub async fn switch_branch(
     name: String,
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
         crate::branch::switch_branch(&mut repo, &name)?;
         Ok(branch_dtos(&repo))
     })
@@ -290,7 +312,9 @@ pub async fn merge_branch(
     author: String,
 ) -> std::result::Result<Commit, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
         crate::branch::merge_branch(&mut repo, &source, &author)
     })
     .await
@@ -302,7 +326,9 @@ pub async fn delete_branch(
     name: String,
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
-        let mut repo = Repo::open_light(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open_light(root)?;
         crate::branch::delete_branch(&mut repo, &name)?;
         Ok(branch_dtos(&repo))
     })
@@ -349,7 +375,9 @@ pub async fn rollback_to_commit(
     author: String,
 ) -> std::result::Result<Commit, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
         match commit::rollback_to_commit(&mut repo, &commit_id, &author) {
             Err(crate::error::KvcError::Nothing) => Err(crate::error::KvcError::BadIndex(
                 "already at this version".into(),
@@ -364,7 +392,9 @@ pub async fn rollback_to_commit(
 #[tauri::command]
 pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit>, String> {
     run(move || {
-        let mut repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
         commit::undo_last_commit(&mut repo)
     })
     .await
@@ -378,9 +408,11 @@ pub async fn restore_file(
     commit_id: String,
 ) -> std::result::Result<(), String> {
     run(move || {
-        let repo = Repo::open(Path::new(&path))?;
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let repo = Repo::open(root)?;
         let bytes = commit::file_at_commit(&repo, &file, &commit_id)?;
-        let target: PathBuf = repo.root.join(&file);
+        let target: PathBuf = crate::repo::safe_join(&repo.root, &file)?;
         std::fs::write(&target, bytes).map_err(|e| crate::error::io_at(&target, e))?;
         Ok(())
     })
@@ -931,8 +963,10 @@ pub async fn commit_diff(
     commit_id: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run(move || {
-        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
+        // Register only after the path is confirmed to be a real repo, so a failed open never
+        // adds a root to the kvcimg scheme's allowlist.
+        register_served_repo(&path);
         let commit = repo
             .commits
             .iter()
@@ -967,8 +1001,10 @@ pub async fn commit_layers(
     on_layer: tauri::ipc::Channel<LayerDto>,
 ) -> std::result::Result<(), String> {
     run(move || {
-        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
+        // Register only after the path is confirmed to be a real repo, so a failed open never
+        // adds a root to the kvcimg scheme's allowlist.
+        register_served_repo(&path);
         let commit = repo
             .commits
             .iter()
@@ -1022,9 +1058,9 @@ fn working_art_dto(
     with_rasters: bool,
     on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
 ) -> Result<ArtDiffDto> {
-    let abs = repo.root.join(file);
+    let abs = crate::repo::safe_join(&repo.root, file)?;
     let bytes = std::fs::read(&abs).map_err(|e| crate::error::io_at(&abs, e))?;
-    let working = kra::parse_working(&bytes)?;
+    let working = kra::parse_working(&bytes, repo.config.low_memory_diff)?;
     let old = last_committed(repo, file);
     let status = if old.is_some() { "M" } else { "A" };
     art_diff_dto(
@@ -1046,8 +1082,10 @@ pub async fn working_diff(
     file: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run(move || {
-        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
+        // Register only after the path is confirmed to be a real repo, so a failed open never
+        // adds a root to the kvcimg scheme's allowlist.
+        register_served_repo(&path);
         if !file.to_lowercase().ends_with(".kra") {
             let old = last_committed(&repo, &file);
             return Ok(vec![text_entry(&CommittedFile {
@@ -1091,8 +1129,10 @@ pub async fn working_layers(
         if !file.to_lowercase().ends_with(".kra") {
             return Ok(());
         }
-        register_served_repo(&path);
         let repo = Repo::open(Path::new(&path))?;
+        // Register only after the path is confirmed to be a real repo, so a failed open never
+        // adds a root to the kvcimg scheme's allowlist.
+        register_served_repo(&path);
         working_art_dto(
             &repo,
             &file,

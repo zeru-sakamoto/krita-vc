@@ -66,13 +66,18 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     }
 
     // --- mark: live (stream key, content hash) pairs -------------------------------------
+    // One reconstruct memo across all manifest loads: a long-lived `.kra` has many manifest
+    // versions on the reachable chain, and each shares a patch-chain prefix with the next —
+    // memoizing keeps the whole marking pass linear instead of quadratic in history length.
+    let mut manifest_memo: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
     let mut live: HashSet<(String, String)> = HashSet::new();
     for c in repo.commits.iter().filter(|c| reachable.contains(&c.id)) {
         for f in &c.files {
             let Some(content) = &f.content else { continue };
             if f.is_kra {
                 live.insert((kra::manifest_stream_key(&f.path), content.clone()));
-                let manifest = kra::load_manifest(repo, &f.path, content)?;
+                let manifest = kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo)?;
                 live.extend(kra::referenced_streams(&f.path, &manifest));
             } else {
                 live.insert((format!("file:{}", f.path), content.clone()));

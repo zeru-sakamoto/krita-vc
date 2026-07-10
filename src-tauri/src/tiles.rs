@@ -46,7 +46,11 @@ pub fn parse(bytes: &[u8]) -> Result<TiledBlock> {
     }
     let count = count.ok_or_else(|| bad("missing DATA count"))?;
 
-    let mut tiles = Vec::with_capacity(count);
+    // `count` is an untrusted header value; a tile record is at least its descriptor line, so the
+    // block's byte length bounds the real tile count. Clamp the preallocation to that so a crafted
+    // `DATA 99999999999` can't force a giant up-front allocation (the loop still errors on any
+    // actual truncation).
+    let mut tiles = Vec::with_capacity(count.min(bytes.len()));
     for _ in 0..count {
         let line = read_line(bytes, &mut pos).ok_or_else(|| bad("truncated tile header"))?;
         let text = std::str::from_utf8(line)
@@ -103,4 +107,35 @@ fn read_line<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 
 fn bad(msg: &str) -> KvcError {
     KvcError::BadTiles(msg.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_roundtrips() {
+        let block = TiledBlock {
+            header: "VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE 4\nDATA 1\n".to_string(),
+            tiles: vec![Tile {
+                x: 0,
+                y: 0,
+                compression: "LZF".into(),
+                data: vec![1, 2, 3, 4],
+            }],
+        };
+        let bytes = serialize(&block);
+        assert_eq!(parse(&bytes).unwrap(), block);
+    }
+
+    #[test]
+    fn huge_data_count_does_not_over_allocate_or_panic() {
+        // A crafted header claiming a preposterous tile count must not force a giant
+        // preallocation (the fix clamps `with_capacity` to the block byte length) and must
+        // fail cleanly on the very first missing tile descriptor rather than aborting.
+        let bytes =
+            b"VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE 4\nDATA 99999999999\n".to_vec();
+        let err = parse(&bytes).unwrap_err();
+        assert!(matches!(err, KvcError::BadTiles(_)));
+    }
 }

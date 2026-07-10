@@ -275,6 +275,44 @@ impl Repo {
         };
         Ok(bytes)
     }
+
+    /// [`Repo::reconstruct`] with a caller-owned memo keyed by content hash. Plain `reconstruct`
+    /// replays the patch chain independently for every version, re-walking shared prefixes — so
+    /// reconstructing every version of one stream is quadratic in chain length. Threading a memo
+    /// across those calls rebuilds each version from its immediate predecessor exactly once,
+    /// collapsing the whole run to linear. A content hash is a pure function of the bytes, so the
+    /// memo is safe to share across stream keys (identical content dedups). Used by GC, which
+    /// loads many manifest versions of long-lived files in one pass.
+    pub fn reconstruct_cached(
+        &self,
+        key: &str,
+        hash: &str,
+        memo: &mut std::collections::HashMap<String, Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        if let Some(bytes) = memo.get(hash) {
+            return Ok(bytes.clone());
+        }
+        let chain = self
+            .chains
+            .chain(key)
+            .ok_or_else(|| KvcError::NotTracked(key.to_string()))?;
+        let v = chain
+            .iter()
+            .find(|x| x.hash == hash)
+            .ok_or_else(|| KvcError::MissingObject(format!("{key}@{hash}")))?;
+        let raw = self.read_object_bytes(&v.object_name())?;
+        let bytes = match &v.base {
+            None => zstd::decode_all(&raw[..])?,
+            Some(base) => {
+                let base_bytes = self.reconstruct_cached(key, base, memo)?;
+                let mut out = Vec::new();
+                Bspatch::new(&raw)?.apply(&base_bytes, Cursor::new(&mut out))?;
+                out
+            }
+        };
+        memo.insert(hash.to_string(), bytes.clone());
+        Ok(bytes)
+    }
 }
 
 /// Read-through cache of reconstructed tile bytes, keyed by content hash and scoped to a

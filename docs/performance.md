@@ -30,13 +30,16 @@ Independent per-layer/per-tile work is farmed across cores instead of running se
 
 - **Layer rasterization** — `art_diff_dto` rasterizes all of a document's layers with
   `par_iter()` (`commands.rs`); order is preserved via indexed collect.
-- **Whole-commit preparation** — `commit_kra` (`kra.rs`) runs in three passes: a serial zip walk
-  (the reader is inherently serial; unchanged entries skip via crc32+size), then **one** rayon
-  pass over every changed entry — all layers' tiles *and* raw entries like `mergedimage.png` —
-  through `prepare_stream` (the CPU-heavy reconstruct+bsdiff+verify/zstd), then a single serial
-  fold (`commit_prepared_batch`). A multi-layer edit costs ~max(layer) instead of sum(layers);
-  each stream key appears once per commit, so parallel prepare can't race — only the fold needs
-  `&mut`.
+- **Whole-commit preparation, chunked** — `commit_kra` (`kra.rs`) walks the zip serially (the
+  reader is inherently serial; unchanged entries skip via crc32+size) accumulating inflated
+  entries into `RESTORE_CHUNK_BUDGET`-bounded chunks (64 MB uncompressed), and per chunk runs a
+  rayon pass over its changed entries — all layers' tiles *and* raw entries like `mergedimage.png`
+  — through `prepare_stream` (the CPU-heavy reconstruct+bsdiff+verify/zstd), then a single serial
+  fold (`flush_entry_chunk` → `commit_prepared_batch`), dropping the buffers before the next chunk
+  reads. A multi-layer edit costs ~max(layer) instead of sum(layers); each stream key appears
+  once per commit, so parallel prepare can't race — only the fold needs `&mut`. **Peak RAM is one
+  chunk**, not the whole decompressed document — previously a first commit or a big edit inflated
+  every changed entry at once (the mirror of `reconstruct_kra`'s restore-side chunking).
 - **`.kra` reconstruction, chunked** — `reconstruct_kra` (`kra.rs`) resolves manifest entries'
   bytes (tile-chain replay included) with `par_iter()` in **budget-bounded chunks**
   (`RESTORE_CHUNK_BUDGET`, 64 MB of uncompressed entry data), each written serially to the zip
@@ -100,6 +103,14 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Manifest reuse** — `kra::load_manifest` reconstructs+parses a `.kra` manifest once per diff
   request; every layer/region/composite read reuses the parsed struct instead of re-walking the
   patch chain per call.
+- **GC manifest memo** — mark-and-sweep loads every reachable commit's `.kra` manifest to walk its
+  referenced streams. Plain `reconstruct` replays each manifest version's patch chain from the
+  nearest full snapshot independently, re-doing the shared prefix every time — quadratic in a
+  file's history length. GC threads one content-hash memo (`Repo::reconstruct_cached` via
+  `kra::load_manifest_memo`) through the marking loop, so each version is rebuilt from its
+  immediate predecessor exactly once — O(N) patch-applies instead of O(N²), turning long-history
+  marking from seconds into milliseconds. A pure content hash keys the memo, so it dedups safely
+  across paths.
 - **Commit-time crc32/size skip** — `commit_kra` compares each zip entry's crc32 + uncompressed
   size (from the central directory, no inflate needed) against the previous commit's manifest for
   that path (`commit_snapshot` passes it in); a match reuses the old manifest entry untouched, so
@@ -121,7 +132,11 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Working-tree diffs never touch the store** — `parse_working`/`WorkingKra` (`kra.rs`) decode a
   working `.kra` straight from an in-memory `ZipArchive`; no `bsdiff`, no chain reconstruct, no
   object writes. Older code staged the working file into the object store just to reuse the
-  rasterizer — viewing a diff should never write.
+  rasterizer — viewing a diff should never write. The opt-in **`lowMemoryDiff`** flag trades a
+  little CPU for bounded peak memory here: instead of holding the whole decompressed document,
+  `WorkingKra` keeps only the compressed archive plus per-entry metadata and re-inflates each
+  entry on demand, so peak RAM is the compressed document plus one decoded entry. Off by default
+  (the in-memory path is faster for interactive diffs); change detection is identical either way.
 - **`Repo::open_light`** — skips chains entirely (even the legacy-monolith parse a pre-sharding
   repo would pay) for read paths that never touch storage (`scan_repository`, `list_commits`).
   With sharded chains a full `Repo::open` is nearly as cheap — shards load on first touch — but
@@ -154,6 +169,11 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Fast PNG encoding** (`raster::rgba_to_png`) — `Compression::Fast` + `FilterType::NoFilter`.
   These PNGs are transient data-URLs consumed once by the webview; encode speed matters, byte size
   doesn't.
+- **Changed-pixel diff at capped resolution** (`raster::changed_grid`) — the changed-pixel mask
+  caps each composite to `MAX_RASTER_DIM` right after decode, before the pixel compare. Holding
+  two full-resolution composite RGBA buffers at once was a transient 2×(w·h·4) spike that stacked
+  with per-layer streaming; the mask is capped to the same bound afterwards anyway, so the output
+  is unchanged while peak memory roughly halves.
 - **`blit`'s row-memcpy fast path** (`raster.rs`) — when a tile sits fully inside the canvas
   (the common case), one row is one `copy_from_slice` instead of a per-pixel loop with bounds
   checks.
@@ -346,3 +366,7 @@ Marked inline where they occur — noted here as a single index:
 - Tile pixel deltas (`tilePixelDeltas`) stay opt-in until the LZF decode/encode cost is
   benchmarked as affordable on 2-core hardware; the old "decode LZF and delta raw pixels"
   upgrade-path note in `tiles.rs` is now this flag.
+- Low-memory working diffs (`lowMemoryDiff`) stay opt-in: re-inflating one entry at a time bounds
+  peak RAM but re-decompresses per layer, so the default in-memory path stays faster for
+  interactive diffs. Only the working-tree diff view is affected; committed diffs and stored data
+  are untouched.

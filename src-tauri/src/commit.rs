@@ -3,7 +3,7 @@
 //! and flushes state. `file_at_commit` rebuilds a file's exact bytes from any commit.
 
 use crate::error::{io_at, KvcError, Result};
-use crate::repo::{hash_bytes, Commit, CommittedFile, Repo, TrackedFile};
+use crate::repo::{hash_bytes, safe_join, Commit, CommittedFile, Repo, TrackedFile};
 use crate::{kra, scan};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -224,7 +224,8 @@ fn restore_bytes(
                 .filter(|c| c.is_kra)
                 .and_then(|c| c.content.as_deref()),
         ) {
-            if let Ok(working) = std::fs::read(repo.root.join(&target.path)) {
+            let working_path = safe_join(&repo.root, &target.path)?;
+            if let Ok(working) = std::fs::read(&working_path) {
                 if let Ok(bytes) = kra::materialize_kra(repo, &target.path, th, ch, &working) {
                     let hash = hash_bytes(&bytes);
                     return Ok((bytes, hash));
@@ -249,7 +250,7 @@ pub fn materialize_tree(
             continue;
         }
         let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
-        let abs = repo.root.join(path);
+        let abs = safe_join(&repo.root, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
@@ -269,7 +270,7 @@ pub fn materialize_tree(
     }
     for path in current.keys() {
         if !target.contains_key(path) {
-            let abs = repo.root.join(path);
+            let abs = safe_join(&repo.root, path)?;
             if abs.exists() {
                 std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
             }
@@ -302,7 +303,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
             continue;
         }
         let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
-        let abs = repo.root.join(path);
+        let abs = safe_join(&repo.root, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
@@ -334,7 +335,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
     // Remove currently-tracked files that didn't exist at the target commit.
     for path in repo.index.files.keys().cloned().collect::<Vec<_>>() {
         if !target.contains_key(&path) {
-            let abs = repo.root.join(&path);
+            let abs = safe_join(&repo.root, &path)?;
             if abs.exists() {
                 std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
             }

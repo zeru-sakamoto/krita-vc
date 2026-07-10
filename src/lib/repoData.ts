@@ -232,6 +232,7 @@ export function clearSessionCaches(): void {
 export interface RepoConfig {
   cacheMaxBytes: number;
   tilePixelDeltas: boolean;
+  lowMemoryDiff: boolean;
 }
 
 /**
@@ -270,6 +271,7 @@ export function useRepoConfig(path: string): {
         path,
         cacheMaxBytes: next.cacheMaxBytes,
         tilePixelDeltas: next.tilePixelDeltas,
+        lowMemoryDiff: next.lowMemoryDiff,
       });
       setConfig(next);
     } catch (e) {
