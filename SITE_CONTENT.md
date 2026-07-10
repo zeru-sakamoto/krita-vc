@@ -31,6 +31,7 @@ uploads, and zero git jargon.
 ## Features
 
 ### Visual layer diffs
+
 Compare any two versions of a painting layer by layer. Toggle side-by-side or swipe-slider
 comparison, zoom and pan to inspect details — perfectly synced between both views — and see
 exactly what changed via a highlighted overlay with a dashed outline tracing the edited pixels'
@@ -42,6 +43,7 @@ painted area — or the whole canvas's size, resolution, and color space.
 ![Screenshot placeholder — layer stack panel + swipe slider diff](placeholder)
 
 ### Real history, real branches
+
 Every save is a full point you can return to. Branch off to try something risky, switch back
 instantly, and merge branches together when you're happy — conflicting edits are flagged, never
 silently overwritten. A color-coded history graph shows exactly how your branches connect.
@@ -49,10 +51,12 @@ silently overwritten. A color-coded history graph shows exactly how your branche
 ![Screenshot placeholder — branch history graph with multiple colored lanes](placeholder)
 
 ### Undo and rollback, without losing anything
+
 Made a save you regret? Undo it. Want to go back three versions? Roll back to it. Krita VCS never
 deletes your history behind your back — old versions stay recoverable until you decide otherwise.
 
 ### Clean up storage, on your terms
+
 Because nothing is destroyed automatically, a project's history can grow over time. One button
 shows you exactly how much space old, unreachable history is taking up, and reclaims it — only
 when you say so.
@@ -60,10 +64,14 @@ when you say so.
 ![Screenshot placeholder — cleanup/storage confirmation dialog](placeholder)
 
 ### Palette diffs
+
 Working with `.gpl` color palettes? Krita VCS shows a color-by-color swatch comparison, with hex
-values, so palette tweaks are as easy to review as a painting.
+values, so palette tweaks are as easy to review as a painting. Support for `.kpl`, `.aco`, and
+`.ase` palettes is on the way, so the same comparison works no matter where your palette comes
+from.
 
 ### Artist Mode
+
 Turn off the technical language entirely. Artist Mode (on by default) swaps commit hashes for
 "Version 12," file paths for asset names, and change codes for plain words like "Updated" — so
 version control reads like a tool for artists, not developers. Prefer the technical view? Turn it
@@ -72,27 +80,28 @@ off any time.
 ![Screenshot placeholder — Artist Mode toggle showing before/after labeling](placeholder)
 
 ### Sign your work, tune it to your machine
+
 Everything lives in one Settings panel. Put your name on every version you save, so a shared
-project reads like a record of who did what. Set how much disk the preview images may use, turn
-on compact storage to shrink the history of heavily-revised paintings, or switch on low-memory
-diffs to compare large files a layer at a time on a modest machine — all optional, all
+project reads like a record of who did what. Set how much disk the preview images may use, or
+turn on compact storage to shrink the history of heavily-revised paintings — all optional, all
 changeable any time.
 
 ### Pick a theme
+
 Choose from eight color themes right in Settings — six dark, two light — from the moody default
 Charcoal to Krita Blue, Tokyo Night, and True Black. Your pick is saved on your machine and
 applied instantly, no restart needed.
 
-| Theme | Background | Accent |
-| --- | --- | --- |
-| Charcoal (default) | `#131210` | `#e07b39` |
-| Krita Blue | `#1e1e24` | `#2e86de` |
-| Electric Cyan | `#1a1d24` | `#00d2d3` |
-| Sunset Coral | `#201e22` | `#ff6b6b` |
-| Tokyo Night | `#1a1b26` | `#7aa2f7` |
-| True Black | `#000000` | `#8b5cf6` |
-| Charcoal Light | `#f4f1ea` | `#a8511a` |
-| Studio Light | `#f5f6fa` | `#2e86de` |
+| Theme              | Background | Accent    |
+| ------------------ | ---------- | --------- |
+| Charcoal (default) | `#131210`  | `#e07b39` |
+| Krita Blue         | `#1e1e24`  | `#2e86de` |
+| Electric Cyan      | `#1a1d24`  | `#00d2d3` |
+| Sunset Coral       | `#201e22`  | `#ff6b6b` |
+| Tokyo Night        | `#1a1b26`  | `#7aa2f7` |
+| True Black         | `#000000`  | `#8b5cf6` |
+| Charcoal Light     | `#f4f1ea`  | `#a8511a` |
+| Studio Light       | `#f5f6fa`  | `#2e86de` |
 
 ![Screenshot placeholder — Settings panel with name field and storage options](placeholder)
 
@@ -102,11 +111,13 @@ applied instantly, no restart needed.
 
 Krita VCS is actively developed. A few things we're still improving:
 
-- **Smarter diffs for non-painting files** — text/config files in a project currently get a basic
-  line view; a full visual diff for these is planned.
-- **Deeper zoom for very large paintings** — comparisons render at a capped resolution to keep
-  cached previews small; a way to go past that cap for pixel-level review on huge canvases is
-  on the roadmap.
+- **Tracking more color palette formats** — `.gpl` swatch diffs work today; support for `.kpl`,
+  `.aco`, and `.ase` palettes is planned so the same color-by-color comparison works no matter
+  where your palette comes from.
+- **Diff stashing** — set aside an in-progress comparison and come back to it later without
+  losing your place, so you can hop between reviews without re-picking the same two versions.
+- **A guided first-launch tour** — a dynamic walkthrough of the app on first open, pointing out
+  the repository switcher, Changes, History, and Settings so new users aren't left guessing.
 
 Have a feature request? [Open an issue on GitHub →]
 
@@ -155,35 +166,36 @@ instructions (with copy-pasteable commands) live in the plugin's own guide:
 ![Screenshot placeholder — Version Control docker inside Krita](placeholder)
 
 ---
-
 ## FAQ
 
-**Does this replace Krita?**
-No — Krita VCS runs alongside Krita as a separate app. You still paint in Krita; Krita VCS just
-watches your project folder and manages its history.
+**What does it do?**
+It keeps every version of your painting as you save, like a save file for each stage of your art.
+You can look back at any earlier version, compare two side by side, or go back to one if you
+change your mind, all without leaving a mess of duplicate files on your computer.
 
 **Is my art uploaded anywhere?**
-No. Krita VCS is local-only by design — there's no remote server, no account, and no sync. All
-version history is stored in a folder on your own machine.
+No. Krita VCS is local-only by design: there's no server, no account, and no sync. Every version
+lives in a folder on your own machine.
 
 **Is it free?**
-Yes, Krita VCS is free and open source. _(License: TBD — check the repository for current
-licensing terms.)_
+Yes, Krita VCS is free and open source. The license is still being finalised, so check the
+repository for current terms.
 
 **What platforms does it support?**
-Krita VCS is a desktop app built with Tauri, currently targeting Windows, with macOS/Linux support
-following the same cross-platform base.
+It's a desktop app built with Tauri, currently targeting Windows, with macOS and Linux following
+on the same cross-platform base.
 
 **Does it work with any file, or just `.kra`?**
-Krita VCS tracks your whole project folder, but its deep visual diffing — layer-by-layer
-comparison — is built specifically for Krita's `.kra` format and `.gpl` palettes. Other files in
-the folder are still tracked and versioned, with a simpler diff view.
+It tracks your whole project folder, but its deep visual diffing, layer by layer, is built for
+Krita's `.kra` format and `.gpl` palettes. Other files are still tracked and versioned, with a
+simpler diff view.
 
 **Will my history get huge over time?**
-Krita VCS only stores what changed between saves, not a full copy each time, so history stays
-compact. If you ever want to reclaim space from old, unreachable versions, the built-in
-"Clean up storage" tool does it with your confirmation.
+It only stores what changed between saves, not a full copy each time, so history stays compact.
+And if you ever want the space back from old, unreachable versions, the built-in "Clean up
+storage" tool does it, with your confirmation.
 
 ---
+
 
 _Screenshots throughout this page are placeholders — final captures to be added._
