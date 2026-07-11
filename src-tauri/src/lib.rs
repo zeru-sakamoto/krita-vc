@@ -5,6 +5,7 @@ pub mod delta;
 pub mod error;
 pub mod gc;
 pub mod kra;
+pub mod palette;
 pub mod raster;
 pub mod repo;
 pub mod scan;

@@ -316,14 +316,19 @@ fn scan_status_and_lockfile_ignore() {
     repo::Repo::init(root).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
 
-    std::fs::write(root.join("notes.txt"), b"hello").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"hello").unwrap();
     std::fs::write(root.join("scratch.kra~"), b"krita lock").unwrap();
+    std::fs::write(root.join("readme.txt"), b"unsupported").unwrap();
 
     let s = scan::scan(&r).unwrap();
-    assert!(s.iter().any(|(p, st)| p == "notes.txt" && st == "U"));
+    assert!(s.iter().any(|(p, st)| p == "notes.gpl" && st == "U"));
     assert!(
         !s.iter().any(|(p, _)| p == "scratch.kra~"),
         "*.kra~ must be ignored"
+    );
+    assert!(
+        !s.iter().any(|(p, _)| p == "readme.txt"),
+        "unsupported file types must never be tracked"
     );
 
     commit::commit_snapshot(&mut r, "init", "t").unwrap();
@@ -332,17 +337,17 @@ fn scan_status_and_lockfile_ignore() {
         "clean tree after commit"
     );
 
-    std::fs::write(root.join("notes.txt"), b"hello world").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"hello world").unwrap();
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.txt" && st == "M"));
+        .any(|(p, st)| p == "notes.gpl" && st == "M"));
 
-    std::fs::remove_file(root.join("notes.txt")).unwrap();
+    std::fs::remove_file(root.join("notes.gpl")).unwrap();
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.txt" && st == "D"));
+        .any(|(p, st)| p == "notes.gpl" && st == "D"));
 }
 
 // --- repo lifecycle --------------------------------------------------------------------
@@ -420,9 +425,9 @@ fn undo_last_commit_keeps_working_tree() {
     repo::Repo::init(root).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
 
-    std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("notes.txt"), b"v2").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"v2").unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     assert_eq!(r.commits.len(), 2);
 
@@ -430,11 +435,11 @@ fn undo_last_commit_keeps_working_tree() {
     let head = commit::undo_last_commit(&mut r).unwrap();
     assert_eq!(r.commits.len(), 1);
     assert_eq!(head.unwrap().id, c1.id);
-    assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"v2");
+    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v2");
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.txt" && st == "M"));
+        .any(|(p, st)| p == "notes.gpl" && st == "M"));
 
     // Undo c1 (the add): file becomes untracked again.
     let head2 = commit::undo_last_commit(&mut r).unwrap();
@@ -443,7 +448,7 @@ fn undo_last_commit_keeps_working_tree() {
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.txt" && st == "U"));
+        .any(|(p, st)| p == "notes.gpl" && st == "U"));
 
     // Undo on an empty log is a no-op.
     assert!(commit::undo_last_commit(&mut r).unwrap().is_none());
@@ -458,17 +463,17 @@ fn rollback_restores_tree_as_new_commit() {
     repo::Repo::init(root).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
 
-    std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("notes.txt"), b"v2").unwrap();
-    std::fs::write(root.join("extra.txt"), b"added later").unwrap();
+    std::fs::write(root.join("notes.gpl"), b"v2").unwrap();
+    std::fs::write(root.join("extra.gpl"), b"added later").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
 
     let _ = c2;
     let c3 = commit::rollback_to_commit(&mut r, &c1.id, "t").unwrap();
     // Working tree matches c1: notes reverted, extra.txt (added in c2) removed.
-    assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), b"v1");
-    assert!(!root.join("extra.txt").exists());
+    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v1");
+    assert!(!root.join("extra.gpl").exists());
     // A new commit captured the restored state; nothing left to commit afterwards.
     assert_eq!(r.commits.len(), 3);
     assert!(c3.message.contains("Restored to Version 1"));
@@ -944,8 +949,8 @@ fn seeded_repo(dir: &tempfile::TempDir) -> repo::Repo {
     let root = dir.path();
     repo::Repo::init(root).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
-    std::fs::write(root.join("a.txt"), b"base-a").unwrap();
-    std::fs::write(root.join("b.txt"), b"base-b").unwrap();
+    std::fs::write(root.join("a.gpl"), b"base-a").unwrap();
+    std::fs::write(root.join("b.gpl"), b"base-b").unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
     r
 }
@@ -963,17 +968,17 @@ fn create_and_switch_roundtrip() {
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
 
     // Commit on the branch, then bounce between the two trees.
-    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
     assert_eq!(c2.parents, vec![c1.id.clone()]);
     assert_eq!(c2.branch, "idea");
 
     branch::switch_branch(&mut r, "main").unwrap();
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 
     branch::switch_branch(&mut r, "idea").unwrap();
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"idea-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"idea-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // State survives a reopen (branches.json persisted).
@@ -989,21 +994,21 @@ fn switch_skips_unchanged_files() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
     // b.txt is identical on both branches; switching must never rewrite it.
-    let before = std::fs::metadata(root.join("b.txt"))
+    let before = std::fs::metadata(root.join("b.gpl"))
         .unwrap()
         .modified()
         .unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    let after = std::fs::metadata(root.join("b.txt"))
+    let after = std::fs::metadata(root.join("b.gpl"))
         .unwrap()
         .modified()
         .unwrap();
     assert_eq!(before, after, "unchanged file was rewritten on switch");
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
 }
 
 #[test]
@@ -1014,13 +1019,13 @@ fn switch_refuses_dirty_tree() {
     branch::create_branch(&mut r, "idea", None).unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
-    std::fs::write(root.join("a.txt"), b"unsaved edit").unwrap();
+    std::fs::write(root.join("a.gpl"), b"unsaved edit").unwrap();
     assert!(matches!(
         branch::switch_branch(&mut r, "idea"),
         Err(KvcError::DirtyTree)
     ));
     // The unsaved edit is untouched.
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"unsaved edit");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved edit");
     assert_eq!(r.branches.current, "main");
 }
 
@@ -1031,7 +1036,7 @@ fn merge_fast_forward() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"feat-a").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
@@ -1040,7 +1045,7 @@ fn merge_fast_forward() {
     assert_eq!(merged.id, c2.id);
     assert_eq!(r.commits.len(), 2);
     assert_eq!(r.branches.tip(), Some(c2.id.as_str()));
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"feat-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"feat-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // Merging again: nothing to do.
@@ -1058,28 +1063,28 @@ fn merge_three_way_no_conflict() {
     let c1 = r.commits[0].clone();
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "feat edits b", "t").unwrap();
 
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
     let c3 = commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
 
     let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
     assert_eq!(m.parents, vec![c3.id.clone(), c2.id.clone()]);
     // Only the source-side change is recorded (diff vs first parent).
     assert_eq!(m.files.len(), 1);
-    assert_eq!(m.files[0].path, "b.txt");
+    assert_eq!(m.files[0].path, "b.gpl");
     assert_eq!(m.files[0].status, "M");
 
     // Working tree has both sides; the merged tree folds correctly via first parents.
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"main-a");
-    assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"feat-b");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"main-a");
+    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"feat-b");
     assert!(scan::scan(&r).unwrap().is_empty());
     let tree = commit::tree_at_commit(&r.commits, &m.id).unwrap();
     assert_ne!(
-        tree["a.txt"].content,
-        c1.files.iter().find(|f| f.path == "a.txt").unwrap().content
+        tree["a.gpl"].content,
+        c1.files.iter().find(|f| f.path == "a.gpl").unwrap().content
     );
 
     // Reachability: everything is now part of main's history.
@@ -1096,18 +1101,18 @@ fn merge_three_way_conflict_takes_source_and_flags() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("a.txt"), b"feat-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"feat-a").unwrap();
     commit::commit_snapshot(&mut r, "feat edits a", "t").unwrap();
 
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
     commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
 
     let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
-    let entry = m.files.iter().find(|f| f.path == "a.txt").unwrap();
+    let entry = m.files.iter().find(|f| f.path == "a.gpl").unwrap();
     assert_eq!(entry.status, "C");
     // Source wins on disk.
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"feat-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"feat-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 }
 
@@ -1119,10 +1124,10 @@ fn list_commits_scoped_by_branch() {
     let c1 = r.commits[0].clone();
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
     let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
 
     // main's history excludes the branch-only commit until it is merged.
@@ -1153,7 +1158,7 @@ fn migration_missing_branches_json() {
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
 
     // The next commit persists branches.json and chains parentage correctly.
-    std::fs::write(root.join("a.txt"), b"v2").unwrap();
+    std::fs::write(root.join("a.gpl"), b"v2").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     assert_eq!(c2.parents, vec![c1.id.clone()]);
     assert!(root.join(".kvc/branches.json").is_file());
@@ -1167,10 +1172,10 @@ fn undo_respects_branch_tip() {
     let c1 = r.commits[0].clone();
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.txt"), b"feat-b").unwrap();
+    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.txt"), b"main-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
     let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
 
     // Commit parent is the branch tip, not the newest commit in the vec.
@@ -1231,14 +1236,14 @@ fn create_branch_from_other_base() {
 
     // Diverge on "idea", then start a new branch from main's tree while standing on idea.
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
     branch::create_branch(&mut r, "third", Some("main")).unwrap();
     assert_eq!(r.branches.current, "third");
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
     // The working tree was materialized to main's files.
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"base-a");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // Unknown base -> error; unsaved changes -> refused, nothing moves.
@@ -1246,13 +1251,13 @@ fn create_branch_from_other_base() {
         branch::create_branch(&mut r, "x", Some("ghost")),
         Err(KvcError::NoBranch(_))
     ));
-    std::fs::write(root.join("a.txt"), b"unsaved").unwrap();
+    std::fs::write(root.join("a.gpl"), b"unsaved").unwrap();
     assert!(matches!(
         branch::create_branch(&mut r, "x", Some("idea")),
         Err(KvcError::DirtyTree)
     ));
     assert_eq!(r.branches.current, "third");
-    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"unsaved");
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved");
 }
 
 #[test]
@@ -1404,7 +1409,7 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.txt"), b"idea-a").unwrap();
+    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
     // Sentinel every shard on disk; a switch (no new stream versions) must rewrite none.
@@ -1434,7 +1439,7 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
         .into_iter()
         .map(|p| (p.clone(), std::fs::read(&p).unwrap()))
         .collect();
-    std::fs::write(root.join("a.txt"), b"main-a2").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a2").unwrap();
     commit::commit_snapshot(&mut r, "on main", "t").unwrap();
     let changed = shard_files(root)
         .into_iter()
@@ -1474,12 +1479,12 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
     std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"x1")).unwrap();
     // A large-ish text file so its versions bsdiff-chain (>64KB, incompressible-ish text).
     let big1: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
-    std::fs::write(root.join("notes.bin"), &big1).unwrap();
+    std::fs::write(root.join("notes.gpl"), &big1).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
     let mut big2 = big1.clone();
     big2.extend_from_slice(b"more");
-    std::fs::write(root.join("notes.bin"), &big2).unwrap();
+    std::fs::write(root.join("notes.gpl"), &big2).unwrap();
     std::fs::write(root.join("art.kra"), mk(b"tileBBBB", b"x1")).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
 
@@ -1524,7 +1529,7 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
             assert_eq!(l.tiles[0].data, tile);
             assert_eq!(kra::read_entry(&kra_bytes, "img/extra.bin").unwrap(), extra);
             assert_eq!(
-                &commit::file_at_commit(repo_ref, "notes.bin", cid).unwrap(),
+                &commit::file_at_commit(repo_ref, "notes.gpl", cid).unwrap(),
                 big
             );
         }
@@ -1725,9 +1730,9 @@ fn commits_log_appends_and_migrates_legacy() {
     assert!(log.is_file(), "init writes the log");
     assert!(!root.join(".kvc/commits.json").exists());
 
-    std::fs::write(root.join("a.txt"), b"one").unwrap();
+    std::fs::write(root.join("a.gpl"), b"one").unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("a.txt"), b"two").unwrap();
+    std::fs::write(root.join("a.gpl"), b"two").unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(text.lines().count(), 2, "one JSON line per commit");
@@ -1743,7 +1748,7 @@ fn commits_log_appends_and_migrates_legacy() {
     std::fs::remove_file(&log).unwrap();
     let mut r = repo::Repo::open(root).unwrap();
     assert_eq!(r.commits.len(), 2, "legacy commits.json readable");
-    std::fs::write(root.join("a.txt"), b"three").unwrap();
+    std::fs::write(root.join("a.gpl"), b"three").unwrap();
     commit::commit_snapshot(&mut r, "c3", "t").unwrap();
     assert!(log.is_file(), "first save writes the log");
     assert!(

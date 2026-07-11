@@ -36,13 +36,13 @@ fn status_commit_roundtrip_and_lock() {
     assert_eq!(status["branch"], "main");
     assert_eq!(status["changes"].as_array().unwrap().len(), 0);
 
-    std::fs::write(root.join("hello.txt"), b"hello world").unwrap();
+    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
 
     let (ok, status) = kvc(root, &["status"]);
     assert!(ok);
     let changes = status["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0]["path"], "hello.txt");
+    assert_eq!(changes[0]["path"], "hello.gpl");
     assert_eq!(changes[0]["status"], "U");
 
     // Commit lands, and the working tree is clean afterward.

@@ -147,11 +147,13 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   internally, so the sections below stay reachable instead of being pushed off-screen. The first
   `palette` entry (if any) is embedded in `ArtDiffView`'s `LayerStackPanel` navigator. Documented
   in [visual-diff-viewer.md](visual-diff-viewer.md).
-- `kind: "palette"` (`.gpl`) → [`PaletteDiffView`](../src/components/vcs/PaletteDiffView.tsx):
+- `kind: "palette"` (`.gpl`, `.kpl`, `.aco`, `.ase`) →
+  [`PaletteDiffView`](../src/components/vcs/PaletteDiffView.tsx):
   always renders **color swatches** grouped by change (Modified / Added / Removed), each swatch
-  showing before/after colors with hex codes. **Not gated by Artist Mode.** The first palette
-  attaches to the art diff's navigator; extra palettes and palette-only diffs get a standalone
-  panel (`StandalonePaletteDiff`, defined inline in `DiffView.tsx`).
+  showing before/after colors with hex codes. **Not gated by Artist Mode.** The `swatches[]` are
+  computed backend-side (`palette.rs`) and rendered as-is — no parsing in the frontend. The first
+  palette attaches to the art diff's navigator; extra palettes and palette-only diffs get a
+  standalone panel (`StandalonePaletteDiff`, defined inline in `DiffView.tsx`).
 - `kind: "text"` (generic config, settings, …):
   - **Artist Mode on** (default) → `FriendlyFileDiff`: no code, no hunks, no line numbers. A
     one-line friendly summary using `assetKind` + `statusVerb` from
@@ -269,6 +271,6 @@ mutating actions: commit/rollback/undo, branch create/switch/merge/delete),
 [`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
 [`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
 [`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `assetKind`,
-`statusVerb`, `layerTypeLabel`, `layerChangeLabel`, `parsePaletteDiff`, `rgbToHex`,
+`statusVerb`, `layerTypeLabel`, `layerChangeLabel`,
 `versionNumbers`/`versionLabel`),
 [`src/lib/format.ts`](../src/lib/format.ts) (timestamps).

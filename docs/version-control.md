@@ -103,7 +103,14 @@ file against `index.json`:
 | `D` | deleted — in the index but absent on disk |
 
 Unchanged files produce nothing. The `.kvc/` directory and Krita lock/autosave files (`*.kra~`)
-are skipped. A file whose **size + mtime still match the index** (`TrackedFile.size`/`mtime`,
+are skipped. A **tracking guardrail** (`scan::is_supported`) further limits what is *newly*
+tracked to the file types Krita VCS actually understands — `.kra` documents and the palette
+formats (`.gpl`/`.kpl`/`.aco`/`.ase`); any other file in the project folder is ignored outright
+(never staged, hashed, or committed). The guard runs only for files **not already in the index**
+(a cheap short-circuit on the steady-state scan), so already-tracked files stay tracked and a repo
+that predates this rule is never silently pruned — and an unsupported file is now rejected by
+extension instead of being read and blake3-hashed like before. A file whose **size + mtime still
+match the index** (`TrackedFile.size`/`mtime`,
 nanosecond resolution) **and whose mtime is strictly older than the index file's own on-disk
 mtime** is assumed unchanged and skipped without being read or hashed — the win for big `.kra`
 files. Everything else is hashed and compared against the committed blake3, so a size-preserving
@@ -122,7 +129,10 @@ are cosmetic).
 
 - **deletion** → drop from the index, record a `D` file entry (no content).
 - **`.kra`** → `kra::commit_kra` decomposes the archive (see below) and returns its manifest hash.
-- **anything else** → `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash.
+- **anything else** (a palette file — the guardrail means nothing else reaches a commit) →
+  `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash. Palettes are small,
+  but they ride the same delta-chain store as everything else, so successive versions bsdiff
+  against each other for free (below the 64 KB patch floor they simply snapshot).
 
 Each non-deleted file's blake3 (plus its size + mtime, for the scanner's fast path) is written
 back into the index (the scan hands its already-read bytes to the commit too, so a big `.kra`
@@ -348,7 +358,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
 | `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |
 | `undo_last_commit(path)` | Drop the last commit (keep working-tree changes); returns the new head or null. |
-| `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (**composite + layer metadata + change regions**, no per-layer rasters — those load lazily), others as minimal text entries. |
+| `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (**composite + layer metadata + change regions**, no per-layer rasters — those load lazily), palette files as **swatch diffs** (`palette` entries — see [Palette diffs](#palette-diffs)), others as minimal text entries. |
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
 | `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
 | `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
@@ -379,5 +389,30 @@ arrive. Both hooks expose a `loading` flag: `MainPanel` shows an "Analyzing chan
 the initial diff, and `ArtDiffView` a "Loading layers…" indicator while the rasters stream in.
 Layer rasters are downscaled to a longest side of `raster::MAX_RASTER_DIM` (2048px) before
 encoding — a diff preview never needs full document resolution, and full-res PNG encode was the
-diff's dominant cost. Non-`.kra` files still get minimal text entries (real line/palette diffs are
-deferred).
+diff's dominant cost. Palette files get real **swatch diffs** (below); other non-`.kra` files
+still get minimal text entries (real line diffs are deferred).
+
+## Palette diffs
+
+The four palette formats ([`palette.rs`](../src-tauri/src/palette.rs)) get a real color-by-color
+swatch diff, computed entirely in the backend (the frontend's `PaletteDiffView` renders the
+result — see [visual-diff-viewer.md](visual-diff-viewer.md#palette-diffs)). Each format is parsed
+to a flat list of named sRGB swatches:
+
+- **`.gpl`** (GIMP) — text; `R G B  Name` lines, `Columns:` header for the grid width.
+- **`.kpl`** (Krita) — a ZIP; `colorset.xml` parsed with `roxmltree` (reusing the `.kra` path's
+  zip + XML deps). `RGB`/`sRGB` entries are exact; `Gray`/`CMYK` are converted.
+- **`.aco`** (Adobe Color) — binary, big-endian. The v1 section gives colors (RGB exact, grayscale/
+  CMYK converted); the optional v2 section supplies UTF-16 names (best-effort — a misparse keeps
+  the v1 colors with hex names).
+- **`.ase`** (Adobe Swatch Exchange) — binary, big-endian; color blocks carry a UTF-16 name + a
+  4-char color model (`RGB `/`CMYK`/`Gray`/`LAB `, converted to sRGB), group blocks are skipped.
+
+`palette::diff` then matches swatches **by name** (first-unconsumed, since names can repeat), so a
+recolor reads as `modified` (before→after) rather than remove+add; name-only-in-new is `added`,
+name-only-in-old is `removed`. `commands::palette_dto` reconstructs each side's bytes
+(`file:<path>` blob stream for the committed side, disk read for the working side), runs the diff,
+and serializes it as the `Palette` `DiffEntryDto` variant (`kind: "palette"`). A malformed palette
+degrades to a plain text entry, so one bad file can't blank the panel. The cost is negligible
+(palettes are KB-sized, parse is O(swatches)), so unlike `.kra` rasters there is no streaming or
+caching — the diff is computed inline on the blocking pool.

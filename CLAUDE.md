@@ -10,7 +10,10 @@ no fetch, no cloud sync. The UI exposes only local operations (commit history, l
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
-`gc`; commands in `commands.rs`). Storage layout: chains are **sharded per tracked file**
+`gc`, `palette`; commands in `commands.rs`). **Tracking guardrail**: the scanner only newly tracks
+*supported* file types — `.kra` documents and the palette formats (`.gpl`/`.kpl`/`.aco`/`.ase`,
+`scan::is_supported`); every other file in the project folder is ignored (never staged, hashed, or
+committed). Already-tracked files stay tracked, so pre-guardrail repos aren't pruned. Storage layout: chains are **sharded per tracked file**
 (`.kvc/chains/`, lazy-loaded, `KVCC2`-tagged bincode — pre-KVCC2 shards and legacy monolithic
 `chains.bin`/`chains.json` migrate transparently), the commit log is **append-only JSON-lines**
 (`.kvc/commits.log`; a commit appends one line, legacy `commits.json` migrates on first save),
@@ -185,11 +188,16 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   (never read off `diff`), so a focused layer shows only its own change and unchanged/added/removed
   layers show none. **Region boxes are normalized 0..1** of the viewBox (composite tile-bbox and
   per-layer alike) — `boxOverlay` scales by width/height, so a region must not be pre-scaled to
-  pixels or it overflows past the canvas' bottom-right. Palette (`.gpl`) files have
-  `kind: "palette"` and always render
+  pixels or it overflows past the canvas' bottom-right. Palette files (`.gpl`, `.kpl`, `.aco`,
+  `.ase`) have `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
   `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**
-  Artist Mode gated. Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
+  Artist Mode gated. The swatch diff is computed **in the backend** (`src-tauri/src/palette.rs`):
+  each format is parsed to a flat list of named sRGB swatches (`.gpl` text, `.kpl` = zip +
+  `colorset.xml` via roxmltree, `.aco`/`.ase` = hand-rolled big-endian binary readers), then
+  `palette::diff` matches swatches by name (recolor = "modified", not remove+add) and
+  `commands::palette_dto` serializes it as the `Palette` `DiffEntryDto` variant from `commit_diff`/
+  `working_diff`. A malformed palette degrades to a plain text entry. Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
   (one-line summary) on, `DiffFileBlock` (raw line diff with +/− and line numbers) off. Layer
   imagery is composited from **inline SVG markup strings** (`src/lib/svgArt.ts` — `layersBody`/
   `wrapSvg`/`compositeSvg`), which is how the backend's base64-PNG rasters render with no raster

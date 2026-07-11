@@ -513,11 +513,63 @@ pub struct TextDiffDto {
     lines: Vec<serde_json::Value>,
 }
 
+/// One swatch in a palette diff — `#RRGGBB` on each side, `None` where the swatch is absent.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwatchDto {
+    name: String,
+    before: Option<String>,
+    after: Option<String>,
+    change: String,
+}
+
+/// Structured color-palette diff (.gpl/.kpl/.aco/.ase) — mirrors `PaletteDiff` in `src/types.ts`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteDiffDto {
+    path: String,
+    status: String,
+    columns: u32,
+    swatches: Vec<SwatchDto>,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DiffEntryDto {
     Art(ArtDiffDto),
     Text(TextDiffDto),
+    Palette(PaletteDiffDto),
+}
+
+/// Assemble a palette DTO from the before/after file bytes (either side `None` for add/delete).
+/// `None` when neither side parses as a palette — the caller then degrades to a text entry.
+fn palette_dto(
+    path: &str,
+    status: &str,
+    old_bytes: Option<&[u8]>,
+    new_bytes: Option<&[u8]>,
+) -> Option<PaletteDiffDto> {
+    let old = old_bytes.and_then(|b| crate::palette::parse(path, b));
+    let new = new_bytes.and_then(|b| crate::palette::parse(path, b));
+    if old.is_none() && new.is_none() {
+        return None;
+    }
+    let d = crate::palette::diff(old.as_ref(), new.as_ref());
+    Some(PaletteDiffDto {
+        path: path.to_string(),
+        status: status.to_string(),
+        columns: d.columns,
+        swatches: d
+            .swatches
+            .into_iter()
+            .map(|s| SwatchDto {
+                name: s.name,
+                before: s.before,
+                after: s.after,
+                change: s.change.to_string(),
+            })
+            .collect(),
+    })
 }
 
 /// Krita opacity (0..255) → the UI's 0..100 scale.
@@ -921,12 +973,29 @@ fn diff_entry(
     with_rasters: bool,
 ) -> DiffEntryDto {
     if f.is_kra && f.status != "D" {
-        committed_art_dto(repo, f, old, with_rasters, None)
+        return committed_art_dto(repo, f, old, with_rasters, None)
             .map(DiffEntryDto::Art)
-            .unwrap_or_else(|_| text_entry(f))
-    } else {
-        text_entry(f)
+            .unwrap_or_else(|_| text_entry(f));
     }
+    if crate::palette::is_palette(&f.path) {
+        let recon =
+            |h: Option<&str>| h.and_then(|h| repo.reconstruct(&format!("file:{}", f.path), h).ok());
+        let new_bytes = if f.status == "D" {
+            None
+        } else {
+            recon(f.content.as_deref())
+        };
+        let old_bytes = recon(old.and_then(|o| o.content.as_deref()));
+        if let Some(dto) = palette_dto(
+            &f.path,
+            &f.status,
+            old_bytes.as_deref(),
+            new_bytes.as_deref(),
+        ) {
+            return DiffEntryDto::Palette(dto);
+        }
+    }
+    text_entry(f)
 }
 
 /// Art diff for a committed `.kra`: load its manifest once, then run the shared builder.
@@ -1088,13 +1157,23 @@ pub async fn working_diff(
         register_served_repo(&path);
         if !file.to_lowercase().ends_with(".kra") {
             let old = last_committed(&repo, &file);
+            let status = if old.is_some() { "M" } else { "A" };
+            if crate::palette::is_palette(&file) {
+                let abs = crate::repo::safe_join(&repo.root, &file)?;
+                let new_bytes = std::fs::read(&abs).ok();
+                let old_bytes = old
+                    .as_ref()
+                    .and_then(|o| o.content.as_deref())
+                    .and_then(|h| repo.reconstruct(&format!("file:{}", file), h).ok());
+                if let Some(dto) =
+                    palette_dto(&file, status, old_bytes.as_deref(), new_bytes.as_deref())
+                {
+                    return Ok(vec![DiffEntryDto::Palette(dto)]);
+                }
+            }
             return Ok(vec![text_entry(&CommittedFile {
                 path: file.clone(),
-                status: if old.is_some() {
-                    "M".into()
-                } else {
-                    "A".into()
-                },
+                status: status.into(),
                 content: None,
                 is_kra: false,
                 file_hash: None,

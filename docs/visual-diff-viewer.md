@@ -2,9 +2,14 @@
 
 For an art VCS, a code-style text patch is the wrong mental model — artists need to see the **actual
 layer imagery** and a **visual comparison** of what changed. Art (`.kra`) files render as a **layer
-stack + before/after canvas**. Color palettes (`.gpl`) have their own `kind: "palette"` type and
-render as **color-swatch grids** (`PaletteDiffView`) regardless of Artist Mode — the first palette
-is embedded in the art diff's layer navigator; standalone palettes get their own panel. Generic
+stack + before/after canvas**. Color palettes (`.gpl`, `.kpl`, `.aco`, `.ase`) have their own
+`kind: "palette"` type and render as **color-swatch grids** (`PaletteDiffView`) regardless of
+Artist Mode — the first palette is embedded in the art diff's layer navigator; standalone palettes
+get their own panel. The swatch diff itself (parse each format → named sRGB swatches, match by
+name, classify added/removed/modified/unchanged) is computed in the **backend**
+(`palette.rs`/`commands::palette_dto` — see
+[version-control.md → Palette diffs](version-control.md#palette-diffs)); the frontend just renders
+the `swatches[]` it receives. Generic
 text files (config, settings) render as a friendly one-line summary (`FriendlyFileDiff`) in Artist
 Mode, or a code-style line diff (`DiffFileBlock`) with it off. See
 [frontend-architecture.md → Diff viewer](frontend-architecture.md#diff-viewer).

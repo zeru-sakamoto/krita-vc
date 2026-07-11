@@ -75,6 +75,13 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
 - **Scanner fast path** (`scan.rs`) — a tracked file whose size+mtime still match the index
   (`TrackedFile.size`/`mtime`, `repo::size_mtime`, nanosecond resolution) is assumed unchanged and
   never read or hashed. Big `.kra` files are the case this matters for.
+- **Tracking guardrail** (`scan::is_supported`) — only `.kra` and palette files (`.gpl`/`.kpl`/
+  `.aco`/`.ase`) are newly tracked; any other file is rejected on a single lowercased-extension
+  check instead of being read and blake3-hashed. The guard only runs for files **not already in
+  the index** (`contains_key` short-circuits the `&&`), so a steady-state scan pays nothing for
+  already-tracked files, and a project folder full of unsupported assets scans strictly faster than
+  before (no per-file I/O for the ignored ones). One `to_lowercase` alloc per untracked file, kept
+  minimal on purpose.
 - **Scan→commit byte + hash handoff** (`scan::scan_detailed`) — the scan already read and
   blake3-hashed every changed file; `commit_snapshot` reuses the hash (plus size/mtime) *and*
   the file bytes themselves (`ScanChange.bytes`, kept under a 512 MB cumulative retention
@@ -129,6 +136,13 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   modified layer — negligible next to the tile reconstruction + PNG encode already paid, and it runs
   inside the same rayon `par_iter`. The mask PNG is cached content-addressed by both layer raster
   keys (`kra::diff_cache_key`), so repeat views skip the diff.
+- **Palette diffs stay off the raster machinery** (`palette.rs`, `commands::palette_dto`) — the
+  four palette formats are KB-sized and their swatch diff is O(swatches), so unlike `.kra` there is
+  deliberately **no two-stage load, no streaming, and no `.kvc/cache/` entry**: the diff is parsed
+  and computed inline inside `commit_diff`/`working_diff` (already on the blocking pool). Adding a
+  cache would cost more than it saves. Version-to-version *storage* still delta-compresses for free
+  — palettes go through the same `store_stream` bsdiff chain as any generic blob (below the 64 KB
+  patch floor they snapshot, which is correct for files this small).
 - **Working-tree diffs never touch the store** — `parse_working`/`WorkingKra` (`kra.rs`) decode a
   working `.kra` straight from an in-memory `ZipArchive`; no `bsdiff`, no chain reconstruct, no
   object writes. Older code staged the working file into the object store just to reuse the

@@ -3,7 +3,7 @@
 // plain-language labels. See src/lib/artistMode.tsx.
 
 import { FileImage, Image, Palette, GearSix, type Icon } from "@phosphor-icons/react";
-import type { ArtLayer, Commit, DiffLine, FileStatus } from "../types";
+import type { ArtLayer, Commit, FileStatus } from "../types";
 
 /** Title-case a slug/word: "skin-tones" → "Skin Tones", "hero" → "Hero". */
 function titleCase(input: string): string {
@@ -103,68 +103,6 @@ export function layerChangeLabel(change: ArtLayer["change"]): string {
     case "unchanged":
       return "Unchanged";
   }
-}
-
-export interface PaletteColor {
-  name: string;
-  color: string;
-}
-export interface PaletteChange {
-  name: string;
-  before: string;
-  after: string;
-}
-export interface PaletteDiff {
-  changed: PaletteChange[];
-  added: PaletteColor[];
-  removed: PaletteColor[];
-}
-
-const COLOR_LINE = /^(\d{1,3})\s+(\d{1,3})\s+(\d{1,3})\s+(.+)$/;
-
-/** "#RRGGBB" (uppercase), clamped to 0..255 per channel. */
-export function rgbToHex(r: number, g: number, b: number): string {
-  const hex = (n: number) =>
-    Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0").toUpperCase();
-  return `#${hex(r)}${hex(g)}${hex(b)}`;
-}
-
-function parseColorLine(text: string): PaletteColor | null {
-  const m = COLOR_LINE.exec(text.trim());
-  if (!m) return null;
-  const [, r, g, b, name] = m;
-  return { name: name.trim(), color: rgbToHex(Number(r), Number(g), Number(b)) };
-}
-
-/**
- * Turns a palette (.gpl) text diff into grouped color changes. A removed +
- * added color with the same name is treated as a single "changed" entry.
- */
-export function parsePaletteDiff(lines: DiffLine[]): PaletteDiff {
-  const added: PaletteColor[] = [];
-  const removed: PaletteColor[] = [];
-  for (const line of lines) {
-    if (line.kind !== "add" && line.kind !== "del") continue;
-    const color = parseColorLine(line.text);
-    if (!color) continue;
-    (line.kind === "add" ? added : removed).push(color);
-  }
-
-  const changed: PaletteChange[] = [];
-  for (let i = removed.length - 1; i >= 0; i--) {
-    const match = added.findIndex((a) => a.name === removed[i].name);
-    if (match !== -1) {
-      changed.unshift({
-        name: removed[i].name,
-        before: removed[i].color,
-        after: added[match].color,
-      });
-      added.splice(match, 1);
-      removed.splice(i, 1);
-    }
-  }
-
-  return { changed, added, removed };
 }
 
 /** Map of commit id → version number, newest commit = highest number. */

@@ -1,6 +1,7 @@
 //! Working-tree scanner: classify each file against the committed index as
 //! untracked (`U`), modified (`M`), or deleted (`D`). Krita lock/autosave files
-//! (`*.kra~`) and the `.kvc/` directory are ignored.
+//! (`*.kra~`) and the `.kvc/` directory are ignored, and only *supported* file types
+//! ([`is_supported`] — `.kra` + palette formats) are ever newly tracked.
 
 use crate::error::{io_at, KvcError, Result};
 use crate::repo::{hash_bytes, Repo};
@@ -77,6 +78,14 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
         }
 
         let rel = rel_path(&repo.root, entry.path());
+
+        // Tracking guardrail: only Krita documents and diffable palette formats are ever newly
+        // tracked. An unsupported file that isn't already in the index is ignored entirely —
+        // never staged, hashed, or committed. Already-tracked files stay tracked, so a repo that
+        // predates this rule isn't silently pruned.
+        if !repo.index.files.contains_key(&rel) && !is_supported(&rel) {
+            continue;
+        }
         seen.insert(rel.clone());
 
         // Fast path: a tracked file with matching size+mtime is unchanged — don't read it. Skipped
@@ -135,6 +144,16 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
         }
     }
     Ok(out)
+}
+
+/// The only files Krita VCS tracks: Krita documents (`.kra`) and the color-palette formats it
+/// can diff (`.gpl`/`.kpl`/`.aco`/`.ase`). Everything else in the project folder is left alone.
+/// One lowercase pass (this runs per untracked file on scan — kept allocation-lean).
+pub fn is_supported(rel: &str) -> bool {
+    let lower = rel.to_lowercase();
+    [".kra", ".gpl", ".kpl", ".aco", ".ase"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 /// Repo-relative path with forward slashes.

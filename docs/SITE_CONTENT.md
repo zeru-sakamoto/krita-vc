@@ -65,10 +65,10 @@ when you say so.
 
 ### Palette diffs
 
-Working with `.gpl` color palettes? Krita VCS shows a color-by-color swatch comparison, with hex
-values, so palette tweaks are as easy to review as a painting. Support for `.kpl`, `.aco`, and
-`.ase` palettes is on the way, so the same comparison works no matter where your palette comes
-from.
+Working with color palettes? Krita VCS shows a color-by-color swatch comparison, with hex
+values, so palette tweaks are as easy to review as a painting — and it works across every common
+palette format: `.gpl` (GIMP), `.kpl` (Krita), and Adobe's `.aco` and `.ase`, no matter where
+your palette comes from.
 
 ### Artist Mode
 
@@ -111,9 +111,6 @@ applied instantly, no restart needed.
 
 Krita VCS is actively developed. A few things we're still improving:
 
-- **Tracking more color palette formats** — `.gpl` swatch diffs work today; support for `.kpl`,
-  `.aco`, and `.ase` palettes is planned so the same color-by-color comparison works no matter
-  where your palette comes from.
 - **Diff stashing** — set aside an in-progress comparison and come back to it later without
   losing your place, so you can hop between reviews without re-picking the same two versions.
 - **A guided first-launch tour** — a dynamic walkthrough of the app on first open, pointing out
@@ -156,9 +153,10 @@ It's a desktop app built with Tauri, currently targeting Windows, with macOS and
 on the same cross-platform base.
 
 **Does it work with any file, or just `.kra`?**
-It tracks your whole project folder, but its deep visual diffing, layer by layer, is built for
-Krita's `.kra` format and `.gpl` palettes. Other files are still tracked and versioned, with a
-simpler diff view.
+It tracks the file types it understands and leaves the rest of your folder alone: Krita paintings
+(`.kra`), with the deep layer-by-layer visual diff, and color palettes (`.gpl`, `.kpl`, `.aco`,
+`.ase`), with a color-by-color swatch diff. Other files sitting in the project folder aren't
+touched — they're never copied into its history.
 
 **Will my history get huge over time?**
 It only stores what changed between saves, not a full copy each time, so history stays compact.

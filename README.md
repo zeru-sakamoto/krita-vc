@@ -30,8 +30,9 @@ files, where git's text-oriented delta model performs poorly.
     region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
     only *that* layer's changed pixels, not the whole-file silhouette. Its color always matches
     the active **theme's accent** (see Settings below).
-  - Click a layer to focus its diff, or view the composited artwork; palettes (`.gpl`) render as
-    color swatches. The inspector shows the selected layer's details (type, visibility, opacity,
+  - Click a layer to focus its diff, or view the composited artwork; color palettes (`.gpl`,
+    `.kpl`, `.aco`, `.ase`) render as a color-by-color swatch diff (added / removed / recolored,
+    with hex values). The inspector shows the selected layer's details (type, visibility, opacity,
     blend, painted bounds) or the composite's size, resolution, and color space.
 - **Real local version control** — commit the whole working tree, browse history as a branch-aware
   graph, and roll back / undo commits.
@@ -53,6 +54,9 @@ files, where git's text-oriented delta model performs poorly.
 - **Custom `.kvc/` store** — chains are sharded per tracked file (lazy-loaded), loose objects are
   sharded 256-way, and a commit with many new objects writes a single pack file instead of many
   loose files (per-file creates dominated large commits on Windows).
+- **Tracked file types** — the scanner only tracks files Krita VCS understands: `.kra` documents
+  and the color-palette formats (`.gpl`, `.kpl`, `.aco`, `.ase`). Anything else in the folder is
+  left untouched — never staged or committed.
 - **`.kra` tile-delta engine** — `.kra` files are ZIP archives of per-layer tiles; the engine diffs
   and stores them at the tile level, so a small edit to one layer stores a small delta, not a whole
   new file.
@@ -115,6 +119,7 @@ src/
 src-tauri/src/ — Rust backend (crate krita_vc_lib)
 ├─ repo, scan, commit, delta, branch, gc   — the local VCS engine
 ├─ kra, tiles, raster                        — .kra parsing, tile store, raster/diff imaging
+├─ palette                                   — .gpl/.kpl/.aco/.ase parsing + swatch diffing
 ├─ commands.rs                               — Tauri #[command] IPC surface
 └─ lib.rs / main.rs                          — Tauri builder + entry point
 
