@@ -59,10 +59,11 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
         {change === "modified" && before && after ? (
           <>
             <SplitSwatch before={before} after={after} />
-            {/* Old hex — left half (top-left triangle = before color) */}
+            {/* Old hex — top-left (matches the before triangle); diagonal placement keeps the
+                two labels from overlapping in a narrow cell. */}
             <span
               className={[
-                "absolute left-1 top-1/2 -translate-y-1/2",
+                "absolute left-1 top-1",
                 HEX_BASE,
                 copied === before ? "text-diff-add-fg" : "text-white",
               ].join(" ")}
@@ -73,10 +74,10 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
             >
               {copied === before ? "✓" : before}
             </span>
-            {/* New hex — right half (bottom-right triangle = after color) */}
+            {/* New hex — bottom-right (matches the after triangle). */}
             <span
               className={[
-                "absolute right-1 top-1/2 -translate-y-1/2",
+                "absolute bottom-1 right-1",
                 HEX_BASE,
                 copied === after ? "text-diff-add-fg" : "text-white",
               ].join(" ")}
@@ -151,8 +152,6 @@ function LegendItem({ color, label }: { color: string; label: string }) {
  * selected in LayerStackPanel's Color Palette section.)
  */
 export function PaletteDiffView({ diff }: { diff: PaletteDiff }) {
-  const cols = diff.columns || 4;
-
   return (
     <div className="flex h-full flex-col overflow-auto bg-bg">
       {/* Legend bar */}
@@ -163,17 +162,19 @@ export function PaletteDiffView({ diff }: { diff: PaletteDiff }) {
         <LegendItem color="border-border bg-surface" label="Unchanged" />
       </div>
 
-      {/* Swatch grid */}
+      {/* Swatch grid: a min cell width keeps hex labels legible and wraps large palettes onto
+          more rows, instead of honoring the palette's column count (which squished 20+ swatches
+          into one unreadable row). */}
       <div
         className="p-4"
         style={{
           display: "grid",
-          gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+          gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))",
           gap: "0.5rem",
         }}
       >
-        {diff.swatches.map((sw) => (
-          <SwatchCell key={sw.name} swatch={sw} />
+        {diff.swatches.map((sw, i) => (
+          <SwatchCell key={`${sw.name}-${i}`} swatch={sw} />
         ))}
       </div>
     </div>

@@ -177,7 +177,12 @@ fn parse_kpl(bytes: &[u8]) -> Option<Palette> {
         .unwrap_or(0);
 
     let mut swatches = Vec::new();
-    for entry in root.children().filter(|n| n.has_tag_name("ColorSetEntry")) {
+    // `descendants`, not `children`: Krita nests swatches inside <Group> elements, so a
+    // shallow child scan misses every grouped color (real palettes parsed to zero swatches).
+    for entry in root
+        .descendants()
+        .filter(|n| n.has_tag_name("ColorSetEntry"))
+    {
         let name = entry.attribute("name").unwrap_or("").trim().to_string();
         // The color lives in a child element whose tag names the color space: RGB/sRGB carry
         // r/g/b as 0..1 floats. Other spaces are rare in .kpl; convert what's cheap, else skip.
@@ -509,6 +514,31 @@ mod tests {
         assert_eq!(p.swatches.len(), 2);
         assert_eq!(p.swatches[0].rgb, (255, 0, 0));
         assert_eq!(p.swatches[1].rgb, (128, 128, 128));
+    }
+
+    #[test]
+    fn kpl_parses_grouped_swatches() {
+        // Real Krita palettes nest swatches inside <Group>; the shallow scan used to drop them.
+        let xml = r#"<ColorSet version="1.0" name="T" columns="2">
+            <ColorSetEntry name="Top"><sRGB r="1" g="0" b="0"/></ColorSetEntry>
+            <Group name="Blues">
+                <ColorSetEntry name="Sky"><sRGB r="0" g="0" b="1"/>
+                    <Position row="0" column="0"/></ColorSetEntry>
+            </Group>
+        </ColorSet>"#;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file::<_, ()>("colorset.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            use std::io::Write;
+            zw.write_all(xml.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let p = parse_kpl(&buf).unwrap();
+        assert_eq!(p.swatches.len(), 2);
+        assert_eq!(p.swatches[1].name, "Sky");
+        assert_eq!(p.swatches[1].rgb, (0, 0, 255));
     }
 
     #[test]

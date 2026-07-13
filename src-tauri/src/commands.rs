@@ -551,10 +551,21 @@ fn palette_dto(
 ) -> Option<PaletteDiffDto> {
     let old = old_bytes.and_then(|b| crate::palette::parse(path, b));
     let new = new_bytes.and_then(|b| crate::palette::parse(path, b));
+    palette_dto_from(path, status, old.as_ref(), new.as_ref())
+}
+
+/// [`palette_dto`] once both sides are already parsed — lets a caller parse each side with its
+/// own format (an embedded palette can be `.gpl` on one side and `.kpl` on the other).
+fn palette_dto_from(
+    path: &str,
+    status: &str,
+    old: Option<&crate::palette::Palette>,
+    new: Option<&crate::palette::Palette>,
+) -> Option<PaletteDiffDto> {
     if old.is_none() && new.is_none() {
         return None;
     }
-    let d = crate::palette::diff(old.as_ref(), new.as_ref());
+    let d = crate::palette::diff(old, new);
     Some(PaletteDiffDto {
         path: path.to_string(),
         status: status.to_string(),
@@ -570,6 +581,103 @@ fn palette_dto(
             })
             .collect(),
     })
+}
+
+/// The logical identity of an embedded palette entry — its basename with the palette extension
+/// and any trailing Krita version segment (`.NNNN`) stripped. Collapses the several files Krita
+/// keeps for one palette (e.g. `sun-set.gpl` + `sun-set.0006.kpl`) onto one key.
+fn palette_logical_key(entry: &str) -> String {
+    let base = entry.rsplit('/').next().unwrap_or(entry).to_lowercase();
+    let stem = [".kpl", ".gpl", ".aco", ".ase"]
+        .iter()
+        .find_map(|e| base.strip_suffix(e))
+        .unwrap_or(&base);
+    match stem.rsplit_once('.') {
+        Some((head, ver)) if !ver.is_empty() && ver.bytes().all(|b| b.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => stem.to_string(),
+    }
+}
+
+/// One representative entry per logical palette in `src`, preferring Krita's native `.kpl` and
+/// then the highest version — so format duplicates and stale exports collapse to a single diff.
+fn logical_palette_reps(src: &kra::KraSource) -> std::collections::HashMap<String, String> {
+    let rank = |n: &str| (n.to_lowercase().ends_with(".kpl"), n.to_string());
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for name in src.palette_entry_names() {
+        let key = palette_logical_key(&name);
+        match map.get(&key) {
+            Some(cur) if rank(cur) >= rank(&name) => {}
+            _ => {
+                map.insert(key, name);
+            }
+        }
+    }
+    map
+}
+
+/// Diffs the document palettes embedded inside a `.kra` against the parent version. Krita keeps
+/// several files per palette (native `.kpl` plus `.gpl` exports, versioned `.NNNN` copies), so
+/// entries are collapsed to one representative per logical palette; unchanged palettes are
+/// dropped, and each result is keyed `<kra>::<palette-file>` so the frontend can label/route it.
+fn kra_palette_dtos(
+    repo: &Repo,
+    relpath: &str,
+    new_src: &kra::KraSource,
+    old_src: Option<&kra::KraSource>,
+) -> Vec<PaletteDiffDto> {
+    let new_reps = logical_palette_reps(new_src);
+    let old_reps = old_src.map(logical_palette_reps).unwrap_or_default();
+
+    let mut keys: Vec<&String> = new_reps.keys().collect();
+    keys.extend(old_reps.keys().filter(|k| !new_reps.contains_key(*k)));
+
+    keys.into_iter()
+        .filter_map(|key| {
+            let new_name = new_reps.get(key);
+            let old_name = old_reps.get(key);
+            let new_hash = new_name.and_then(|n| new_src.entry_hash(n));
+            let old_hash = old_name.and_then(|n| old_src.and_then(|o| o.entry_hash(n)));
+            if new_hash.is_some() && new_hash == old_hash {
+                return None; // unchanged embedded palette
+            }
+            // Parse each side with its own entry name so the format dispatch is correct even when
+            // the representative flips format across versions.
+            let new = new_name.and_then(|n| {
+                new_src
+                    .entry_bytes(repo, relpath, n)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| crate::palette::parse(n, &b))
+            });
+            let old = old_name.and_then(|n| {
+                old_src.and_then(|o| {
+                    o.entry_bytes(repo, relpath, n)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| crate::palette::parse(n, &b))
+                })
+            });
+            let status = match (old.is_some(), new.is_some()) {
+                (false, _) => "A",
+                (true, false) => "D",
+                (true, true) => "M",
+            };
+            let basename = new_name
+                .or(old_name)
+                .map(|n| n.rsplit('/').next().unwrap_or(n))
+                .unwrap_or(key);
+            let dto_path = format!("{relpath}::{basename}");
+            let dto = palette_dto_from(&dto_path, status, old.as_ref(), new.as_ref())?;
+            // A byte change with no swatch-level change (Krita re-serializing IDs/order on save)
+            // isn't worth a panel — only surface palettes whose swatches actually changed.
+            dto.swatches
+                .iter()
+                .any(|s| s.change != "unchanged")
+                .then_some(dto)
+        })
+        .collect()
 }
 
 /// Krita opacity (0..255) → the UI's 0..100 scale.
@@ -971,11 +1079,33 @@ fn diff_entry(
     f: &CommittedFile,
     old: Option<&CommittedFile>,
     with_rasters: bool,
-) -> DiffEntryDto {
+) -> Vec<DiffEntryDto> {
     if f.is_kra && f.status != "D" {
-        return committed_art_dto(repo, f, old, with_rasters, None)
-            .map(DiffEntryDto::Art)
-            .unwrap_or_else(|_| text_entry(f));
+        // Load the manifest once and run both the art diff and the embedded-palette diff off it,
+        // so the `.kra` can emit its Art entry plus one Palette entry per changed document palette.
+        let Some(manifest) = f
+            .content
+            .as_deref()
+            .and_then(|h| kra::load_manifest(repo, &f.path, h).ok())
+        else {
+            return vec![text_entry(f)];
+        };
+        let new_src = kra::KraSource::Committed(&manifest);
+        let Ok(art) = art_diff_dto(repo, &f.path, &f.status, &new_src, old, with_rasters, None)
+        else {
+            return vec![text_entry(f)];
+        };
+        let old_manifest = old
+            .and_then(|o| o.content.as_deref())
+            .and_then(|h| kra::load_manifest(repo, &f.path, h).ok());
+        let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
+        let mut out = vec![DiffEntryDto::Art(art)];
+        out.extend(
+            kra_palette_dtos(repo, &f.path, &new_src, old_src.as_ref())
+                .into_iter()
+                .map(DiffEntryDto::Palette),
+        );
+        return out;
     }
     if crate::palette::is_palette(&f.path) {
         let recon =
@@ -992,10 +1122,10 @@ fn diff_entry(
             old_bytes.as_deref(),
             new_bytes.as_deref(),
         ) {
-            return DiffEntryDto::Palette(dto);
+            return vec![DiffEntryDto::Palette(dto)];
         }
     }
-    text_entry(f)
+    vec![text_entry(f)]
 }
 
 /// Art diff for a committed `.kra`: load its manifest once, then run the shared builder.
@@ -1051,7 +1181,7 @@ pub async fn commit_diff(
         Ok(commit
             .files
             .iter()
-            .map(|f| diff_entry(&repo, f, parent_tree.get(&f.path), false))
+            .flat_map(|f| diff_entry(&repo, f, parent_tree.get(&f.path), false))
             .collect())
     })
     .await
@@ -1179,18 +1309,44 @@ pub async fn working_diff(
                 file_hash: None,
             })]);
         }
-        let entry = working_art_dto(&repo, &file, false, None)
-            .map(DiffEntryDto::Art)
-            .unwrap_or_else(|_| {
-                text_entry(&CommittedFile {
-                    path: file.clone(),
-                    status: "M".into(),
-                    content: None,
-                    is_kra: true,
-                    file_hash: None,
-                })
-            });
-        Ok(vec![entry])
+        // Parse the working `.kra` once, then run the art diff and the embedded-palette diff off
+        // the same source (mirrors `diff_entry`'s committed path). `working_art_dto` stays for the
+        // raster-streaming `working_layers`.
+        let art_text = || {
+            text_entry(&CommittedFile {
+                path: file.clone(),
+                status: "M".into(),
+                content: None,
+                is_kra: true,
+                file_hash: None,
+            })
+        };
+        let abs = crate::repo::safe_join(&repo.root, &file)?;
+        let Ok(bytes) = std::fs::read(&abs) else {
+            return Ok(vec![art_text()]);
+        };
+        let Ok(working) = kra::parse_working(&bytes, repo.config.low_memory_diff) else {
+            return Ok(vec![art_text()]);
+        };
+        let new_src = kra::KraSource::Working(&working);
+        let old = last_committed(&repo, &file);
+        let status = if old.is_some() { "M" } else { "A" };
+        let Ok(art) = art_diff_dto(&repo, &file, status, &new_src, old.as_ref(), false, None)
+        else {
+            return Ok(vec![art_text()]);
+        };
+        let old_manifest = old
+            .as_ref()
+            .and_then(|o| o.content.as_deref())
+            .and_then(|h| kra::load_manifest(&repo, &file, h).ok());
+        let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
+        let mut out = vec![DiffEntryDto::Art(art)];
+        out.extend(
+            kra_palette_dtos(&repo, &file, &new_src, old_src.as_ref())
+                .into_iter()
+                .map(DiffEntryDto::Palette),
+        );
+        Ok(out)
     })
     .await
 }
@@ -1225,4 +1381,29 @@ pub async fn working_layers(
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::palette_logical_key;
+
+    #[test]
+    fn palette_logical_key_collapses_format_and_version_duplicates() {
+        // The real files Krita packs for one palette all fold to a single key.
+        assert_eq!(
+            palette_logical_key("test-file/palettes/sun-set.gpl"),
+            "sun-set"
+        );
+        assert_eq!(
+            palette_logical_key("test-file/palettes/sun-set.0006.kpl"),
+            "sun-set"
+        );
+        // A different palette keeps its own identity.
+        assert_eq!(
+            palette_logical_key("test-file/palettes/godscrown.gpl"),
+            "godscrown"
+        );
+        // A dotted name without a numeric version segment is preserved.
+        assert_eq!(palette_logical_key("palettes/My.Palette.kpl"), "my.palette");
+    }
 }

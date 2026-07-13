@@ -183,6 +183,7 @@ function RepoShell({ repo }: { repo: Repository }) {
                   version={selectedVersion}
                   entries={diff}
                   focus={focus}
+                  isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
                   onClose={() => setInspectorOpen(false)}
                 />
               )}

@@ -1361,6 +1361,17 @@ impl KraManifest {
         })
     }
 
+    /// Paths of non-tiled (`Raw`) archive entries — the only entries an embedded palette can be.
+    pub fn raw_entry_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                KraEntry::Raw { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn tile_index(&self) -> TileIndex {
         self.entries
             .iter()
@@ -1554,6 +1565,17 @@ impl WorkingKra {
             .collect()
     }
 
+    /// Paths of non-tiled (`Raw`) archive entries — the only entries an embedded palette can be.
+    pub fn raw_entry_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e {
+                WorkingEntry::Raw { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Raw bytes of a non-tiled entry: borrowed from RAM in normal mode, re-inflated from
     /// `source` (owned) in low-memory mode. `None` if `name` isn't a non-tiled entry.
     pub fn entry_bytes(&self, name: &str) -> Option<std::borrow::Cow<'_, [u8]>> {
@@ -1728,6 +1750,24 @@ impl KraSource<'_> {
             KraSource::Committed(m) => entry_bytes(repo, relpath, m, name),
             KraSource::Working(w) => Ok(w.entry_bytes(name).map(|b| b.to_vec())),
         }
+    }
+
+    /// Names of embedded document-palette entries. Krita stores document palettes as `.kpl`
+    /// blobs under `<image>/palettes/`; the `palettes/` substring plus a palette-extension
+    /// check keep this robust to Krita-version path differences.
+    pub fn palette_entry_names(&self) -> Vec<String> {
+        let names = match self {
+            KraSource::Committed(m) => m.raw_entry_names(),
+            KraSource::Working(w) => w.raw_entry_names(),
+        };
+        names
+            .into_iter()
+            .filter(|n| {
+                let l = n.to_lowercase();
+                l.contains("palettes/") || crate::palette::is_palette(&l)
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Content hash of a non-tiled entry, if present — the composite's cache key.

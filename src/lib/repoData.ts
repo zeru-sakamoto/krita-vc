@@ -12,6 +12,7 @@ interface BackendCommit {
   timestamp: string;
   parents: string[];
   branch?: string;
+  restoredFrom?: string;
   files: { path: string; status: string; content: string | null; isKra: boolean }[];
 }
 
@@ -45,6 +46,7 @@ export function useCommits(path: string, nonce = 0): Commit[] {
               parents: c.parents,
               // Pre-branching commits are stamped "" — leave those unset.
               branch: c.branch || undefined,
+              restoredFrom: c.restoredFrom,
               changes: c.files.map((f) => ({ path: f.path, status: f.status as FileStatus })),
             })
           )

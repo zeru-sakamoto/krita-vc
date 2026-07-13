@@ -67,6 +67,63 @@ export interface GraphLayout {
   laneCount: number;
 }
 
+// Pixel geometry for a lane column — shared by the per-row rail (`CommitGraphRail`) and the
+// cross-row revert-link overlay (`CommitGraph`) so both agree on where a lane sits.
+export const LANE_W = 16;
+// Dedicated gutter left of lane 0 for the revert-link overlay, so it doesn't run on top of the
+// lane-0 dots/lines.
+export const LINK_GUTTER_W = 10;
+export const ORIGIN_X = 12 + LINK_GUTTER_W;
+/** X for a revert link's vertical run — middle of the dedicated left gutter. */
+export const REVERT_LINK_X = LINK_GUTTER_W / 2;
+
+export function laneX(lane: number): number {
+  return ORIGIN_X + lane * LANE_W;
+}
+
+export function railWidth(laneCount: number): number {
+  return ORIGIN_X + Math.max(1, laneCount) * LANE_W;
+}
+
+const REVERT_CORNER_R = 4;
+
+/** SVG path for a revert link: out from `(x1, y1)`, down the gutter at `gutterX`, in to `(x2, y2)`, with rounded corners. */
+export function elbowPath(x1: number, y1: number, gutterX: number, x2: number, y2: number): string {
+  const r = REVERT_CORNER_R;
+  const dx1 = Math.sign(x1 - gutterX) || 1;
+  const dy = Math.sign(y2 - y1) || 1;
+  const dx2 = Math.sign(x2 - gutterX) || 1;
+  return [
+    `M ${x1} ${y1}`,
+    `L ${gutterX + dx1 * r} ${y1}`,
+    `Q ${gutterX} ${y1} ${gutterX} ${y1 + dy * r}`,
+    `L ${gutterX} ${y2 - dy * r}`,
+    `Q ${gutterX} ${y2} ${gutterX + dx2 * r} ${y2}`,
+    `L ${x2} ${y2}`,
+  ].join(" ");
+}
+
+export interface RevertLink {
+  fromIndex: number;
+  toIndex: number;
+}
+
+/**
+ * One link per rollback commit whose restored-from target is also in `commits` — draws the
+ * graph line connecting a restored version back to the version it copied from. Silently
+ * skipped when the target isn't in the current list (e.g. off-branch, not loaded).
+ */
+export function buildRevertLinks(commits: Commit[]): RevertLink[] {
+  const indexById = new Map(commits.map((c, i) => [c.id, i]));
+  const links: RevertLink[] = [];
+  commits.forEach((c, fromIndex) => {
+    if (!c.restoredFrom) return;
+    const toIndex = indexById.get(c.restoredFrom);
+    if (toIndex !== undefined) links.push({ fromIndex, toIndex });
+  });
+  return links;
+}
+
 function firstFree(lanes: (string | null)[]): number {
   const idx = lanes.indexOf(null);
   if (idx !== -1) return idx;

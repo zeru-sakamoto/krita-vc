@@ -102,6 +102,7 @@ pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<C
         parents,
         branch: repo.branches.current.clone(),
         files,
+        restored_from: None,
     };
     repo.commits.push(commit.clone());
     repo.branches.set_tip(&id);
@@ -289,7 +290,13 @@ pub fn materialize_tree(
 /// the whole `.kra` decompose (`commit_snapshot`) just to rediscover those hashes doubled the
 /// rollback cost. The diff vs the current tip is exactly the first-parent invariant a commit's
 /// `files` must satisfy, and zero new objects are needed — everything is already stored.
+///
+/// If `commit_id` is the current tip, there's nothing new to record — delegates to
+/// [`discard_to_tip`] to discard uncommitted changes instead.
 pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Result<Commit> {
+    if repo.branches.tip() == Some(commit_id) {
+        return discard_to_tip(repo, commit_id);
+    }
     let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
     let current = current_tree(repo);
@@ -376,11 +383,68 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         parents,
         branch: repo.branches.current.clone(),
         files,
+        restored_from: Some(commit_id.to_string()),
     };
     repo.commits.push(commit.clone());
     repo.branches.set_tip(&id);
     repo.save()?;
     Ok(commit)
+}
+
+/// Discard uncommitted changes and reset the working tree to `tip_id` — no new commit.
+/// Errors `Nothing` if the tree is already clean.
+///
+/// Uses the real on-disk scan ([`scan::scan_detailed`]), unlike `current_tree` above which is
+/// derived from committed history and would trivially equal `tip_id`'s own tree. Rewrites go
+/// through [`bytes_of`] (full store rebuild), not the incremental [`restore_bytes`] path — that
+/// path trusts the on-disk file as a diff base, which doesn't hold for the dirty file being
+/// discarded.
+fn discard_to_tip(repo: &mut Repo, tip_id: &str) -> Result<Commit> {
+    let target = tree_at_commit(&repo.commits, tip_id)
+        .ok_or_else(|| KvcError::NoCommit(tip_id.to_string()))?;
+    let dirty = scan::scan_detailed(repo, false)?;
+    if dirty.is_empty() {
+        return Err(KvcError::Nothing);
+    }
+
+    for change in &dirty {
+        let abs = safe_join(&repo.root, &change.rel)?;
+        if change.status == "U" {
+            // Never committed — discarding it means it goes away.
+            if abs.exists() {
+                std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
+            }
+            continue;
+        }
+        // "M" or "D": rewrite from the committed store.
+        let f = target
+            .get(&change.rel)
+            .ok_or_else(|| KvcError::NotTracked(change.rel.clone()))?;
+        let (bytes, hash) = bytes_of(repo, f)?;
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        }
+        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        let (size, mtime) = std::fs::metadata(&abs)
+            .map(|m| crate::repo::size_mtime(&m))
+            .unwrap_or((0, 0));
+        repo.index.files.insert(
+            change.rel.clone(),
+            TrackedFile {
+                hash,
+                is_kra: f.is_kra,
+                size,
+                mtime,
+            },
+        );
+    }
+    repo.save()?;
+    repo.commits
+        .iter()
+        .rev()
+        .find(|c| c.id == tip_id)
+        .cloned()
+        .ok_or_else(|| KvcError::NoCommit(tip_id.to_string()))
 }
 
 /// "Version N" where N is the target's 1-based position among commits reachable from the

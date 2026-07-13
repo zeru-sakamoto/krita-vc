@@ -1,7 +1,7 @@
 //! End-to-end engine tests against real file I/O in tempdirs (no logic mocked).
 
 use krita_vc_lib::{
-    branch, commands, commit, delta, error::KvcError, kra, raster, repo, scan, tiles,
+    branch, commands, commit, delta, error::KvcError, kra, palette, raster, repo, scan, tiles,
 };
 use std::io::Write;
 
@@ -307,6 +307,86 @@ fn working_kra_diff_is_read_only_and_detects_changes() {
     assert_eq!(count_objects(root), objs_before);
 }
 
+/// A `.kpl` blob (zip of a colorset.xml) with the given named sRGB swatches — the shape Krita
+/// embeds inside a `.kra` under `<image>/palettes/`.
+fn kpl_blob(swatches: &[(&str, (u8, u8, u8))]) -> Vec<u8> {
+    let mut xml = String::from(r#"<ColorSet version="1.0" columns="4">"#);
+    for (name, (r, g, b)) in swatches {
+        xml.push_str(&format!(
+            r#"<ColorSetEntry name="{name}"><sRGB r="{}" g="{}" b="{}"/></ColorSetEntry>"#,
+            *r as f64 / 255.0,
+            *g as f64 / 255.0,
+            *b as f64 / 255.0,
+        ));
+    }
+    xml.push_str("</ColorSet>");
+    let mut out = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        zw.start_file::<_, ()>("colorset.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(xml.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+    out
+}
+
+/// A recolored document palette embedded in a `.kra` is discovered on both sides, flagged
+/// changed, and its recolored swatch reads as "modified" — the backend half of the
+/// embedded-palette diff feature.
+#[test]
+fn kra_embedded_palette_color_change_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let kra1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, b"tileAAAA")])),
+        ("img/palettes/pal.kpl", kpl_blob(&[("Skin", (255, 0, 0))])),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "tester").unwrap();
+    let manifest_hash = c1
+        .files
+        .iter()
+        .find(|f| f.path == "art.kra")
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+    let manifest = kra::load_manifest(&r, "art.kra", &manifest_hash).unwrap();
+    let old_src = kra::KraSource::Committed(&manifest);
+
+    // Working copy: same palette entry, one swatch recolored red -> blue.
+    let kra2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&[(0, 0, b"tileAAAA")])),
+        ("img/palettes/pal.kpl", kpl_blob(&[("Skin", (0, 0, 255))])),
+    ]);
+    let working = kra::parse_working(&kra2, false).unwrap();
+    let new_src = kra::KraSource::Working(&working);
+
+    // Discovered on the working side, and flagged changed (different content hash).
+    let name = "img/palettes/pal.kpl";
+    assert!(new_src.palette_entry_names().iter().any(|n| n == name));
+    assert_ne!(new_src.entry_hash(name), old_src.entry_hash(name));
+
+    // The swatch diff sees the recolor as a modification.
+    let old_bytes = old_src.entry_bytes(&r, "art.kra", name).unwrap().unwrap();
+    let new_bytes = new_src.entry_bytes(&r, "art.kra", name).unwrap().unwrap();
+    let old_pal = palette::parse("pal.kpl", &old_bytes).unwrap();
+    let new_pal = palette::parse("pal.kpl", &new_bytes).unwrap();
+    let d = palette::diff(Some(&old_pal), Some(&new_pal));
+    let skin = d.swatches.iter().find(|s| s.name == "Skin").unwrap();
+    assert_eq!(skin.change, "modified");
+    assert_eq!(skin.before.as_deref(), Some("#FF0000"));
+    assert_eq!(skin.after.as_deref(), Some("#0000FF"));
+}
+
 // --- scanner ---------------------------------------------------------------------------
 
 #[test]
@@ -482,6 +562,57 @@ fn rollback_restores_tree_as_new_commit() {
     // Rolling back to the current head (the tree already matches) is a no-op → Nothing.
     assert!(matches!(
         commit::rollback_to_commit(&mut r, &c3.id, "t"),
+        Err(KvcError::Nothing)
+    ));
+
+    // The historical rollback commit records what it restored.
+    assert_eq!(c3.restored_from.as_deref(), Some(c1.id.as_str()));
+}
+
+/// "Rolling back" to the version you're already on has nothing new to record — it should
+/// instead discard whatever's uncommitted and reset the working tree, in place.
+#[test]
+fn rollback_to_tip_discards_dirty_changes_without_new_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
+    // Second tracked file so the "D" branch has something real to restore.
+    std::fs::write(root.join("more.gpl"), b"kept").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+
+    // Dirty the tree *after* the tip commit: edit a tracked file, delete another, and add an
+    // untracked one — none of this was ever recorded.
+    std::fs::write(root.join("notes.gpl"), b"scratch edit").unwrap();
+    std::fs::remove_file(root.join("more.gpl")).unwrap();
+    std::fs::write(root.join("art.gpl"), b"never committed").unwrap();
+    assert!(!scan::scan(&r).unwrap().is_empty());
+
+    let tip = r.branches.tip().unwrap().to_string();
+    let restored = commit::rollback_to_commit(&mut r, &tip, "t").unwrap();
+
+    assert_eq!(
+        restored.id, tip,
+        "discard must not synthesize a new commit id"
+    );
+    assert_eq!(
+        r.commits.len(),
+        1,
+        "discarding to the tip must not record a new commit"
+    );
+    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v1");
+    assert_eq!(std::fs::read(root.join("more.gpl")).unwrap(), b"kept");
+    assert!(
+        !root.join("art.gpl").exists(),
+        "an untracked file must be discarded, not kept"
+    );
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    // Clean tree afterwards: rolling back to the tip again is a no-op → Nothing.
+    assert!(matches!(
+        commit::rollback_to_commit(&mut r, &tip, "t"),
         Err(KvcError::Nothing)
     ));
 }

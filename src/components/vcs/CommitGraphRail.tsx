@@ -1,16 +1,5 @@
 import { memo } from "react";
-import type { GraphRow } from "../../lib/graph";
-
-const LANE_W = 16;
-const ORIGIN_X = 12;
-
-export function railWidth(laneCount: number): number {
-  return ORIGIN_X + Math.max(1, laneCount) * LANE_W;
-}
-
-function laneX(lane: number): number {
-  return ORIGIN_X + lane * LANE_W;
-}
+import { laneX, railWidth, type GraphRow } from "../../lib/graph";
 
 /**
  * The graph rail for one commit row: vertical lane lines + branch/merge

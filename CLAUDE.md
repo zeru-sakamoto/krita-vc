@@ -197,7 +197,12 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   `colorset.xml` via roxmltree, `.aco`/`.ase` = hand-rolled big-endian binary readers), then
   `palette::diff` matches swatches by name (recolor = "modified", not remove+add) and
   `commands::palette_dto` serializes it as the `Palette` `DiffEntryDto` variant from `commit_diff`/
-  `working_diff`. A malformed palette degrades to a plain text entry. Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
+  `working_diff`. A malformed palette degrades to a plain text entry. A `.kra` diff also emits a
+  `Palette` entry per **embedded document palette** that changed — Krita stores document palettes
+  as `.kpl` blobs under `<image>/palettes/` inside the archive; `commands::kra_palette_dtos`
+  enumerates them via `KraSource::palette_entry_names`, skips unchanged ones by content hash, and
+  runs them through the same `palette_dto` (so one `.kra` yields its `Art` entry plus zero-or-more
+  `Palette` entries, keyed `<kra>::<palette-file>`). Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
   (one-line summary) on, `DiffFileBlock` (raw line diff with +/− and line numbers) off. Layer
   imagery is composited from **inline SVG markup strings** (`src/lib/svgArt.ts` — `layersBody`/
   `wrapSvg`/`compositeSvg`), which is how the backend's base64-PNG rasters render with no raster

@@ -25,6 +25,8 @@ interface InspectorProps {
   entries: DiffEntry[];
   /** The diff navigator's selection (which art file + which layer/composite), or null. */
   focus: { path: string; id: string } | null;
+  /** True when `commit` is the current branch tip — restoring it discards in place. */
+  isTip: boolean;
   onClose: () => void;
 }
 
@@ -87,7 +89,7 @@ function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null 
  * mirroring the diff navigator's layer/composite selection.
  * (DESIGN.md → Layout & App Shell → Inspector panel)
  */
-export function Inspector({ commit, version, entries, focus, onClose }: InspectorProps) {
+export function Inspector({ commit, version, entries, focus, isTip, onClose }: InspectorProps) {
   const { artistMode } = useArtistMode();
   const { rollbackToCommit, saving } = useRepository();
   const [confirmRestore, setConfirmRestore] = useState(false);
@@ -220,8 +222,9 @@ export function Inspector({ commit, version, entries, focus, onClose }: Inspecto
           }
         >
           <p className="text-[13px] leading-relaxed text-text-muted">
-            This copies that version's files into your working folder and saves the result as a new
-            version. Nothing in your history is lost — you can always come back.
+            {isTip
+              ? "This discards any unsaved changes and restores your last saved version. No new version is recorded."
+              : "This copies that version's files into your working folder and saves the result as a new version. Nothing in your history is lost — you can always come back."}
           </p>
           {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
         </Modal>

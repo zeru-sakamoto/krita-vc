@@ -118,7 +118,12 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   [`buildGraph`](../src/lib/graph.ts); node colors are stable **per branch**
   (`branchColorMap` — accent for the current branch, then `info`/`success`/`warning` tokens, a
   deliberate functional exception to the single-accent rule), and branch tips get a `BranchBadge`
-  on their commit card. Selection drives the main panel.
+  on their commit card. A rollback commit (`Commit.restoredFrom`) gets a dashed **elbow connector**
+  back to the version it restored (`buildRevertLinks` + `elbowPath` in `graph.ts`), routed through
+  a dedicated gutter left of the lanes so it never overlaps the solid lineage lines — since each
+  row is its own isolated rail SVG, `CommitGraph` measures real row pixel centers via a
+  `ResizeObserver` to draw this one overlay across non-adjacent rows. Selection drives the main
+  panel.
 - **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): a "Saving to
   `<BranchBadge>`" header (the current branch — a commit always lands on it), then working-tree
   changes (from `scan_repository`) grouped Staged / Unstaged, with per-file

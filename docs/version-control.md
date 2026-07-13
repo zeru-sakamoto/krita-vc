@@ -267,11 +267,19 @@ reconstructs from the manifest (`reconstruct_kra`), otherwise from the blob stre
 
 Two higher-level history operations build on this ([`commit.rs`](../src-tauri/src/commit.rs)):
 
-- **Rollback** (`rollback_to_commit`) — computes the target tree via `tree_at_commit` (the
-  first-parent fold), materializes it into the working tree (skipping files whose committed
-  content already matches the current tree, writing the rest, deleting ones that didn't exist at
-  the target) then records it as a **new** commit on the current branch via `commit_snapshot` —
-  non-destructive and reversible. Returns `Nothing` if the tree already matches.
+- **Rollback** (`rollback_to_commit`) — if `commit_id` is a **historical** (non-tip) commit:
+  computes its tree via `tree_at_commit` (the first-parent fold), materializes it into the
+  working tree (skipping files whose committed content already matches the current tree, writing
+  the rest, deleting ones that didn't exist at the target), then records it as a **new** commit on
+  the current branch — synthesized directly from the tree diff (every restored file's hash is
+  already known, so this skips a full `commit_snapshot` rescan) — non-destructive and reversible.
+  The new commit's `restored_from` is set to `commit_id`, so the history graph can draw a link back to it
+  (`CommitGraph`'s revert-link overlay in the frontend). If `commit_id` **is** the current branch
+  tip, there's nothing new to record, so it delegates to `discard_to_tip` instead: this scans the
+  **actual on-disk** working tree (`scan::scan_detailed`, not `current_tree` — which is derived
+  from committed history and would trivially already match the tip) and rewrites/removes exactly
+  the dirty files back to the tip's committed content, in place — no new commit. Either path
+  returns `Nothing` if there's nothing to do (tree already matches).
 - **Undo last commit** (`undo_last_commit`) — a *soft* reset of the **current branch tip** (which
   may sit mid-vec after a switch): removes that commit by id, rewinds the branch tip to its first
   parent, and rewinds only the index entries for the paths it touched (from the new tip's tree).
@@ -356,7 +364,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
-| `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; record a new commit. |
+| `rollback_to_commit(path, commitId, author)` | Restore the whole tree to a commit; records a new commit, unless `commitId` is the current tip — then it discards uncommitted changes in place instead. |
 | `undo_last_commit(path)` | Drop the last commit (keep working-tree changes); returns the new head or null. |
 | `commit_diff(path, commitId)` | The commit's visual diff: `.kra` files as art diffs (**composite + layer metadata + change regions**, no per-layer rasters — those load lazily), palette files as **swatch diffs** (`palette` entries — see [Palette diffs](#palette-diffs)), others as minimal text entries. |
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |

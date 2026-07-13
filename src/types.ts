@@ -43,6 +43,8 @@ export interface Commit {
   parents: string[];
   /** Branch this commit belongs to — used for graph lane coloring/labels. */
   branch?: string;
+  /** For a rollback commit, the id of the historical commit it restored — draws a graph link. */
+  restoredFrom?: string;
 }
 
 export type DiffLineKind = "add" | "del" | "context" | "hunk";

@@ -35,7 +35,9 @@ files, where git's text-oriented delta model performs poorly.
     with hex values). The inspector shows the selected layer's details (type, visibility, opacity,
     blend, painted bounds) or the composite's size, resolution, and color space.
 - **Real local version control** — commit the whole working tree, browse history as a branch-aware
-  graph, and roll back / undo commits.
+  graph, and roll back / undo commits. Rolling back to the version you're already on just discards
+  unsaved changes in place (no new history entry); rolling back to an older one records a new
+  commit, linked back to it in the graph by a dashed connector.
 - **Branching & merging** — create, switch, merge (fast-forward or two-parent), and delete local
   branches, all backed by real tree materialization.
 - **Storage housekeeping** — a "Clean up storage" action reclaims history unreachable from any

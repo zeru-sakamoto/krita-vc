@@ -460,6 +460,9 @@ pub struct Commit {
     /// (merge commits record every path where the merged result differs from the first parent).
     /// `tree_at_commit` relies on this to fold along the first-parent chain only.
     pub files: Vec<CommittedFile>,
+    /// Id of the commit a rollback restored, for the history graph's link line. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<String>,
 }
 
 /// Local branches: name -> tip commit id (`""` = branch has no commits yet).
