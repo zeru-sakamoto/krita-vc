@@ -1,8 +1,8 @@
 [package]
 name = "krita-vc"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.2.0"
+description = "Krita Version Control"
+authors = ["Zeru Sakamoto"]
 edition = "2021"
 # Two [[bin]] targets now exist (the Tauri app + the headless `kvc` CLI); tell bare
 # `cargo run` (what Tauri's dev/build commands invoke) which one to launch.
