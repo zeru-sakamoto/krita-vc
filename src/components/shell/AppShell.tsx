@@ -10,7 +10,13 @@ import { MainPanel } from "../MainPanel";
 import { IconButton } from "../ui/IconButton";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
-import { useBranches, useCommits, useCommitDiff, useWorkingDiff } from "../../lib/repoData";
+import {
+  useBranches,
+  useCommits,
+  useCommitDiff,
+  useWorkingDiff,
+  type DiffResult,
+} from "../../lib/repoData";
 import { versionLabel, versionNumbers, assetName } from "../../lib/friendly";
 import type { Repository } from "../../types";
 
@@ -85,24 +91,27 @@ function RepoShell({ repo }: { repo: Repository }) {
   );
   const selectedVersion = selectedId ? (versions.get(selectedId) ?? 0) : 0;
 
-  // In the Changes view, a clicked file shows its working-tree diff; otherwise the selected
-  // commit's diff. Both hooks run (the inactive one gets a null id and stays empty).
-  const showWorking = activeView === "changes" && focusedFile != null;
+  // The Changes view never shows History's selection, focused file or not — a leftover
+  // `selectedId`/`selectedCommit` from History must not leak into the toolbar, canvas, or
+  // Inspector once the user switches tabs. `showWorking` narrows further: only true once a
+  // changed file is actually focused, which is when there's a real working-tree diff to fetch.
+  const inChanges = activeView === "changes";
+  const showWorking = inChanges && focusedFile != null;
   const commitDiff = useCommitDiff(repo.path, selectedId);
   const workingDiff = useWorkingDiff(repo.path, showWorking ? focusedFile : null, refreshNonce);
+  const emptyDiff: DiffResult = { entries: [], error: null, loading: false };
   const {
     entries: diff,
     error: diffError,
     loading: diffLoading,
-  } = showWorking ? workingDiff : commitDiff;
+  } = inChanges ? (showWorking ? workingDiff : emptyDiff) : commitDiff;
   const activeFile = diff[0]?.path ?? null;
 
-  const emptyHint =
-    activeView === "changes"
-      ? "Select a changed file to preview."
-      : artistMode
-        ? "Select a version to view its changes."
-        : "Select a commit to view its diff.";
+  const emptyHint = inChanges
+    ? "Select a changed file to preview."
+    : artistMode
+      ? "Select a version to view its changes."
+      : "Select a commit to view its diff.";
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-text">
@@ -128,15 +137,19 @@ function RepoShell({ repo }: { repo: Repository }) {
           <div className="flex min-w-0 flex-1 flex-col border-l border-border">
             {/* Toolbar — commit context (left) + inspector toggle (right) */}
             <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-              {showWorking ? (
-                <>
-                  <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
-                    Unsaved changes
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-[13px] text-text">
-                    {artistMode ? assetName(focusedFile) : focusedFile}
-                  </span>
-                </>
+              {inChanges ? (
+                showWorking ? (
+                  <>
+                    <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+                      Unsaved changes
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-[13px] text-text">
+                      {artistMode ? assetName(focusedFile) : focusedFile}
+                    </span>
+                  </>
+                ) : (
+                  <span className="flex-1 text-[13px] text-text-muted">No changes to show</span>
+                )
               ) : selectedCommit ? (
                 <>
                   <span
@@ -172,17 +185,19 @@ function RepoShell({ repo }: { repo: Repository }) {
                 loading={diffLoading}
                 emptyHint={emptyHint}
                 repoPath={repo.path}
-                commitId={showWorking ? null : selectedId}
+                commitId={inChanges ? null : selectedId}
                 working={showWorking}
                 nonce={refreshNonce}
                 onFocus={setFocus}
               />
               {inspectorOpen && (
                 <Inspector
-                  commit={selectedCommit}
+                  commit={inChanges ? null : selectedCommit}
                   version={selectedVersion}
                   entries={diff}
                   focus={focus}
+                  working={inChanges}
+                  focusedFile={focusedFile}
                   isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
                   onClose={() => setInspectorOpen(false)}
                 />

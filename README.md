@@ -7,13 +7,13 @@ synced zoom/pan) of each `.kra` file.
 
 > **Status:** fully working end to end. The Rust backend is a **real, custom local VCS** with its
 > own `.kvc/` store (not git) and a `.kra` tile-delta engine; the React frontend drives it over
-> Tauri IPC. There is **no mock data** — in a plain browser the UI renders but all repository
+> Tauri IPC. There is **no mock data**: in a plain browser the UI renders, but all repository
 > actions are no-ops (UI-development mode only).
 
 ## What it is (and isn't)
 
 This is a **local-only** version-control system. There is intentionally **no remote, push, pull, or
-cloud sync** — no accounts, no server, nothing leaves your machine. A "repository" is just a folder
+cloud sync**: no accounts, no server, nothing leaves your machine. A "repository" is just a folder
 you designate; the app creates a `.kvc/` store inside it and tracks the art files there. The UI
 exposes only local operations: commit history, working-tree changes, and local branches.
 
@@ -22,11 +22,11 @@ files, where git's text-oriented delta model performs poorly.
 
 ## Features
 
-- **Visual layer diffs** for `.kra` files — a Krita-style layer panel beside a before/after canvas.
+- **Visual layer diffs** for `.kra` files: a Krita-style layer panel beside a before/after canvas.
   - **Side-by-side** and **swipe slider** compare modes.
-  - **Synced zoom & pan** — wheel to zoom toward the cursor, space- or middle-mouse-drag to pan;
+  - **Synced zoom & pan**: wheel to zoom toward the cursor, space- or middle-mouse-drag to pan,
     applied identically across both modes so before/after and the slider divider stay aligned.
-  - **Changed-pixel highlighting** — a true per-pixel diff (toggle on/off), with a coarse
+  - **Changed-pixel highlighting**: a true per-pixel diff (toggle on/off), with a coarse
     region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
     only *that* layer's changed pixels, not the whole-file silhouette. Its color always matches
     the active **theme's accent** (see Settings below).
@@ -34,35 +34,37 @@ files, where git's text-oriented delta model performs poorly.
     `.kpl`, `.aco`, `.ase`) render as a color-by-color swatch diff (added / removed / recolored,
     with hex values). The inspector shows the selected layer's details (type, visibility, opacity,
     blend, painted bounds) or the composite's size, resolution, and color space.
-- **Real local version control** — commit the whole working tree, browse history as a branch-aware
+- **Real local version control**: commit the whole working tree, browse history as a branch-aware
   graph, and roll back / undo commits. Rolling back to the version you're already on just discards
   unsaved changes in place (no new history entry); rolling back to an older one records a new
   commit, linked back to it in the graph by a dashed connector.
-- **Branching & merging** — create, switch, merge (fast-forward or two-parent), and delete local
+- **Branching & merging**: create, switch, merge (fast-forward or two-parent), and delete local
   branches, all backed by real tree materialization.
-- **Storage housekeeping** — a "Clean up storage" action reclaims history unreachable from any
+- **Storage housekeeping**: a "Clean up storage" action reclaims history unreachable from any
   branch tip (mark-and-sweep GC), and the raster preview cache is size-budgeted with LRU pruning.
-- **Settings** (activity-bar gear) — one place for user preferences: the Artist Mode toggle, a
-  **theme selector** (8 color themes, including a true-black option, applied instantly via CSS —
-  the visual-diff highlight color follows the chosen theme's accent), the **author name** signed
-  on your versions, and per-repository **preview-cache size**, **compact-storage**, and
+- **Settings** (activity-bar gear). One place for user preferences: the Artist Mode toggle, a
+  **custom title bar** toggle (a frameless window with its own draggable title bar and window
+  controls, on by default; switch back to your OS's native frame any time, no restart needed), a
+  **theme selector** (8 color themes, including a true-black option, applied instantly via CSS,
+  with the visual-diff highlight color following the chosen theme's accent), the **author name**
+  signed on your versions, and per-repository **preview-cache size**, **compact-storage**, and
   **low-memory diffs** options, plus "Clean up storage".
-- **Artist Mode** — a global toggle (default on) that swaps git/code jargon for plain language
+- **Artist Mode**: a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).
 
 ## How it works
 
-- **Custom `.kvc/` store** — chains are sharded per tracked file (lazy-loaded), loose objects are
+- **Custom `.kvc/` store**: chains are sharded per tracked file (lazy-loaded), loose objects are
   sharded 256-way, and a commit with many new objects writes a single pack file instead of many
   loose files (per-file creates dominated large commits on Windows).
-- **Tracked file types** — the scanner only tracks files Krita VCS understands: `.kra` documents
+- **Tracked file types**: the scanner only tracks files Krita VCS understands: `.kra` documents
   and the color-palette formats (`.gpl`, `.kpl`, `.aco`, `.ase`). Anything else in the folder is
-  left untouched — never staged or committed.
-- **`.kra` tile-delta engine** — `.kra` files are ZIP archives of per-layer tiles; the engine diffs
+  left untouched and is never staged or committed.
+- **`.kra` tile-delta engine**: `.kra` files are ZIP archives of per-layer tiles; the engine diffs
   and stores them at the tile level, so a small edit to one layer stores a small delta, not a whole
   new file.
-- **Two-stage visual diffs** — `commit_diff` returns the capped composite + layer metadata fast,
+- **Two-stage visual diffs**: `commit_diff` returns the capped composite + layer metadata fast,
   then per-layer rasters **stream** in over a Tauri channel as each finishes. Rasters are cached
   content-addressed in `.kvc/cache/` and served to the webview as browser-cacheable `kvcimg://`
   URLs. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md) and
@@ -77,11 +79,11 @@ npm install          # install JS dependencies
 npm run tauri dev    # run the full desktop app (Vite dev server + Tauri webview)
 ```
 
-Then use the top-bar repository switcher to **Create** or **Browse** to a folder — that becomes a
+Then use the top-bar repository switcher to **Create** or **Browse** to a folder; that becomes a
 local repository (a `.kvc/` store is initialized inside it). Drop a `.kra` file in, commit, edit it
 in Krita, and commit again to see a visual diff.
 
-Frontend-only (in a browser, no Tauri shell — UI development only, no backend):
+Frontend-only (in a browser, no Tauri shell; UI development only, no backend):
 
 ```bash
 npm run dev          # Vite dev server at http://localhost:1420
@@ -132,21 +134,21 @@ krita-plugin/  — optional Krita docker plugin (see below)
 
 ## Krita plugin
 
-A companion "Version Control" docker for Krita itself — commit, quick-checkpoint, and
+A companion "Version Control" docker for Krita itself: commit, quick-checkpoint, and
 branch-switch without alt-tabbing to this app. It's a small Python (PyKrita) plugin that
 shells out to `kvc`, a headless CLI built from the same Rust engine
-(`src-tauri/src/bin/kvc.rs`, no Tauri dependency) — so the plugin and the desktop app
+(`src-tauri/src/bin/kvc.rs`, no Tauri dependency), so the plugin and the desktop app
 always go through identical commit/branch code against the same `.kvc` store. See
 [`krita-plugin/README.md`](krita-plugin/README.md) for build + install steps.
 
 ## Documentation
 
-- [`docs/`](docs/README.md) — frontend architecture, the file-tracking / version-control backend,
+- [`docs/`](docs/README.md): frontend architecture, the file-tracking / version-control backend,
   the visual diff viewer, and performance.
-- [`krita-plugin/README.md`](krita-plugin/README.md) — the in-Krita commit docker: install,
+- [`krita-plugin/README.md`](krita-plugin/README.md): the in-Krita commit docker: install,
   usage, and troubleshooting.
-- [`DESIGN.md`](DESIGN.md) — design tokens, components, and interaction spec.
-- [`CLAUDE.md`](CLAUDE.md) — repo guidance and commands.
+- [`DESIGN.md`](DESIGN.md): design tokens, components, and interaction spec.
+- [`CLAUDE.md`](CLAUDE.md): repo guidance and commands.
 
 ## Recommended IDE setup
 

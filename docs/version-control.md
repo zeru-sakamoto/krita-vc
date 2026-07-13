@@ -196,7 +196,13 @@ decompose it into streams so small edits stay small:
   only stores those tiles. Tiles are `prepare_stream`'d **in parallel** (`rayon`) — the diff/zstd
   work fans across cores — then `commit_prepared` serially (each tile is a distinct key, so no
   race), which is the bulk of a commit's cost.
-- **Every other archive entry** becomes one stream (`kra:<path>:entry:<name>`).
+- **Every other archive entry** becomes one stream (`kra:<path>:entry:<name>`) — including a
+  tiled layer's sibling `<entry>.defaultpixel` file, if Krita wrote one: the fill color for any
+  pixel the layer's tiles don't cover (Krita only tiles a layer's painted-on regions, so a
+  uniformly-filled layer — a solid "Background" layer, most commonly — is otherwise mostly
+  untiled). Raster reconstruction for the diff viewer reads this back to seed the canvas before
+  blitting real tiles on top, instead of defaulting to transparent (see
+  [visual-diff-viewer.md](visual-diff-viewer.md)).
 - A **JSON manifest** (`kra:<path>:manifest`) records entry order, per-entry blob hashes, per-tile
   refs, and each entry's zip **crc32 + uncompressed size** — enough to reassemble a logically
   identical archive (`mimetype` stays first and stored; tiles re-emitted uncompressed in their

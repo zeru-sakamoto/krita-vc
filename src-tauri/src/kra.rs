@@ -1078,6 +1078,7 @@ fn raster_cache_key(
     tiles: &mut [(i64, i64, &str)],
     width: i64,
     height: i64,
+    default_pixel: Option<[u8; 4]>,
 ) -> String {
     tiles.sort_unstable();
     let mut h = blake3::Hasher::new();
@@ -1091,6 +1092,9 @@ fn raster_cache_key(
         )
         .as_bytes(),
     );
+    // Fold in the default-pixel fill so a change there (with no tile record touched) still
+    // invalidates the cache — see `decode_default_pixel`.
+    h.update(&default_pixel.unwrap_or([0, 0, 0, 0]));
     for (x, y, hash) in tiles.iter() {
         h.update(format!("\0{x},{y},{hash}").as_bytes());
     }
@@ -1135,6 +1139,34 @@ pub struct LayerRaster {
     pub key: String,
 }
 
+/// A tiled entry only stores tiles for its painted-on regions — Krita fills everything else
+/// (e.g. a freshly created, uniformly-colored layer with few or no real tiles, like a solid
+/// white "Background" layer) from a sibling `<entry path>.defaultpixel` archive entry: one
+/// pixel's raw bytes in the layer's native channel order (BGRA for the RGBA8 tiles this parser
+/// supports). `None` for any other size — caller then keeps the transparent-zero fallback.
+fn decode_default_pixel(bytes: &[u8]) -> Option<[u8; 4]> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    Some([bytes[2], bytes[1], bytes[0], bytes[3]]) // BGRA -> RGBA
+}
+
+/// [`decode_default_pixel`] for a committed manifest's sibling `.defaultpixel` entry.
+fn default_pixel_rgba(
+    repo: &Repo,
+    relpath: &str,
+    manifest: &KraManifest,
+    entry_path: &str,
+) -> Option<[u8; 4]> {
+    let name = format!("{entry_path}.defaultpixel");
+    let blob = manifest.entries.iter().find_map(|e| match e {
+        KraEntry::Raw { path, blob, .. } if *path == name => Some(blob.as_str()),
+        _ => None,
+    })?;
+    let bytes = repo.reconstruct(&entry_key(relpath, &name), blob).ok()?;
+    decode_default_pixel(&bytes)
+}
+
 /// Reconstruct one paint layer's pixels as a full `width`x`height` PNG data URL, or `None` if
 /// the layer has no tile data / uses an unsupported colorspace.
 pub fn layer_raster(
@@ -1168,9 +1200,10 @@ pub fn layer_raster(
         return Ok(None); // ponytail: RGBA8 tiles only.
     }
     let cache_dir = repo.cache_dir();
+    let default_pixel = default_pixel_rgba(repo, relpath, manifest, &entry_path);
     let mut key_tiles: Vec<(i64, i64, &str)> =
         refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
-    let key = raster_cache_key(&entry_path, &mut key_tiles, width, height);
+    let key = raster_cache_key(&entry_path, &mut key_tiles, width, height, default_pixel);
     if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
         let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
         return Ok(Some(LayerRaster { url, png, key }));
@@ -1195,6 +1228,11 @@ pub fn layer_raster(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut canvas = vec![0u8; (width * height * 4) as usize];
+    if let Some(fill) = default_pixel {
+        for px in canvas.chunks_exact_mut(4) {
+            px.copy_from_slice(&fill);
+        }
+    }
     for (x, y, px) in decoded.into_iter().flatten() {
         crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
     }
@@ -1635,6 +1673,11 @@ impl WorkingKra {
             .and_then(|p| p.parent())
             .unwrap_or(cache_dir)
             .to_path_buf();
+        // See `default_pixel_rgba`'s doc comment: the sibling `.defaultpixel` entry fills
+        // whatever the tile records don't cover.
+        let default_pixel = self
+            .entry_bytes(&format!("{entry_path}.defaultpixel"))
+            .and_then(|b| decode_default_pixel(&b));
         match &self.source {
             // Normal mode: tiles carry their data — rasterize straight from RAM.
             None => {
@@ -1649,7 +1692,15 @@ impl WorkingKra {
                     })
                     .expect("tiled entry located above");
                 rasterize_working_tiles(
-                    entry_path, &header, tiles, &hashes, width, height, cache_dir, &root,
+                    entry_path,
+                    &header,
+                    tiles,
+                    &hashes,
+                    width,
+                    height,
+                    cache_dir,
+                    &root,
+                    default_pixel,
                 )
             }
             // Low-memory mode: re-inflate just this layer entry, then rasterize it.
@@ -1668,6 +1719,7 @@ impl WorkingKra {
                     height,
                     cache_dir,
                     &root,
+                    default_pixel,
                 )
             }
         }
@@ -1688,6 +1740,7 @@ fn rasterize_working_tiles(
     height: i64,
     cache_dir: &std::path::Path,
     root: &std::path::Path,
+    default_pixel: Option<[u8; 4]>,
 ) -> Result<Option<LayerRaster>> {
     let (tw, th, ps) = tile_dims(header);
     if tw <= 0 || th <= 0 || ps != 4 {
@@ -1698,7 +1751,7 @@ fn rasterize_working_tiles(
         .zip(hashes)
         .map(|(t, h)| (t.x, t.y, h.as_str()))
         .collect();
-    let key = raster_cache_key(entry_path, &mut key_tiles, width, height);
+    let key = raster_cache_key(entry_path, &mut key_tiles, width, height, default_pixel);
     if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
         let url = crate::raster::raster_url(root, cache_dir, &key, &png);
         return Ok(Some(LayerRaster { url, png, key }));
@@ -1712,6 +1765,11 @@ fn rasterize_working_tiles(
         })
         .collect();
     let mut canvas = vec![0u8; (width * height * 4) as usize];
+    if let Some(fill) = default_pixel {
+        for px in canvas.chunks_exact_mut(4) {
+            px.copy_from_slice(&fill);
+        }
+    }
     for (x, y, px) in decoded {
         crate::raster::blit(&mut canvas, width, height, x, y, &px, tw, th);
     }

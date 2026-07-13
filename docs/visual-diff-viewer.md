@@ -181,10 +181,14 @@ stages** so the panel appears immediately instead of blocking on every layer's r
    [`useArtLayers`](../src/lib/repoData.ts) and **streamed**: the command takes a Tauri
    `Channel<LayerDto>` and sends each layer the moment its rasters finish (rayon-parallel, so
    out of order; the frontend merges by layer id over the metadata from stage 1). Each layer's
-   pixels are reconstructed from stored tiles (LZF-decoded, planar BGRA → RGBA, downscaled to
-   ≤`MAX_RASTER_DIM` via an **area-average box filter** — `raster::cap_rgba`/`box_downscale`, in
-   premultiplied-alpha space so transparent edges don't bleed dark; sharper than the old
-   nearest-neighbour under zoom), PNG-encoded) and arrive as **SVG `<image href="data:image/png;base64,…">`
+   pixels are reconstructed from stored tiles (LZF-decoded, planar BGRA → RGBA) blitted onto a
+   canvas seeded from that entry's sibling `.defaultpixel` archive entry — Krita only stores
+   tiles for a layer's painted-on regions, so a uniformly-filled layer (e.g. a solid "Background"
+   layer) is otherwise mostly or entirely untiled; without this fill, those regions decoded as
+   transparent instead of their real color. The canvas is then downscaled to ≤`MAX_RASTER_DIM`
+   via an **area-average box filter** — `raster::cap_rgba`/`box_downscale`, in premultiplied-alpha
+   space so transparent edges don't bleed dark; sharper than the old nearest-neighbour under
+   zoom), PNG-encoded) and arrive as **SVG `<image href="data:image/png;base64,…">`
    markup** in `ArtLayer.before`/`after`. A **modified** layer also carries its own
    `diffImage`/`diffOutline`/`regions` in the same `LayerDto` (diffed from the before/after rasters
    the stream already decoded), so the highlight follows the selected layer. `layersBody`/`wrapSvg`/
@@ -199,7 +203,8 @@ with different canvas dimensions letterboxes instead of stretching.
 
 **Caching:** every capped PNG (composite and per-layer) is written to **`.kvc/cache/`**, keyed by
 a hash of the content that produced it (composite: the entry's content hash; layer: tile
-positions + hashes + dims + cap). Keys are content-derived, so entries never invalidate, unchanged
+positions + hashes + dims + cap + the resolved `.defaultpixel` fill, so a fill-only change with
+no tile touched still invalidates the cache). Keys are content-derived, so entries never invalidate, unchanged
 layers share one entry across commits and across the committed/working paths, and a repeat view —
 including after an app restart — skips reconstruct/decode/encode entirely. In-session, the
 frontend also memoizes `commit_diff` results and streamed layer sets (small LRU maps in

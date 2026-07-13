@@ -44,7 +44,7 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 | Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
-| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable; selected commit's version/hash, author, date, message, changed files, plus a **Selected** section that mirrors the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
+| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, changed files, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
 | Status bar | [`StatusBar`](../src/components/shell/StatusBar.tsx) | Active file, branch, commit/version count. |
 
 The center toolbar (in `AppShell`) holds the inspector show/hide button. The **Artist view**
@@ -65,8 +65,8 @@ State lives in `RepoShell` and flows down via props:
 
 | State | Drives |
 |-------|--------|
-| `activeView` | Which sidebar panel renders; the active activity-bar icon. |
-| `selectedId` | Selected commit → main-panel diff + inspector. |
+| `activeView` | Which sidebar panel renders; the active activity-bar icon. Also gates the toolbar header, main-panel diff, and Inspector: switching to `"changes"` immediately drops any History selection from all three (derived `inChanges` flag), regardless of whether a working file happens to be focused yet. |
+| `selectedId` | Selected commit → main-panel diff + inspector, but only while `activeView !== "changes"`. |
 | `inspectorOpen` | Inspector visibility. |
 | `focus` | The diff navigator's layer/composite pick (`{ path, id }`), reported up by `ArtDiffView`'s `onFocus` → the Inspector's **Selected** section. |
 

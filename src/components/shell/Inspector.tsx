@@ -25,6 +25,10 @@ interface InspectorProps {
   entries: DiffEntry[];
   /** The diff navigator's selection (which art file + which layer/composite), or null. */
   focus: { path: string; id: string } | null;
+  /** True when showing uncommitted working-tree changes rather than a selected commit. */
+  working: boolean;
+  /** The focused file's path, when `working` is true. */
+  focusedFile: string | null;
   /** True when `commit` is the current branch tip — restoring it discards in place. */
   isTip: boolean;
   onClose: () => void;
@@ -89,7 +93,16 @@ function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null 
  * mirroring the diff navigator's layer/composite selection.
  * (DESIGN.md → Layout & App Shell → Inspector panel)
  */
-export function Inspector({ commit, version, entries, focus, isTip, onClose }: InspectorProps) {
+export function Inspector({
+  commit,
+  version,
+  entries,
+  focus,
+  working,
+  focusedFile,
+  isTip,
+  onClose,
+}: InspectorProps) {
   const { artistMode } = useArtistMode();
   const { rollbackToCommit, saving } = useRepository();
   const [confirmRestore, setConfirmRestore] = useState(false);
@@ -125,13 +138,38 @@ export function Inspector({ commit, version, entries, focus, isTip, onClose }: I
       {/* Single header row — py-1.5, aligns with the "Modified Hero" file header */}
       <div className="flex shrink-0 items-center border-b border-border bg-surface-2 px-3 py-2 h-8">
         <span className="flex-1 text-[11px] font-medium uppercase tracking-wide text-text-muted">
-          {artistMode ? "Version" : "Commit"}
+          {working ? "Changes" : artistMode ? "Version" : "Commit"}
         </span>
         <IconButton icon={X} label="Close inspector" size={16} onClick={onClose} />
       </div>
       {/* Scrollable content */}
       <div className="min-h-0 flex-1 overflow-auto bg-surface">
-        {!commit ? (
+        {working ? (
+          focusedFile ? (
+            <div className="flex flex-col">
+              <div className="border-b border-border py-1">
+                <MetaRow label="Status">
+                  <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+                    Unsaved changes
+                  </span>
+                </MetaRow>
+                <MetaRow label="File">
+                  <span className={["selectable", artistMode ? "" : "font-mono"].join(" ")}>
+                    {artistMode ? assetName(focusedFile) : focusedFile}
+                  </span>
+                </MetaRow>
+              </div>
+
+              {showSelected && focusedArt && (
+                <SelectedDetails art={focusedArt} layer={focusedLayer} />
+              )}
+            </div>
+          ) : (
+            <div className="grid h-full place-items-center px-6 text-center text-[12px] text-text-muted">
+              No changes to show.
+            </div>
+          )
+        ) : !commit ? (
           <div className="grid h-full place-items-center px-6 text-center text-[12px] text-text-muted">
             Select a commit to inspect its details.
           </div>
@@ -189,7 +227,7 @@ export function Inspector({ commit, version, entries, focus, isTip, onClose }: I
       </div>
 
       {/* Restore (rollback) action */}
-      {commit && (
+      {!working && commit && (
         <div className="shrink-0 border-t border-border bg-surface-2 px-3 py-2">
           <Button
             variant="default"

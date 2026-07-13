@@ -804,6 +804,64 @@ fn kra_layer_raster_decodes_to_png() {
 }
 
 #[test]
+fn kra_layer_raster_fills_untiled_region_from_default_pixel() {
+    // Krita only stores tiles for a layer's painted-on regions; anywhere else — e.g. most of a
+    // freshly created, uniformly-filled "Background" layer — is filled from a sibling
+    // `<entry>.defaultpixel` file instead. A 128x64 canvas with one real 64x64 tile on the left
+    // and a `.defaultpixel` covering the rest must decode to that fill color on the right, not
+    // transparent black.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let maindoc = br#"<!DOCTYPE DOC>
+<DOC><IMAGE name="img" width="128" height="64"><layers>
+<layer name="Background" uuid="bg" opacity="255" compositeop="normal" nodetype="paintlayer" filename="layer1"/>
+</layers></IMAGE></DOC>"#
+        .to_vec();
+
+    let kra = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(10, 20, 30, 255))]),
+        ),
+        // BGRA opaque white — the untiled region's fill.
+        ("img/layers/layer1.defaultpixel", vec![255, 255, 255, 255]),
+        ("mergedimage.png", b"\x89PNG\r\n\x1a\n fake".to_vec()),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra).unwrap();
+    let c = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    let manifest_hash = c
+        .files
+        .iter()
+        .find(|f| f.path == "art.kra")
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+    let manifest = kra::load_manifest(&r, "art.kra", &manifest_hash).unwrap();
+
+    let cache = delta::TileCache::new();
+    let rst = kra::layer_raster(&r, "art.kra", &manifest, "img", "layer1", 128, 64, &cache)
+        .unwrap()
+        .expect("layer1 should decode to a raster");
+
+    let (pixels, w, h, has_alpha, _) = raster::decode_png_plain(&rst.png).expect("valid PNG");
+    assert!(has_alpha);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        &pixels[i..i + 4]
+    };
+    // Untiled region (right half): the default-pixel fill, fully opaque — not transparent.
+    assert_eq!(px(w * 3 / 4, h / 2), [255, 255, 255, 255]);
+    // Tiled region (left half): the real painted color, unaffected by the default pixel.
+    assert_eq!(px(w / 4, h / 2), [10, 20, 30, 255]);
+}
+
+#[test]
 fn parse_image_meta_reads_richer_fields() {
     let xml = br#"<!DOCTYPE DOC>
 <DOC><IMAGE name="img" width="64" height="64" x-res="300" y-res="300" colorspacename="RGBA" profile="sRGB-elle-V2-srgbtrc.icc"><layers>
