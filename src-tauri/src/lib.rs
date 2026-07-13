@@ -43,6 +43,7 @@ pub fn run() {
             commands::restore_file,
             commands::rollback_to_commit,
             commands::undo_last_commit,
+            commands::discard_changes,
             commands::commit_diff,
             commands::commit_layers,
             commands::working_diff,

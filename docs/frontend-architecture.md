@@ -43,8 +43,8 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 | Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
 | Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
-| Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders the selected commit's diff (art-diff canvas height is drag-resizable), or an empty state. |
-| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, changed files, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
+| Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders **one selected file** of the current commit/working diff (art-diff canvas height is drag-resizable), or an empty state. Which file is chosen by the Inspector's file list (`selectedFile`/`onSelectFile`, lifted to `RepoShell`); a multi-file commit no longer stacks every file's diff at once. |
+| Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode's **changed-files list doubles as the main panel's file selector** — click a row to show that file in `DiffView`; a `.kra` row with an embedded document palette gets a palette sub-row that jumps straight to that palette's pane (`focusId`), and standalone palette files get their own row under a separate "Palettes" heading. Also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
 | Status bar | [`StatusBar`](../src/components/shell/StatusBar.tsx) | Active file, branch, commit/version count. |
 
 The center toolbar (in `AppShell`) holds the inspector show/hide button. The **Artist view**
@@ -69,9 +69,11 @@ State lives in `RepoShell` and flows down via props:
 | `selectedId` | Selected commit → main-panel diff + inspector, but only while `activeView !== "changes"`. |
 | `inspectorOpen` | Inspector visibility. |
 | `focus` | The diff navigator's layer/composite pick (`{ path, id }`), reported up by `ArtDiffView`'s `onFocus` → the Inspector's **Selected** section. |
+| `selectedFile` / `selectedFocusId` | Which file (among possibly several in the current diff) `DiffView` renders, and an optional navigator id to seed its view with (e.g. jump straight to an embedded palette). Set by the Inspector's file list; defaults to the diff's first top-level entry and resets when the diff changes and the current selection no longer applies. |
 
 Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) — `useCommits`
-(branch-scoped history), `useBranches` (local branches + current + tips), `useWorkingDiff`
+(branch-scoped history), `useBranches` (local branches + current + tips), `useWorkingChanges`
+(the real `scan_repository` result + a UI-only `staged` flag per file), `useWorkingDiff`
 (working-tree visual diffs), `useArtLayers` (streamed per-layer rasters) — all keyed by the
 selected repository path and the shared `refreshNonce`. `useCommitDiff` (committed visual
 diffs) keys only on path + commit id: a commit's diff is immutable once made, so it never needs
@@ -91,16 +93,20 @@ sent as the `author` on new commits/merges/rollbacks, falling back to `"You"` wh
 readable outside React via `readAuthorName()` for `repository.tsx`'s callbacks), and the
 selected repository ([`src/lib/repository.tsx`](../src/lib/repository.tsx) — list + `currentId`,
 persisted to `localStorage`; the `TopBar` switcher reads it). The repository context also owns
-`refreshNonce`/`refresh` (force a scan/history refetch) and the shared `saving` / `busyMessage` /
-`scanning` busy flags — `saving` locks staging and drives the `StatusBar` progress bar during a
-commit, `busyMessage` (a human-readable label, or `null` when idle) drives the full-screen
-`BusyOverlay` during any write op, `scanning` spins the Changes refresh button. All five providers
-are mounted in [`App.tsx`](../src/App.tsx).
+`refreshNonce`/`refresh` (force a scan/history refetch), `discardChanges(paths)` (discard
+uncommitted changes — empty `paths` discards everything dirty, otherwise just those relative
+paths; used by `ChangesPanel`'s per-file discard and `Sidebar`'s "Discard current changes"), and
+the shared `saving` / `busyMessage` / `scanning` busy flags — `saving` locks staging and drives the
+`StatusBar` progress bar during a commit, `busyMessage` (a human-readable label, or `null` when
+idle) drives the full-screen `BusyOverlay` during any write op, `scanning` spins the Changes
+refresh button. All five providers are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
-(`Sidebar`), the art-diff canvas height (`ArtDiffView`), per-file staging toggles (`ChangesPanel`),
-modal open/close state (`BranchesPanel`, `Sidebar`), and the diff view/compare/highlight controls
-(`ArtDiffView`).
+(`Sidebar`), the art-diff canvas height (`ArtDiffView`), modal open/close state (`BranchesPanel`,
+`Sidebar`), and the diff view/compare/highlight controls (`ArtDiffView`). The working-tree items
++ per-file staged flag are the one exception: `useWorkingChanges` (below) is called in `Sidebar`,
+not `ChangesPanel`, and passed down as props, since `Sidebar`'s "Discard current changes" action
+needs the same staged/unstaged split without a second scan.
 Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize.ts) hook
 (pointer-capture drag, clamped, persisted under a `krita-vc:` key).
 
@@ -126,11 +132,17 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   panel.
 - **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): a "Saving to
   `<BranchBadge>`" header (the current branch — a commit always lands on it), then working-tree
-  changes (from `scan_repository`) grouped Staged / Unstaged, with per-file
-  and **Stage all / Unstage all** toggles. Staging is cosmetic — `commit_snapshot` captures the
-  whole working tree. While a commit is in flight the staging controls lock, the commit button
-  shows a spinner, the `StatusBar` shows an indeterminate progress bar (shared `saving` flag),
-  and `BusyOverlay` blocks the app (`busyMessage`).
+  changes grouped Staged / Unstaged, with per-file and **Stage all / Unstage all** toggles.
+  Staging is **real**: `commit_snapshot`'s optional `paths` (`commit::commit_selected` in Rust)
+  restricts the commit to the staged relative paths, leaving the rest dirty. Hitting "Commit
+  version" with nothing staged, or with only some files staged, shows a confirm `Modal` first
+  (commit everything anyway / commit only the staged files) before calling through; all-staged
+  commits right away. Each row also has a **discard** button (reverts just that file to its last
+  saved version, behind a confirm modal); the sidebar's `…` menu adds "Discard current changes"
+  (all *unstaged* files at once — staged files are left alone), both backed by the repository
+  context's `discardChanges`. While a commit or discard is in flight the staging controls lock,
+  the commit button shows a spinner, the `StatusBar` shows an indeterminate progress bar (shared
+  `saving` flag), and `BusyOverlay` blocks the app (`busyMessage`).
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
   list with **real actions** — click a branch to switch, hover (or keyboard-focus) a row for
   "Merge into current" and "Delete" (both behind plain-language confirm modals), "New branch"
@@ -144,21 +156,29 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
 
 ## Diff viewer
 
-`DiffView` partitions entries by `kind` and routes each group independently:
+`DiffView` shows **one top-level entry at a time** — `selectedPath` (from the Inspector's file
+list, defaulting to the diff's first entry) picks it out of `entries`, and the rest simply aren't
+rendered. Embedded palettes (`kind: "palette"`, path `<kra>::<palette-file>`) aren't independently
+selectable top-level entries — they're reached via their parent `.kra`'s own selection plus a
+`focusId` that seeds the art view's navigator (see below). The selected entry routes by `kind`:
 
-- `kind: "art"` (`.kra`) → [`ArtDiffView`](../src/components/vcs/ArtDiffView.tsx): a visual layer
+- `"art"` (`.kra`) → [`ArtDiffView`](../src/components/vcs/ArtDiffView.tsx): a visual layer
   diff. The layers + before/after canvas sit in a **drag-resizable region** (handle along its bottom
   edge, height clamped and persisted via `useResize`); when shrunk the layer list and canvas scroll
-  internally, so the sections below stay reachable instead of being pushed off-screen. The first
-  `palette` entry (if any) is embedded in `ArtDiffView`'s `LayerStackPanel` navigator. Documented
-  in [visual-diff-viewer.md](visual-diff-viewer.md).
-- `kind: "palette"` (`.gpl`, `.kpl`, `.aco`, `.ase`) →
-  [`PaletteDiffView`](../src/components/vcs/PaletteDiffView.tsx):
-  always renders **color swatches** grouped by change (Modified / Added / Removed), each swatch
-  showing before/after colors with hex codes. **Not gated by Artist Mode.** The `swatches[]` are
-  computed backend-side (`palette.rs`) and rendered as-is — no parsing in the frontend. The first
-  palette attaches to the art diff's navigator; extra palettes and palette-only diffs get a
-  standalone panel (`StandalonePaletteDiff`, defined inline in `DiffView.tsx`).
+  internally, so the sections below stay reachable instead of being pushed off-screen. That file's
+  embedded palette (if any, matched by the `<kra>::` prefix) is embedded in
+  `ArtDiffView`'s `LayerStackPanel` navigator; `initialFocusId` (from `DiffView`'s `focusId`) seeds
+  the navigator's initial selection, so clicking a palette sub-row in the Inspector jumps straight
+  to that pane instead of defaulting to the composite. Documented in
+  [visual-diff-viewer.md](visual-diff-viewer.md).
+- `"palette"` (`.gpl`, `.kpl`, `.aco`, `.ase`, selected standalone) →
+  [`PaletteDiffView`](../src/components/vcs/PaletteDiffView.tsx) via `StandalonePaletteDiff`
+  (defined inline in `DiffView.tsx`): always renders **color swatches** grouped by change
+  (Modified / Added / Removed), each swatch showing before/after colors with hex codes. **Not
+  gated by Artist Mode.** The `swatches[]` are computed backend-side (`palette.rs`) and rendered
+  as-is — no parsing in the frontend. Its header uses `paletteName` (below), not `assetName` —
+  Krita's raw palette filenames carry an internal resource-version segment
+  (`<name>.<NNNN>.<ext>`, e.g. `sun-set.0006.kpl`) that `assetName` wouldn't strip.
 - `kind: "text"` (generic config, settings, …):
   - **Artist Mode on** (default) → `FriendlyFileDiff`: no code, no hunks, no line numbers. A
     one-line friendly summary using `assetKind` + `statusVerb` from
@@ -180,6 +200,7 @@ Label helpers live in [`src/lib/friendly.ts`](../src/lib/friendly.ts).
 | Non-art diff | Color-swatch / one-line summary (`FriendlyFileDiff`) | Code-style line diff (`DiffFileBlock`) |
 | Commit hash (cards, toolbar, Inspector) | `Version N` (`versionLabel`) | Short hash |
 | File paths (Inspector, status bar, art header) | Asset name (`assetName`, no folder/extension) | Full path |
+| Palette file paths (standalone/embedded palette headers, Inspector palette rows) | Palette name (`paletteName` — also strips Krita's internal `.NNNN` resource-version segment) | Full path |
 | Status code (`FileStatusChip`) | Icon + word ("Updated") | Single letter (`M`) |
 | Status-bar count | "N versions" | "N commits" |
 
@@ -275,7 +296,7 @@ mutating actions: commit/rollback/undo, branch create/switch/merge/delete),
 [`src/lib/useResize.ts`](../src/lib/useResize.ts) (shared drag-resize hook),
 [`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
 [`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
-[`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `assetKind`,
-`statusVerb`, `layerTypeLabel`, `layerChangeLabel`,
+[`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `paletteName`,
+`assetKind`, `statusVerb`, `layerTypeLabel`, `layerChangeLabel`,
 `versionNumbers`/`versionLabel`),
 [`src/lib/format.ts`](../src/lib/format.ts) (timestamps).

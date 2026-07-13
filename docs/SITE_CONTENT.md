@@ -44,9 +44,11 @@ painted area, or the whole canvas's size, resolution, and color space.
 
 ### Real history, real branches
 
-Every save is a full point you can return to. Branch off to try something risky, switch back
-instantly, and merge branches together when you're happy. Conflicting edits are flagged, never
-silently overwritten. A color-coded history graph shows exactly how your branches connect.
+Every save is a full point you can return to. Choose exactly which files a version includes, or
+save everything at once. Branch off to try something risky, switch back instantly, and merge
+branches together when you're happy. Conflicting edits are flagged, never silently overwritten —
+if one branch edited a file and the other deleted it, the edit wins. A color-coded history graph
+shows exactly how your branches connect.
 
 ![Screenshot placeholder: branch history graph with multiple colored lanes](placeholder)
 
@@ -54,6 +56,8 @@ silently overwritten. A color-coded history graph shows exactly how your branche
 
 Made a save you regret? Undo it. Want to go back three versions? Roll back to it. Krita VCS never
 deletes your history behind your back. Old versions stay recoverable until you decide otherwise.
+Mid-edit and want a fresh start on just one file? Discard its unsaved changes on the spot, or
+discard everything you haven't staged yet in one go, always with a confirmation first.
 
 ### Clean up storage, on your terms
 

@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
-import { CircleNotch, Minus, Plus } from "@phosphor-icons/react";
+import { useState, type Dispatch, type SetStateAction } from "react";
+import { ArrowCounterClockwise, CircleNotch, Minus, Plus } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Branch, WorkingChange } from "../../types";
 import { BranchBadge } from "./BranchBadge";
 import { FileStatusChip } from "./FileStatusChip";
+import { Button } from "../ui/Button";
+import { Modal } from "../ui/Modal";
 import { useRepository } from "../../lib/repository";
+import { useArtistMode } from "../../lib/artistMode";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
+import { assetName } from "../../lib/friendly";
 import { inTauri } from "../../lib/tauri";
 
 function Section({
@@ -17,6 +21,7 @@ function Section({
   disabled,
   focusedFile,
   onFocusFile,
+  onDiscardFile,
 }: {
   title: string;
   items: WorkingChange[];
@@ -29,6 +34,8 @@ function Section({
   /** File whose working-tree diff is currently shown in the main panel. */
   focusedFile: string | null;
   onFocusFile: (path: string) => void;
+  /** Discard this one file's uncommitted changes. */
+  onDiscardFile: (path: string) => void;
 }) {
   return (
     <div>
@@ -68,6 +75,16 @@ function Section({
             </button>
             <button
               type="button"
+              title="Discard changes to this file"
+              aria-label="Discard changes to this file"
+              onClick={() => onDiscardFile(change.path)}
+              disabled={disabled}
+              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-white/5 hover:text-danger group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ArrowCounterClockwise size={12} />
+            </button>
+            <button
+              type="button"
               title={action === "stage" ? "Stage" : "Unstage"}
               aria-label={action === "stage" ? "Stage file" : "Unstage file"}
               onClick={() => onToggle(change.path)}
@@ -95,72 +112,75 @@ export function ChangesPanel({
   currentBranch,
   focusedFile,
   onFocusFile,
+  items,
+  setItems,
+  error,
 }: {
   currentBranch: Branch;
   focusedFile: string | null;
   onFocusFile: (path: string) => void;
+  /** Working-tree changes + their cosmetic staged flag — lifted to `Sidebar` so the
+   *  "discard current changes" action can see the same staged/unstaged split. */
+  items: WorkingChange[];
+  setItems: Dispatch<SetStateAction<WorkingChange[]>>;
+  error: string | null;
 }) {
-  const { current, refreshNonce, refresh, saving, setSaving, setBusyMessage, setScanning } =
-    useRepository();
+  const { current, saving, setSaving, setBusyMessage, refresh, discardChanges } = useRepository();
+  const { artistMode } = useArtistMode();
   const { authorName } = useAuthorName();
-  const [items, setItems] = useState<WorkingChange[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
+  const [commitError, setCommitError] = useState<string | null>(null);
+  const [confirmDiscardPath, setConfirmDiscardPath] = useState<string | null>(null);
+  const [discardError, setDiscardError] = useState<string | null>(null);
+  const [confirmCommit, setConfirmCommit] = useState<"none" | "partial" | null>(null);
 
   const path = current?.path ?? null;
-
-  useEffect(() => {
-    // No backend in a plain browser (`npm run dev`), nothing to scan without a repo.
-    if (!inTauri() || !path) {
-      setItems([]);
-      return;
-    }
-    let cancelled = false;
-    setScanning(true);
-    invoke<WorkingChange[]>("scan_repository", { path })
-      .then((changes) => {
-        if (!cancelled) {
-          setItems(changes);
-          setError(null);
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setItems([]);
-          setError(String(e));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setScanning(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [path, refreshNonce, setScanning]);
 
   const toggle = (path: string) =>
     setItems((prev) => prev.map((c) => (c.change.path === path ? { ...c, staged: !c.staged } : c)));
   const setAll = (staged: boolean) => setItems((prev) => prev.map((c) => ({ ...c, staged })));
 
-  const commit = async () => {
+  const discardOne = async () => {
+    if (!confirmDiscardPath) return;
+    setDiscardError(null);
+    try {
+      await discardChanges([confirmDiscardPath]);
+      setConfirmDiscardPath(null);
+    } catch (e) {
+      setDiscardError(String(e));
+    }
+  };
+
+  const doCommit = async (paths: string[] | null) => {
     if (!message.trim() || saving || !path) return;
     setSaving(true);
     setBusyMessage("Committing changes — please wait…");
-    setError(null);
+    setCommitError(null);
     try {
       await invoke("commit_snapshot", {
         path,
         message: message.trim(),
         author: resolvedAuthor(authorName),
+        paths,
       });
       setMessage("");
+      setConfirmCommit(null);
       refresh(); // refetch changes (now clean) + history
     } catch (e) {
-      setError(String(e));
+      setCommitError(String(e));
     } finally {
       setSaving(false);
       setBusyMessage(null);
     }
+  };
+
+  // Nothing staged -> confirm committing everything. Some staged, some not -> confirm
+  // committing only the staged files (the rest stay dirty). All staged -> commit right away.
+  const commit = () => {
+    if (!message.trim() || saving || !path) return;
+    if (staged.length === 0) setConfirmCommit("none");
+    else if (unstaged.length > 0) setConfirmCommit("partial");
+    else doCommit(staged.map((c) => c.change.path));
   };
 
   if (error && items.length === 0) {
@@ -187,6 +207,7 @@ export function ChangesPanel({
         disabled={saving}
         focusedFile={focusedFile}
         onFocusFile={onFocusFile}
+        onDiscardFile={setConfirmDiscardPath}
       />
       <div className="my-1 h-px bg-border" />
       <Section
@@ -198,6 +219,7 @@ export function ChangesPanel({
         disabled={saving}
         focusedFile={focusedFile}
         onFocusFile={onFocusFile}
+        onDiscardFile={setConfirmDiscardPath}
       />
 
       {inTauri() && (
@@ -209,7 +231,7 @@ export function ChangesPanel({
             rows={2}
             className="resize-none rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
           />
-          {error && <p className="text-[11px] text-danger">{error}</p>}
+          {commitError && <p className="text-[11px] text-danger">{commitError}</p>}
           <button
             type="button"
             onClick={commit}
@@ -220,6 +242,61 @@ export function ChangesPanel({
             {saving ? "Saving version…" : "Commit version"}
           </button>
         </div>
+      )}
+
+      {confirmDiscardPath && (
+        <Modal
+          title="Discard changes to this file?"
+          onClose={() => (saving ? undefined : setConfirmDiscardPath(null))}
+          footer={
+            <>
+              <Button onClick={() => setConfirmDiscardPath(null)} disabled={saving}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={discardOne} disabled={saving}>
+                {saving ? "Discarding…" : "Discard"}
+              </Button>
+            </>
+          }
+        >
+          <p className="text-[13px] leading-relaxed text-text-muted">
+            This permanently reverts{" "}
+            <span className="font-medium text-text">
+              {artistMode ? assetName(confirmDiscardPath) : confirmDiscardPath}
+            </span>{" "}
+            to its last saved version. Any unsaved edits to it are lost.
+          </p>
+          {discardError && <p className="mt-3 text-[12px] text-danger">{discardError}</p>}
+        </Modal>
+      )}
+
+      {confirmCommit && (
+        <Modal
+          title={confirmCommit === "none" ? "Nothing staged" : "Some changes aren't staged"}
+          onClose={() => (saving ? undefined : setConfirmCommit(null))}
+          footer={
+            <>
+              <Button onClick={() => setConfirmCommit(null)} disabled={saving}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() =>
+                  doCommit(confirmCommit === "none" ? null : staged.map((c) => c.change.path))
+                }
+                disabled={saving}
+              >
+                {saving ? "Saving version…" : "Commit anyway"}
+              </Button>
+            </>
+          }
+        >
+          <p className="text-[13px] leading-relaxed text-text-muted">
+            {confirmCommit === "none"
+              ? "You haven't staged any changes. Commit everything in Changes anyway?"
+              : `${unstaged.length} unstaged file${unstaged.length === 1 ? "" : "s"} won't be included. Commit only the ${staged.length} staged file${staged.length === 1 ? "" : "s"}?`}
+          </p>
+          {commitError && <p className="mt-3 text-[12px] text-danger">{commitError}</p>}
+        </Modal>
       )}
     </div>
   );

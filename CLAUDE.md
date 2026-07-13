@@ -139,7 +139,11 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   (`CommitGraph` + `CommitGraphRail`, lane layout from `lib/graph.ts`; lane colors are a deliberate
   functional exception to the single-accent rule), branch badge, file-status chip, the sidebar
   panels (`ChangesPanel` — working-tree changes with per-file + stage-all/unstage-all toggles;
-  staging is cosmetic since `commit_snapshot` captures the whole tree; while a commit is in flight
+  staging determines what a commit actually captures: `commit_snapshot`'s optional `paths` arg
+  (`commit::commit_selected` in Rust) restricts the commit to those relative paths, leaving the
+  rest dirty. Hitting "Commit version" with nothing staged or with a partial selection shows a
+  confirm `Modal` first (commit everything anyway / commit only the staged files) before calling
+  through; while a commit is in flight
   the staging controls lock, the commit button spins, and the `StatusBar` shows a progress bar, via
   the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
   branches with **real actions**: click to switch, hover-row merge/delete with confirm modals

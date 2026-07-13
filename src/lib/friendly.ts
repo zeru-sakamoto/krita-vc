@@ -16,11 +16,27 @@ function titleCase(input: string): string {
     .join(" ");
 }
 
-/** Basename without extension, de-slugged + title-cased. */
+/** Basename without extension — the file's real name, case preserved exactly (only
+ *  path/extension stripped and separators de-slugged to spaces for readability). */
 export function assetName(path: string): string {
   const base = path.split(/[\\/]/).pop() ?? path;
   const stem = base.replace(/\.[^.]+$/, "");
-  return titleCase(stem) || base;
+  const deslugged = stem.replace(/[-_]+/g, " ").trim();
+  return deslugged || base;
+}
+
+/**
+ * Friendly label for a palette `DiffEntry`'s path. Handles both standalone palette files and
+ * embedded ones (keyed `<kra>::<palette-file>` — takes the palette's own segment). Krita's raw
+ * representative filename is `<name>.<NNNN>.<ext>` (e.g. `sun-set.0006.kpl`) — a real extension
+ * *and* an internal resource-version segment — so both get stripped, not just the extension.
+ */
+export function paletteName(path: string): string {
+  const own = path.includes("::") ? (path.split("::").pop() ?? path) : path;
+  const base = own.split(/[\\/]/).pop() ?? own;
+  const stem = base.replace(/\.[^.]+$/, "").replace(/\.\d+$/, "");
+  const deslugged = stem.replace(/[-_]+/g, " ").trim();
+  return deslugged || base;
 }
 
 export interface AssetKind {

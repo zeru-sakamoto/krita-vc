@@ -119,13 +119,14 @@ clean"** rule: a quick re-save right after a commit can land in the *same* files
 the index write and, if the byte size is unchanged too (`"v1"` → `"v2"`), size+mtime alone can't
 tell it apart from "untouched". So any working file whose mtime is `>=` the index file's mtime
 (`.kvc/index.json`, statted once per scan) is treated as racy and re-hashed rather than trusted;
-files committed in an earlier tick keep the fast path. There is **no staging area** — the scanner
-reports the whole working-tree delta and a commit captures all of it (the frontend's stage toggles
-are cosmetic).
+files committed in an earlier tick keep the fast path. Staging is a **selection over the same
+scan**, not a separate index: `commit_selected`'s optional `paths` filters the scanned changes
+down to a subset before committing, leaving everything else dirty.
 
-## Committing — `commit_snapshot`
+## Committing — `commit_snapshot` / `commit_selected`
 
-[`commit.rs`](../src-tauri/src/commit.rs) scans, then routes each change:
+[`commit.rs`](../src-tauri/src/commit.rs) scans, optionally filters to `paths` (`commit_selected`;
+`commit_snapshot` is just `commit_selected(.., None)`), then routes each change:
 
 - **deletion** → drop from the index, record a `D` file entry (no content).
 - **`.kra`** → `kra::commit_kra` decomposes the archive (see below) and returns its manifest hash.
@@ -286,6 +287,12 @@ Two higher-level history operations build on this ([`commit.rs`](../src-tauri/sr
   from committed history and would trivially already match the tip) and rewrites/removes exactly
   the dirty files back to the tip's committed content, in place — no new commit. Either path
   returns `Nothing` if there's nothing to do (tree already matches).
+- **Discard working changes** (`discard_working_changes`, the `discard_changes` command) — the
+  general form of the same in-place rewrite `discard_to_tip` uses, exposed directly to the
+  frontend so it can discard less than everything: an optional `paths` filter limits it to those
+  relative paths (e.g. the Changes panel's per-file "discard" action, or the sidebar's "Discard
+  current changes" restricted to unstaged files), `None` discards every dirty file. `discard_to_tip`
+  is now a thin wrapper calling this with `None`. Errors `Nothing` if nothing in scope is dirty.
 - **Undo last commit** (`undo_last_commit`) — a *soft* reset of the **current branch tip** (which
   may sit mid-vec after a switch): removes that commit by id, rewinds the branch tip to its first
   parent, and rewinds only the index entries for the paths it touched (from the new tip's tree).
@@ -323,7 +330,9 @@ deduplicates across branches for free.
   against the merge base (first common ancestor): changed only in source → taken; changed only
   in current → kept (no entry — the first parent already has it); changed in **both** → the
   source version wins and the entry is flagged `"C"` (art files can't be content-merged; the UI
-  surfaces the flag as "Needs review"). The merge commit has `parents: [current_tip, source_tip]`
+  surfaces the flag as "Needs review"). When one side **deleted** a file and the other **edited**
+  it, the edit is kept rather than the deletion winning — a conflict never destroys data — still
+  flagged `"C"` either way. The merge commit has `parents: [current_tip, source_tip]`
   and its `files` is the merged result's diff vs the first parent — preserving the fold
   invariant. `NothingToMerge` when the source is already part of the current branch.
 - **Delete** (`delete_branch`) — removes the label only (refused for the current branch and for
@@ -358,7 +367,8 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `open_repository(path)` | Validate + load (success = it opened). |
 | `delete_repository(path)` | Permanently delete the folder (guarded by `is_repo`). |
 | `scan_repository(path)` | Working-tree changes as `WorkingChange[]` (`staged: false`). |
-| `commit_snapshot(path, message, author)` | Commit the whole working tree; returns the `Commit`. |
+| `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths (the frontend's "staged" set), omitted/`null` commits everything. Returns the `Commit`. |
+| `discard_changes(path, paths)` | Discard uncommitted changes, restoring them to the branch tip's committed content — no new commit. Empty `paths` discards everything dirty; otherwise only those relative paths. |
 | `list_commits(path)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. |
 | `list_branches(path)` | All local branches as `{ name, tip, current }`. |
 | `create_branch(path, name, base?)` | Create + switch to a branch. No `base` (or `base` = current): instant, at the current tip. Different `base`: materializes that branch's tree first (refused on unsaved changes). Returns the branch list. |
@@ -381,12 +391,15 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 
 The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell:
 
-- **In Tauri** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx) calls `scan_repository`
-  / `commit_snapshot`; [`useCommits`](../src/lib/repoData.ts) calls `list_commits` and maps
-  `BackendCommit` → the frontend `Commit` shape; [`useBranches`](../src/lib/repoData.ts) calls
-  `list_branches`; [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, the
-  native folder picker (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, branch
-  create/switch/merge/delete).
+- **In Tauri** — [`useWorkingChanges`](../src/lib/repoData.ts) (shared by `ChangesPanel` and
+  `Sidebar`, so both see the same staged/unstaged split off one scan) calls `scan_repository`;
+  `ChangesPanel` calls `commit_snapshot` with the staged paths (or `null`/the full set, behind a
+  confirm modal, when nothing or only some files are staged); [`useCommits`](../src/lib/repoData.ts)
+  calls `list_commits` and maps `BackendCommit` → the frontend `Commit` shape;
+  [`useBranches`](../src/lib/repoData.ts) calls `list_branches`;
+  [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, the native folder
+  picker (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, `discardChanges`,
+  branch create/switch/merge/delete).
 - **In a plain browser** (`npm run dev`, no backend) — the hooks return empty results and
   repository/branch actions are no-ops; the status bar shows a "Browser preview" badge. There is
   no mock data.

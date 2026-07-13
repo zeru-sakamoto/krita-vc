@@ -204,12 +204,13 @@ pub async fn commit_snapshot(
     path: String,
     message: String,
     author: String,
+    paths: Option<Vec<String>>,
 ) -> std::result::Result<Commit, String> {
     run(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root)?;
         let mut repo = Repo::open(root)?;
-        commit::commit_snapshot(&mut repo, &message, &author)
+        commit::commit_selected(&mut repo, &message, &author, paths.as_deref())
     })
     .await
 }
@@ -396,6 +397,31 @@ pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit
         let _lock = RepoLock::acquire(root)?;
         let mut repo = Repo::open(root)?;
         commit::undo_last_commit(&mut repo)
+    })
+    .await
+}
+
+/// Discard uncommitted working-tree changes, restoring them to the current branch tip's
+/// committed content — no new commit. `paths` empty discards every dirty file; otherwise only
+/// those relative paths are touched (the frontend passes just the unstaged ones, since staging
+/// is a UI-only concept the backend doesn't track).
+#[tauri::command]
+pub async fn discard_changes(path: String, paths: Vec<String>) -> std::result::Result<(), String> {
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
+        let tip = repo
+            .branches
+            .tip()
+            .ok_or_else(|| crate::error::KvcError::NoCommit(String::new()))?
+            .to_string();
+        let filter = if paths.is_empty() {
+            None
+        } else {
+            Some(paths.as_slice())
+        };
+        commit::discard_working_changes(&mut repo, &tip, filter)
     })
     .await
 }

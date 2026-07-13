@@ -74,8 +74,9 @@ export const LANE_W = 16;
 // lane-0 dots/lines.
 export const LINK_GUTTER_W = 10;
 export const ORIGIN_X = 12 + LINK_GUTTER_W;
-/** X for a revert link's vertical run — middle of the dedicated left gutter. */
-export const REVERT_LINK_X = LINK_GUTTER_W / 2;
+/** X for a revert link's vertical run — centered between the panel's left edge (x=0) and
+ * lane 0's node column (`ORIGIN_X`), not just the dedicated gutter. */
+export const REVERT_LINK_X = ORIGIN_X / 2;
 
 export function laneX(lane: number): number {
   return ORIGIN_X + lane * LANE_W;

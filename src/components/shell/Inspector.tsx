@@ -1,16 +1,17 @@
-import { useState } from "react";
-import { ArrowCounterClockwise, X } from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { ArrowCounterClockwise, Palette as PaletteIcon, X } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
 import { FileStatusChip } from "../vcs/FileStatusChip";
 import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
-import type { ArtDiff, ArtLayer, Commit, DiffEntry } from "../../types";
+import type { ArtDiff, ArtLayer, Commit, DiffEntry, FileChange, PaletteDiff } from "../../types";
 import { fullTimestamp } from "../../lib/format";
 import {
   assetName,
   layerChangeLabel,
   layerTypeLabel,
+  paletteName,
   statusVerb,
   versionLabel,
 } from "../../lib/friendly";
@@ -32,6 +33,10 @@ interface InspectorProps {
   /** True when `commit` is the current branch tip — restoring it discards in place. */
   isTip: boolean;
   onClose: () => void;
+  /** Which changed file (among possibly several) is currently shown in the main panel. */
+  selectedFile: string | null;
+  /** Selects a file (and optionally a navigator id within it) to show in the main panel. */
+  onSelectFile: (path: string, focusId?: string) => void;
 }
 
 function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -102,11 +107,32 @@ export function Inspector({
   focusedFile,
   isTip,
   onClose,
+  selectedFile,
+  onSelectFile,
 }: InspectorProps) {
   const { artistMode } = useArtistMode();
   const { rollbackToCommit, saving } = useRepository();
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Split the commit's changed files into selectable rows: regular files (each carrying its
+  // embedded palette, if any, per `<kra>::<palette-file>`-keyed entries) and standalone palettes.
+  const { fileChanges, paletteChanges } = useMemo(() => {
+    const files: { change: FileChange; embeddedPalette: PaletteDiff | undefined }[] = [];
+    const palettes: FileChange[] = [];
+    for (const c of commit?.changes ?? []) {
+      const entry = entries.find((e) => e.path === c.path);
+      if (entry?.kind === "palette") {
+        palettes.push(c);
+      } else {
+        const embeddedPalette = entries.find(
+          (e): e is PaletteDiff => e.kind === "palette" && e.path.startsWith(`${c.path}::`)
+        );
+        files.push({ change: c, embeddedPalette });
+      }
+    }
+    return { fileChanges: files, paletteChanges: palettes };
+  }, [commit, entries]);
 
   // Resolve the navigator selection against the current diff. A stale focus (e.g. the next
   // commit is text-only, or a palette is selected) resolves to nothing and the section hides —
@@ -200,23 +226,83 @@ export function Inspector({
                 Changed files ({commit.changes.length})
               </h3>
               <ul className="flex flex-col">
-                {commit.changes.map((c) => (
-                  <li
-                    key={c.path}
-                    className="flex items-center gap-2 rounded-button px-1 py-1 hover:bg-white/5"
-                  >
-                    <FileStatusChip status={c.status} />
-                    <span
+                {fileChanges.map(({ change: c, embeddedPalette }) => (
+                  <li key={c.path} className="flex flex-col">
+                    <button
+                      type="button"
+                      onClick={() => onSelectFile(c.path, undefined)}
                       className={[
-                        "selectable truncate text-[12px] text-text",
-                        artistMode ? "" : "font-mono",
+                        "flex w-full items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
+                        selectedFile === c.path
+                          ? "border-accent bg-accent/12"
+                          : "border-transparent hover:bg-white/5",
                       ].join(" ")}
                     >
-                      {artistMode ? assetName(c.path) : c.path}
-                    </span>
+                      <FileStatusChip status={c.status} />
+                      <span
+                        className={[
+                          "selectable truncate text-[12px] text-text",
+                          artistMode ? "" : "font-mono",
+                        ].join(" ")}
+                      >
+                        {artistMode ? assetName(c.path) : c.path}
+                      </span>
+                    </button>
+                    {embeddedPalette && (
+                      <button
+                        type="button"
+                        onClick={() => onSelectFile(c.path, PALETTE_ID)}
+                        className={[
+                          "ml-4 flex items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
+                          focus?.path === c.path && focus?.id === PALETTE_ID
+                            ? "border-accent bg-accent/12"
+                            : "border-transparent hover:bg-white/5",
+                        ].join(" ")}
+                      >
+                        <PaletteIcon size={12} className="shrink-0 text-text-muted" />
+                        <span className="selectable truncate text-[11px] text-text-muted">
+                          {artistMode ? paletteName(embeddedPalette.path) : embeddedPalette.path}
+                        </span>
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>
+
+              {paletteChanges.length > 0 && (
+                <>
+                  <h3 className="mb-1.5 mt-2 text-[11px] font-medium uppercase text-text-muted">
+                    Palettes ({paletteChanges.length})
+                  </h3>
+                  <ul className="flex flex-col">
+                    {paletteChanges.map((c) => (
+                      <li key={c.path}>
+                        <button
+                          type="button"
+                          onClick={() => onSelectFile(c.path, undefined)}
+                          className={[
+                            "flex w-full items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
+                            selectedFile === c.path
+                              ? "border-accent bg-accent/12"
+                              : "border-transparent hover:bg-white/5",
+                          ].join(" ")}
+                        >
+                          <FileStatusChip status={c.status} />
+                          <PaletteIcon size={13} className="shrink-0 text-text-muted" />
+                          <span
+                            className={[
+                              "selectable truncate text-[12px] text-text",
+                              artistMode ? "" : "font-mono",
+                            ].join(" ")}
+                          >
+                            {artistMode ? paletteName(c.path) : c.path}
+                          </span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </div>
 
             {showSelected && focusedArt && (

@@ -17,6 +17,10 @@ interface MainPanelProps {
   nonce?: number;
   /** Forwarded to the diff viewer so the navigator selection reaches the Inspector. */
   onFocus?: (f: { path: string; id: string }) => void;
+  /** Which file (among several in the current diff) to show — from the Inspector's file list. */
+  selectedFile?: string | null;
+  /** Navigator id to seed the selected file's view with, e.g. jump straight to its palette. */
+  focusId?: string;
 }
 
 /**
@@ -34,6 +38,8 @@ export function MainPanel({
   working,
   nonce,
   onFocus,
+  selectedFile,
+  focusId,
 }: MainPanelProps) {
   if (diff.length > 0) {
     return (
@@ -45,6 +51,8 @@ export function MainPanel({
           working={working}
           nonce={nonce}
           onFocus={onFocus}
+          selectedPath={selectedFile}
+          focusId={focusId}
         />
       </main>
     );

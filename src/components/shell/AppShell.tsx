@@ -67,6 +67,10 @@ function RepoShell({ repo }: { repo: Repository }) {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   // Which layer/composite the diff navigator has selected — mirrored into the Inspector.
   const [focus, setFocus] = useState<{ path: string; id: string } | null>(null);
+  // Which file (among a multi-file commit) the Inspector's file list has selected, and an
+  // optional navigator id to seed that file's view with (e.g. jump straight to its palette).
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [selectedFocusId, setSelectedFocusId] = useState<string | undefined>(undefined);
 
   // Keep a valid selection as history loads/changes (default to the newest commit).
   useEffect(() => {
@@ -106,6 +110,19 @@ function RepoShell({ repo }: { repo: Repository }) {
     loading: diffLoading,
   } = inChanges ? (showWorking ? workingDiff : emptyDiff) : commitDiff;
   const activeFile = diff[0]?.path ?? null;
+
+  // Keep a valid file selection as the diff loads/changes (default to the first entry).
+  // "Top-level" excludes embedded palettes (`<kra>::<palette-file>`), which aren't
+  // independently selectable — they're reached via their parent .kra's sub-row instead.
+  useEffect(() => {
+    const topLevelPaths = new Set(
+      diff.filter((e) => !(e.kind === "palette" && e.path.includes("::"))).map((e) => e.path)
+    );
+    if (!selectedFile || !topLevelPaths.has(selectedFile)) {
+      setSelectedFile(diff[0]?.path ?? null);
+      setSelectedFocusId(undefined);
+    }
+  }, [diff, selectedFile]);
 
   const emptyHint = inChanges
     ? "Select a changed file to preview."
@@ -189,6 +206,8 @@ function RepoShell({ repo }: { repo: Repository }) {
                 working={showWorking}
                 nonce={refreshNonce}
                 onFocus={setFocus}
+                selectedFile={selectedFile}
+                focusId={selectedFocusId}
               />
               {inspectorOpen && (
                 <Inspector
@@ -200,6 +219,11 @@ function RepoShell({ repo }: { repo: Repository }) {
                   focusedFile={focusedFile}
                   isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
                   onClose={() => setInspectorOpen(false)}
+                  selectedFile={selectedFile}
+                  onSelectFile={(path, focusId) => {
+                    setSelectedFile(path);
+                    setSelectedFocusId(focusId);
+                  }}
                 />
               )}
             </div>

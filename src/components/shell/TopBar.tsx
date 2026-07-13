@@ -72,7 +72,7 @@ export function TopBar() {
 
   return (
     <header
-      className="flex h-9 shrink-0 items-center border-b border-border bg-surface px-2"
+      className="flex h-9 shrink-0 items-center gap-1.5 border-b border-border bg-surface px-2"
       {...(showWindowControls ? { "data-tauri-drag-region": true } : {})}
     >
       <img src="/logo.svg" alt="" className="h-5 w-5 shrink-0" />

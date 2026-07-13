@@ -36,7 +36,7 @@ export const CommitCard = memo(function CommitCard({
       onClick={() => onSelect(commit.id)}
       aria-pressed={selected}
       className={[
-        "block w-full py-2.5 pl-1 pr-3 text-left",
+        "block w-full py-2.5 px-3 text-left",
         "transition-colors duration-100 ease-out",
         selected ? "bg-accent/12" : "hover:bg-white/5",
       ].join(" ")}

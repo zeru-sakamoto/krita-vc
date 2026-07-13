@@ -66,8 +66,9 @@ pub fn switch_branch(repo: &mut Repo, name: &str) -> Result<()> {
 
 /// Merge `source` into the current branch. Fast-forwards when possible; otherwise builds a
 /// two-parent merge commit via a per-file three-way against the merge base. Art files can't
-/// be content-merged, so when both sides changed the same file the **source** version wins
-/// and the entry is flagged `"C"` for the UI to surface.
+/// be content-merged, so when both sides edited the same file the **source** version wins;
+/// when one side deleted it and the other edited it, the edit is kept (never destroy data on
+/// a conflict) — either way the entry is flagged `"C"` for the UI to surface.
 ///
 /// The merge commit's `files` records the merged result's diff vs the **first parent**
 /// (the current branch) — the invariant `tree_at_commit` folds by.

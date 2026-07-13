@@ -79,6 +79,8 @@ const Pane = memo(function Pane({
 interface ArtDiffViewProps {
   diff: ArtDiff;
   palette?: PaletteDiff;
+  /** Navigator id to seed the initial selection with, e.g. jump straight to the palette pane. */
+  initialFocusId?: string;
   /** Diff source for lazily fetching this file's per-layer rasters. Absent in the browser. */
   repoPath?: string;
   commitId?: string | null;
@@ -91,6 +93,7 @@ interface ArtDiffViewProps {
 export function ArtDiffView({
   diff,
   palette,
+  initialFocusId,
   repoPath,
   commitId,
   working,
@@ -98,7 +101,7 @@ export function ArtDiffView({
   onFocus,
 }: ArtDiffViewProps) {
   const { artistMode } = useArtistMode();
-  const [selectedId, setSelectedId] = useState<string>(COMPOSITE_ID);
+  const [selectedId, setSelectedId] = useState<string>(initialFocusId ?? COMPOSITE_ID);
 
   // Mirror the navigator selection into the Inspector. Fires on mount (default composite) and on
   // every selection change; `onFocus` (a stable setState) makes this a no-churn dependency.

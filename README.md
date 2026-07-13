@@ -31,15 +31,21 @@ files, where git's text-oriented delta model performs poorly.
     only *that* layer's changed pixels, not the whole-file silhouette. Its color always matches
     the active **theme's accent** (see Settings below).
   - Click a layer to focus its diff, or view the composited artwork; color palettes (`.gpl`,
-    `.kpl`, `.aco`, `.ase`) render as a color-by-color swatch diff (added / removed / recolored,
-    with hex values). The inspector shows the selected layer's details (type, visibility, opacity,
-    blend, painted bounds) or the composite's size, resolution, and color space.
-- **Real local version control**: commit the whole working tree, browse history as a branch-aware
-  graph, and roll back / undo commits. Rolling back to the version you're already on just discards
-  unsaved changes in place (no new history entry); rolling back to an older one records a new
-  commit, linked back to it in the graph by a dashed connector.
+    `.kpl`, `.aco`, `.ase`) — standalone or embedded inside a `.kra` — render as a color-by-color
+    swatch diff (added / removed / recolored, with hex values). When a version touches several
+    files, the inspector's file list picks which one the main panel shows, and it shows the
+    selected file's or layer's details (type, visibility, opacity, blend, painted bounds) or the
+    composite's size, resolution, and color space.
+- **Real local version control**: stage exactly the files you want (or commit everything, with a
+  confirm prompt if some changes aren't staged), browse history as a branch-aware graph, and roll
+  back / undo commits. Rolling back to the version you're already on just discards unsaved changes
+  in place (no new history entry); rolling back to an older one records a new commit, linked back
+  to it in the graph by a dashed connector. Changed your mind mid-edit? Discard a single file's
+  unsaved changes, or every unstaged file at once, without touching what's staged.
 - **Branching & merging**: create, switch, merge (fast-forward or two-parent), and delete local
-  branches, all backed by real tree materialization.
+  branches, all backed by real tree materialization. Conflicting edits are flagged for review; if
+  one side edited a file and the other deleted it, the edit wins, so a merge never quietly loses
+  work.
 - **Storage housekeeping**: a "Clean up storage" action reclaims history unreachable from any
   branch tip (mark-and-sweep GC), and the raster preview cache is size-budgeted with LRU pruning.
 - **Settings** (activity-bar gear). One place for user preferences: the Artist Mode toggle, a

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  ArrowCounterClockwise,
   ArrowsClockwise,
   ArrowUUpLeft,
   CaretDown,
@@ -10,7 +11,7 @@ import { DockerPanel } from "./DockerPanel";
 import type { ActivityView } from "./ActivityBar";
 import { IconButton } from "../ui/IconButton";
 import { Button } from "../ui/Button";
-import { Menu } from "../ui/Menu";
+import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { BranchBadge } from "../vcs/BranchBadge";
 import { CommitGraph } from "../vcs/CommitGraph";
@@ -24,6 +25,7 @@ import {
 } from "../vcs/BranchDialogs";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
+import { useWorkingChanges } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import type { Branch, Commit } from "../../types";
 
@@ -63,13 +65,34 @@ export function Sidebar({
   onFocusFile,
   onShowChanges,
 }: SidebarProps) {
-  const { refresh, scanning, undoLastCommit, switchBranch, saving } = useRepository();
+  const {
+    current,
+    refreshNonce,
+    refresh,
+    scanning,
+    setScanning,
+    undoLastCommit,
+    discardChanges,
+    switchBranch,
+    saving,
+  } = useRepository();
   const { artistMode } = useArtistMode();
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [saveFirst, setSaveFirst] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
+  const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
+  const [discardAllError, setDiscardAllError] = useState<string | null>(null);
+
+  // Lifted here (not local to ChangesPanel) so "Discard current changes" can see the same
+  // staged/unstaged split without a second scan — staging has no backend concept of its own.
+  const {
+    items: workingItems,
+    setItems: setWorkingItems,
+    error: workingError,
+  } = useWorkingChanges(current?.path ?? null, refreshNonce, setScanning);
+  const unstagedPaths = workingItems.filter((c) => !c.staged).map((c) => c.change.path);
 
   const onSwitch = async (name: string) => {
     if (name === currentBranch.name || saving) return;
@@ -89,6 +112,16 @@ export function Sidebar({
       setConfirmUndo(false);
     } catch (e) {
       setUndoError(String(e));
+    }
+  };
+
+  const onDiscardAll = async () => {
+    setDiscardAllError(null);
+    try {
+      await discardChanges(unstagedPaths);
+      setConfirmDiscardAll(false);
+    } catch (e) {
+      setDiscardAllError(String(e));
     }
   };
   const {
@@ -134,6 +167,20 @@ export function Sidebar({
             setConfirmUndo(true);
           },
         },
+        ...(view === "changes"
+          ? ([
+              {
+                id: "discard-all",
+                label: "Discard current changes",
+                icon: <ArrowCounterClockwise size={14} />,
+                disabled: unstagedPaths.length === 0 || saving,
+                onSelect: () => {
+                  setDiscardAllError(null);
+                  setConfirmDiscardAll(true);
+                },
+              },
+            ] satisfies MenuItem[])
+          : []),
       ]}
     />
   );
@@ -211,6 +258,9 @@ export function Sidebar({
             currentBranch={currentBranch}
             focusedFile={focusedFile}
             onFocusFile={onFocusFile}
+            items={workingItems}
+            setItems={setWorkingItems}
+            error={workingError}
           />
         )}
 
@@ -253,6 +303,30 @@ export function Sidebar({
             re-save.
           </p>
           {undoError && <p className="mt-3 text-[12px] text-danger">{undoError}</p>}
+        </Modal>
+      )}
+
+      {confirmDiscardAll && (
+        <Modal
+          title="Discard current changes?"
+          onClose={() => (saving ? undefined : setConfirmDiscardAll(false))}
+          footer={
+            <>
+              <Button onClick={() => setConfirmDiscardAll(false)} disabled={saving}>
+                Cancel
+              </Button>
+              <Button variant="destructive" onClick={onDiscardAll} disabled={saving}>
+                {saving ? "Discarding…" : "Discard"}
+              </Button>
+            </>
+          }
+        >
+          <p className="text-[13px] leading-relaxed text-text-muted">
+            This permanently reverts {unstagedPaths.length}{" "}
+            {unstagedPaths.length === 1 ? "file" : "files"} to their last saved version. Staged
+            files aren't touched. Any unsaved edits are lost.
+          </p>
+          {discardAllError && <p className="mt-3 text-[12px] text-danger">{discardAllError}</p>}
         </Modal>
       )}
     </div>

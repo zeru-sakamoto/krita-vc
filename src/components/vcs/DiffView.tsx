@@ -1,10 +1,11 @@
+import { Palette as PaletteIcon } from "@phosphor-icons/react";
 import type { ArtDiff, DiffEntry, DiffLine, PaletteDiff, TextDiff } from "../../types";
 import { FileStatusChip } from "./FileStatusChip";
 import { ArtDiffView } from "./ArtDiffView";
 import { PaletteDiffView } from "./PaletteDiffView";
 import { LayerStackPanel, PALETTE_ID } from "./LayerStackPanel";
 import { useArtistMode } from "../../lib/artistMode";
-import { assetKind, assetName, statusVerb } from "../../lib/friendly";
+import { assetKind, assetName, paletteName, statusVerb } from "../../lib/friendly";
 import { useState } from "react";
 
 /** Per-line background/foreground per DESIGN.md → Diff Colors. */
@@ -101,6 +102,7 @@ function FriendlyFileDiff({ file }: { file: TextDiff }) {
  * attach them to. Mirrors the ArtDiffView layout (left navigator + right grid).
  */
 function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
+  const { artistMode } = useArtistMode();
   const [selectedId, setSelectedId] = useState<string>(PALETTE_ID);
   // Build a minimal ArtDiff shell so LayerStackPanel can render a palette-only navigator.
   // We pass a zero-layer ArtDiff so the Layers section is empty; only Color Palette shows.
@@ -118,8 +120,9 @@ function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
       {/* Header */}
       <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-y border-border bg-surface px-3 py-1.5">
         <FileStatusChip status={palette.status} />
+        <PaletteIcon size={14} className="shrink-0 text-text-muted" />
         <span className="selectable text-[12px] font-medium text-text">
-          {assetName(palette.path)}
+          {artistMode ? paletteName(palette.path) : palette.path}
         </span>
       </div>
       <div className="flex" style={{ minHeight: 300 }}>
@@ -139,6 +142,10 @@ function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
 
 interface DiffViewProps {
   entries: DiffEntry[];
+  /** Which top-level entry (by path) to show. Defaults to the first entry when absent/stale. */
+  selectedPath?: string | null;
+  /** Navigator id to seed the selected art file's view with (e.g. jump to its palette pane). */
+  focusId?: string;
   /** Diff source, forwarded to art views for lazy per-layer raster loading. Absent in the browser. */
   repoPath?: string;
   commitId?: string | null;
@@ -148,52 +155,62 @@ interface DiffViewProps {
   onFocus?: (f: { path: string; id: string }) => void;
 }
 
-export function DiffView({ entries, repoPath, commitId, working, nonce, onFocus }: DiffViewProps) {
+export function DiffView({
+  entries,
+  selectedPath,
+  focusId,
+  repoPath,
+  commitId,
+  working,
+  nonce,
+  onFocus,
+}: DiffViewProps) {
   const { artistMode } = useArtistMode();
 
-  // Partition entries by kind so we can attach the first palette to the first art diff's navigator.
-  const artDiffs: ArtDiff[] = entries.filter((e): e is ArtDiff => e.kind === "art");
-  const paletteDiffs: PaletteDiff[] = entries.filter((e): e is PaletteDiff => e.kind === "palette");
-  const textDiffs: TextDiff[] = entries.filter((e): e is TextDiff => e.kind === "text");
+  // Embedded palettes (`<kra>::<palette-file>`) aren't independently selectable — they're
+  // reached via their parent .kra's own view instead.
+  const topLevel = entries.filter((e) => !(e.kind === "palette" && e.path.includes("::")));
+  const selected = topLevel.find((e) => e.path === selectedPath) ?? topLevel[0];
 
-  // The first palette (if any) is embedded in the first art diff's LayerStackPanel.
-  // Any additional palettes (rare) render standalone.
-  const attachedPalette = paletteDiffs[0];
-  const extraPalettes = paletteDiffs.slice(1);
+  if (!selected) {
+    return <div className="h-full flex flex-col overflow-auto bg-bg" />;
+  }
 
-  return (
-    <div className="h-full flex flex-col overflow-auto bg-bg">
-      {/* Art diffs — first one gets the palette embedded in its navigator */}
-      {artDiffs.map((diff, i) => (
+  if (selected.kind === "art") {
+    const embeddedPalette = entries.find(
+      (e): e is PaletteDiff => e.kind === "palette" && e.path.startsWith(`${selected.path}::`)
+    );
+    return (
+      <div className="h-full flex flex-col overflow-auto bg-bg">
         <ArtDiffView
-          key={diff.path}
-          diff={diff}
-          palette={i === 0 ? attachedPalette : undefined}
+          key={`${selected.path}:${focusId ?? "auto"}`}
+          diff={selected}
+          palette={embeddedPalette}
+          initialFocusId={focusId}
           repoPath={repoPath}
           commitId={commitId}
           working={working}
           nonce={nonce}
           onFocus={onFocus}
         />
-      ))}
+      </div>
+    );
+  }
 
-      {/* Palette-only: if there are palettes but no art diff, show standalone */}
-      {artDiffs.length === 0 && attachedPalette && (
-        <StandalonePaletteDiff key={attachedPalette.path} palette={attachedPalette} />
-      )}
+  if (selected.kind === "palette") {
+    return (
+      <div className="h-full flex flex-col overflow-auto bg-bg">
+        <StandalonePaletteDiff key={selected.path} palette={selected} />
+      </div>
+    );
+  }
 
-      {/* Extra palettes (not attached to any art diff) */}
-      {extraPalettes.map((p) => (
-        <StandalonePaletteDiff key={p.path} palette={p} />
-      ))}
-
-      {/* Text (config, etc.) — friendly summary in artist mode, raw diff otherwise */}
-      {textDiffs.map((file) =>
-        artistMode ? (
-          <FriendlyFileDiff key={file.path} file={file} />
-        ) : (
-          <DiffFileBlock key={file.path} file={file} />
-        )
+  return (
+    <div className="h-full flex flex-col overflow-auto bg-bg">
+      {artistMode ? (
+        <FriendlyFileDiff key={selected.path} file={selected} />
+      ) : (
+        <DiffFileBlock key={selected.path} file={selected} />
       )}
     </div>
   );

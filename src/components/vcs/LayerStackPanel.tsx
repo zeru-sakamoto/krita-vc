@@ -2,7 +2,8 @@ import { memo, useMemo } from "react";
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
 import { compositeSvg } from "../../lib/svgArt";
-import { assetName } from "../../lib/friendly";
+import { paletteName } from "../../lib/friendly";
+import { useArtistMode } from "../../lib/artistMode";
 import { FileStatusChip } from "./FileStatusChip";
 
 export const COMPOSITE_ID = "composite";
@@ -145,6 +146,7 @@ export const LayerStackPanel = memo(function LayerStackPanel({
   onSelect,
   pendingIds,
 }: LayerStackPanelProps) {
+  const { artistMode } = useArtistMode();
   // Derive an overall palette change status: prefer M > A > D over unchanged swatches.
   const paletteStatus: FileStatus | null = palette ? (palette.status ?? null) : null;
 
@@ -201,7 +203,9 @@ export const LayerStackPanel = memo(function LayerStackPanel({
             <Row selected={selectedId === PALETTE_ID} onClick={() => onSelect(PALETTE_ID)}>
               <PaletteThumb swatches={palette.swatches} />
               <span className="flex min-w-0 flex-1 flex-col">
-                <span className="truncate text-[12px] text-text">{assetName(palette.path)}</span>
+                <span className="truncate text-[12px] text-text">
+                  {artistMode ? paletteName(palette.path) : palette.path}
+                </span>
                 <span className="truncate font-mono text-[10px] text-text-muted">
                   {palette.swatches.length} swatches
                 </span>

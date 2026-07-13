@@ -534,6 +534,37 @@ fn undo_last_commit_keeps_working_tree() {
     assert!(commit::undo_last_commit(&mut r).unwrap().is_none());
 }
 
+#[test]
+fn commit_selected_only_includes_named_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"a1").unwrap();
+    std::fs::write(root.join("b.gpl"), b"b1").unwrap();
+
+    // Only "staging" a.gpl: it's committed, b.gpl stays a pending "U" change.
+    let c1 = commit::commit_selected(&mut r, "only a", "t", Some(&["a.gpl".to_string()])).unwrap();
+    assert_eq!(c1.files.len(), 1);
+    assert_eq!(c1.files[0].path, "a.gpl");
+    assert!(scan::scan(&r)
+        .unwrap()
+        .iter()
+        .any(|(p, st)| p == "b.gpl" && st == "U"));
+
+    // Committing with a selection that matches nothing dirty errors Nothing.
+    assert!(matches!(
+        commit::commit_selected(&mut r, "nothing", "t", Some(&["missing.gpl".to_string()])),
+        Err(KvcError::Nothing)
+    ));
+
+    // b.gpl is still there to commit normally afterward.
+    let c2 = commit::commit_snapshot(&mut r, "rest", "t").unwrap();
+    assert_eq!(c2.files.len(), 1);
+    assert_eq!(c2.files[0].path, "b.gpl");
+}
+
 // --- rollback to a version (records a new commit) -------------------------------------
 
 #[test]
@@ -1302,6 +1333,28 @@ fn merge_three_way_conflict_takes_source_and_flags() {
     assert_eq!(entry.status, "C");
     // Source wins on disk.
     assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"feat-a");
+    assert!(scan::scan(&r).unwrap().is_empty());
+}
+
+#[test]
+fn merge_three_way_delete_vs_modify_conflict_keeps_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    branch::create_branch(&mut r, "feat", None).unwrap();
+    std::fs::remove_file(root.join("a.gpl")).unwrap();
+    commit::commit_snapshot(&mut r, "feat deletes a", "t").unwrap();
+
+    branch::switch_branch(&mut r, "main").unwrap();
+    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
+    commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
+
+    let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
+    let entry = m.files.iter().find(|f| f.path == "a.gpl").unwrap();
+    assert_eq!(entry.status, "C");
+    // The edit is kept rather than losing it to the delete.
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"main-a");
     assert!(scan::scan(&r).unwrap().is_empty());
 }
 

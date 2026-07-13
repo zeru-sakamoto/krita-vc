@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { ArtLayer, Branch, Commit, DiffEntry, FileStatus } from "../types";
+import type { ArtLayer, Branch, Commit, DiffEntry, FileStatus, WorkingChange } from "../types";
 import { inTauri } from "./tauri";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
@@ -62,6 +62,55 @@ export function useCommits(path: string, nonce = 0): Commit[] {
   }, [path, nonce]);
 
   return commits;
+}
+
+/**
+ * Real working-tree changes for `path` via `scan_repository` (staged is a UI-only flag —
+ * the backend has no notion of it). Lifted out of `ChangesPanel` so `Sidebar`'s "discard
+ * current changes" action can see the same staged/unstaged split without a second scan.
+ * Empty in a plain browser (no backend). `nonce` forces a refetch (e.g. after committing).
+ */
+export function useWorkingChanges(
+  path: string | null,
+  nonce: number,
+  setScanning: (v: boolean) => void
+): {
+  items: WorkingChange[];
+  setItems: Dispatch<SetStateAction<WorkingChange[]>>;
+  error: string | null;
+} {
+  const [items, setItems] = useState<WorkingChange[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!inTauri() || !path) {
+      setItems([]);
+      return;
+    }
+    let cancelled = false;
+    setScanning(true);
+    invoke<WorkingChange[]>("scan_repository", { path })
+      .then((changes) => {
+        if (!cancelled) {
+          setItems(changes);
+          setError(null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setItems([]);
+          setError(String(e));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setScanning(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce, setScanning]);
+
+  return { items, setItems, error };
 }
 
 /** Shape returned by the branch Tauri commands (serde camelCase). */

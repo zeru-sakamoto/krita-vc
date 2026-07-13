@@ -9,9 +9,24 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
+    commit_selected(repo, message, author, None)
+}
+
+/// Commit working-tree changes, optionally restricted to `only` (e.g. the frontend's "staged"
+/// paths) — files outside that set are left dirty, uncommitted. `None` commits everything,
+/// matching [`commit_snapshot`]. Errors `Nothing` if the selected set has no changes.
+pub fn commit_selected(
+    repo: &mut Repo,
+    message: &str,
+    author: &str,
+    only: Option<&[String]>,
+) -> Result<Commit> {
     // `keep_bytes`: changed files hand their just-read buffers straight to the commit below
     // (budgeted — see `scan::RETAIN_BUDGET`), so a big .kra isn't read twice per commit.
-    let changes = scan::scan_detailed(repo, true)?;
+    let mut changes = scan::scan_detailed(repo, true)?;
+    if let Some(only) = only {
+        changes.retain(|c| only.iter().any(|p| p == &c.rel));
+    }
     if changes.is_empty() {
         return Err(KvcError::Nothing);
     }
@@ -391,23 +406,36 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
     Ok(commit)
 }
 
-/// Discard uncommitted changes and reset the working tree to `tip_id` — no new commit.
-/// Errors `Nothing` if the tree is already clean.
+/// Discard uncommitted changes, restoring the working tree (and index) to `tip_id` — no new
+/// commit. When `paths` is `Some`, only those relative paths are touched (e.g. so the frontend
+/// can discard everything except files it's marked "staged" — staging has no backend concept of
+/// its own); `None` discards every dirty file. Errors `Nothing` if nothing in scope is dirty.
 ///
 /// Uses the real on-disk scan ([`scan::scan_detailed`]), unlike `current_tree` above which is
 /// derived from committed history and would trivially equal `tip_id`'s own tree. Rewrites go
 /// through [`bytes_of`] (full store rebuild), not the incremental [`restore_bytes`] path — that
 /// path trusts the on-disk file as a diff base, which doesn't hold for the dirty file being
 /// discarded.
-fn discard_to_tip(repo: &mut Repo, tip_id: &str) -> Result<Commit> {
+pub fn discard_working_changes(
+    repo: &mut Repo,
+    tip_id: &str,
+    paths: Option<&[String]>,
+) -> Result<()> {
     let target = tree_at_commit(&repo.commits, tip_id)
         .ok_or_else(|| KvcError::NoCommit(tip_id.to_string()))?;
     let dirty = scan::scan_detailed(repo, false)?;
-    if dirty.is_empty() {
+    let selected: Vec<&scan::ScanChange> = match paths {
+        Some(only) => dirty
+            .iter()
+            .filter(|c| only.iter().any(|p| p == &c.rel))
+            .collect(),
+        None => dirty.iter().collect(),
+    };
+    if selected.is_empty() {
         return Err(KvcError::Nothing);
     }
 
-    for change in &dirty {
+    for change in selected {
         let abs = safe_join(&repo.root, &change.rel)?;
         if change.status == "U" {
             // Never committed — discarding it means it goes away.
@@ -438,7 +466,14 @@ fn discard_to_tip(repo: &mut Repo, tip_id: &str) -> Result<Commit> {
             },
         );
     }
-    repo.save()?;
+    repo.save()
+}
+
+/// Discard uncommitted changes and reset the working tree to `tip_id` — no new commit.
+/// Errors `Nothing` if the tree is already clean. Delegates to [`discard_working_changes`];
+/// returns the (unchanged) tip commit, matching [`rollback_to_commit`]'s return shape.
+fn discard_to_tip(repo: &mut Repo, tip_id: &str) -> Result<Commit> {
+    discard_working_changes(repo, tip_id, None)?;
     repo.commits
         .iter()
         .rev()

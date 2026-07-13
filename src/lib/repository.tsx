@@ -34,6 +34,11 @@ interface RepositoryValue {
   /** Undo the last commit, keeping working-tree changes. */
   undoLastCommit: () => Promise<void>;
   /**
+   * Discard uncommitted working-tree changes — no new commit. Empty `paths` discards
+   * everything; otherwise only those relative paths are touched.
+   */
+  discardChanges: (paths: string[]) => Promise<void>;
+  /**
    * Create a branch and switch to it. Starts at the current tip (instant, no file I/O)
    * unless `base` names another branch, which switches the working tree to that branch's
    * files first (refused while there are unsaved changes).
@@ -212,6 +217,22 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     }
   }, [current, refresh]);
 
+  const discardChanges = useCallback(
+    async (paths: string[]) => {
+      if (!inTauri() || !current) return;
+      setSaving(true);
+      setBusyMessage("Discarding changes — please wait…");
+      try {
+        await invoke("discard_changes", { path: current.path, paths });
+        refresh();
+      } finally {
+        setSaving(false);
+        setBusyMessage(null);
+      }
+    },
+    [current, refresh]
+  );
+
   // Branch mutations share one shape: invoke + refresh with the saving flag held (locks
   // staging, drives the StatusBar progress bar, and the full-screen BusyOverlay via `label`).
   // Errors rethrow so panels can show friendly messages (e.g. the dirty-tree save-first
@@ -291,6 +312,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       removeRepository,
       rollbackToCommit,
       undoLastCommit,
+      discardChanges,
       createBranch,
       switchBranch,
       mergeBranch,
@@ -315,6 +337,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       removeRepository,
       rollbackToCommit,
       undoLastCommit,
+      discardChanges,
       createBranch,
       switchBranch,
       mergeBranch,
