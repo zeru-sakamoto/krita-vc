@@ -5,6 +5,15 @@ import type { Repository } from "../types";
 import { inTauri } from "./tauri";
 import { clearSessionCaches } from "./repoData";
 import { readAuthorName, resolvedAuthor } from "./authorName";
+import { timed } from "./perf";
+
+/** Map a branch Tauri command to the Performance-report op label (unknowns pass through). */
+const BRANCH_OP: Record<string, string> = {
+  switch_branch: "switch",
+  merge_branch: "merge",
+  create_branch: "create",
+  delete_branch: "delete",
+};
 
 /**
  * Selected local repository. The app is local-only (no remotes); a repository is a
@@ -190,11 +199,17 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       setSaving(true);
       setBusyMessage("Restoring version — please wait…");
       try {
-        await invoke("rollback_to_commit", {
-          path: current.path,
-          commitId,
-          author: resolvedAuthor(readAuthorName()),
-        });
+        // Records against the NEW commit the rollback creates (c.id), not the target `commitId`.
+        await timed(
+          current.path,
+          "rollback",
+          invoke<{ id: string }>("rollback_to_commit", {
+            path: current.path,
+            commitId,
+            author: resolvedAuthor(readAuthorName()),
+          }),
+          (c) => ({ commitId: c.id })
+        );
         refresh();
       } finally {
         setSaving(false);
@@ -238,12 +253,24 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   // Errors rethrow so panels can show friendly messages (e.g. the dirty-tree save-first
   // prompt). No-ops without a backend/repository.
   const branchMutation = useCallback(
-    async (command: string, args: Record<string, string>, label: string) => {
+    async (
+      command: string,
+      args: Record<string, string>,
+      label: string,
+      // Pull extra fields (e.g. the resulting commit id) off the command's result into the timing
+      // sample — used so a merge's timing ties to the version it created.
+      meta?: (value: unknown) => { commitId?: string }
+    ) => {
       if (!inTauri() || !current) return;
       setSaving(true);
       setBusyMessage(label);
       try {
-        await invoke(command, { path: current.path, ...args });
+        await timed(
+          current.path,
+          BRANCH_OP[command] ?? command,
+          invoke(command, { path: current.path, ...args }),
+          meta
+        );
         refresh();
       } finally {
         setSaving(false);
@@ -272,7 +299,9 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       branchMutation(
         "merge_branch",
         { source, author: resolvedAuthor(readAuthorName()) },
-        "Merging branches — please wait…"
+        "Merging branches — please wait…",
+        // merge_branch returns the (merge) Commit — tie its save time to that version.
+        (c) => ({ commitId: (c as { id?: string }).id })
       ),
     [branchMutation]
   );

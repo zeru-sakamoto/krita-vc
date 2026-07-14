@@ -2,6 +2,7 @@ import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { ArtLayer, Branch, Commit, DiffEntry, FileStatus, WorkingChange } from "../types";
 import { inTauri } from "./tauri";
+import { timed } from "./perf";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
 interface BackendCommit {
@@ -203,7 +204,9 @@ export function useCommitDiff(path: string, commitId: string | null): DiffResult
     }
     let cancelled = false;
     setResult({ entries: [], error: null, loading: true });
-    invoke<DiffEntry[]>("commit_diff", { path, commitId })
+    timed(path, "diff", invoke<DiffEntry[]>("commit_diff", { path, commitId }), () => ({
+      commitId,
+    }))
       .then((entries) => {
         diffCache.set(key, entries);
         while (diffCache.size > DIFF_CACHE_MAX) {
@@ -237,7 +240,7 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
     }
     let cancelled = false;
     setResult({ entries: [], error: null, loading: true });
-    invoke<DiffEntry[]>("working_diff", { path, file })
+    timed(path, "diff", invoke<DiffEntry[]>("working_diff", { path, file }))
       .then((entries) => {
         if (!cancelled) setResult({ entries, error: null, loading: false });
       })
@@ -331,6 +334,54 @@ export function useRepoConfig(path: string): {
   };
 
   return { config, error, update };
+}
+
+/** One version's full-copy cost vs. what it added to the store, from `repo_storage_stats`. */
+export interface VersionRow {
+  version: number;
+  commitId: string;
+  message: string;
+  fileCount: number;
+  originalBytes: number;
+  /** On-disk bytes this version added to the delta store (first-reference attribution). */
+  storedBytes: number;
+}
+
+/** Shape of the `repo_storage_stats` command (serde camelCase) — feeds the Performance tab. */
+export interface StorageStats {
+  naiveBytes: number;
+  actualBytes: number;
+  savedBytes: number;
+  perVersion: VersionRow[];
+}
+
+/**
+ * Storage-savings report for `path` via `repo_storage_stats`: per-version original sizes plus
+ * the delta store's real footprint. `null` while loading or in a plain browser (no backend).
+ * `nonce` refetches after a mutation (e.g. a new commit grows the numbers).
+ */
+export function useStorageStats(path: string, nonce = 0): StorageStats | null {
+  const [stats, setStats] = useState<StorageStats | null>(null);
+
+  useEffect(() => {
+    if (!inTauri()) {
+      setStats(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<StorageStats>("repo_storage_stats", { path })
+      .then((s) => {
+        if (!cancelled) setStats(s);
+      })
+      .catch(() => {
+        if (!cancelled) setStats(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce]);
+
+  return stats;
 }
 
 export function useArtLayers(

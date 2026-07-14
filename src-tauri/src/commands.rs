@@ -184,6 +184,194 @@ pub async fn set_repo_config(
     .await
 }
 
+/// One row of the storage report: what a full copy of version N would have cost, versus what it
+/// actually added to the delta store.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionRow {
+    /// 1-based version number (commits are stored oldest-first).
+    pub version: u32,
+    pub commit_id: String,
+    pub message: String,
+    pub file_count: u32,
+    /// Sum of the original (uncompressed) sizes of every file tracked at this version.
+    pub original_bytes: u64,
+    /// On-disk bytes this version *added* to the store — the objects it was the first to
+    /// introduce (first-reference attribution). 0 for versions whose objects were all already
+    /// stored by an earlier version, and for pre-`original_size` history it may under-count.
+    pub stored_bytes: u64,
+}
+
+/// Storage the delta store saves versus naively keeping a full copy of every file per version.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStats {
+    /// Σ of every version's full-copy cost — the hypothetical "one full copy per version" total.
+    pub naive_bytes: u64,
+    /// Actual bytes the `.kvc` object + chain store occupies on disk.
+    pub actual_bytes: u64,
+    /// `naive - actual`, clamped at 0.
+    pub saved_bytes: u64,
+    pub per_version: Vec<VersionRow>,
+}
+
+/// Recursively sum the byte length of every file under `dir` (missing dir -> 0).
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(m) = e.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// Map every stored object name (`<hash>.full` / `<hash>.<base>.patch`) to its on-disk byte size,
+/// across both loose objects and pack entries — the size lookup for per-commit attribution.
+/// Mirrors GC's object/pack walk (`gc.rs`).
+fn object_size_map(repo: &Repo) -> std::collections::HashMap<String, u64> {
+    let mut map = std::collections::HashMap::new();
+    let objects = crate::repo::objects_dir(&repo.root);
+    let pack_dir = crate::delta::pack_dir(&objects);
+
+    // Loose objects (sharded `<xx>/<name>` + legacy flat), skipping the pack subdir.
+    let mut stack = vec![objects.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p != pack_dir {
+                    stack.push(p);
+                }
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if let Ok(m) = e.metadata() {
+                    map.insert(name.to_string(), m.len());
+                }
+            }
+        }
+    }
+    // Packed objects — payload length per entry (pack header/index overhead is left unattributed).
+    if let Ok(rd) = std::fs::read_dir(&pack_dir) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "pack") {
+                continue;
+            }
+            if let Some(entries) = crate::delta::read_pack_header(&path) {
+                for (name, _off, len) in entries {
+                    map.insert(name, len as u64);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The object name a `(stream key, content hash)` pair resolves to, via its chain.
+fn object_of(repo: &Repo, key: &str, hash: &str) -> Option<String> {
+    repo.chains
+        .chain(key)?
+        .iter()
+        .find(|v| v.hash == hash)
+        .map(|v| v.object_name())
+}
+
+/// Attribute each stored object's bytes to the **first** commit (oldest-first) that references it,
+/// so a version's `stored_bytes` is exactly what it newly added to the store (objects are
+/// content-addressed and shared across versions). Best-effort: a manifest that fails to reconstruct
+/// still attributes its own object, just not its tile sub-streams.
+fn stored_bytes_by_commit(
+    repo: &Repo,
+    size_of: &std::collections::HashMap<String, u64>,
+) -> std::collections::HashMap<String, u64> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut memo: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut out = std::collections::HashMap::new();
+    // repo.commits is append order = oldest-first.
+    for c in &repo.commits {
+        let mut refs: Vec<String> = Vec::new();
+        for f in &c.files {
+            let Some(content) = &f.content else { continue };
+            if f.is_kra {
+                if let Some(o) = object_of(repo, &kra::manifest_stream_key(&f.path), content) {
+                    refs.push(o);
+                }
+                if let Ok(manifest) = kra::load_manifest_memo(repo, &f.path, content, &mut memo) {
+                    for (k, h) in kra::referenced_streams(&f.path, &manifest) {
+                        if let Some(o) = object_of(repo, &k, &h) {
+                            refs.push(o);
+                        }
+                    }
+                }
+            } else if let Some(o) = object_of(repo, &format!("file:{}", f.path), content) {
+                refs.push(o);
+            }
+        }
+        let mut stored = 0u64;
+        for o in refs {
+            if seen.insert(o.clone()) {
+                stored += size_of.get(&o).copied().unwrap_or(0);
+            }
+        }
+        out.insert(c.id.clone(), stored);
+    }
+    out
+}
+
+/// Pure storage-report computation (no async, testable): per-version original sizes and per-version
+/// delta-store cost vs the store's real on-disk footprint. `original_size` and per-version
+/// attribution are effectively forward-only — history from before those existed under-counts.
+pub fn compute_storage_stats(repo: &Repo) -> StorageStats {
+    let size_of = object_size_map(repo);
+    let stored_by_commit = stored_bytes_by_commit(repo, &size_of);
+    let per_version: Vec<VersionRow> = repo
+        .commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // ponytail: O(commits × files) tree re-fold per version; fine for hand-scale histories.
+            let tree = commit::tree_at_commit(&repo.commits, &c.id).unwrap_or_default();
+            let original_bytes = tree.values().map(|f| f.original_size).sum();
+            VersionRow {
+                version: (i + 1) as u32,
+                commit_id: c.id.clone(),
+                message: c.message.clone(),
+                file_count: tree.len() as u32,
+                original_bytes,
+                stored_bytes: stored_by_commit.get(&c.id).copied().unwrap_or(0),
+            }
+        })
+        .collect();
+    let naive_bytes = per_version.iter().map(|r| r.original_bytes).sum();
+    let actual_bytes = dir_bytes(&crate::repo::objects_dir(&repo.root))
+        + dir_bytes(&crate::repo::chains_dir(&repo.root));
+    StorageStats {
+        naive_bytes,
+        actual_bytes,
+        saved_bytes: naive_bytes.saturating_sub(actual_bytes),
+        per_version,
+    }
+}
+
+/// Per-version original-size breakdown + the delta store's real footprint, for the
+/// Performance report.
+#[tauri::command]
+pub async fn repo_storage_stats(path: String) -> std::result::Result<StorageStats, String> {
+    run(move || Ok(compute_storage_stats(&Repo::open(Path::new(&path))?))).await
+}
+
 #[tauri::command]
 pub async fn scan_repository(path: String) -> std::result::Result<Vec<WorkingChange>, String> {
     run(move || {
@@ -1333,6 +1521,7 @@ pub async fn working_diff(
                 content: None,
                 is_kra: false,
                 file_hash: None,
+                original_size: 0,
             })]);
         }
         // Parse the working `.kra` once, then run the art diff and the embedded-palette diff off
@@ -1345,6 +1534,7 @@ pub async fn working_diff(
                 content: None,
                 is_kra: true,
                 file_hash: None,
+                original_size: 0,
             })
         };
         let abs = crate::repo::safe_join(&repo.root, &file)?;

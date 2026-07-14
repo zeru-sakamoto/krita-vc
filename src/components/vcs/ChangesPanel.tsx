@@ -11,6 +11,7 @@ import { useArtistMode } from "../../lib/artistMode";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
 import { assetName } from "../../lib/friendly";
 import { inTauri } from "../../lib/tauri";
+import { timed } from "../../lib/perf";
 
 function Section({
   title,
@@ -157,12 +158,17 @@ export function ChangesPanel({
     setBusyMessage("Committing changes — please wait…");
     setCommitError(null);
     try {
-      await invoke("commit_snapshot", {
+      await timed(
         path,
-        message: message.trim(),
-        author: resolvedAuthor(authorName),
-        paths,
-      });
+        "commit",
+        invoke<{ id: string }>("commit_snapshot", {
+          path,
+          message: message.trim(),
+          author: resolvedAuthor(authorName),
+          paths,
+        }),
+        (c) => ({ commitId: c.id })
+      );
       setMessage("");
       setConfirmCommit(null);
       refresh(); // refetch changes (now clean) + history

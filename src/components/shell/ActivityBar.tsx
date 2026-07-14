@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { ClockCounterClockwise, GitBranch, Stack, GearSix } from "@phosphor-icons/react";
+import { ClockCounterClockwise, GitBranch, Stack, GearSix, Gauge } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
 import { SettingsModal } from "./SettingsModal";
 
-export type ActivityView = "changes" | "history" | "branches";
+export type ActivityView = "changes" | "history" | "branches" | "performance";
 
 interface ActivityBarProps {
   active: ActivityView;
@@ -14,6 +14,7 @@ const ITEMS: { view: ActivityView; icon: typeof Stack; label: string }[] = [
   { view: "changes", icon: Stack, label: "Changes" },
   { view: "history", icon: ClockCounterClockwise, label: "History" },
   { view: "branches", icon: GitBranch, label: "Branches" },
+  { view: "performance", icon: Gauge, label: "Performance" },
 ];
 
 /**

@@ -41,7 +41,7 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
 | Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches` \| `performance`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders **one selected file** of the current commit/working diff (art-diff canvas height is drag-resizable), or an empty state. Which file is chosen by the Inspector's file list (`selectedFile`/`onSelectFile`, lifted to `RepoShell`); a multi-file commit no longer stacks every file's diff at once. |
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode's **changed-files list doubles as the main panel's file selector** — click a row to show that file in `DiffView`; a `.kra` row with an embedded document palette gets a palette sub-row that jumps straight to that palette's pane (`focusId`), and standalone palette files get their own row under a separate "Palettes" heading. Also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
@@ -153,6 +153,11 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   [`BranchDialogs.tsx`](../src/components/vcs/BranchDialogs.tsx); the backend's dirty-tree error
   (stable `"unsaved changes"` prefix) becomes a friendly save-first prompt with a jump to the
   Changes view. This is a local-only VCS — there are no remotes.
+- **`performance`** — [`PerformancePanel`](../src/components/vcs/PerformancePanel.tsx): the
+  Performance report — a summary card (average operation times + total storage saved), a
+  scrollable per-version card list (stored vs full-copy bytes + % saved + save/compare time), and a
+  pinned recent-operations log. Timing is client-side (localStorage); storage comes from the
+  `repo_storage_stats` backend command. See [performance-report.md](performance-report.md).
 
 ## Diff viewer
 
@@ -268,7 +273,8 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ ActivityBar ─ SettingsModal (gear) ─ CleanupModal ("Clean up storage…")
 ├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
-│                         └─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
+│                         ├─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
+│                         └─ performance → PerformancePanel (summary + per-version cards + recent ops)
 ├─ MainPanel ─ DiffView ──┬─ art     → ArtDiffView ─┬─ LayerStackPanel ─ FileStatusChip
 │                         │          (+ 1st palette)  ├─ ArtCanvas        (side-by-side)
 │                         │                           └─ CompareSlider ─ ArtCanvas (swipe)
