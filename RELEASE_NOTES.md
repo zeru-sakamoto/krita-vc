@@ -16,6 +16,9 @@
 - **Restore lineage in the history graph.** Restoring an older version now draws a dashed
   connector back to the version it was restored from, so the graph shows where a rollback
   came from at a glance.
+- **Performance tab.** A new activity-bar tab shows what the delta store is saving you: a
+  per-version storage-saved breakdown (already around 50% smaller than a full copy by your
+  second save, and climbing from there) alongside save/compare timing for every version.
 
 ### Fixes
 
