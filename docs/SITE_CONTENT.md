@@ -67,6 +67,17 @@ when you say so.
 
 ![Screenshot placeholder: cleanup/storage confirmation dialog](placeholder)
 
+### Performance, in numbers
+
+A **Performance** tab shows exactly what Krita VCS is saving you, no guessing. Every version
+lists what it actually added to your history next to what a full copy would have cost, with a
+percent-saved badge, so you watch the savings compound in real time: already around **50% smaller
+than a full copy by your second save**, and climbing higher with every version after that, since
+each new save only stores what changed. Alongside it, per-version save and compare times, so you
+can see the app is keeping pace with your painting, not slowing it down.
+
+![Screenshot placeholder: Performance tab with storage-saved and timing cards](placeholder)
+
 ### Palette diffs
 
 Working with color palettes? Krita VCS shows a color-by-color swatch comparison, with hex
