@@ -35,7 +35,7 @@ export function WindowChromeProvider({ children }: { children: React.ReactNode }
     } catch {
       // ignore (e.g. private mode) — state still works for the session
     }
-    // ponytail: one-frame flash possible on boot before this runs when native chrome
+    // One-frame flash possible on boot before this runs when native chrome
     // is the saved preference (tauri.conf.json's static default is decorations:false).
     // Acceptable, same tradeoff as theme's pre-paint flash guard; revisit only if noticeable.
     if (inTauri()) {

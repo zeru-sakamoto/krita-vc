@@ -169,7 +169,7 @@ pub fn commit_kra(
         }
         let name = f.name().to_string();
         // crc32/size come from the central directory — no decompression needed to compare.
-        // ponytail: crc32+size as the change detector (~2^-32 false-match per changed entry);
+        // Uses crc32+size as the change detector (~2^-32 false-match per changed entry);
         // upgrade path is hashing the compressed bytes.
         let (crc32, size) = (f.crc32(), f.size());
         if size > 0 {
@@ -1197,7 +1197,7 @@ pub fn layer_raster(
 
     let (tw, th, ps) = tile_dims(header);
     if tw <= 0 || th <= 0 || ps != 4 {
-        return Ok(None); // ponytail: RGBA8 tiles only.
+        return Ok(None); // RGBA8 tiles only.
     }
     let cache_dir = repo.cache_dir();
     let default_pixel = default_pixel_rgba(repo, relpath, manifest, &entry_path);
@@ -1296,7 +1296,7 @@ pub struct TileDiff {
 /// Compare two tile indexes in one pass — the old side's per-entry `(x,y) -> hash` map is
 /// built exactly once and feeds both the changed-entry set and the union region (previously
 /// two functions each rebuilt it).
-/// ponytail: a single union box across all layers — cheap and enough for the highlight overlay;
+/// A single union box across all layers — cheap and enough for the highlight overlay;
 /// per-layer boxes if the UI ever needs them.
 pub fn diff_tile_indexes(
     old: &TileIndexRef,
@@ -1744,7 +1744,7 @@ fn rasterize_working_tiles(
 ) -> Result<Option<LayerRaster>> {
     let (tw, th, ps) = tile_dims(header);
     if tw <= 0 || th <= 0 || ps != 4 {
-        return Ok(None); // ponytail: RGBA8 tiles only.
+        return Ok(None); // RGBA8 tiles only.
     }
     let mut key_tiles: Vec<(i64, i64, &str)> = tiles
         .iter()

@@ -5,7 +5,7 @@
 //! tile is `TILEWIDTH*TILEHEIGHT*PIXELSIZE` bytes, stored **planar** (one full channel plane
 //! after another) in the colorspace's native channel order.
 //!
-//! ponytail: only RGBA 8-bit (PIXELSIZE 4, planar B,G,R,A) is decoded — the overwhelmingly
+//! Only RGBA 8-bit (PIXELSIZE 4, planar B,G,R,A) is decoded — the overwhelmingly
 //! common Krita paint layer. Anything else returns `None` and the UI falls back to the
 //! composite (mergedimage.png). Upgrade path: branch on the layer's colorspace/depth here.
 
@@ -58,7 +58,7 @@ pub fn lzf_decompress(data: &[u8], expected: usize) -> Option<Vec<u8>> {
 /// Compress with liblzf's format (greedy hash-table matcher). Round-trips through
 /// [`lzf_decompress`]; byte-parity with Krita's own encoder is *not* required — any valid
 /// LZF stream decodes identically, and Krita reads whatever the flag byte says.
-/// ponytail: ~50-line port of `lzf_c` — no crate carries this format reliably.
+/// ~50-line port of `lzf_c` — no crate carries this format reliably.
 pub fn lzf_compress(data: &[u8]) -> Vec<u8> {
     const MAX_OFF: usize = 1 << 13; // 13-bit offset field
     const MAX_REF: usize = (1 << 8) + (1 << 3) - 1; // 264: 3-bit len code + extension byte
@@ -165,7 +165,7 @@ pub fn planar_to_rgba(planar: &[u8], tw: usize, th: usize) -> Option<Vec<u8>> {
 /// Decode one tile's stored bytes into interleaved RGBA (`tw*th*4`). `None` if unsupported.
 pub fn tile_to_rgba(stored: &[u8], tw: usize, th: usize, pixelsize: usize) -> Option<Vec<u8>> {
     if pixelsize != 4 {
-        return None; // ponytail: RGBA8 only.
+        return None; // RGBA8 only.
     }
     let planar = tile_planar(stored, tw * th * pixelsize)?;
     planar_to_rgba(&planar, tw, th)
@@ -643,7 +643,7 @@ pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         let mut enc = png::Encoder::new(Cursor::new(&mut png), width, height);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        // ponytail: these rasters are transient data-URLs for the webview — encode speed matters,
+        // These rasters are transient data-URLs for the webview — encode speed matters,
         // byte size doesn't. Fast deflate + no row filter over max compression.
         enc.set_compression(png::Compression::Fast);
         enc.set_filter(png::FilterType::NoFilter);
@@ -885,7 +885,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Minimal standard base64 encoder (no padding omitted). ponytail: ~15 lines beats a dep.
+/// Minimal standard base64 encoder (no padding omitted). ~15 lines beats a dep.
 fn base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);

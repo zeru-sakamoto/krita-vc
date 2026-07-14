@@ -57,7 +57,7 @@ class VcDocker(DockWidget):
 
     def canvasChanged(self, canvas):
         # Required override; the poll timer (not canvas signals, which vary across
-        # Krita versions) drives all state updates. ponytail: timer poll, switch to
+        # Krita versions) drives all state updates. Uses a timer poll, switch to
         # a real change signal only if 1.5s staleness ever becomes a complaint.
         pass
 

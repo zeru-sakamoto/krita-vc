@@ -504,7 +504,7 @@ fn version_label(repo: &Repo, commit_id: &str) -> String {
 /// edits reappear as uncommitted changes on the next scan. Only the index is rewound, for the
 /// paths the popped commit touched. Returns the new head commit (or `None` if the log is empty).
 ///
-/// ponytail: objects/chain versions from the popped commit are left in place — they're
+/// Objects/chain versions from the popped commit are left in place — they're
 /// content-addressed, so they're harmless orphans and dedup on any future re-commit.
 pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
     let tip_id = match repo.branches.tip() {

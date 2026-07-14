@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 /// Hand-rolled `--flag value` parser — five subcommands, not worth a dependency.
-// ponytail: flat arg parse, adopt clap only if subcommands grow.
+// Flat arg parse, adopt clap only if subcommands grow.
 fn parse_flags(args: &[String]) -> HashMap<String, String> {
     let mut flags = HashMap::new();
     let mut it = args.iter();

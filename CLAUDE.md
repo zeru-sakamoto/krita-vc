@@ -65,6 +65,12 @@ control (the backend), the visual diff viewer, and [performance](docs/performanc
 `.kra` diff path is fast: staged/streamed loading, rayon parallelism, the `.kvc/cache/` raster
 cache, raster downscaling, and the dev/release build profile).
 
+## Conventions
+
+Deliberate simplifications/shortcuts (duplicated data that can't be shared across a build
+boundary, a narrower fix than the "proper" one, etc.) get a plain comment at the point of the
+shortcut explaining what and why — no `ponytail:`-style tags, not a prose explanation elsewhere.
+
 ## Commands
 
 Package manager is npm (`package-lock.json` is present).

@@ -100,7 +100,7 @@ impl Repo {
 
         // Try to store as a patch against the head; fall back to a full snapshot if the head
         // can't be reconstructed (a previously corrupted chain) or the patch doesn't round-trip.
-        // ponytail: verifying the patch here guarantees every stored version rebuilds, so a
+        // Verifying the patch here guarantees every stored version rebuilds, so a
         // corrupt chain can never reach a commit and brick it. The extra bspatch is cheap next
         // to the bsdiff we already ran.
         let patched = match &head {
@@ -109,7 +109,7 @@ impl Repo {
             // couple of KB, and every later read walks the whole chain back; already-compressed
             // content (mergedimage.png etc.) yields patches near full size. Both go straight
             // to a 1-object zstd full: commits and reads become a single read + decode.
-            // ponytail: patch-floor gate + magic sniff — tune here if storage ever matters more.
+            // Patch-floor gate + magic sniff — tune here if storage ever matters more.
             _ if bytes.len() < opts.patch_floor || looks_compressed(bytes) => None,
             // Patch against the current head while under the chain threshold.
             Some(h) if h.chain_len + 1 <= max => match self.reconstruct(key, &h.hash) {
@@ -334,7 +334,7 @@ impl TileCache {
         if let Some(v) = self.0.lock().unwrap().get(hash) {
             return Ok(v.clone());
         }
-        // ponytail: racing threads may reconstruct the same hash twice — harmless, idempotent.
+        // Racing threads may reconstruct the same hash twice — harmless, idempotent.
         let bytes = std::sync::Arc::new(repo.reconstruct(key, hash)?);
         self.0
             .lock()

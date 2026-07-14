@@ -7,12 +7,15 @@
     <title>Krita VCS</title>
     <style>
       /* Themed background + spinner shown before React mounts (avoids a white/black
-         startup flash). Static markup only — main.tsx's render() replaces #root's
-         contents wholesale, so this disappears on its own, no cleanup JS needed. */
+         startup flash). Colors come from --boot-bg/--boot-accent, set by the inline
+         script below from the persisted theme (see src/lib/theme.tsx) so the flash
+         matches whatever theme the user picked. Static markup only — main.tsx's
+         render() replaces #root's contents wholesale, so this disappears on its
+         own, no cleanup JS needed. */
       html,
       body {
         margin: 0;
-        background: #131210;
+        background: var(--boot-bg, #131210);
       }
       #boot-spinner {
         position: fixed;
@@ -24,8 +27,8 @@
         width: 28px;
         height: 28px;
         border-radius: 50%;
-        border: 3px solid #2d2b28;
-        border-top-color: #e07b39;
+        border: 3px solid rgba(128, 128, 128, 0.25);
+        border-top-color: var(--boot-accent, #e07b39);
         animation: boot-spin 0.7s linear infinite;
       }
       @keyframes boot-spin {
@@ -34,6 +37,26 @@
         }
       }
     </style>
+    <script>
+      // Duplicates THEMES' bg/accent from src/lib/theme.tsx (can't import a module
+      // here — this runs before bundling). Keep the two in sync by hand.
+      (function () {
+        var THEME_COLORS = {
+          charcoal: ["#131210", "#e07b39"],
+          "krita-blue": ["#1e1e24", "#2e86de"],
+          "electric-cyan": ["#1a1d24", "#00d2d3"],
+          "sunset-coral": ["#201e22", "#ff6b6b"],
+          "tokyo-night": ["#1a1b26", "#7aa2f7"],
+          "true-black": ["#000000", "#8b5cf6"],
+          "charcoal-light": ["#f4f1ea", "#a8511a"],
+          "studio-light": ["#f5f6fa", "#2e86de"],
+        };
+        var id = localStorage.getItem("krita-vc:theme");
+        var colors = THEME_COLORS[id] || THEME_COLORS.charcoal;
+        document.documentElement.style.setProperty("--boot-bg", colors[0]);
+        document.documentElement.style.setProperty("--boot-accent", colors[1]);
+      })();
+    </script>
   </head>
 
   <body>

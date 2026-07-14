@@ -180,7 +180,7 @@ html[data-theme="charcoal-light"] {
   --color-diff-add-fg: #1f7a3a;
   --color-diff-del: #f7dcdc;
   --color-diff-del-fg: #b3261e;
-  /* ponytail: see studio-light note — diff overlays tuned for dark. */
+  /* See studio-light note — diff overlays tuned for dark. */
 }
 
 html[data-theme="studio-light"] {
@@ -204,7 +204,7 @@ html[data-theme="studio-light"] {
   --color-diff-add-fg: #1f7a3a;
   --color-diff-del: #f7dcdc;
   --color-diff-del-fg: #b3261e;
-  /* ponytail: diff-viewer changed-pixel mask/hatch overlays were tuned for
+  /* diff-viewer changed-pixel mask/hatch overlays were tuned for
      dark; functional here but not re-tuned. Refine if it reads poorly. */
 }
 

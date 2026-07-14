@@ -49,7 +49,7 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 /// commands and the `kvc` CLI alike — takes this so a plugin commit can't interleave with a
 /// desktop commit/switch/GC into a torn write. A crash leaves a stale lock; GC's stale-`*.tmp`
 /// style cleanup is the recovery path (the file is removed on drop in the normal case).
-// ponytail: advisory create-new lock; upgrade to fs2 flock only if a stale lock ever bites.
+// Advisory create-new lock; upgrade to fs2 flock only if a stale lock ever bites.
 pub struct RepoLock(PathBuf);
 
 impl RepoLock {
@@ -705,7 +705,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// ponytail: compact (not pretty) — `.kvc/` JSON is machine state; pretty-printing scaled
+/// Compact (not pretty) — `.kvc/` JSON is machine state; pretty-printing scaled
 /// badly with history size back when chains were JSON too.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
@@ -840,7 +840,7 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 /// `(size, mtime)` for a path, for the scanner's re-hash cache. mtime is **nanoseconds** since the
 /// epoch — second resolution is too coarse (a save in the same second as the last commit, at the
 /// same size, would be missed). Best-effort: 0 if unavailable (forces a re-hash, which is safe).
-/// ponytail: relies on the OS updating mtime on every save (Krita rewrites the file, so it does);
+/// Relies on the OS updating mtime on every save (Krita rewrites the file, so it does);
 /// a tool that preserves mtime while changing same-size content would slip past — upgrade path is
 /// git's "racy" rule (re-hash anything whose mtime isn't strictly older than the last index write).
 pub fn size_mtime(meta: &std::fs::Metadata) -> (u64, u64) {

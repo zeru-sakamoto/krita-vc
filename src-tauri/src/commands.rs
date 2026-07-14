@@ -1181,7 +1181,7 @@ pub fn committed_art_dto(
 /// The visual diff for a commit: one entry per changed file. `.kra` files render as art diffs
 /// (composite + layer metadata; the heavy per-layer rasters are fetched lazily via `commit_layers`
 /// so the panel appears immediately). Everything else is a minimal text entry.
-/// ponytail: real line/palette diffs for non-.kra files are deferred — the focus is .kra fidelity.
+/// Real line/palette diffs for non-.kra files are deferred — the focus is .kra fidelity.
 #[tauri::command]
 pub async fn commit_diff(
     path: String,

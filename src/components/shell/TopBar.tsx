@@ -209,7 +209,7 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
   const [confirmPath, setConfirmPath] = useState("");
   const [busy, setBusy] = useState(false);
 
-  // ponytail: last two path segments (parent\repo) — enough to confirm intent without typing the full path
+  // Last two path segments (parent\repo) — enough to confirm intent without typing the full path
   const shortPath = repo.path.split(/[\\/]/).filter(Boolean).slice(-2).join("\\");
   const canConfirm = !busy && (!deleteFolder || confirmPath.replace(/\//g, "\\") === shortPath);
 

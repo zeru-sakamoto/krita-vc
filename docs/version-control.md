@@ -78,7 +78,7 @@ rollback, undo, restore, real cleanup, config write, delete) **and** the `kvc` C
 plugin shells out to share the same lock, so a plugin commit can't interleave with a desktop
 commit/switch/GC into a torn write. A second writer gets `KvcError::Locked` ("repository is
 busy") rather than corrupting state. Read-only commands (scan, history, diffs, dry-run cleanup)
-don't lock. A crash leaves a stale lock, which GC's `*.tmp`-style cleanup can sweep. ponytail:
+don't lock. A crash leaves a stale lock, which GC's `*.tmp`-style cleanup can sweep. It's an
 advisory create-new lock; upgrade to an OS flock only if a stale lock ever bites.
 
 ### Path safety
@@ -212,7 +212,7 @@ decompose it into streams so small edits stay small:
   (`commit_snapshot` looks it up via the current tip's tree) and, for each zip entry whose crc32 +
   size (read from the central directory, no decompression needed) match the previous manifest's,
   reuses that manifest entry verbatim instead of inflating/re-storing it. Commit cost becomes
-  proportional to the entries that actually changed. ponytail: crc32+size as the change detector
+  proportional to the entries that actually changed. Uses crc32+size as the change detector
   (~2⁻³² false-match chance per changed entry); upgrade path is hashing the compressed bytes.
 - **The composite is block-tiled** (`KraEntry::CompositePng`) — `mergedimage.png` changes on
   nearly every commit and, as an opaque PNG, used to add its full multi-MB self per commit
