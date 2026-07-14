@@ -61,9 +61,11 @@ Non-`.kra` diffs are still minimal. Rust tests live in `src-tauri/tests/`; the f
 runner yet — if you add one, update this file.
 
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
-control (the backend), the visual diff viewer, and [performance](docs/performance.md) (why the
+control (the backend), the visual diff viewer, [performance](docs/performance.md) (why the
 `.kra` diff path is fast: staged/streamed loading, rayon parallelism, the `.kvc/cache/` raster
-cache, raster downscaling, and the dev/release build profile).
+cache, raster downscaling, and the dev/release build profile), and the
+[performance report](docs/performance-report.md) (the **Performance** tab: client-side operation
+timing + per-version storage-saved-vs-full-copy metrics).
 
 ## Conventions
 
@@ -120,7 +122,7 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
 - **Shell** (`src/components/shell/`): `AppShell.tsx` splits on the selected repository — a
   welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
   and wires a top bar plus four zones — `TopBar` (repository switcher) above `ActivityBar`
-  (changes/history/branches, plus a gear opening `SettingsModal`) | `Sidebar` (resizable, content switches on the active view) |
+  (changes/history/branches/performance, plus a gear opening `SettingsModal`) | `Sidebar` (resizable, content switches on the active view) |
   `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`. `BusyOverlay.tsx` is a
   full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
   during any write op (commit, branch switch/merge/create/delete, rollback, undo, cleanup),

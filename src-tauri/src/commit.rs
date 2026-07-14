@@ -53,6 +53,7 @@ pub fn commit_selected(
                 content: None,
                 is_kra: false,
                 file_hash: None,
+                original_size: 0,
             });
             continue;
         }
@@ -97,6 +98,7 @@ pub fn commit_selected(
             content: Some(content),
             is_kra,
             file_hash: Some(hash),
+            original_size: size,
         });
     }
 
@@ -352,6 +354,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
             content: f.content.clone(),
             is_kra: f.is_kra,
             file_hash: Some(hash),
+            original_size: size,
         });
     }
     // Remove currently-tracked files that didn't exist at the target commit.
@@ -373,6 +376,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
                 content: None,
                 is_kra: cf.is_kra,
                 file_hash: None,
+                original_size: 0,
             });
         }
     }

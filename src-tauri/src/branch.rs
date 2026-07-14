@@ -162,6 +162,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                 content: sf.content.clone(),
                 is_kra: sf.is_kra,
                 file_hash: sf.file_hash.clone(),
+                original_size: sf.original_size,
             }),
             (None, Some(cf)) => {
                 if conflicted {
@@ -173,6 +174,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                         content: cf.content.clone(),
                         is_kra: cf.is_kra,
                         file_hash: cf.file_hash.clone(),
+                        original_size: cf.original_size,
                     });
                 } else {
                     files.push(CommittedFile {
@@ -181,6 +183,7 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
                         content: None,
                         is_kra: cf.is_kra,
                         file_hash: None,
+                        original_size: 0,
                     });
                 }
             }

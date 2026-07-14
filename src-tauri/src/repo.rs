@@ -441,6 +441,11 @@ pub struct CommittedFile {
     /// and on deletions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_hash: Option<String>,
+    /// Original (uncompressed) byte size of the working file as it sat on disk when this commit
+    /// recorded it — feeds the "storage saved vs full-copy-per-version" report. 0 for deletions
+    /// and for records from before the field existed (`#[serde(default)]`).
+    #[serde(default)]
+    pub original_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -17,6 +17,7 @@ import { BranchBadge } from "../vcs/BranchBadge";
 import { CommitGraph } from "../vcs/CommitGraph";
 import { ChangesPanel } from "../vcs/ChangesPanel";
 import { BranchesPanel } from "../vcs/BranchesPanel";
+import { PerformancePanel } from "../vcs/PerformancePanel";
 import {
   CreateBranchModal,
   SaveFirstModal,
@@ -33,6 +34,7 @@ const PANEL_TITLE: Record<ActivityView, string> = {
   changes: "Changes",
   history: "History",
   branches: "Branches",
+  performance: "Performance",
 };
 
 interface SidebarProps {
@@ -190,6 +192,8 @@ export function Sidebar({
       <DockerPanel
         title={PANEL_TITLE[view]}
         className="flex-1"
+        // Performance manages its own internal scroll (pinned recent-ops); others scroll whole.
+        scroll={view !== "performance"}
         actions={
           view === "changes" ? (
             <>
@@ -265,6 +269,8 @@ export function Sidebar({
         )}
 
         {view === "branches" && <BranchesPanel branches={branches} onShowChanges={onShowChanges} />}
+
+        {view === "performance" && <PerformancePanel />}
       </DockerPanel>
 
       {/* Resize handle */}

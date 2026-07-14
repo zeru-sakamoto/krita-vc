@@ -565,6 +565,84 @@ fn commit_selected_only_includes_named_paths() {
     assert_eq!(c2.files[0].path, "b.gpl");
 }
 
+#[test]
+fn commit_records_original_size_and_it_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let body = b"twelve bytes"; // 12 bytes on disk
+    std::fs::write(root.join("swatches.gpl"), body).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    assert_eq!(c1.files[0].original_size, body.len() as u64);
+
+    // Survives the append-only JSONL round-trip (serde default keeps legacy lines readable).
+    let r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(r2.commits[0].files[0].original_size, body.len() as u64);
+
+    // Deletions record 0.
+    std::fs::remove_file(root.join("swatches.gpl")).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    assert_eq!(c2.files[0].status, "D");
+    assert_eq!(c2.files[0].original_size, 0);
+}
+
+#[test]
+fn storage_stats_sums_per_version_and_beats_full_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // v1: one 100-byte file. v2: it grows to 300 bytes + a new 50-byte file (tree = 350).
+    std::fs::write(root.join("a.gpl"), vec![b'a'; 100]).unwrap();
+    commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    std::fs::write(root.join("a.gpl"), vec![b'a'; 300]).unwrap();
+    std::fs::write(root.join("b.gpl"), vec![b'b'; 50]).unwrap();
+    commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let s = commands::compute_storage_stats(&r);
+    // One row per commit, folding the FULL tree (not just the diff) each version.
+    assert_eq!(s.per_version.len(), 2);
+    assert_eq!(
+        (s.per_version[0].version, s.per_version[0].original_bytes),
+        (1, 100)
+    );
+    assert_eq!(
+        (s.per_version[1].file_count, s.per_version[1].original_bytes),
+        (2, 350)
+    );
+    // Naive "full copy per version" cost is the sum; the delta store must not exceed it.
+    assert_eq!(s.naive_bytes, 450);
+    assert!(
+        s.actual_bytes <= s.naive_bytes,
+        "delta store should not exceed full copies"
+    );
+    assert_eq!(s.saved_bytes, s.naive_bytes - s.actual_bytes);
+
+    // Each row carries its commit id + message, for the per-version cards.
+    assert_eq!(s.per_version[0].message, "v1");
+    assert_eq!(s.per_version[1].commit_id, r.commits[1].id);
+
+    // Per-version stored bytes: every version that recorded content added some, none exceeds its
+    // own full-copy cost, and the attributed total never exceeds the whole store.
+    for row in &s.per_version {
+        assert!(row.stored_bytes > 0, "v{} stored nothing", row.version);
+        assert!(
+            row.stored_bytes <= row.original_bytes,
+            "v{} stored more than a full copy",
+            row.version
+        );
+    }
+    let attributed: u64 = s.per_version.iter().map(|r| r.stored_bytes).sum();
+    assert!(
+        attributed <= s.actual_bytes,
+        "attributed {attributed} exceeds store {}",
+        s.actual_bytes
+    );
+}
+
 // --- rollback to a version (records a new commit) -------------------------------------
 
 #[test]

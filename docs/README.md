@@ -21,6 +21,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,
   parallelism, caching, downscaling, and the build profile tuning behind each.
+- [**Performance report**](performance-report.md) — the **Performance** tab: client-side operation
+  timing (localStorage) and the storage saved vs. full-copy-per-version metric, and how each is
+  measured.
 
 ## See also
 
