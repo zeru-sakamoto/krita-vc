@@ -35,6 +35,10 @@ with no backend, the UI renders empty states).
                  history; undo/GC rewrite it. Legacy commits.json migrates on first save
   branches.json  branch name → tip commit id, plus the current branch (written after the
                  log, so a torn log append is never a dangling tip)
+  stashes.json   the set-aside shelf: work parked off to the side of history (see Stashes
+                 below). Written last, for the same reason branches.json is — a stash record
+                 must never outlive the chain content it points at. Absent = empty shelf,
+                 which is the whole migration for repos that predate stashing
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff),
                  sharded 256-way (objects/<hash[..2]>/, flat legacy paths still read); a
                  commit with ≥32 new objects writes them as one objects/pack/<hash>.pack
@@ -52,7 +56,9 @@ Nothing on the hot path ever deletes stored data — undo and branch-delete just
 reference, leaving orphaned commits/chain versions/objects behind (harmless, since objects are
 content-addressed and dedup on any re-commit). The user-facing **"Clean up storage"** action
 (`cleanup_repository`, mark-and-sweep in [`gc.rs`](../src-tauri/src/gc.rs)) reclaims everything
-unreachable from any branch tip: unreachable commits leave the log, dead chain versions leave
+unreachable from any branch tip **or stash** (a stash is referenced by nothing in the commit log,
+so it has to be rooted explicitly or a cleanup would destroy set-aside work): unreachable commits
+leave the log, dead chain versions leave
 their shards, dead loose objects are deleted, and packs are dropped (fully dead) or rewritten
 with survivors only when >25% dead (below that, rewriting costs more IO than it frees). A live
 patch's whole chain back to its full snapshot counts as reachable. GC also prunes the raster
@@ -339,6 +345,56 @@ deduplicates across branches for free.
   `main`, `DeleteMain`); its commits stay in `commits.log` as harmless unreachable data. The
   Branches panel also hides the delete affordance on `main`.
 
+## Stashes — setting work aside
+
+[`stash.rs`](../src-tauri/src/stash.rs) parks the working tree's changes off to the side of
+history, reverts the files on disk, and brings them back later. In the UI this is **"Set aside"**
+(Artist Mode) / **"Stash"**, from the Changes panel's ⋮ menu, the save-first prompt, and Settings.
+
+A stash is **not a commit** and never enters `commits.log`. That's deliberate: as a commit it
+would show up as a spurious version row in the storage report (`compute_storage_stats` walks
+every commit unfiltered) and, being parented on the tip, would silently block "Undo the last
+version". Instead a `Stash` record — id, label, author, timestamp, origin branch, and
+`files: Vec<CommittedFile>` — lives in `.kvc/stashes.json`.
+
+Storage is entirely borrowed from the commit path. `commit::store_change` (shared with
+`commit_selected`) stores each changed file through the **same relpath-keyed streams** a commit
+uses (`kra:{rel}:*` / `file:{rel}`), so a stashed `.kra`'s unchanged tiles dedup against
+committed history — setting aside a lightly-edited document costs almost nothing. It also means
+`gc.rs` marks a stash's content with the same walk it uses for commits, and `commit::bytes_of`
+restores it with no new code.
+
+Three things in here are load-bearing, and each has a test that fails without it:
+
+- **A stash must not touch `index.json`.** The index is the *committed* head; a stash commits
+  nothing. `store_change` returns the index entry rather than applying it, and `stash::create`
+  drops it. Recording the stashed hash would make the revert below scan the file as clean and
+  skip it — the set-aside would silently fail to clear the tree.
+- **`create` saves before it reverts.** `discard_working_changes` erases the work from disk
+  *before* its own save, so the record must already be durable when it runs; otherwise a crash
+  mid-revert leaves the files reverted with no record of what was in them. Saving first inverts
+  the failure mode to a harmless one (stash on the shelf, files still dirty).
+- **`pop` writes the files before dropping the record**, for the mirror-image reason. A crash
+  between the two just means the next pop reports a conflict — recoverable.
+
+The operations:
+
+- **Create** (`stash::create`) — scans, filters to `only` (the frontend's staged selection;
+  staging has no backend concept of its own), stores the content, records the stash,
+  then reverts via `commit::discard_working_changes`. `Nothing` if nothing in scope is dirty;
+  `NoCommit` on a repo with no commits — there's no committed state to revert to, and the UI
+  gates the menu items on `commits.length` the way undo does.
+- **Pop** (`stash::pop`) — all-or-nothing. If *any* path in the stash is dirty it refuses with
+  `StashConflict` naming the files and leaves the stash intact; overwriting would destroy work
+  with no way back. Otherwise it writes each file (`"D"` records delete instead), leaves the
+  index alone — which is exactly what makes the restored work scan as changed again — and drops
+  the record. Popping onto a different branch is allowed: `branch` is recorded for display only
+  and nothing is ever looked up by it, so a stash outlives its origin branch.
+- **Drop / drop-all** (`stash::drop_one` / `drop_all`) — take a stash off the shelf without
+  restoring it. These run on an `open_light` repo and so must use `save_stashes()`, never
+  `save()` (which would rewrite index/commits from partial state — the same hazard documented on
+  `save_branches`). The content lingers until the next "Clean up storage" reclaims it.
+
 ## Raster delivery (`kvcimg` URI scheme)
 
 In the desktop shell, cached diff rasters ship as `kvcimg://` URLs (`raster::raster_url`)
@@ -375,7 +431,11 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one, and never `main`). Returns the branch list. |
-| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip. `dryRun` reports what would be freed without deleting anything. |
+| `list_stashes(path)` | The set-aside shelf as `StashDto[]` (`{ id, label, author, timestamp, branch, changes }`), newest-first for the UI. Stream hashes stay backend-side. |
+| `create_stash(path, label, author, paths?)` | Set aside working-tree changes and revert those files; `paths` restricts it to those relative paths (the frontend passes its staged selection), omitted/`null` sets aside everything dirty. Returns the shelf. Needs `Repo::open` — storing content writes streams, which a light repo forbids. |
+| `pop_stash(path, id)` | Bring a stash back into the working tree and drop it from the shelf. Errors `"stash conflict: …"` if anything it holds is dirty (the frontend matches that prefix). Returns the shelf. |
+| `drop_stash(path, id)` / `drop_all_stashes(path)` | Remove stashes without restoring them; storage is reclaimed by the next `cleanup_repository`. |
+| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip **or stash**. `dryRun` reports what would be freed without deleting anything. |
 | `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |

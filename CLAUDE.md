@@ -10,16 +10,27 @@ no fetch, no cloud sync. The UI exposes only local operations (commit history, l
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
-`gc`, `palette`; commands in `commands.rs`). **Tracking guardrail**: the scanner only newly tracks
+`gc`, `palette`, `stash`; commands in `commands.rs`). **Tracking guardrail**: the scanner only newly tracks
 *supported* file types — `.kra` documents and the palette formats (`.gpl`/`.kpl`/`.aco`/`.ase`,
 `scan::is_supported`); every other file in the project folder is ignored (never staged, hashed, or
 committed). Already-tracked files stay tracked, so pre-guardrail repos aren't pruned. Storage layout: chains are **sharded per tracked file**
 (`.kvc/chains/`, lazy-loaded, `KVCC2`-tagged bincode — pre-KVCC2 shards and legacy monolithic
 `chains.bin`/`chains.json` migrate transparently), the commit log is **append-only JSON-lines**
 (`.kvc/commits.log`; a commit appends one line, legacy `commits.json` migrates on first save),
+stashes live in `.kvc/stashes.json` (absent = empty shelf, which is the whole migration),
 loose objects are sharded 256-way (`objects/<xx>/`, flat legacy stays readable), and a
 commit with ≥32 new objects writes **one pack file** (`objects/pack/*.pack`) instead of loose
-files — per-file creates dominated large commits on Windows. The `.kra` composite
+files — per-file creates dominated large commits on Windows. **Stashing** ("Set aside" in Artist
+Mode) parks working-tree changes off to the side of history and reverts the files on disk
+(`stash.rs`, records in `.kvc/stashes.json` — deliberately *not* `commits.log`, which would put
+spurious version rows in the Performance tab and block undo). Stash content reuses the commit
+path's relpath-keyed streams via the shared `commit::store_change`, so a stashed `.kra` dedups
+its tiles against history for free; three orderings are load-bearing and each has a test —
+a stash must **not** write `repo.index` (else the revert scans clean and silently keeps the
+tree dirty), `create` must save **before** reverting (else a crash erases the work with no
+record), and `pop` must write files **before** dropping the record. Pop is all-or-nothing:
+`StashConflict` (prefix `"stash conflict"`, distinct from the `"unsaved changes"` one) if any
+stashed path is dirty. See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside). The `.kra` composite
 (`mergedimage.png`) is stored as **content-addressed 256px pixel blocks**
 (`KraEntry::CompositePng`) instead of a full PNG per commit — the store's former dominant cost;
 restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
@@ -28,7 +39,8 @@ several× larger on disk), and restores are memory-bounded (64 MB build chunks).
 `tilePixelDeltas` config flag (off by default) stores decoded tile pixels that bsdiff
 across versions — mixed histories are safe via a per-ref `raw` flag. A user-facing **"Clean up
 storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powered confirm
-modal in the **Settings modal**) reclaims history unreachable from any branch tip **and** prunes the raster
+modal in the **Settings modal**) reclaims history unreachable from any branch tip **or stash**
+(stashes are GC roots — nothing in `commits.log` references them) **and** prunes the raster
 cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
 rewrites on >25% dead, and consolidates small packs; the raster cache (`.kvc/cache/`) is
 size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Settings** (activity-bar
@@ -38,16 +50,18 @@ bar** toggle (`windowChrome.tsx`, default **on** — the window boots with no OS
 `@tauri-apps/api/window`, and the preference is applied live through `setDecorations`, no
 restart needed — see the Shell section below), an **author name**
 (`authorName.tsx`, persisted to `localStorage`, sent as the `author` on new commits/merges/
-rollbacks, falling back to `"You"`), and per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs
-(`get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only write) plus "Clean up
-storage". **Branching is real**: `.kvc/branches.json` maps branch name → tip
+rollbacks, falling back to `"You"`), per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs
+(`get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only write), "Clean up
+storage", and the **set-aside shelf** (every stash with its origin branch + age; per-row remove
+and remove-all, confirms rendered as *sibling* modals per the `CleanupModal` pattern — `Modal`
+has no portal). **Branching is real**: `.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
 commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
 commits reachable from the current branch tip. The frontend drives it via Tauri `invoke` in the
 desktop shell (history, scan, commit, repo lifecycle, rollback/undo, branch create/switch/merge/
-delete, and per-commit visual diffs). **There is no mock data**: in a plain browser
+delete, stash create/pop/drop, and per-commit visual diffs). **There is no mock data**: in a plain browser
 (`npm run dev`, no backend) the data hooks return empty results, repository/branch actions are
 no-ops, and the status bar shows a "Browser preview" badge — browser mode is for UI work only.
 `.kra` diffs are real and load in two
@@ -160,7 +174,17 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   (the delete affordance is hidden on `main` — the backend also refuses it with `DeleteMain`), a
   "New branch" modal; shared dialogs live in `BranchDialogs.tsx`, and the backend's dirty-tree
   error — matched on its stable `"unsaved changes"` prefix — becomes a friendly save-first prompt
-  with a jump to the Changes view. The History sidebar has a live branch-switcher `Menu` (with a
+  offering three ways out: save, **set it aside** (stashes everything, then retries the blocked
+  switch/merge), or jump to Changes. **Set-aside actions** sit in the `Sidebar` panel-options
+  `Menu` as **three divider-separated groups**: undo/discard, then set-aside, then bring-back.
+  `Menu` still has no submenus, but gained a `MenuItem.separator` flag (a `border-t` above that
+  row) since one `footer` group can only draw one rule and this needs two. Two set-aside rows,
+  changes-view only as they act on the working tree (staged files / everything, both gated on
+  `commits.length` — there's no committed state to revert to otherwise), plus two `footer`
+  bring-back rows shown in both views (latest, or a picker).
+  Dialogs live in `StashDialogs.tsx` (`SetAsideModal` label prompt, `PickStashModal`,
+  `StashConflictModal` + `isStashConflictError`), fed by `useStashes` via `list_stashes`.
+  The History sidebar has a live branch-switcher `Menu` (with a
   "New branch…" footer), the graph colors nodes per branch (`branchColorMap` in `lib/graph.ts`,
   current branch = accent) and badges branch tips on their commit cards, and `useBranches` in
   `lib/repoData.ts` feeds it all via `list_branches`), and the diff viewer

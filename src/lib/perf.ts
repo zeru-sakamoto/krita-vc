@@ -15,7 +15,7 @@ export interface PerfSample {
   commitId?: string;
 }
 
-// ponytail: last 100 samples/repo — bounds localStorage without a real ring buffer.
+// Last 100 samples/repo — bounds localStorage without a real ring buffer.
 const CAP = 100;
 const keyFor = (repoPath: string) => `krita-vc:perf:${repoPath}`;
 

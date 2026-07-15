@@ -5,6 +5,7 @@ import {
   ArrowUUpLeft,
   CaretDown,
   DotsThreeVertical,
+  ListBullets,
   Plus,
 } from "@phosphor-icons/react";
 import { DockerPanel } from "./DockerPanel";
@@ -24,9 +25,18 @@ import {
   errorText,
   isUnsavedChangesError,
 } from "../vcs/BranchDialogs";
+import {
+  PickStashModal,
+  SetAsideModal,
+  StashConflictModal,
+  StashIcon,
+  UnstashIcon,
+  isStashConflictError,
+  type StashScope,
+} from "../vcs/StashDialogs";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
-import { useWorkingChanges } from "../../lib/repoData";
+import { useStashes, useWorkingChanges } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import type { Branch, Commit } from "../../types";
 
@@ -76,6 +86,7 @@ export function Sidebar({
     undoLastCommit,
     discardChanges,
     switchBranch,
+    popStash,
     saving,
   } = useRepository();
   const { artistMode } = useArtistMode();
@@ -86,6 +97,14 @@ export function Sidebar({
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
   const [discardAllError, setDiscardAllError] = useState<string | null>(null);
+  const [setAside, setSetAside] = useState<{ scope: StashScope; paths: string[] | null } | null>(
+    null
+  );
+  const [pickStash, setPickStash] = useState(false);
+  const [stashConflict, setStashConflict] = useState<string | null>(null);
+  // The branch the pending switch was aiming at, held across the save-first prompt so setting
+  // work aside can complete the switch the user actually asked for.
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
 
   // Lifted here (not local to ChangesPanel) so "Discard current changes" can see the same
   // staged/unstaged split without a second scan — staging has no backend concept of its own.
@@ -95,6 +114,8 @@ export function Sidebar({
     error: workingError,
   } = useWorkingChanges(current?.path ?? null, refreshNonce, setScanning);
   const unstagedPaths = workingItems.filter((c) => !c.staged).map((c) => c.change.path);
+  const stagedPaths = workingItems.filter((c) => c.staged).map((c) => c.change.path);
+  const stashes = useStashes(current?.path ?? null, refreshNonce);
 
   const onSwitch = async (name: string) => {
     if (name === currentBranch.name || saving) return;
@@ -102,7 +123,21 @@ export function Sidebar({
     try {
       await switchBranch(name);
     } catch (e) {
-      if (isUnsavedChangesError(e)) setSaveFirst(true);
+      if (isUnsavedChangesError(e)) {
+        setPendingSwitch(name);
+        setSaveFirst(true);
+      } else setSwitchError(errorText(e));
+    }
+  };
+
+  const onPop = async (id: string) => {
+    setSwitchError(null);
+    try {
+      await popStash(id);
+      setPickStash(false);
+    } catch (e) {
+      setPickStash(false);
+      if (isStashConflictError(e)) setStashConflict(errorText(e));
       else setSwitchError(errorText(e));
     }
   };
@@ -140,11 +175,67 @@ export function Sidebar({
     storageKey: "krita-vc:sidebar-width",
   });
 
-  // Shared "panel options" menu (history + changes). Currently just the undo action.
+  // Shared "panel options" menu (history + changes), in three groups: undo/discard, then
+  // setting work aside, then bringing it back. The first divider is the set-aside group's own
+  // `separator`; the second is the `footer` group's rule.
+  //
+  // Setting work aside acts on the working tree, so those rows are changes-only; bringing it
+  // back shows in both views, since you might well be looking at history when you want it back.
+  const openSetAside = (scope: StashScope, paths: string[] | null) => {
+    setSwitchError(null);
+    setSetAside({ scope, paths });
+  };
+  const setAsideItems = (
+    view === "changes"
+      ? [
+          {
+            id: "stash-staged",
+            label: artistMode ? "Set aside staged files" : "Stash staged",
+            icon: <StashIcon size={14} />,
+            separator: true,
+            // Needs a commit to revert back to, same guard as undo.
+            disabled: stagedPaths.length === 0 || commits.length === 0 || saving,
+            onSelect: () => openSetAside("staged", stagedPaths),
+          },
+          {
+            id: "stash-all",
+            label: artistMode ? "Set aside everything" : "Stash all",
+            icon: <StashIcon size={14} />,
+            disabled: workingItems.length === 0 || commits.length === 0 || saving,
+            onSelect: () => openSetAside("all", null),
+          },
+        ]
+      : []
+  ) satisfies MenuItem[];
+  const stashFooter = [
+    {
+      id: "stash-pop-latest",
+      label: artistMode ? "Bring back latest" : "Pop latest stash",
+      icon: <UnstashIcon size={14} />,
+      detail:
+        stashes.length === 0
+          ? undefined
+          : artistMode
+            ? `${stashes.length} set aside`
+            : `${stashes.length} ${stashes.length === 1 ? "stash" : "stashes"}`,
+      disabled: stashes.length === 0 || saving,
+      // The list is newest-first, so [0] is the latest.
+      onSelect: () => void onPop(stashes[0].id),
+    },
+    {
+      id: "stash-pick",
+      label: artistMode ? "Bring back…" : "Pop stash…",
+      icon: <ListBullets size={14} />,
+      disabled: stashes.length === 0 || saving,
+      onSelect: () => setPickStash(true),
+    },
+  ] satisfies MenuItem[];
+
   const panelOptions = (
     <Menu
       align="right"
       minWidth={200}
+      footer={stashFooter}
       trigger={(open) => (
         <span
           title="Panel options"
@@ -183,6 +274,7 @@ export function Sidebar({
               },
             ] satisfies MenuItem[])
           : []),
+        ...setAsideItems,
       ]}
     />
   );
@@ -285,7 +377,47 @@ export function Sidebar({
 
       {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}
       {saveFirst && (
-        <SaveFirstModal onClose={() => setSaveFirst(false)} onShowChanges={onShowChanges} />
+        <SaveFirstModal
+          onClose={() => {
+            setSaveFirst(false);
+            setPendingSwitch(null);
+          }}
+          onShowChanges={onShowChanges}
+          onSetAside={() => {
+            setSaveFirst(false);
+            openSetAside("all", null);
+          }}
+        />
+      )}
+
+      {setAside && (
+        <SetAsideModal
+          scope={setAside.scope}
+          paths={setAside.paths}
+          onClose={() => setSetAside(null)}
+          // The tree is clean now, so a switch that was blocked can finally go through.
+          onDone={() => {
+            const target = pendingSwitch;
+            setPendingSwitch(null);
+            if (target) void onSwitch(target);
+          }}
+        />
+      )}
+
+      {pickStash && (
+        <PickStashModal
+          stashes={stashes}
+          onClose={() => setPickStash(false)}
+          onPick={(id) => void onPop(id)}
+        />
+      )}
+
+      {stashConflict && (
+        <StashConflictModal
+          message={stashConflict}
+          onClose={() => setStashConflict(null)}
+          onShowChanges={onShowChanges}
+        />
       )}
 
       {confirmUndo && (

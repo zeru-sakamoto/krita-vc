@@ -11,6 +11,7 @@ import {
   errorText,
   isUnsavedChangesError,
 } from "./BranchDialogs";
+import { SetAsideModal } from "./StashDialogs";
 import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
 
@@ -31,9 +32,13 @@ export function BranchesPanel({
 
   const [createOpen, setCreateOpen] = useState(false);
   const [saveFirst, setSaveFirst] = useState(false);
+  const [setAsideOpen, setSetAsideOpen] = useState(false);
   const [mergeTarget, setMergeTarget] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The action the dirty tree blocked, kept so setting work aside can retry the switch or merge
+  // the user actually asked for rather than just dismissing the prompt.
+  const [blocked, setBlocked] = useState<(() => Promise<void>) | null>(null);
 
   // Shared error routing: the dirty-tree guard gets the friendly save-first dialog,
   // everything else shows inline under the list.
@@ -43,8 +48,10 @@ export function BranchesPanel({
       await fn();
       return true;
     } catch (e) {
-      if (isUnsavedChangesError(e)) setSaveFirst(true);
-      else setError(errorText(e));
+      if (isUnsavedChangesError(e)) {
+        setBlocked(() => fn);
+        setSaveFirst(true);
+      } else setError(errorText(e));
       return false;
     }
   };
@@ -134,7 +141,31 @@ export function BranchesPanel({
 
       {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}
       {saveFirst && (
-        <SaveFirstModal onClose={() => setSaveFirst(false)} onShowChanges={onShowChanges} />
+        <SaveFirstModal
+          onClose={() => {
+            setSaveFirst(false);
+            setBlocked(null);
+          }}
+          onShowChanges={onShowChanges}
+          onSetAside={() => {
+            setSaveFirst(false);
+            setSetAsideOpen(true);
+          }}
+        />
+      )}
+
+      {setAsideOpen && (
+        <SetAsideModal
+          scope="all"
+          paths={null}
+          onClose={() => setSetAsideOpen(false)}
+          // The tree is clean now, so retry whatever the dirty tree blocked.
+          onDone={() => {
+            const retry = blocked;
+            setBlocked(null);
+            if (retry) void attempt(retry);
+          }}
+        />
       )}
 
       {mergeTarget && (

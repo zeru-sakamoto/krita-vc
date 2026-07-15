@@ -41,6 +41,14 @@ pub enum KvcError {
     #[error("unsaved changes: save or discard your work before switching branches")]
     DirtyTree,
 
+    // Deliberately does NOT start with "unsaved changes" — that prefix is matched above for the
+    // branch-switch prompt, and a stash conflict needs its own frontend dialog.
+    #[error("stash conflict: {0} changed since you set this aside — save or discard first")]
+    StashConflict(String),
+
+    #[error("no such stash: {0}")]
+    NoStash(String),
+
     #[error("no such branch: {0}")]
     NoBranch(String),
 

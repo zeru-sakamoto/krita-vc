@@ -341,7 +341,7 @@ pub fn compute_storage_stats(repo: &Repo) -> StorageStats {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            // ponytail: O(commits × files) tree re-fold per version; fine for hand-scale histories.
+            // O(commits × files) tree re-fold per version; fine for hand-scale histories.
             let tree = commit::tree_at_commit(&repo.commits, &c.id).unwrap_or_default();
             let original_bytes = tree.values().map(|f| f.original_size).sum();
             VersionRow {
@@ -610,6 +610,112 @@ pub async fn discard_changes(path: String, paths: Vec<String>) -> std::result::R
             Some(paths.as_slice())
         };
         commit::discard_working_changes(&mut repo, &tip, filter)
+    })
+    .await
+}
+
+// --- stashes ----------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashDto {
+    pub id: String,
+    pub label: String,
+    pub author: String,
+    pub timestamp: String,
+    pub branch: String,
+    pub changes: Vec<FileChange>,
+}
+
+/// Stashes newest-first for the UI (the engine stores them oldest-first). The order is load-
+/// bearing: "bring back the latest" takes the first row. Stream hashes stay backend-side — the
+/// frontend only ever shows which files a stash holds.
+pub fn stash_dtos(repo: &Repo) -> Vec<StashDto> {
+    crate::stash::list(repo)
+        .iter()
+        .rev()
+        .map(|s| StashDto {
+            id: s.id.clone(),
+            label: s.label.clone(),
+            author: s.author.clone(),
+            timestamp: s.timestamp.clone(),
+            branch: s.branch.clone(),
+            changes: s
+                .files
+                .iter()
+                .map(|f| FileChange {
+                    path: f.path.clone(),
+                    status: f.status.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn list_stashes(path: String) -> std::result::Result<Vec<StashDto>, String> {
+    run(move || {
+        let repo = Repo::open_light(Path::new(&path))?;
+        Ok(stash_dtos(&repo))
+    })
+    .await
+}
+
+/// Set the working tree's changes aside and revert the files on disk. `paths` empty sets aside
+/// everything dirty; otherwise only those relative paths (the frontend passes its staged or
+/// untracked selection, since staging is a UI-only concept the backend doesn't track).
+#[tauri::command]
+pub async fn create_stash(
+    path: String,
+    label: String,
+    author: String,
+    paths: Option<Vec<String>>,
+) -> std::result::Result<Vec<StashDto>, String> {
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        // Full open: storing the stashed content writes streams, which a light repo forbids.
+        let mut repo = Repo::open(root)?;
+        crate::stash::create(&mut repo, &label, &author, paths.as_deref())?;
+        Ok(stash_dtos(&repo))
+    })
+    .await
+}
+
+/// Bring a stash back into the working tree and take it off the shelf. Errors
+/// `KvcError::StashConflict` (message prefix `"stash conflict"`) if anything it touches has
+/// changed since — the frontend matches that prefix to offer a save-or-discard prompt.
+#[tauri::command]
+pub async fn pop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open(root)?;
+        crate::stash::pop(&mut repo, &id)?;
+        Ok(stash_dtos(&repo))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn drop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open_light(root)?;
+        crate::stash::drop_one(&mut repo, &id)?;
+        Ok(stash_dtos(&repo))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn drop_all_stashes(path: String) -> std::result::Result<usize, String> {
+    run(move || {
+        let root = Path::new(&path);
+        let _lock = RepoLock::acquire(root)?;
+        let mut repo = Repo::open_light(root)?;
+        crate::stash::drop_all(&mut repo)
     })
     .await
 }

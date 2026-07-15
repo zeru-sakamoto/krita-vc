@@ -250,7 +250,8 @@ never breaks existing raw-tiled commits.
 Nothing on the hot path ever deletes stored data (undo and branch-delete orphan objects by
 design — content-addressed orphans are harmless), so a long-lived repo only grows. The
 user-facing "Clean up storage" action (`cleanup_repository`, mark-and-sweep in `gc.rs`)
-reclaims everything unreachable from any branch tip: unreachable commits leave the log, dead
+reclaims everything unreachable from any branch tip **or stash** (stashes are rooted explicitly —
+nothing in the commit log references them): unreachable commits leave the log, dead
 chain versions leave their shards, dead loose objects are deleted, and packs are dropped
 (fully dead) or rewritten with survivors only — but only when **>25 % of the pack is dead**
 (`worth_rewriting`): rewriting rereads every survivor, so reclaiming a few KB from a big pack

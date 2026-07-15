@@ -104,13 +104,18 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-/** Shown when a switch/merge is blocked by unsaved working-tree changes. */
+/**
+ * Shown when a switch/merge is blocked by unsaved working-tree changes. `onSetAside` offers the
+ * third way out — park the work and carry on — so this isn't a dead end.
+ */
 export function SaveFirstModal({
   onClose,
   onShowChanges,
+  onSetAside,
 }: {
   onClose: () => void;
   onShowChanges?: () => void;
+  onSetAside?: () => void;
 }) {
   const { artistMode } = useArtistMode();
   return (
@@ -120,6 +125,9 @@ export function SaveFirstModal({
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
+          {onSetAside && (
+            <Button onClick={onSetAside}>{artistMode ? "Set it aside" : "Stash it"}</Button>
+          )}
           {onShowChanges && (
             <Button
               variant="primary"
@@ -136,8 +144,8 @@ export function SaveFirstModal({
     >
       <p className="text-[13px] leading-relaxed text-text-muted">
         {artistMode
-          ? "You have work that isn't saved as a version yet. Save it first so nothing gets lost, then switch."
-          : "The working tree has uncommitted changes. Commit (or undo) them before switching branches."}
+          ? "You have work that isn't saved as a version yet. Save it first so nothing gets lost — or set it aside and pick it up later."
+          : "The working tree has uncommitted changes. Commit, stash, or undo them before switching branches."}
       </p>
     </Modal>
   );

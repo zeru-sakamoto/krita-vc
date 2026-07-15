@@ -12,6 +12,7 @@
 //!                  rewriting the whole history; undo/GC rewrite it). Legacy repos carry a
 //!                  commits.json instead — migrated to the log on first save
 //!   branches.json  branch name -> tip commit id, plus the current branch
+//!   stashes.json   work set aside off to the side of history (also a GC root); absent = empty
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
 //!   cache/         capped raster PNGs (bounded, see `raster::cache_prune`)
 //! ```
@@ -470,6 +471,35 @@ pub struct Commit {
     pub restored_from: Option<String>,
 }
 
+/// Work set aside off to the side of history — see [`crate::stash`].
+///
+/// Deliberately *not* a `Commit` in `commits.log`: a stash is not history. Keeping it out means
+/// it can't show up as a spurious version row in the storage report, and can't block `undo` by
+/// looking like a child of the tip. `files` is still `Vec<CommittedFile>` because the content is
+/// stored through the very same relpath-keyed streams a commit uses — so a stashed `.kra`'s tiles
+/// dedup against committed history for free, and [`crate::gc`] can mark them with the same walk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stash {
+    pub id: String,
+    /// User's label for the stash. May be empty — the UI falls back to the file list.
+    pub label: String,
+    pub author: String,
+    pub timestamp: String,
+    /// Branch this was set aside on. Display only — a stash can be brought back onto any branch,
+    /// including after this one is deleted, because `files` carries its own content hashes and
+    /// nothing here is ever looked up.
+    pub branch: String,
+    pub files: Vec<CommittedFile>,
+}
+
+/// The shelf: every stash in the repo, oldest first (so `last()` is "the latest").
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stashes {
+    pub stashes: Vec<Stash>,
+}
+
 /// Local branches: name -> tip commit id (`""` = branch has no commits yet).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -532,6 +562,8 @@ pub struct Repo {
     pub(crate) packs: crate::delta::Packs,
     pub commits: Vec<Commit>,
     pub branches: Branches,
+    /// Work set aside off to the side of history — see [`crate::stash`]. Also a GC root.
+    pub stashes: Stashes,
     /// How many of `commits` are already lines in `commits.log`; `save()` appends the rest.
     commits_persisted: usize,
     /// Force a full log rewrite on the next `save()`: set on legacy `commits.json` migration
@@ -596,6 +628,7 @@ impl Repo {
             packs: crate::delta::Packs::default(),
             commits,
             branches,
+            stashes: read_stashes(&kvc)?,
             commits_persisted: persisted,
             commits_rewrite: migrate,
             config_dirty,
@@ -622,6 +655,7 @@ impl Repo {
             packs: crate::delta::Packs::default(),
             commits,
             branches,
+            stashes: read_stashes(&kvc)?,
             commits_persisted: persisted,
             commits_rewrite: migrate,
             config_dirty,
@@ -647,7 +681,8 @@ impl Repo {
     /// and skip chains entirely ([`ChainStore::has_dirty`]). The commit log normally takes one
     /// O(1) append per new commit — never a rewrite that grows with total history. Write order
     /// matters: `branches.json` (the tips) goes last, so a torn log append is always an
-    /// unreachable orphan record, never a dangling branch tip.
+    /// unreachable orphan record, never a dangling branch tip. `stashes.json` follows for the
+    /// same reason — a stash record must never outlive the chain content it points at.
     pub fn save(&mut self) -> Result<()> {
         let kvc = kvc_dir(&self.root);
         if self.config_dirty {
@@ -660,6 +695,7 @@ impl Repo {
         }
         self.flush_commits(&kvc)?;
         write_json(&kvc.join("branches.json"), &self.branches)?;
+        write_json(&kvc.join("stashes.json"), &self.stashes)?;
         Ok(())
     }
 
@@ -698,6 +734,13 @@ impl Repo {
     /// [`Repo::save`] rewrites index/commits from possibly-partial state.
     pub fn save_branches(&self) -> Result<()> {
         write_json(&kvc_dir(&self.root).join("branches.json"), &self.branches)
+    }
+
+    /// Flush only `stashes.json` — same reasoning as [`Repo::save_branches`]: dropping a stash
+    /// runs on an `open_light` repo, where a full [`Repo::save`] would rewrite index/commits from
+    /// possibly-partial state.
+    pub fn save_stashes(&self) -> Result<()> {
+        write_json(&kvc_dir(&self.root).join("stashes.json"), &self.stashes)
     }
 }
 
@@ -821,6 +864,17 @@ fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
         read_json(&path)
     } else {
         Ok(Branches::migrated(commits))
+    }
+}
+
+/// An absent `stashes.json` is an empty shelf — that's the whole migration for repos that
+/// predate stashing.
+fn read_stashes(kvc: &Path) -> Result<Stashes> {
+    let path = kvc.join("stashes.json");
+    if path.is_file() {
+        read_json(&path)
+    } else {
+        Ok(Stashes::default())
     }
 }
 

@@ -1,6 +1,14 @@
 import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { ArtLayer, Branch, Commit, DiffEntry, FileStatus, WorkingChange } from "../types";
+import type {
+  ArtLayer,
+  Branch,
+  Commit,
+  DiffEntry,
+  FileStatus,
+  Stash,
+  WorkingChange,
+} from "../types";
 import { inTauri } from "./tauri";
 import { timed } from "./perf";
 
@@ -157,6 +165,32 @@ export function useBranches(path: string, nonce = 0): Branch[] {
   }, [path, nonce]);
 
   return branches;
+}
+
+/** The set-aside shelf, newest first (the backend already reverses it). */
+export function useStashes(path: string | null, nonce = 0): Stash[] {
+  const [stashes, setStashes] = useState<Stash[]>([]);
+
+  useEffect(() => {
+    // No backend in a plain browser — the shelf is always empty and the actions are no-ops.
+    if (!inTauri() || !path) {
+      setStashes([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<Stash[]>("list_stashes", { path })
+      .then((s) => {
+        if (!cancelled) setStashes(s);
+      })
+      .catch(() => {
+        if (!cancelled) setStashes([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce]);
+
+  return stashes;
 }
 
 /** A diff result plus any backend error, so callers can show a message instead of a blank panel. */

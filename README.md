@@ -42,18 +42,24 @@ files, where git's text-oriented delta model performs poorly.
   in place (no new history entry); rolling back to an older one records a new commit, linked back
   to it in the graph by a dashed connector. Changed your mind mid-edit? Discard a single file's
   unsaved changes, or every unstaged file at once, without touching what's staged.
+- **Set aside** (stash): park working-tree changes off to the side — staged files or everything —
+  and bring them back later, without leaving a version in your history. A switch or merge blocked
+  by unsaved changes offers setting them aside as a one-click way through, and a Settings-modal
+  shelf lists every set-aside item with its origin branch and age.
 - **Branching & merging**: create, switch, merge (fast-forward or two-parent), and delete local
   branches, all backed by real tree materialization. Conflicting edits are flagged for review; if
   one side edited a file and the other deleted it, the edit wins, so a merge never quietly loses
   work.
 - **Storage housekeeping**: a "Clean up storage" action reclaims history unreachable from any
-  branch tip (mark-and-sweep GC), and the raster preview cache is size-budgeted with LRU pruning.
+  branch tip or set-aside stash (mark-and-sweep GC), and the raster preview cache is
+  size-budgeted with LRU pruning.
 - **Settings** (activity-bar gear). One place for user preferences: the Artist Mode toggle, a
   **custom title bar** toggle (a frameless window with its own draggable title bar and window
   controls, on by default; switch back to your OS's native frame any time, no restart needed), a
   **theme selector** (8 color themes, including a true-black option, applied instantly via CSS,
   with the visual-diff highlight color following the chosen theme's accent), the **author name**
-  signed on your versions, and per-repository **preview-cache size**, **compact-storage**, and
+  signed on your versions, the **set-aside shelf** (every stash, with per-item remove and
+  remove-all), and per-repository **preview-cache size**, **compact-storage**, and
   **low-memory diffs** options, plus "Clean up storage".
 - **Artist Mode**: a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
@@ -118,7 +124,8 @@ src/
 │  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, SettingsModal,
 │  │            Sidebar, Inspector, StatusBar, BusyOverlay
 │  ├─ vcs/     — diff viewer (DiffView, ArtDiffView, ArtCanvas, CompareSlider,
-│  │            LayerStackPanel, PaletteDiffView), commit graph, branch/changes panels
+│  │            LayerStackPanel, PaletteDiffView), commit graph, branch/changes panels,
+│  │            StashDialogs (set-aside prompts)
 │  ├─ ui/      — IconButton, Button, Menu, Modal
 │  └─ MainPanel.tsx
 ├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode +
@@ -127,7 +134,7 @@ src/
 └─ types.ts    — domain types (the frontend ↔ backend contract)
 
 src-tauri/src/ — Rust backend (crate krita_vc_lib)
-├─ repo, scan, commit, delta, branch, gc   — the local VCS engine
+├─ repo, scan, commit, delta, branch, gc, stash   — the local VCS engine
 ├─ kra, tiles, raster                        — .kra parsing, tile store, raster/diff imaging
 ├─ palette                                   — .gpl/.kpl/.aco/.ase parsing + swatch diffing
 ├─ commands.rs                               — Tauri #[command] IPC surface

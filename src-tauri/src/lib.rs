@@ -9,6 +9,7 @@ pub mod palette;
 pub mod raster;
 pub mod repo;
 pub mod scan;
+pub mod stash;
 pub mod tiles;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -44,6 +45,11 @@ pub fn run() {
             commands::rollback_to_commit,
             commands::undo_last_commit,
             commands::discard_changes,
+            commands::list_stashes,
+            commands::create_stash,
+            commands::pop_stash,
+            commands::drop_stash,
+            commands::drop_all_stashes,
             commands::commit_diff,
             commands::commit_layers,
             commands::working_diff,

@@ -72,16 +72,24 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     let mut manifest_memo: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let mut live: HashSet<(String, String)> = HashSet::new();
-    for c in repo.commits.iter().filter(|c| reachable.contains(&c.id)) {
-        for f in &c.files {
-            let Some(content) = &f.content else { continue };
-            if f.is_kra {
-                live.insert((kra::manifest_stream_key(&f.path), content.clone()));
-                let manifest = kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo)?;
-                live.extend(kra::referenced_streams(&f.path, &manifest));
-            } else {
-                live.insert((format!("file:{}", f.path), content.clone()));
-            }
+    // Stashes are roots too, not just branch tips: a stash's content is referenced by nothing in
+    // `commits.log`, so without this the sweep below would delete the chains and objects behind
+    // every set-aside — the work would be unrecoverable. Their files are `CommittedFile`s stored
+    // through the same streams, so the same walk marks them.
+    let rooted = repo
+        .commits
+        .iter()
+        .filter(|c| reachable.contains(&c.id))
+        .flat_map(|c| &c.files)
+        .chain(repo.stashes.stashes.iter().flat_map(|s| &s.files));
+    for f in rooted {
+        let Some(content) = &f.content else { continue };
+        if f.is_kra {
+            live.insert((kra::manifest_stream_key(&f.path), content.clone()));
+            let manifest = kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo)?;
+            live.extend(kra::referenced_streams(&f.path, &manifest));
+        } else {
+            live.insert((format!("file:{}", f.path), content.clone()));
         }
     }
 

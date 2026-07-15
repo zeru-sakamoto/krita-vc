@@ -37,69 +37,17 @@ pub fn commit_selected(
 
     let mut files = Vec::new();
     for change in changes {
-        let scan::ScanChange {
-            rel,
-            status,
-            hash,
-            size,
-            mtime,
-            bytes,
-        } = change;
-        if status == "D" {
-            repo.index.files.remove(&rel);
-            files.push(CommittedFile {
-                path: rel,
-                status: "D".into(),
-                content: None,
-                is_kra: false,
-                file_hash: None,
-                original_size: 0,
-            });
-            continue;
+        let rel = change.rel.clone();
+        let (record, tracked) = store_change(repo, change, &prev_tree)?;
+        match tracked {
+            Some(tf) => {
+                repo.index.files.insert(rel, tf);
+            }
+            None => {
+                repo.index.files.remove(&rel);
+            }
         }
-
-        // Reuse the scan's buffer when it kept one; only over-budget files pay a re-read.
-        let abs = repo.root.join(&rel);
-        let bytes = match bytes {
-            Some(b) => b,
-            None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
-        };
-        let is_kra = rel.to_lowercase().ends_with(".kra");
-
-        let content = if is_kra {
-            let prev = prev_tree
-                .get(&rel)
-                .filter(|f| f.is_kra)
-                .and_then(|f| f.content.as_deref())
-                .and_then(|h| kra::load_manifest(repo, &rel, h).ok());
-            kra::commit_kra(repo, &rel, &bytes, prev.as_ref())?
-        } else {
-            repo.store_stream(&format!("file:{rel}"), &bytes)?
-        };
-        drop(bytes);
-
-        repo.index.files.insert(
-            rel.clone(),
-            TrackedFile {
-                hash: hash.clone(),
-                is_kra,
-                size,
-                mtime,
-            },
-        );
-
-        files.push(CommittedFile {
-            path: rel,
-            status: if status == "U" {
-                "A".into()
-            } else {
-                "M".into()
-            },
-            content: Some(content),
-            is_kra,
-            file_hash: Some(hash),
-            original_size: size,
-        });
+        files.push(record);
     }
 
     let timestamp = crate::repo::now_iso();
@@ -125,6 +73,84 @@ pub fn commit_selected(
     repo.branches.set_tip(&id);
     repo.save()?;
     Ok(commit)
+}
+
+/// Store one scanned change's content and describe it as a [`CommittedFile`], plus the
+/// [`TrackedFile`] the caller *may* record for it (`None` for a deletion, which un-tracks).
+///
+/// The index write is the caller's choice on purpose. A commit applies it; [`crate::stash`] must
+/// **not** — the index means "committed head", and a stash doesn't commit anything. If a stash
+/// recorded the stashed content's hash there, the revert that immediately follows would scan the
+/// file as clean and do nothing, so the set-aside would silently fail to clear the tree.
+///
+/// Takes `change` by value: its `bytes` are moved into the store, so the whole `.kra` buffer the
+/// scan already read is reused rather than cloned (cf. [`scan::RETAIN_BUDGET`]).
+pub(crate) fn store_change(
+    repo: &mut Repo,
+    change: scan::ScanChange,
+    prev_tree: &BTreeMap<String, CommittedFile>,
+) -> Result<(CommittedFile, Option<TrackedFile>)> {
+    let scan::ScanChange {
+        rel,
+        status,
+        hash,
+        size,
+        mtime,
+        bytes,
+    } = change;
+    if status == "D" {
+        return Ok((
+            CommittedFile {
+                path: rel,
+                status: "D".into(),
+                content: None,
+                is_kra: false,
+                file_hash: None,
+                original_size: 0,
+            },
+            None,
+        ));
+    }
+
+    // Reuse the scan's buffer when it kept one; only over-budget files pay a re-read.
+    let abs = repo.root.join(&rel);
+    let bytes = match bytes {
+        Some(b) => b,
+        None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
+    };
+    let is_kra = rel.to_lowercase().ends_with(".kra");
+
+    let content = if is_kra {
+        let prev = prev_tree
+            .get(&rel)
+            .filter(|f| f.is_kra)
+            .and_then(|f| f.content.as_deref())
+            .and_then(|h| kra::load_manifest(repo, &rel, h).ok());
+        kra::commit_kra(repo, &rel, &bytes, prev.as_ref())?
+    } else {
+        repo.store_stream(&format!("file:{rel}"), &bytes)?
+    };
+    drop(bytes);
+
+    let tracked = TrackedFile {
+        hash: hash.clone(),
+        is_kra,
+        size,
+        mtime,
+    };
+    let record = CommittedFile {
+        path: rel,
+        status: if status == "U" {
+            "A".into()
+        } else {
+            "M".into()
+        },
+        content: Some(content),
+        is_kra,
+        file_hash: Some(hash),
+        original_size: size,
+    };
+    Ok((record, Some(tracked)))
 }
 
 /// Reconstruct the exact bytes of `relpath` as recorded in commit `commit_id`.
@@ -211,7 +237,7 @@ pub fn current_tree(repo: &Repo) -> BTreeMap<String, CommittedFile> {
 /// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob),
 /// plus the blake3 of those bytes for the index. A generic blob's stream hash *is* blake3 of
 /// its exact bytes (write-time verified), so only a rebuilt `.kra` pays a hash pass.
-fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
+pub(crate) fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
     let content = f
         .content
         .as_deref()

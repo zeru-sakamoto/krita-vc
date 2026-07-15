@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
-import { Broom, CaretDown } from "@phosphor-icons/react";
+import { Broom, CaretDown, Trash } from "@phosphor-icons/react";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
+import { IconButton } from "../ui/IconButton";
 import { Menu } from "../ui/Menu";
+import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme } from "../../lib/theme";
 import { useRepository, type CleanupReport } from "../../lib/repository";
-import { useRepoConfig } from "../../lib/repoData";
+import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useWindowChrome } from "../../lib/windowChrome";
+import type { Stash } from "../../types";
 
 const CACHE_PRESETS_MB = [128, 256, 512, 1024, 2048];
 
@@ -75,13 +78,16 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
 }
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
-  const { current } = useRepository();
+  const { current, refreshNonce } = useRepository();
   const { artistMode, toggle: toggleArtistMode } = useArtistMode();
   const { customTitleBar, toggle: toggleWindowChrome } = useWindowChrome();
   const { authorName, setAuthorName } = useAuthorName();
   const { theme, setTheme } = useTheme();
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
+  const stashes = useStashes(current?.path ?? null, refreshNonce);
   const [showCleanup, setShowCleanup] = useState(false);
+  const [showDropAll, setShowDropAll] = useState(false);
+  const [confirmDrop, setConfirmDrop] = useState<Stash | null>(null);
 
   return (
     <>
@@ -148,6 +154,17 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </section>
 
         {current && (
+          <section className="mb-5">
+            <SectionHeading>{artistMode ? "Set-aside shelf" : "Stashes"}</SectionHeading>
+            <StashShelf
+              stashes={stashes}
+              onConfirmDrop={setConfirmDrop}
+              onConfirmDropAll={() => setShowDropAll(true)}
+            />
+          </section>
+        )}
+
+        {current && (
           <section>
             <SectionHeading>This repository</SectionHeading>
 
@@ -204,7 +221,168 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         )}
       </Modal>
       {showCleanup && <CleanupModal onClose={() => setShowCleanup(false)} />}
+      {showDropAll && <DropAllStashesModal onClose={() => setShowDropAll(false)} />}
+      {confirmDrop && <DropStashModal stash={confirmDrop} onClose={() => setConfirmDrop(null)} />}
     </>
+  );
+}
+
+/**
+ * The set-aside shelf: every stash in the repo with its origin branch and age. Removing one
+ * here is a discard, not a restore — bringing work back lives in the Changes panel menu, so
+ * this list stays a management view. Confirms are raised to `SettingsModal` and rendered as
+ * siblings, never nested inside this modal's panel.
+ */
+function StashShelf({
+  stashes,
+  onConfirmDrop,
+  onConfirmDropAll,
+}: {
+  stashes: Stash[];
+  onConfirmDrop: (s: Stash) => void;
+  onConfirmDropAll: () => void;
+}) {
+  const { saving } = useRepository();
+  const { artistMode } = useArtistMode();
+
+  if (stashes.length === 0) {
+    return (
+      <p className="text-[12px] text-text-muted">
+        {artistMode
+          ? "Nothing set aside. Use the ⋮ menu in Changes to tuck work away and pick it up later."
+          : "No stashes. Use the ⋮ menu in the Changes panel to stash your working tree."}
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <ul className="flex flex-col">
+        {stashes.map((s) => (
+          <li key={s.id} className="group flex items-center gap-2 rounded-button py-1.5">
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[13px] text-text">{stashTitle(s)}</span>
+              <span className="mt-0.5 block truncate text-[11px] text-text-muted">
+                {stashSummary(s)}
+              </span>
+            </span>
+            <span className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100">
+              <IconButton
+                icon={Trash}
+                label={artistMode ? "Remove this set-aside work" : "Drop this stash"}
+                size={16}
+                disabled={saving}
+                onClick={() => onConfirmDrop(s)}
+              />
+            </span>
+          </li>
+        ))}
+      </ul>
+      <Button variant="destructive" className="mt-3" disabled={saving} onClick={onConfirmDropAll}>
+        <Trash size={14} />
+        {artistMode ? "Remove all" : "Drop all stashes"}
+      </Button>
+    </>
+  );
+}
+
+function DropStashModal({ stash, onClose }: { stash: Stash; onClose: () => void }) {
+  const { dropStash, saving } = useRepository();
+  const { artistMode } = useArtistMode();
+  const [error, setError] = useState<string | null>(null);
+
+  const onDrop = async () => {
+    setError(null);
+    try {
+      await dropStash(stash.id);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <Modal
+      title={artistMode ? "Remove this work for good?" : "Drop this stash?"}
+      onClose={() => (saving ? undefined : onClose())}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button variant="destructive" onClick={onDrop} disabled={saving}>
+            {saving ? "Removing…" : "Remove"}
+          </Button>
+        </>
+      }
+    >
+      <p className="text-[13px] leading-relaxed text-text-muted">
+        {artistMode ? (
+          <>
+            <span className="text-text">{stashTitle(stash)}</span> will be gone for good — this
+            doesn't bring the files back first. The space it uses is freed the next time you clean
+            up storage.
+          </>
+        ) : (
+          <>
+            Drops <span className="text-text">{stashTitle(stash)}</span> without restoring it. Its
+            objects are reclaimed by the next storage cleanup.
+          </>
+        )}
+      </p>
+      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+    </Modal>
+  );
+}
+
+function DropAllStashesModal({ onClose }: { onClose: () => void }) {
+  const { current, refreshNonce, dropAllStashes, saving } = useRepository();
+  const { artistMode } = useArtistMode();
+  const stashes = useStashes(current?.path ?? null, refreshNonce);
+  const count = stashes.length;
+  const [error, setError] = useState<string | null>(null);
+
+  const onDropAll = async () => {
+    setError(null);
+    try {
+      await dropAllStashes();
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <Modal
+      title={artistMode ? "Empty the shelf?" : "Drop all stashes?"}
+      onClose={() => (saving ? undefined : onClose())}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button variant="destructive" onClick={onDropAll} disabled={saving}>
+            {saving ? "Removing…" : "Remove all"}
+          </Button>
+        </>
+      }
+    >
+      <p className="text-[13px] leading-relaxed text-text-muted">
+        {artistMode ? (
+          <>
+            All {count} {count === 1 ? "piece" : "pieces"} of set-aside work will be gone for good,
+            without coming back to your files first. The space is freed the next time you clean up
+            storage.
+          </>
+        ) : (
+          <>
+            Drops all {count} {count === 1 ? "stash" : "stashes"} without restoring them. Their
+            objects are reclaimed by the next storage cleanup.
+          </>
+        )}
+      </p>
+      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+    </Modal>
   );
 }
 

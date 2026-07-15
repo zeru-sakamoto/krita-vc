@@ -13,6 +13,8 @@ export interface MenuItem {
   action?: React.ReactNode;
   /** Greys out the row and blocks selection. */
   disabled?: boolean;
+  /** Draws a divider above this row, starting a new group. Matches the `footer` rule. */
+  separator?: boolean;
   onSelect: () => void;
 }
 
@@ -55,7 +57,13 @@ export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }:
   }, [open]);
 
   const renderItem = (item: MenuItem) => (
-    <div key={item.id} className="group relative flex items-center">
+    <div
+      key={item.id}
+      className={[
+        "group relative flex items-center",
+        item.separator ? "mt-1 border-t border-border pt-1" : "",
+      ].join(" ")}
+    >
       <button
         type="button"
         role="menuitem"

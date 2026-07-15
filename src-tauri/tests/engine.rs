@@ -1,7 +1,8 @@
 //! End-to-end engine tests against real file I/O in tempdirs (no logic mocked).
 
 use krita_vc_lib::{
-    branch, commands, commit, delta, error::KvcError, kra, palette, raster, repo, scan, tiles,
+    branch, commands, commit, delta, error::KvcError, gc, kra, palette, raster, repo, scan, stash,
+    tiles,
 };
 use std::io::Write;
 
@@ -2596,4 +2597,226 @@ fn repo_config_round_trips_across_reopen() {
     let reopened = repo::Repo::open_light(root).unwrap();
     assert_eq!(reopened.config.cache_max_bytes, 512 * 1024 * 1024);
     assert!(reopened.config.tile_pixel_deltas);
+}
+
+// --- setting work aside ----------------------------------------------------------------
+
+#[test]
+fn stash_all_reverts_working_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::write(root.join("new.gpl"), b"brand new").unwrap();
+    let s = stash::create(&mut r, "lighting pass", "t", None).unwrap();
+
+    assert_eq!(s.label, "lighting pass");
+    assert_eq!(s.branch, "main");
+    assert_eq!(s.files.len(), 2);
+    assert_eq!(stash::list(&r).len(), 1);
+    // The tree is clean again: the edit is reverted and the never-committed file is gone.
+    assert!(scan::scan(&r).unwrap().is_empty());
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert!(!root.join("new.gpl").exists());
+    // History is untouched — a stash is not a commit.
+    assert_eq!(r.commits.len(), 1);
+}
+
+#[test]
+fn stash_then_pop_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::write(root.join("new.gpl"), b"brand new").unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+
+    stash::pop(&mut r, &s.id).unwrap();
+
+    // Byte-exact restore, and the shelf is empty again.
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"wip-a");
+    assert_eq!(std::fs::read(root.join("new.gpl")).unwrap(), b"brand new");
+    assert!(stash::list(&r).is_empty());
+    // The index must still hold the *committed* head, so the restored work reads as unsaved
+    // rather than silently looking already-committed.
+    let mut seen = scan::scan(&r).unwrap();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("a.gpl".to_string(), "M".to_string()),
+            ("new.gpl".to_string(), "U".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn stash_selected_paths_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::write(root.join("b.gpl"), b"wip-b").unwrap();
+    let only = vec!["a.gpl".to_string()];
+    let s = stash::create(&mut r, "just a", "t", Some(&only)).unwrap();
+
+    assert_eq!(s.files.len(), 1);
+    // a.gpl reverted; b.gpl left dirty.
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"wip-b");
+    assert_eq!(
+        scan::scan(&r).unwrap(),
+        vec![("b.gpl".to_string(), "M".to_string())]
+    );
+}
+
+#[test]
+fn pop_refuses_when_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+    // Same file edited again since setting aside.
+    std::fs::write(root.join("a.gpl"), b"newer work").unwrap();
+
+    match stash::pop(&mut r, &s.id) {
+        Err(KvcError::StashConflict(files)) => assert_eq!(files, "a.gpl"),
+        other => panic!("expected StashConflict, got {other:?}"),
+    }
+    // Nothing lost on either side: the newer edit stands and the stash survives.
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"newer work");
+    assert_eq!(stash::list(&r).len(), 1);
+    // The conflict message must not collide with the branch-switch prompt's prefix.
+    assert!(!KvcError::StashConflict("a.gpl".into())
+        .to_string()
+        .starts_with("unsaved changes"));
+}
+
+#[test]
+fn gc_keeps_stashed_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+
+    // A stash is reachable from no branch tip — only rooting it keeps its content alive.
+    gc::collect_garbage(&mut r, false).unwrap();
+
+    let mut r = repo::Repo::open(root).unwrap();
+    stash::pop(&mut r, &s.id).unwrap();
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"wip-a");
+}
+
+#[test]
+fn dropped_stash_content_is_collectable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+    let with_stash = count_objects(root);
+
+    stash::drop_one(&mut r, &s.id).unwrap();
+    assert!(stash::list(&r).is_empty());
+
+    let mut r = repo::Repo::open(root).unwrap();
+    gc::collect_garbage(&mut r, false).unwrap();
+    assert!(
+        count_objects(root) < with_stash,
+        "dropping the last stash should make its content collectable"
+    );
+}
+
+#[test]
+fn stash_requires_a_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    std::fs::write(root.join("a.gpl"), b"never committed").unwrap();
+
+    // No tip means no committed state to revert to.
+    assert!(matches!(
+        stash::create(&mut r, "", "t", None),
+        Err(KvcError::NoCommit(_))
+    ));
+    assert_eq!(
+        std::fs::read(root.join("a.gpl")).unwrap(),
+        b"never committed"
+    );
+}
+
+#[test]
+fn stash_with_nothing_dirty_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = seeded_repo(&dir);
+    assert!(matches!(
+        stash::create(&mut r, "", "t", None),
+        Err(KvcError::Nothing)
+    ));
+}
+
+#[test]
+fn stash_dedups_kra_tiles_against_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let mk = |t1: &[u8], t2: &[u8]| {
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&[(0, 0, t1), (64, 0, t2)])),
+        ])
+    };
+    std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"tileBBBB")).unwrap();
+    commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    let committed = count_objects(root);
+
+    // Only the second tile changes — the first must dedup against the committed version, which
+    // is the whole premise of storing stashes through the same relpath-keyed streams.
+    std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"tileZZZZ")).unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+    let grew = count_objects(root) - committed;
+    assert!(
+        grew <= 3,
+        "a one-tile edit should cost a handful of objects, not a full copy (grew by {grew})"
+    );
+
+    // ...and it still restores byte-exactly.
+    stash::pop(&mut r, &s.id).unwrap();
+    let on_disk = std::fs::read(root.join("art.kra")).unwrap();
+    let l = tiles::parse(&kra::read_entry(&on_disk, "img/layers/layer1").unwrap()).unwrap();
+    assert_eq!(l.tiles[1].data, b"tileZZZZ");
+}
+
+#[test]
+fn stash_dtos_are_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    std::fs::write(root.join("a.gpl"), b"first wip").unwrap();
+    stash::create(&mut r, "older", "t", None).unwrap();
+    std::fs::write(root.join("b.gpl"), b"second wip").unwrap();
+    stash::create(&mut r, "newer", "t", None).unwrap();
+
+    // The engine stores oldest-first; the UI's "bring back the latest" takes row 0, so the DTO
+    // list must be reversed or that button silently restores the wrong work.
+    let dtos = commands::stash_dtos(&r);
+    let labels: Vec<&str> = dtos.iter().map(|d| d.label.as_str()).collect();
+    assert_eq!(labels, vec!["newer", "older"]);
+    // Statuses survive the CommittedFile -> FileChange mapping for the status chip.
+    assert_eq!(dtos[0].changes[0].path, "b.gpl");
+    assert_eq!(dtos[0].changes[0].status, "M");
+    assert_eq!(dtos[0].branch, "main");
 }

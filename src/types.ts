@@ -175,3 +175,20 @@ export interface WorkingChange {
   change: FileChange;
   staged: boolean;
 }
+
+/**
+ * Work set aside off to the side of history — "Set aside" in Artist Mode, "Stash" otherwise.
+ * Not a commit: stashes live on their own shelf and never appear in history.
+ */
+export interface Stash {
+  id: string;
+  /** The user's label. May be empty — fall back to the file list. */
+  label: string;
+  author: string;
+  /** ISO timestamp. */
+  timestamp: string;
+  /** Branch it was set aside on. Display only — a stash can be brought back anywhere. */
+  branch: string;
+  /** Which files it holds, for the summary line. */
+  changes: FileChange[];
+}

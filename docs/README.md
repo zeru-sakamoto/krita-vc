@@ -15,8 +15,8 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   ownership, the component map, **Artist Mode** (the global friendly-labels toggle), and the
   **theme selector** (color themes + the theme-reactive diff highlight).
 - [**File tracking & version control**](version-control.md) — the Rust backend: the `.kvc/` store,
-  the scanner, commits, branches (create/switch/merge), delta-chain storage, the `.kra` tile
-  engine, and the Tauri commands.
+  the scanner, commits, branches (create/switch/merge), stashes (setting work aside),
+  delta-chain storage, the `.kra` tile engine, and the Tauri commands.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,

@@ -48,6 +48,21 @@ interface RepositoryValue {
    */
   discardChanges: (paths: string[]) => Promise<void>;
   /**
+   * Set uncommitted work aside and revert those files to their committed state. `null` paths
+   * sets aside everything dirty; otherwise only those relative paths. Needs at least one
+   * commit — there's no committed state to revert to otherwise.
+   */
+  createStash: (label: string, paths: string[] | null) => Promise<void>;
+  /**
+   * Bring a stash back into the working tree and take it off the shelf. Rejects (with a
+   * `"stash conflict"`-prefixed error) if anything it holds has changed since.
+   */
+  popStash: (id: string) => Promise<void>;
+  /** Remove a stash without restoring it. Its storage is reclaimed by the next cleanup. */
+  dropStash: (id: string) => Promise<void>;
+  /** Empty the shelf. */
+  dropAllStashes: () => Promise<void>;
+  /**
    * Create a branch and switch to it. Starts at the current tip (instant, no file I/O)
    * unless `base` names another branch, which switches the working tree to that branch's
    * files first (refused while there are unsaved changes).
@@ -248,6 +263,77 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     [current, refresh]
   );
 
+  // Stash actions can't go through `branchMutation` — its args are string-only and these carry
+  // a path list. Same shape otherwise; errors rethrow so panels can show the conflict prompt.
+  const createStash = useCallback(
+    async (label: string, paths: string[] | null) => {
+      if (!inTauri() || !current) return;
+      setSaving(true);
+      setBusyMessage("Setting your work aside — please wait…");
+      try {
+        await timed(
+          current.path,
+          "stash",
+          invoke("create_stash", {
+            path: current.path,
+            label,
+            author: resolvedAuthor(readAuthorName()),
+            paths,
+          })
+        );
+        refresh();
+      } finally {
+        setSaving(false);
+        setBusyMessage(null);
+      }
+    },
+    [current, refresh]
+  );
+
+  const popStash = useCallback(
+    async (id: string) => {
+      if (!inTauri() || !current) return;
+      setSaving(true);
+      setBusyMessage("Bringing your work back — please wait…");
+      try {
+        await timed(current.path, "stash", invoke("pop_stash", { path: current.path, id }));
+        refresh();
+      } finally {
+        setSaving(false);
+        setBusyMessage(null);
+      }
+    },
+    [current, refresh]
+  );
+
+  // Shelf edits skip `busyMessage`: they're metadata-only writes made from inside the Settings
+  // modal, and the full-screen overlay would cover the very list being edited (cf. the cleanup
+  // dry run). `saving` alone is enough to lock the buttons.
+  const dropStash = useCallback(
+    async (id: string) => {
+      if (!inTauri() || !current) return;
+      setSaving(true);
+      try {
+        await invoke("drop_stash", { path: current.path, id });
+        refresh();
+      } finally {
+        setSaving(false);
+      }
+    },
+    [current, refresh]
+  );
+
+  const dropAllStashes = useCallback(async () => {
+    if (!inTauri() || !current) return;
+    setSaving(true);
+    try {
+      await invoke("drop_all_stashes", { path: current.path });
+      refresh();
+    } finally {
+      setSaving(false);
+    }
+  }, [current, refresh]);
+
   // Branch mutations share one shape: invoke + refresh with the saving flag held (locks
   // staging, drives the StatusBar progress bar, and the full-screen BusyOverlay via `label`).
   // Errors rethrow so panels can show friendly messages (e.g. the dirty-tree save-first
@@ -342,6 +428,10 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       rollbackToCommit,
       undoLastCommit,
       discardChanges,
+      createStash,
+      popStash,
+      dropStash,
+      dropAllStashes,
       createBranch,
       switchBranch,
       mergeBranch,
@@ -367,6 +457,10 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       rollbackToCommit,
       undoLastCommit,
       discardChanges,
+      createStash,
+      popStash,
+      dropStash,
+      dropAllStashes,
       createBranch,
       switchBranch,
       mergeBranch,

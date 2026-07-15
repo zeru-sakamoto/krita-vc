@@ -41,7 +41,7 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
 | Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches` \| `performance`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches` \| `performance`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders **one selected file** of the current commit/working diff (art-diff canvas height is drag-resizable), or an empty state. Which file is chosen by the Inspector's file list (`selectedFile`/`onSelectFile`, lifted to `RepoShell`); a multi-file commit no longer stacks every file's diff at once. |
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode's **changed-files list doubles as the main panel's file selector** — click a row to show that file in `DiffView`; a `.kra` row with an embedded document palette gets a palette sub-row that jumps straight to that palette's pane (`focusId`), and standalone palette files get their own row under a separate "Palettes" heading. Also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
@@ -142,7 +142,8 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   (all *unstaged* files at once — staged files are left alone), both backed by the repository
   context's `discardChanges`. While a commit or discard is in flight the staging controls lock,
   the commit button shows a spinner, the `StatusBar` shows an indeterminate progress bar (shared
-  `saving` flag), and `BusyOverlay` blocks the app (`busyMessage`).
+  `saving` flag), and `BusyOverlay` blocks the app (`busyMessage`). The same `…` menu also holds
+  the **set-aside** actions — see [Stashes](#stashes--setting-work-aside) below.
 - **`branches`** — [`BranchesPanel`](../src/components/vcs/BranchesPanel.tsx): the local branch
   list with **real actions** — click a branch to switch, hover (or keyboard-focus) a row for
   "Merge into current" and "Delete" (both behind plain-language confirm modals), "New branch"
@@ -151,13 +152,45 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   through as `createBranch(name, base)`, which materializes that branch's tree before recording the
   new branch (refused, with a friendly prompt, on unsaved changes). Shared dialogs live in
   [`BranchDialogs.tsx`](../src/components/vcs/BranchDialogs.tsx); the backend's dirty-tree error
-  (stable `"unsaved changes"` prefix) becomes a friendly save-first prompt with a jump to the
-  Changes view. This is a local-only VCS — there are no remotes.
+  (stable `"unsaved changes"` prefix) becomes a friendly `SaveFirstModal` offering three ways out:
+  save first (jump to Changes), **set it aside** (stash everything, then retry the blocked
+  switch/merge automatically), or cancel. This is a local-only VCS — there are no remotes.
 - **`performance`** — [`PerformancePanel`](../src/components/vcs/PerformancePanel.tsx): the
   Performance report — a summary card (average operation times + total storage saved), a
   scrollable per-version card list (stored vs full-copy bytes + % saved + save/compare time), and a
   pinned recent-operations log. Timing is client-side (localStorage); storage comes from the
   `repo_storage_stats` backend command. See [performance-report.md](performance-report.md).
+
+## Stashes — setting work aside
+
+"Set aside" (Artist Mode) / "Stash" parks working-tree changes off to the side of history so
+they can be brought back later, without polluting commit history — see the backend model in
+[version-control.md](version-control.md#stashes--setting-work-aside). The frontend surfaces it in
+two places:
+
+- **`Sidebar`'s panel-options `Menu`** (history + changes) is grouped into three
+  divider-separated sections: undo/discard, then set-aside, then bring-back (`Menu` gained a
+  `MenuItem.separator` flag — a rule above that row — since one `footer` group can only draw one
+  divider and this needs two). The two set-aside rows ("Set aside staged files" / "Set aside
+  everything") are **changes-view only**, since they act on the working tree, and are gated on
+  `commits.length` — same guard as undo, since there's no committed state to revert to otherwise.
+  The two bring-back rows ("Bring back latest" / "Bring back…") are `footer` items shown in
+  **both** views, since you might be looking at History when you want a stash back.
+- **`SettingsModal`**'s "Set-aside shelf" section lists every stash (label/asset summary +
+  origin branch + age) via `useStashes`, with per-row remove and a "Remove all" — a pure
+  management view, not a restore path (bringing work back stays in the Sidebar menu above).
+  Confirms (`DropStashModal`, `DropAllStashesModal`) render as *sibling* modals next to
+  `SettingsModal`, the same pattern `CleanupModal` uses, since `Modal` has no portal.
+
+Dialogs live in [`StashDialogs.tsx`](../src/components/vcs/StashDialogs.tsx): `SetAsideModal`
+(label prompt, used by both the Sidebar menu and the save-first prompt's "set it aside" button),
+`PickStashModal` (choose which stash to pop), `StashConflictModal` +
+`isStashConflictError` (the pop-time `"stash conflict"`-prefixed error, distinct from the
+branch/merge `"unsaved changes"` one), plus the `StashIcon`/`UnstashIcon` glyphs and the
+`stashTitle`/`stashSummary` label helpers (also reused by `SettingsModal`'s shelf rows). Data
+comes from `useStashes` in [`repoData.ts`](../src/lib/repoData.ts) (`list_stashes`, newest first);
+mutations (`createStash`, `popStash`, `dropStash`, `dropAllStashes`) live on the repository
+context alongside the other write actions.
 
 ## Diff viewer
 
@@ -270,7 +303,8 @@ Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cy
 ```
 AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ TopBar ─ Menu (repository switcher)
-├─ ActivityBar ─ SettingsModal (gear) ─ CleanupModal ("Clean up storage…")
+├─ ActivityBar ─ SettingsModal (gear) ─┬─ CleanupModal ("Clean up storage…")
+│                                       └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
 ├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
 │                         ├─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
@@ -287,6 +321,10 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is set)
 ```
 
+`StashDialogs.tsx` (`SetAsideModal`, `PickStashModal`, `StashConflictModal`) is shared between
+`Sidebar`'s panel-options menu and `BranchesPanel`/`Sidebar`'s save-first prompt; `SettingsModal`
+reuses its `stashTitle`/`stashSummary` helpers for the set-aside shelf rows.
+
 The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `ArtistModeProvider` →
 `AuthorNameProvider` → `WindowChromeProvider` (all mounted in [`App.tsx`](../src/App.tsx)).
 
@@ -297,8 +335,10 @@ outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStat
 
 Cross-cutting libs: [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx) (the toggle context),
 [`src/lib/repository.tsx`](../src/lib/repository.tsx) (selected-repository context + all
-mutating actions: commit/rollback/undo, branch create/switch/merge/delete),
-[`src/lib/repoData.ts`](../src/lib/repoData.ts) (data hooks: commits, branches, diffs, layers),
+mutating actions: commit/rollback/undo, stash create/pop/drop/drop-all, branch
+create/switch/merge/delete),
+[`src/lib/repoData.ts`](../src/lib/repoData.ts) (data hooks: commits, branches, diffs, layers,
+stashes),
 [`src/lib/useResize.ts`](../src/lib/useResize.ts) (shared drag-resize hook),
 [`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
 [`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
