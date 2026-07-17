@@ -108,14 +108,17 @@ file against `index.json`:
 | `M` | modified — blake3 differs from the index head |
 | `D` | deleted — in the index but absent on disk |
 
-Unchanged files produce nothing. The `.kvc/` directory and Krita lock/autosave files (`*.kra~`)
-are skipped. A **tracking guardrail** (`scan::is_supported`) further limits what is *newly*
+Unchanged files produce nothing. The `.kvc/` directory and Krita's backup file (`*.kra~`) are
+skipped by the walk. A **tracking guardrail** (`scan::is_supported`) further limits what is *newly*
 tracked to the file types Krita VCS actually understands — `.kra` documents and the palette
 formats (`.gpl`/`.kpl`/`.aco`/`.ase`); any other file in the project folder is ignored outright
-(never staged, hashed, or committed). The guard runs only for files **not already in the index**
+(never staged, hashed, or committed). It also rejects Krita's **autosave** artifact
+(`foo.kra-autosave.kra`, dot-prefixed on Linux/macOS): `is_supported` is a suffix match, not an
+extension parse, so that scratch file ends in `.kra` and would otherwise be tracked as a document
+and get its own chain shard. The guard runs only for files **not already in the index**
 (a cheap short-circuit on the steady-state scan), so already-tracked files stay tracked and a repo
-that predates this rule is never silently pruned — and an unsupported file is now rejected by
-extension instead of being read and blake3-hashed like before. A file whose **size + mtime still
+that predates either rule is never silently pruned — and an unsupported file is now rejected by
+suffix instead of being read and blake3-hashed like before. A file whose **size + mtime still
 match the index** (`TrackedFile.size`/`mtime`,
 nanosecond resolution) **and whose mtime is strictly older than the index file's own on-disk
 mtime** is assumed unchanged and skipped without being read or hashed — the win for big `.kra`
@@ -384,16 +387,75 @@ The operations:
   then reverts via `commit::discard_working_changes`. `Nothing` if nothing in scope is dirty;
   `NoCommit` on a repo with no commits — there's no committed state to revert to, and the UI
   gates the menu items on `commits.length` the way undo does.
-- **Pop** (`stash::pop`) — all-or-nothing. If *any* path in the stash is dirty it refuses with
-  `StashConflict` naming the files and leaves the stash intact; overwriting would destroy work
-  with no way back. Otherwise it writes each file (`"D"` records delete instead), leaves the
-  index alone — which is exactly what makes the restored work scan as changed again — and drops
-  the record. Popping onto a different branch is allowed: `branch` is recorded for display only
-  and nothing is ever looked up by it, so a stash outlives its origin branch.
+- **Pop** (`stash::pop`) — writes each file (`"D"` records delete instead), leaves the index alone
+  — which is exactly what makes the restored work scan as changed again — and drops the record.
+  A **conflict** is a stashed path that's been edited since it was set aside:
+  - A conflicting **`.kra`** is **merged**, not refused: the layers the set-aside version actually
+    **added or modified** are folded into the working file (clashing top-level layer names suffixed
+    ` [2]`, each incoming layer's data files + uuid remapped to fresh ids) via
+    [`merge::merge_layers`](../src-tauri/src/merge.rs), so the artist reconciles them by hand in
+    Krita — see [Merging set-aside `.kra` work](#merging-set-aside-kra-work-on-a-pop-conflict).
+  - **Any other conflict** still hard-refuses the *whole* pop with `StashConflict` before a byte is
+    written — a non-`.kra` file (no layers to merge) or a stashed *deletion* landing on edited work;
+    overwriting either would destroy the current work with no way back.
+  - Bytes for every file are computed **before** the first disk write, so a merge that can't be done
+    cleanly (`MergeFailed`) leaves the working tree and the stash untouched.
+
+  Popping onto a different branch is allowed: `branch` is recorded for display only and nothing is
+  ever looked up by it, so a stash outlives its origin branch.
 - **Drop / drop-all** (`stash::drop_one` / `drop_all`) — take a stash off the shelf without
   restoring it. These run on an `open_light` repo and so must use `save_stashes()`, never
   `save()` (which would rewrite index/commits from partial state — the same hazard documented on
   `save_branches`). The content lingers until the next "Clean up storage" reclaims it.
+
+### Merging set-aside `.kra` work on a pop conflict
+
+When a pop finds the working `.kra` has been edited since it was set aside, both versions are the
+same document taken two ways, so [`merge::merge_layers`](../src-tauri/src/merge.rs) folds the
+set-aside version's **added and modified** layers into the working file rather than making the artist
+choose one version to lose. The result opens in Krita with the working stack **plus** just those
+set-aside changes, ready to reconcile by hand — combining *whole* layers is automatic; reconciling
+pixels *within* a layer is the manual part.
+
+Only the *changed* layers cross over, not the whole stack: `merge_layers` takes the committed
+**ancestor** both sides diverged from (the file's version at the branch tip, passed by `stash::pop`)
+and skips any incoming top-level layer unchanged since — matched by uuid, then compared on the
+layer's **content**, not any byte-for-byte form. Each `layers/layerN…` data file is canonicalized to
+its **tiles sorted by position** (`canon_entry`): Krita's tile *order* within a layer's data file
+isn't stable across saves, so two saves that wrote the same tiles in a different order reconstruct to
+different bytes but must still compare equal — this is the case that made an untouched layer fold in
+as a duplicate. Non-tiled entries (`.defaultpixel`, `.icc`, shape-layer SVG) compare verbatim, and
+the per-file blobs are collected filename-independently (Krita may renumber `layerN`). On top of the
+tiles, a small set of **meaningful metadata** attributes (`name`/`opacity`/`compositeop`/`visible`/
+`x`/`y`) must match. It deliberately does **not** compare the raw `<layer>` XML: Krita rewrites
+volatile per-save attributes — `selected` on the active layer, `collapsed`, timeline flags — every
+save, so an untouched layer's XML differs between two saves and a text compare would fold *every*
+layer in (one of the bugs this path had). Anything whose tiles or meaningful metadata differ, or a
+layer with no ancestor match (a genuinely new layer), folds in — so a real change is never dropped;
+an obscure metadata attribute left off the list is at worst *not* folded, never spuriously
+duplicated. With no ancestor (`None`) every incoming layer folds, the pre-fix behaviour. If *every*
+incoming layer matches the ancestor (the set-aside change was only outside the layer stack, e.g.
+canvas size), there's nothing to fold and it surfaces `MergeFailed`, untouched.
+
+Mechanics (all on the raw `.kra`, no engine internals):
+- The working file is the **base**; the set-aside version's added/modified top-level layers are
+  spliced in as the first children of base's `<layers>`, so they land **on top** of the stack.
+- `roxmltree` (read-only) locates each incoming `<layer>` subtree by byte range (`Node::range`) and
+  base's `<layers>` insertion point; the id/name edits are whole-token string replaces
+  (`filename="…"`, `uuid="…"`) — safe because uuids (`{hex}`) and filenames (`layerN`) never contain
+  XML-special characters, so no XML-writer dependency is needed.
+- Every incoming layer's data files and uuid are **remapped to fresh, collision-free ids** (new
+  `layerN` above base's highest, checked against the actual archive too so an orphan file can't
+  clash; uuids synthesized from `blake3`, no `uuid` crate) and its archive entries copied into
+  base's `layers/` dir. A top-level layer whose **name** clashes with a base layer is suffixed
+  ` [2]`, ` [3]`, … — opening-tag only, so nested layer/mask names are left alone.
+- It **refuses** (`MergeFailed`, nothing written) rather than emit a file Krita can't open when the
+  two versions use **different color spaces**; a canvas-*size* difference is allowed through (Krita
+  opens it — the incoming layers may just sit at an offset).
+
+No frontend or CLI change was needed: a merged pop returns normally through `pop_stash` / the `kvc`
+CLI, so the existing "brought back" success path applies, and the artist sees the ` [2]` layers
+directly in Krita. `StashConflict` still surfaces for the non-`.kra` refuse case.
 
 ## Raster delivery (`kvcimg` URI scheme)
 
@@ -421,7 +483,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `init_repository(path)` | Create a fresh `.kvc/` store. |
 | `is_repository(path)` | Does `path` already have a `.kvc/` store? |
 | `open_repository(path)` | Validate + load (success = it opened). |
-| `delete_repository(path)` | Permanently delete the folder (guarded by `is_repo`). |
+| `delete_repository(path)` | Delete the folder (guarded by `is_repo`), preferring the OS Recycle Bin. Returns `true` if the Recycle Bin was used, `false` if it fell back to a permanent delete. |
 | `scan_repository(path)` | Working-tree changes as `WorkingChange[]` (`staged: false`). |
 | `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths (the frontend's "staged" set), omitted/`null` commits everything. Returns the `Commit`. |
 | `discard_changes(path, paths)` | Discard uncommitted changes, restoring them to the branch tip's committed content — no new commit. Empty `paths` discards everything dirty; otherwise only those relative paths. |
@@ -446,6 +508,32 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
 | `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
 | `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
+| `export_repository_zip(path, dest)` | Zip the whole repository folder (art files + `.kvc/`) to `dest`. Manual backup — see [Backup & recovery](#backup--recovery). |
+| `export_repositories_zip(paths, destDir)` | Zip every repo in `paths` into `destDir`, one `<folder-name>-<date>.zip` each. Returns the paths that failed rather than aborting the batch on one bad repo. |
+
+## Backup & recovery
+
+There is no automated backup, sync, or cloud storage — this is a local-only app and any safety
+net has to be either OS-level or something the user triggers themselves. Two mechanisms cover
+the two ways a repository can be lost:
+
+- **Deleting a repository through the app** (`delete_repository`, `Repo::delete` in
+  [`repo.rs`](../src-tauri/src/repo.rs)) moves the folder to the OS Recycle Bin (the `trash`
+  crate) instead of removing it outright, so an accidental delete from inside the app is
+  recoverable the same way an accidental Explorer/Finder delete is — restore it from the Recycle
+  Bin and re-add it via Browse. `Repo::delete` falls back to a permanent `remove_dir_all` only if
+  the trash move itself fails, and reports which happened (`Ok(true)` = trashed, `Ok(false)` =
+  permanent) so the UI can warn rather than close silently.
+- **Total loss outside the app's control** — the whole project folder deleted via `rm -rf` or
+  Shift+Delete, disk failure, an external tool corrupting `.kvc/` — isn't something the app can
+  intervene in after the fact. The only protection is a backup made *before* it happens: **"Back
+  up this repository…"** in the Settings modal (`export_repository_zip`) zips the whole folder to
+  a path the user picks via a native Save dialog — the same `.kra` files plus full version
+  history, ready to move to an external drive or the user's own cloud storage. **"Back up all
+  repositories…"** in the repository switcher menu (`export_repositories_zip`) does the same for
+  every known repo into one chosen destination folder. Recovery is just extraction: since
+  `Repo::is_repo` only checks that `.kvc/config.json` exists, unzipping a backup anywhere and
+  pointing Browse at it reopens it as a fully working repository — no dedicated "restore" command.
 
 ## Frontend integration
 
@@ -457,8 +545,9 @@ The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell
   confirm modal, when nothing or only some files are staged); [`useCommits`](../src/lib/repoData.ts)
   calls `list_commits` and maps `BackendCommit` → the frontend `Commit` shape;
   [`useBranches`](../src/lib/repoData.ts) calls `list_branches`;
-  [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, the native folder
-  picker (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, `discardChanges`,
+  [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, backup
+  (`export_repository_zip`/`export_repositories_zip`), the native folder/save picker
+  (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, `discardChanges`,
   branch create/switch/merge/delete).
 - **In a plain browser** (`npm run dev`, no backend) — the hooks return empty results and
   repository/branch actions are no-ops; the status bar shows a "Browser preview" badge. There is

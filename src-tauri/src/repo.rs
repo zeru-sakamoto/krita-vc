@@ -20,9 +20,12 @@
 use crate::error::{io_at, KvcError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 pub const KVC_DIR: &str = ".kvc";
 
@@ -72,6 +75,20 @@ impl Drop for RepoLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+fn walk_err(e: walkdir::Error) -> KvcError {
+    match e.into_io_error() {
+        Some(io) => KvcError::Io(io),
+        None => KvcError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "directory walk failed",
+        )),
+    }
+}
+
+fn zip_err(e: zip::result::ZipError) -> KvcError {
+    KvcError::CorruptZip(e.to_string())
 }
 
 pub fn kvc_dir(root: &Path) -> PathBuf {
@@ -585,6 +602,30 @@ impl Repo {
         if kvc.join("config.json").exists() {
             return Err(KvcError::AlreadyRepo(root.to_path_buf()));
         }
+
+        // Ancestor guard: refuse to nest inside an existing repo. Just path-component
+        // walking + a config.json stat per ancestor, no directory traversal.
+        for ancestor in root.ancestors().skip(1) {
+            if Self::is_repo(ancestor) {
+                return Err(KvcError::NestedRepo(ancestor.to_path_buf()));
+            }
+        }
+
+        // Descendant guard: refuse to swallow an existing repo somewhere below root.
+        // root may not exist yet (created below via create_dir_all), so skip the walk
+        // entirely rather than let WalkDir error on a missing path.
+        if root.is_dir() {
+            let walker = walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_entry(|e| e.file_name() != KVC_DIR);
+            for entry in walker {
+                let entry = entry.map_err(walk_err)?;
+                if entry.depth() > 0 && entry.file_type().is_dir() && Self::is_repo(entry.path()) {
+                    return Err(KvcError::ContainsRepo(entry.path().to_path_buf()));
+                }
+            }
+        }
+
         std::fs::create_dir_all(objects_dir(root)).map_err(|e| io_at(&kvc, e))?;
         std::fs::create_dir_all(cache_dir(root)).map_err(|e| io_at(&kvc, e))?;
         std::fs::create_dir_all(chains_dir(root)).map_err(|e| io_at(&kvc, e))?;
@@ -595,13 +636,52 @@ impl Repo {
         Ok(())
     }
 
-    /// Permanently delete a repository folder (its whole tree, art files included).
-    /// Guarded by [`is_repo`] so a stray path can't be wiped.
-    pub fn delete(root: &Path) -> Result<()> {
+    /// Delete a repository folder (its whole tree, art files included), preferring the OS
+    /// Recycle Bin so an accidental delete stays recoverable from Explorer/Finder. Falls back to
+    /// a permanent `remove_dir_all` if the trash move fails (e.g. no trash provider on that
+    /// filesystem) so the action never gets stuck — the returned bool tells the caller which
+    /// happened. Guarded by [`is_repo`] so a stray path can't be wiped.
+    pub fn delete(root: &Path) -> Result<bool> {
         if !Self::is_repo(root) {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
-        std::fs::remove_dir_all(root).map_err(|e| io_at(root, e))
+        if trash::delete(root).is_ok() {
+            return Ok(true);
+        }
+        std::fs::remove_dir_all(root).map_err(|e| io_at(root, e))?;
+        Ok(false)
+    }
+
+    /// Zip a repository's whole folder (art files + `.kvc/`) to `dest` — a manual, on-demand
+    /// backup for the user to move to their own cloud storage or an external drive. It's the
+    /// only thing that helps against loss the app can't intervene in (the project folder deleted
+    /// outside the app, disk failure, external corruption): extracting the zip anywhere and
+    /// Browsing to it "just works" since [`is_repo`] only checks for `.kvc/config.json`.
+    pub fn export_zip(root: &Path, dest: &Path) -> Result<()> {
+        if !Self::is_repo(root) {
+            return Err(KvcError::NotARepo(root.to_path_buf()));
+        }
+        let file = std::fs::File::create(dest).map_err(|e| io_at(dest, e))?;
+        let mut zw = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.map_err(walk_err)?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            // Zip entry names are `/`-separated regardless of platform.
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            zw.start_file(rel, opts).map_err(zip_err)?;
+            let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
+            zw.write_all(&bytes)?;
+        }
+        zw.finish().map_err(zip_err)?;
+        Ok(())
     }
 
     /// Validate `.kvc/` and load its state. Chains load lazily per shard; only a repo still

@@ -85,9 +85,14 @@ pub fn create(
 
 /// Bring a stash back: write its files onto the working tree and take it off the shelf.
 ///
-/// All-or-nothing. If anything the stash touches has been changed since, this refuses with
-/// [`KvcError::StashConflict`] naming the files and leaves the stash intact — overwriting would
-/// destroy work with no way back.
+/// A conflicting `.kra` — one edited since it was set aside — is **merged** rather than refused:
+/// the set-aside version's layers are folded into the working file (clashing layer names suffixed
+/// ` [2]`), so the artist reconciles them by hand in Krita (see [`crate::merge`]). Any other
+/// conflict still hard-refuses the whole pop with [`KvcError::StashConflict`], before anything is
+/// written: a non-`.kra` file (no layers to merge) or a stashed *deletion* landing on edited work
+/// — overwriting either would destroy the current work with no way back. A `.kra` merge that
+/// can't be done cleanly (different color space, unparseable) surfaces [`KvcError::MergeFailed`]
+/// and likewise leaves both sides untouched.
 pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
     let idx = repo
         .stashes
@@ -98,33 +103,71 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
     let stash = repo.stashes.stashes[idx].clone();
 
     let dirty = scan::scan_detailed(repo, false)?;
-    let mut clash: Vec<&str> = stash
+    let is_conflict = |path: &str| dirty.iter().any(|d| d.rel == path);
+
+    // Only a conflicting `.kra` we're *bringing back* (not deleting) can be merged. Every other
+    // conflict refuses the whole pop up front — before a byte is written — keeping the
+    // all-or-nothing guarantee for those and never silently discarding the current work.
+    let mut refuse: Vec<&str> = stash
         .files
         .iter()
-        .filter(|f| dirty.iter().any(|d| d.rel == f.path))
+        .filter(|f| is_conflict(&f.path) && !(f.is_kra && f.status != "D"))
         .map(|f| f.path.as_str())
         .collect();
-    if !clash.is_empty() {
-        clash.sort();
-        return Err(KvcError::StashConflict(clash.join(", ")));
+    if !refuse.is_empty() {
+        refuse.sort();
+        return Err(KvcError::StashConflict(refuse.join(", ")));
     }
 
+    // Compute every file's final bytes first: a merge that can't be done cleanly errors here,
+    // before anything hits the disk, so the working tree and the stash stay untouched.
+    enum Action {
+        Write(std::path::PathBuf, Vec<u8>),
+        Delete(std::path::PathBuf),
+    }
+    // The committed tree the set-aside version diverged from — the merge base for a conflicting
+    // `.kra`, so only its added/modified layers fold in (not every unchanged one).
+    let committed = commit::current_tree(repo);
+    let mut actions = Vec::with_capacity(stash.files.len());
     for f in &stash.files {
         let abs = safe_join(&repo.root, &f.path)?;
         if f.status == "D" {
             // The stash recorded this file as deleted — bringing it back deletes it again.
-            if abs.exists() {
-                std::fs::remove_file(&abs).map_err(|e| io_at(&abs, e))?;
-            }
+            actions.push(Action::Delete(abs));
             continue;
         }
         // Full store rebuild, not the incremental `restore_bytes` path — that one trusts the
         // on-disk file as a diff base, which isn't what's sitting there.
-        let (bytes, _) = commit::bytes_of(repo, f)?;
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        let (stashed, _) = commit::bytes_of(repo, f)?;
+        let bytes = if is_conflict(&f.path) {
+            // Guaranteed a `.kra` by the refuse check above. Fold the set-aside layers into the
+            // edited working file instead of overwriting (and losing) it.
+            let working = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
+            let ancestor = match committed.get(&f.path) {
+                Some(cf) => Some(commit::bytes_of(repo, cf)?.0),
+                None => None,
+            };
+            crate::merge::merge_layers(&working, &stashed, ancestor.as_deref())?
+        } else {
+            stashed
+        };
+        actions.push(Action::Write(abs, bytes));
+    }
+
+    for action in &actions {
+        match action {
+            Action::Delete(abs) => {
+                if abs.exists() {
+                    std::fs::remove_file(abs).map_err(|e| io_at(abs, e))?;
+                }
+            }
+            Action::Write(abs, bytes) => {
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+                }
+                std::fs::write(abs, bytes).map_err(|e| io_at(abs, e))?;
+            }
         }
-        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
     }
 
     // The index is left alone on purpose: it still holds the committed head, which is exactly

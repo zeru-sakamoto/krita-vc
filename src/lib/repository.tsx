@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { Repository } from "../types";
 import { inTauri } from "./tauri";
 import { clearSessionCaches } from "./repoData";
@@ -36,8 +36,18 @@ interface RepositoryValue {
   browseRepository: () => void;
   /** Create a new folder named `name` inside `parentPath`, init it, and select it. */
   createRepository: (parentPath: string, name: string) => Promise<void>;
-  /** Drop a repo from the list; if `deleteFolder`, also delete it on disk. */
-  removeRepository: (id: string, deleteFolder: boolean) => Promise<void>;
+  /**
+   * Drop a repo from the list; if `deleteFolder`, also delete it on disk (preferring the OS
+   * Recycle Bin). Resolves `false` only when a folder delete fell back to a permanent one.
+   */
+  removeRepository: (id: string, deleteFolder: boolean) => Promise<boolean>;
+  /** Zip a repository's whole folder to a user-chosen path. Null if canceled or in a browser. */
+  backupRepository: (id: string) => Promise<string | null>;
+  /**
+   * Zip every known repository into a user-chosen destination folder. Resolves the list of
+   * repo paths that failed (empty = all succeeded), or null if canceled or in a browser.
+   */
+  backupAllRepositories: () => Promise<string[] | null>;
   /** Restore the working tree to `commitId` and record it as a new commit. */
   rollbackToCommit: (commitId: string) => Promise<void>;
   /** Undo the last commit, keeping working-tree changes. */
@@ -191,16 +201,59 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   const removeRepository = useCallback(
     async (id: string, deleteFolder: boolean) => {
       const repo = repositories.find((r) => r.id === id);
-      if (!repo) return;
-      if (deleteFolder && inTauri()) await invoke("delete_repository", { path: repo.path });
+      if (!repo) return true;
+      const usedTrash =
+        deleteFolder && inTauri()
+          ? await invoke<boolean>("delete_repository", { path: repo.path })
+          : true;
       setRepositories((prev) => {
         const next = prev.filter((r) => r.id !== id);
         setCurrentId((cur) => (cur === id ? (next[0]?.id ?? "") : cur));
         return next;
       });
+      return usedTrash;
     },
     [repositories]
   );
+
+  // Manual last-resort backup: zips the whole project folder (art + `.kvc/`) to a user-chosen
+  // path/folder. Doesn't touch `saving` (nothing here is mutated) but still drives the
+  // BusyOverlay via `busyMessage` since zipping a large `objects/` dir isn't instant.
+  const backupRepository = useCallback(
+    async (id: string): Promise<string | null> => {
+      if (!inTauri()) return null;
+      const repo = repositories.find((r) => r.id === id);
+      if (!repo) return null;
+      const dest = await save({
+        defaultPath: `${repo.name}-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+      if (!dest) return null;
+      setBusyMessage("Backing up repository — please wait…");
+      try {
+        await invoke("export_repository_zip", { path: repo.path, dest });
+        return dest;
+      } finally {
+        setBusyMessage(null);
+      }
+    },
+    [repositories]
+  );
+
+  const backupAllRepositories = useCallback(async (): Promise<string[] | null> => {
+    if (!inTauri() || repositories.length === 0) return null;
+    const destDir = await open({ directory: true, title: "Choose a folder for the backups" });
+    if (typeof destDir !== "string") return null;
+    setBusyMessage("Backing up repositories — please wait…");
+    try {
+      return await invoke<string[]>("export_repositories_zip", {
+        paths: repositories.map((r) => r.path),
+        destDir,
+      });
+    } finally {
+      setBusyMessage(null);
+    }
+  }, [repositories]);
 
   const current = useMemo(
     () => repositories.find((r) => r.id === currentId) ?? repositories[0] ?? null,
@@ -425,6 +478,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       browseRepository,
       createRepository,
       removeRepository,
+      backupRepository,
+      backupAllRepositories,
       rollbackToCommit,
       undoLastCommit,
       discardChanges,
@@ -454,6 +509,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       browseRepository,
       createRepository,
       removeRepository,
+      backupRepository,
+      backupAllRepositories,
       rollbackToCommit,
       undoLastCommit,
       discardChanges,

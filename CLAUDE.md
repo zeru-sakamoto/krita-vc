@@ -10,10 +10,15 @@ no fetch, no cloud sync. The UI exposes only local operations (commit history, l
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own `.kvc/` store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
-`gc`, `palette`, `stash`; commands in `commands.rs`). **Tracking guardrail**: the scanner only newly tracks
+`gc`, `palette`, `stash`, `merge`; commands in `commands.rs`). **Tracking guardrail**: the scanner only newly tracks
 *supported* file types — `.kra` documents and the palette formats (`.gpl`/`.kpl`/`.aco`/`.ase`,
 `scan::is_supported`); every other file in the project folder is ignored (never staged, hashed, or
-committed). Already-tracked files stay tracked, so pre-guardrail repos aren't pruned. Storage layout: chains are **sharded per tracked file**
+committed). Already-tracked files stay tracked, so pre-guardrail repos aren't pruned. `is_supported`
+is a **suffix match on the whole relpath**, not an extension parse, so Krita's autosave artifact
+(`foo.kra-autosave.kra`, dot-prefixed on Linux/macOS) ends in `.kra` and would be tracked as a real
+document — it's rejected explicitly, and that rejection lives in `is_supported` (gating *new*
+tracking only) rather than in the scan walk, so a repo that already committed one isn't pruned.
+Krita's backup file (`*.kra~`) is skipped separately, in `scan_detailed`'s walk. Storage layout: chains are **sharded per tracked file**
 (`.kvc/chains/`, lazy-loaded, `KVCC2`-tagged bincode — pre-KVCC2 shards and legacy monolithic
 `chains.bin`/`chains.json` migrate transparently), the commit log is **append-only JSON-lines**
 (`.kvc/commits.log`; a commit appends one line, legacy `commits.json` migrates on first save),
@@ -28,9 +33,27 @@ path's relpath-keyed streams via the shared `commit::store_change`, so a stashed
 its tiles against history for free; three orderings are load-bearing and each has a test —
 a stash must **not** write `repo.index` (else the revert scans clean and silently keeps the
 tree dirty), `create` must save **before** reverting (else a crash erases the work with no
-record), and `pop` must write files **before** dropping the record. Pop is all-or-nothing:
-`StashConflict` (prefix `"stash conflict"`, distinct from the `"unsaved changes"` one) if any
-stashed path is dirty. See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside). The `.kra` composite
+record), and `pop` must write files **before** dropping the record (and computes every file's
+bytes **before** the first write, so a failed merge leaves the tree + shelf untouched). On a pop
+**conflict** (a stashed path edited since), a conflicting **`.kra` is merged** — only the layers the
+set-aside version actually **added or modified** are folded into the working file (`merge_layers`
+takes the committed **ancestor** and skips incoming top-level layers unchanged since, matched by
+uuid then compared on **content** — each `layers/layerN` data file canonicalized to its tiles
+**sorted by position** (Krita's tile *order* isn't stable across saves, so equal tiles reconstruct
+to different bytes; `canon_entry`), collected filename-independently (Krita renumbers `layerN`) —
+plus a small curated metadata set [`name`/`opacity`/`compositeop`/`visible`/`x`/`y`]. Deliberately
+**not** raw `<layer>` XML or whole-blob bytes: Krita rewrites volatile attrs like `selected` and
+reshuffles tile order every save, so either would fold *every* layer in — the bug this had. `None`
+ancestor folds all; an obscure metadata attr off the list is at worst not folded, never spuriously
+duplicated), clashing top-level layer names suffixed ` [2]`, folded data
+files + uuids remapped to fresh ids (`merge.rs`, `merge::merge_layers`, dep-free `roxmltree`-range +
+string-token `.kra` surgery) — so the artist reconciles by hand in Krita; it refuses (`MergeFailed`,
+nothing written) on a different color space, or when the set-aside change is only outside the layer
+stack (nothing to fold). **Any other conflict** still
+hard-refuses the whole pop with `StashConflict` (prefix `"stash conflict"`, distinct from the
+`"unsaved changes"` one) — a non-`.kra` file or a stashed *deletion* onto edited work. No
+frontend/CLI change: a merged pop returns normally, so the existing "brought back" path applies.
+See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside). The `.kra` composite
 (`mergedimage.png`) is stored as **content-addressed 256px pixel blocks**
 (`KraEntry::CompositePng`) instead of a full PNG per commit — the store's former dominant cost;
 restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
@@ -44,17 +67,25 @@ modal in the **Settings modal**) reclaims history unreachable from any branch ti
 cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
 rewrites on >25% dead, and consolidates small packs; the raster cache (`.kvc/cache/`) is
 size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Settings** (activity-bar
-gear → `SettingsModal`) is the single home for user prefs: Artist-view toggle, a **custom title
-bar** toggle (`windowChrome.tsx`, default **on** — the window boots with no OS-native chrome;
-`TopBar` doubles as the draggable title bar with its own minimize/maximize/close controls via
-`@tauri-apps/api/window`, and the preference is applied live through `setDecorations`, no
-restart needed — see the Shell section below), an **author name**
-(`authorName.tsx`, persisted to `localStorage`, sent as the `author` on new commits/merges/
-rollbacks, falling back to `"You"`), per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs
-(`get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only write), "Clean up
-storage", and the **set-aside shelf** (every stash with its origin branch + age; per-row remove
-and remove-all, confirms rendered as *sibling* modals per the `CleanupModal` pattern — `Modal`
-has no portal). **Branching is real**: `.kvc/branches.json` maps branch name → tip
+gear → `SettingsModal`) is the single home for user prefs, organized into three left-hand category
+tabs (a static list regardless of whether a repository is selected — a tab whose settings need one
+shows a plain "Open a repository…" fallback rather than disappearing, so the tab set never jumps
+around as you switch repos): **Appearance** (Artist-view toggle, a **custom title bar** toggle
+(`windowChrome.tsx`, default **on** — the window boots with no OS-native chrome; `TopBar` doubles
+as the draggable title bar with its own minimize/maximize/close controls via `@tauri-apps/api/window`,
+and the preference is applied live through `setDecorations`, no restart needed — see the Shell
+section below), an **author name** (`authorName.tsx`, persisted to `localStorage`, sent as the
+`author` on new commits/merges/rollbacks, falling back to `"You"`), and the theme picker), **Set-
+Aside** (the shelf: every stash with its origin branch + age; per-row remove and remove-all,
+confirms rendered as *sibling* modals per the `CleanupModal` pattern — `Modal` has no portal), and
+**Storage** (per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs — `get_repo_config`/`set_repo_config`
+→ `Repo::save_config`, a config-only write — plus "Clean up storage"). Backing up a repository
+(`backupRepository` in `repository.tsx`, zips the project via `export_repository_zip`) is **not**
+in Settings — it's its own one-click zip-icon `IconButton` in `ActivityBar.tsx`, directly above
+the Settings gear, wired to a small global toast (`lib/toast.tsx`, `ToastProvider`/`useToast`,
+single-slot, auto-dismissing, bottom-right, reusing the `--z-toast` token) for the "Saved to …"/
+error result, since the busy overlay covers only the in-flight zip itself. **Branching is real**:
+`.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
@@ -114,8 +145,12 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 
 - **Frontend** (`src/`): standard Vite + React 19 + TypeScript app. Entry point `src/main.tsx` mounts `App.tsx` into `index.html`. Built output goes to `dist/`, which `src-tauri/tauri.conf.json` (`build.frontendDist`) points at for packaged builds.
 - **Backend** (`src-tauri/`): Rust crate `krita_vc_lib`. `src-tauri/src/main.rs` is the binary entry point and just calls `krita_vc_lib::run()` defined in `src-tauri/src/lib.rs`, where the `tauri::Builder` is configured, plugins are registered, and Tauri commands are wired up via `invoke_handler(tauri::generate_handler![...])`.
-- **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Five subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`) taking `--repo <path>` plus scalars, each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit). Commit/switch/create-branch take an advisory `.kvc/kvc.lock` (create-exclusive, released on drop) so it can't race a concurrent desktop-app write — the engine itself has no locking. This is what the Krita plugin (below) shells out to. Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
-- **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, one-tap checkpoint, and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above. Deliberately does not do repo init, history browsing/restore, or anything remote — those stay desktop-app-only. See [`krita-plugin/README.md`](krita-plugin/README.md).
+- **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Nine subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`, `discard`, `stash`, `stash-pop`, `stash-list`) taking `--repo <path>` plus scalars, each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit). The optional file-subset flag (`--paths` on `commit`/`discard`/`stash`) is a **JSON array** — the hand-rolled parser is a map, so a repeated flag would overwrite, and paths can contain commas; omitting it means "everything". Every mutating subcommand takes an advisory `.kvc/kvc.lock` (create-exclusive, released on drop) so it can't race a concurrent desktop-app write — the engine itself has no locking; reads (`status`, `branches`, `stash-list`) take none, so the plugin's 1.5s poll never contends. `status` carries a `stashes` count so that poll needn't spawn a third process. The **no-args usage line is load-bearing**: the plugin's "Locate kvc…" picker identifies the binary by its literal `"usage: kvc"` prefix, so widen the command list freely but never change that prefix. `stash-list` reuses `commands::stash_dtos` for its **newest-first** order, which "bring back latest" depends on. Contract tests: `src-tauri/tests/kvc_cli.rs` (spawns the real binary). Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
+- **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit (with per-file ticks), one-tap checkpoint, discard, set-aside/bring-back, save-and-rescan (⟳), and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above. Deliberately does not do repo init, history browsing/restore, undo, branch merge/delete, or anything remote — those stay desktop-app-only. The engine only sees the disk, Krita's canvas only memory, so the docker moves both ways and **both directions are load-bearing**:
+  - **memory → disk** (`_save_tracked`, all *modified* `.kra` under the repo root — `.kra` only, since Krita may raise an export dialog on a `.png` and hang the UI thread it's saving on). Driven by focus entering the docker (`QApplication.focusChanged` — not an event filter; focus lands on child widgets and `FocusIn` won't reach the dock), the ⟳ button, and `_commit_with_message`. Two traps: commit **must `refresh()` between the save and `_selected_paths()`** or it skips the very work just written (a doc clean *before* the save isn't in `_shown_paths`/`checked`); and `_save_tracked` sets `busy` because `doc.save()` spins the event loop, which would let the 1.5s poll `kvc status` a half-written `.kra`.
+  - **disk → memory** (`_rebuild_docs`, wrapping switch/discard/stash/pop). Refuses while any open doc is unsaved, then **closes and reopens** each doc whose file changed (mtime/size snapshot — `switch` doesn't report what it rewrote). Drop the reopen and Krita keeps serving the pre-op copy, so the next Ctrl+S silently reverts the operation; drop the refusal and that reopen eats real work — the engine's dirty-tree guard never sees Krita's memory.
+
+  Consequence to preserve: auto-save makes that refusal rare, so **Discard's confirm is the only thing standing between the artist and losing saved-but-uncommitted work** — saving isn't committing, and the reopen takes the undo history too. Also: checkbox state lives in `VcDocker.checked`, **not** the widget (the poll rebuilds the list and would wipe a tick mid-edit; the rebuild is skipped when the path list is unchanged). `kvc_client.py` blocks the UI thread by design (see its header). See [`krita-plugin/README.md`](krita-plugin/README.md).
 - **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (e.g. `greet` in `lib.rs`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `lib.rs` (or a module it includes) and registered in `generate_handler!`.
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `opener:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.

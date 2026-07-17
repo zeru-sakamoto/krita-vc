@@ -1,8 +1,8 @@
 //! End-to-end engine tests against real file I/O in tempdirs (no logic mocked).
 
 use krita_vc_lib::{
-    branch, commands, commit, delta, error::KvcError, gc, kra, palette, raster, repo, scan, stash,
-    tiles,
+    branch, commands, commit, delta, error::KvcError, gc, kra, merge, palette, raster, repo, scan,
+    stash, tiles,
 };
 use std::io::Write;
 
@@ -390,6 +390,65 @@ fn kra_embedded_palette_color_change_detected() {
 
 // --- scanner ---------------------------------------------------------------------------
 
+/// Krita's autosave artifact ends in `.kra`, so a naive suffix test tracks the artist's scratch
+/// state as a document — its own chain shard, its own changelist row, committed as junk. The
+/// Krita plugin drives saves now, which makes these appear and vanish under the scanner.
+#[test]
+fn scan_ignores_krita_autosave_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("hero.kra"), b"real document").unwrap();
+    std::fs::write(root.join("hero.kra-autosave.kra"), b"scratch").unwrap();
+    // Dot-prefixed on Linux/macOS — and the scanner has no dotfile rule to fall back on.
+    std::fs::write(root.join(".hero.kra-autosave.kra"), b"scratch").unwrap();
+
+    let s = scan::scan(&r).unwrap();
+    assert!(
+        s.iter().any(|(p, st)| p == "hero.kra" && st == "U"),
+        "the suffix rule must not eat real documents"
+    );
+    for junk in ["hero.kra-autosave.kra", ".hero.kra-autosave.kra"] {
+        assert!(
+            !s.iter().any(|(p, _)| p == junk),
+            "{junk} must never be newly tracked"
+        );
+    }
+    assert!(!scan::is_supported("hero.kra-autosave.kra"));
+    assert!(scan::is_supported("hero.kra"));
+}
+
+/// The guardrail's standing promise: the autosave rule gates *new* tracking only, so a repo that
+/// already committed one keeps it rather than sprouting a phantom `D` row on upgrade.
+#[test]
+fn already_tracked_autosave_file_stays_tracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // Force it into the index the way a pre-fix repo would have.
+    let rel = "hero.kra-autosave.kra".to_string();
+    std::fs::write(root.join(&rel), b"one").unwrap();
+    r.index.files.insert(
+        rel.clone(),
+        repo::TrackedFile {
+            hash: "stale".into(),
+            is_kra: true,
+            size: 3,
+            mtime: 0,
+        },
+    );
+
+    let s = scan::scan(&r).unwrap();
+    assert!(
+        s.iter().any(|(p, st)| p == &rel && st == "M"),
+        "an already-tracked autosave file must not be silently pruned: {s:?}"
+    );
+}
+
 #[test]
 fn scan_status_and_lockfile_ignore() {
     let dir = tempfile::tempdir().unwrap();
@@ -462,6 +521,34 @@ fn open_errors_and_index_roundtrip() {
 }
 
 #[test]
+fn init_refuses_nested_repo_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+
+    repo::Repo::init(&parent).unwrap();
+    assert!(matches!(
+        repo::Repo::init(&child),
+        Err(KvcError::NestedRepo(p)) if p == parent
+    ));
+}
+
+#[test]
+fn init_refuses_nested_repo_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+
+    repo::Repo::init(&child).unwrap();
+    assert!(matches!(
+        repo::Repo::init(&parent),
+        Err(KvcError::ContainsRepo(p)) if p == child
+    ));
+}
+
+#[test]
 fn delete_guarded_then_removes() {
     let dir = tempfile::tempdir().unwrap();
     let plain = dir.path().join("not-a-repo");
@@ -478,12 +565,40 @@ fn delete_guarded_then_removes() {
         "guarded delete must not touch the folder"
     );
 
-    // A real repo is removed whole.
+    // A real repo is removed whole, preferring the OS Recycle Bin.
     let real = dir.path().join("repo");
     std::fs::create_dir(&real).unwrap();
     repo::Repo::init(&real).unwrap();
-    repo::Repo::delete(&real).unwrap();
+    let used_trash = repo::Repo::delete(&real).unwrap();
     assert!(!real.exists(), "delete should remove the repository folder");
+    assert!(
+        used_trash,
+        "expected the folder to move to the Recycle Bin, not be permanently deleted"
+    );
+}
+
+#[test]
+fn export_zip_round_trips_into_a_reopenable_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_repo(&dir);
+    let root = dir.path();
+
+    // Destination lives outside `root` — zipping into a folder being walked would grow forever.
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip(root, &zip_path).unwrap();
+
+    let extracted = out.path().join("extracted");
+    std::fs::create_dir(&extracted).unwrap();
+    let file = std::fs::File::open(&zip_path).unwrap();
+    let mut za = zip::ZipArchive::new(file).unwrap();
+    za.extract(&extracted).unwrap();
+
+    assert!(repo::Repo::is_repo(&extracted));
+    let r2 = repo::Repo::open(&extracted).unwrap();
+    assert_eq!(r2.commits.len(), 1);
+    assert_eq!(std::fs::read(extracted.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(std::fs::read(extracted.join("b.gpl")).unwrap(), b"base-b");
 }
 
 // --- maindoc.xml layer metadata diff ---------------------------------------------------
@@ -2797,6 +2912,360 @@ fn stash_dedups_kra_tiles_against_history() {
     let on_disk = std::fs::read(root.join("art.kra")).unwrap();
     let l = tiles::parse(&kra::read_entry(&on_disk, "img/layers/layer1").unwrap()).unwrap();
     assert_eq!(l.tiles[1].data, b"tileZZZZ");
+}
+
+// --- bringing set-aside .kra work back: layer merge ------------------------------------
+
+/// A `.kra` whose `<IMAGE>` carries `colorspace` and whose `<layers>` are the given
+/// `(name, uuid, filename, tile_data)` paint layers, each with a matching `img/layers/<filename>`
+/// tiled entry.
+fn layered_kra(image: &str, colorspace: &str, layers: &[(&str, &str, &str, &[u8])]) -> Vec<u8> {
+    let mut xml = format!(
+        "<!DOCTYPE DOC>\n<DOC><IMAGE name=\"{image}\" width=\"128\" height=\"128\" \
+         colorspacename=\"{colorspace}\"><layers>\n"
+    );
+    for (name, uuid, filename, _) in layers {
+        xml.push_str(&format!(
+            "<layer name=\"{name}\" uuid=\"{uuid}\" opacity=\"255\" compositeop=\"normal\" \
+             nodetype=\"paintlayer\" filename=\"{filename}\"/>\n"
+        ));
+    }
+    xml.push_str("</layers></IMAGE></DOC>");
+
+    let mut keys: Vec<String> = vec!["mimetype".into(), "maindoc.xml".into()];
+    let mut datas: Vec<Vec<u8>> = vec![b"application/x-krita".to_vec(), xml.into_bytes()];
+    for (_, _, filename, data) in layers {
+        // `data` is &&[u8] here (match ergonomics over &[tuple]); tiled() wants &[u8].
+        keys.push(format!("{image}/layers/{filename}"));
+        datas.push(tiled(&[(0, 0, *data)]));
+    }
+    let refs: Vec<(&str, Vec<u8>)> = keys
+        .iter()
+        .zip(datas)
+        .map(|(k, d)| (k.as_str(), d))
+        .collect();
+    pack_kra(&refs)
+}
+
+/// Names, filenames and uuids of a merged .kra's layers, for assertions.
+fn layer_meta(kra_bytes: &[u8]) -> kra::ImageMeta {
+    kra::parse_image_meta(&kra::read_entry(kra_bytes, "maindoc.xml").unwrap()).unwrap()
+}
+
+#[test]
+fn merge_layers_folds_stashed_layers_and_renames_clashes() {
+    // Working file: Background + Lines. Set-aside version: a re-touched Background (name clash)
+    // plus a unique Sketch layer.
+    let base = layered_kra(
+        "img",
+        "RGBA",
+        &[
+            ("Background", "{bg}", "layer1", b"tileBGxx"),
+            ("Lines", "{ln}", "layer2", b"tileLN.."),
+        ],
+    );
+    let incoming = layered_kra(
+        "img",
+        "RGBA",
+        &[
+            ("Background", "{bg}", "layer1", b"tileBGed"),
+            ("Sketch", "{sk}", "layer3", b"tileSK.."),
+        ],
+    );
+
+    let merged = merge::merge_layers(&base, &incoming, None).unwrap();
+    let meta = layer_meta(&merged);
+
+    let names: std::collections::HashSet<&str> =
+        meta.layers.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains("Background"), "base layer kept");
+    assert!(names.contains("Lines"), "base layer kept");
+    assert!(names.contains("Sketch"), "set-aside layer folded in");
+    assert!(names.contains("Background [2]"), "name clash suffixed");
+    assert_eq!(meta.layers.len(), 4, "all four layers present");
+
+    // Filenames + uuids are unique and every data file exists under its (remapped) name.
+    let uniq = |vals: Vec<&str>| {
+        let n = vals.len();
+        let mut v = vals;
+        v.sort();
+        v.dedup();
+        v.len() == n
+    };
+    assert!(
+        uniq(meta.layers.iter().map(|l| l.filename.as_str()).collect()),
+        "layer filenames unique"
+    );
+    assert!(
+        uniq(meta.layers.iter().map(|l| l.uuid.as_str()).collect()),
+        "layer uuids unique"
+    );
+    for l in &meta.layers {
+        assert!(
+            kra::read_entry(&merged, &format!("img/layers/{}", l.filename)).is_ok(),
+            "missing data file for {}",
+            l.name
+        );
+    }
+
+    // The set-aside's unique tile data crossed over under its remapped filename.
+    let sketch = meta.layers.iter().find(|l| l.name == "Sketch").unwrap();
+    let block = tiles::parse(
+        &kra::read_entry(&merged, &format!("img/layers/{}", sketch.filename)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(block.tiles[0].data, b"tileSK..");
+}
+
+#[test]
+fn merge_layers_refuses_on_colorspace_mismatch() {
+    let base = layered_kra("img", "RGBA", &[("L", "{a}", "layer1", b"aaaa")]);
+    let incoming = layered_kra("img", "CMYK", &[("L", "{b}", "layer1", b"bbbb")]);
+    assert!(matches!(
+        merge::merge_layers(&base, &incoming, None),
+        Err(KvcError::MergeFailed(_))
+    ));
+}
+
+/// A `.kra` with realistic Krita layer attributes — including the volatile `selected` on whichever
+/// layer is active — so a merge's "unchanged" test can't lean on the raw `<layer>` XML matching.
+fn krita_kra(layers: &[(&str, &str, &str, bool, &[u8])]) -> Vec<u8> {
+    let mut xml = String::from(
+        "<!DOCTYPE DOC>\n<DOC><IMAGE name=\"img\" width=\"128\" height=\"128\" \
+         colorspacename=\"RGBA\"><layers>\n",
+    );
+    for (name, uuid, filename, selected, _) in layers {
+        let sel = if *selected { " selected=\"true\"" } else { "" };
+        xml.push_str(&format!(
+            "<layer name=\"{name}\" uuid=\"{uuid}\" filename=\"{filename}\" opacity=\"255\" \
+             compositeop=\"normal\" visible=\"1\" x=\"0\" y=\"0\" collapsed=\"0\" locked=\"0\" \
+             colorlabel=\"0\" nodetype=\"paintlayer\"{sel}/>\n"
+        ));
+    }
+    xml.push_str("</layers></IMAGE></DOC>");
+
+    let mut keys: Vec<String> = vec!["mimetype".into(), "maindoc.xml".into()];
+    let mut datas: Vec<Vec<u8>> = vec![b"application/x-krita".to_vec(), xml.into_bytes()];
+    for (_, _, filename, _, data) in layers {
+        keys.push(format!("img/layers/{filename}"));
+        datas.push(tiled(&[(0, 0, *data)]));
+    }
+    let refs: Vec<(&str, Vec<u8>)> = keys
+        .iter()
+        .zip(datas)
+        .map(|(k, d)| (k.as_str(), d))
+        .collect();
+    pack_kra(&refs)
+}
+
+#[test]
+fn merge_layers_skips_unchanged_despite_krita_attr_churn() {
+    // Ancestor (committed): Background is the active layer.
+    let ancestor = krita_kra(&[
+        ("Background", "{bg}", "layer1", true, b"tileBG.."),
+        ("Lines", "{ln}", "layer2", false, b"tileLN.."),
+    ]);
+    // Set-aside: the artist modified Lines and added Sketch. Background is *untouched*, but Krita
+    // renumbered its data file (layer1 -> layer5) and moved `selected` off it — exactly the churn
+    // that made a raw-XML compare treat every unchanged layer as changed.
+    let incoming = krita_kra(&[
+        ("Background", "{bg}", "layer5", false, b"tileBG.."),
+        ("Lines", "{ln}", "layer6", true, b"tileLNmd"),
+        ("Sketch", "{sk}", "layer7", false, b"tileSK.."),
+    ]);
+    // Working: edited since it was set aside, so the pop is a conflict.
+    let base = krita_kra(&[
+        ("Background", "{bg}", "layer1", true, b"tileBGwk"),
+        ("Lines", "{ln}", "layer2", false, b"tileLNwk"),
+    ]);
+
+    let merged = merge::merge_layers(&base, &incoming, Some(&ancestor)).unwrap();
+    let names: std::collections::HashSet<String> = layer_meta(&merged)
+        .layers
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
+
+    // Only the set-aside's real changes fold in: the modified Lines (name clash -> [2]) and the
+    // added Sketch. The untouched Background is NOT duplicated despite its churned attributes.
+    assert!(names.contains("Lines [2]"), "modified layer folded in");
+    assert!(names.contains("Sketch"), "added layer folded in");
+    assert!(
+        !names.contains("Background [2]"),
+        "unchanged layer must not be duplicated"
+    );
+    assert_eq!(
+        names.len(),
+        4,
+        "base Background+Lines plus Lines [2]+Sketch"
+    );
+}
+
+#[test]
+fn merge_layers_skips_unchanged_despite_tile_reordering() {
+    // A .kra whose paint layers carry the given (already tile-encoded) data files.
+    fn kra(layers: &[(&str, &str, &str, Vec<u8>)]) -> Vec<u8> {
+        let mut xml = String::from(
+            "<!DOCTYPE DOC>\n<DOC><IMAGE name=\"img\" width=\"128\" height=\"128\" \
+             colorspacename=\"RGBA\"><layers>\n",
+        );
+        for (name, uuid, filename, _) in layers {
+            xml.push_str(&format!(
+                "<layer name=\"{name}\" uuid=\"{uuid}\" filename=\"{filename}\" opacity=\"255\" \
+                 compositeop=\"normal\" visible=\"1\" nodetype=\"paintlayer\"/>\n"
+            ));
+        }
+        xml.push_str("</layers></IMAGE></DOC>");
+        let mut keys: Vec<String> = vec!["mimetype".into(), "maindoc.xml".into()];
+        let mut datas: Vec<Vec<u8>> = vec![b"application/x-krita".to_vec(), xml.into_bytes()];
+        for (_, _, filename, data) in layers {
+            keys.push(format!("img/layers/{filename}"));
+            datas.push(data.clone());
+        }
+        let refs: Vec<(&str, Vec<u8>)> = keys
+            .iter()
+            .zip(datas)
+            .map(|(k, d)| (k.as_str(), d))
+            .collect();
+        pack_kra(&refs)
+    }
+
+    let ancestor = kra(&[(
+        "Base",
+        "{b}",
+        "layer1",
+        tiled(&[(0, 0, b"tileAAAA"), (64, 0, b"tileBBBB")]),
+    )]);
+    // Set-aside: Base is untouched but Krita wrote its two tiles in the opposite order (tile order
+    // isn't stable across saves, so it reconstructs to different bytes), and a Sketch was added.
+    let incoming = kra(&[
+        (
+            "Base",
+            "{b}",
+            "layer1",
+            tiled(&[(64, 0, b"tileBBBB"), (0, 0, b"tileAAAA")]),
+        ),
+        ("Sketch", "{s}", "layer2", tiled(&[(0, 0, b"tileSKSK")])),
+    ]);
+    let base = kra(&[(
+        "Base",
+        "{b}",
+        "layer1",
+        tiled(&[(0, 0, b"tileAAAA"), (64, 0, b"tileBBBB")]),
+    )]);
+
+    let merged = merge::merge_layers(&base, &incoming, Some(&ancestor)).unwrap();
+    let names: Vec<String> = layer_meta(&merged)
+        .layers
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
+
+    // Base must not be duplicated despite the reordered tiles; only the added Sketch folds in.
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("Base")).count(),
+        1,
+        "unchanged layer duplicated because its tiles were reordered"
+    );
+    assert!(names.iter().any(|n| n == "Sketch"), "added layer folded in");
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn pop_merges_conflicting_kra_instead_of_refusing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let v1 = layered_kra(
+        "img",
+        "RGBA",
+        &[
+            ("Background", "{bg}", "layer1", b"tileBG.."),
+            ("Lines", "{ln}", "layer2", b"tileLN.."),
+        ],
+    );
+    std::fs::write(root.join("art.kra"), &v1).unwrap();
+    commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    // Set aside a version that *modifies* Background, leaves Lines untouched, and *adds* Sketch;
+    // the tree reverts to v1.
+    let aside = layered_kra(
+        "img",
+        "RGBA",
+        &[
+            ("Background", "{bg}", "layer1", b"tileBGmd"),
+            ("Lines", "{ln}", "layer2", b"tileLN.."),
+            ("Sketch", "{sk}", "layer3", b"tileSK.."),
+        ],
+    );
+    std::fs::write(root.join("art.kra"), &aside).unwrap();
+    let s = stash::create(&mut r, "sketch pass", "t", None).unwrap();
+    // The revert reconstructs the .kra (re-deflated, not byte-identical to the fixture), so assert
+    // the tree is *clean* rather than byte-equal to v1.
+    assert!(
+        scan::scan(&r).unwrap().is_empty(),
+        "stash reverted the tree"
+    );
+
+    // Edit the file again so art.kra conflicts with the set-aside version.
+    let edited = layered_kra(
+        "img",
+        "RGBA",
+        &[
+            ("Background", "{bg}", "layer1", b"tileBGwk"),
+            ("Lines", "{ln}", "layer2", b"tileLN.."),
+        ],
+    );
+    std::fs::write(root.join("art.kra"), &edited).unwrap();
+
+    // Pops without refusing, and the shelf empties.
+    stash::pop(&mut r, &s.id).unwrap();
+    assert!(stash::list(&r).is_empty());
+
+    // Only the set-aside's *changes* fold in: the modified Background (clash suffixed) and the
+    // added Sketch. The untouched Lines is NOT duplicated — no "Lines [2]".
+    let meta = layer_meta(&std::fs::read(root.join("art.kra")).unwrap());
+    let names: std::collections::HashSet<&str> =
+        meta.layers.iter().map(|l| l.name.as_str()).collect();
+    assert!(names.contains("Background"), "working Background kept");
+    assert!(names.contains("Lines"), "working Lines kept");
+    assert!(names.contains("Sketch"), "added layer folded in");
+    assert!(names.contains("Background [2]"), "modified layer folded in");
+    assert!(
+        !names.contains("Lines [2]"),
+        "unchanged layer not duplicated"
+    );
+    assert_eq!(meta.layers.len(), 4);
+}
+
+#[test]
+fn pop_merge_failure_leaves_working_tree_and_stash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    let v1 = layered_kra("img", "RGBA", &[("L", "{a}", "layer1", b"aaaa")]);
+    std::fs::write(root.join("art.kra"), &v1).unwrap();
+    commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+
+    let aside = layered_kra("img", "RGBA", &[("L", "{a}", "layer1", b"aside")]);
+    std::fs::write(root.join("art.kra"), &aside).unwrap();
+    let s = stash::create(&mut r, "", "t", None).unwrap();
+
+    // Working copy now uses a different color space, so the merge can't be done cleanly.
+    let edited = layered_kra("img", "CMYK", &[("L", "{a}", "layer1", b"cmyk")]);
+    std::fs::write(root.join("art.kra"), &edited).unwrap();
+
+    assert!(matches!(
+        stash::pop(&mut r, &s.id),
+        Err(KvcError::MergeFailed(_))
+    ));
+    // Nothing written, nothing lost: the working file stands and the stash survives.
+    assert_eq!(std::fs::read(root.join("art.kra")).unwrap(), edited);
+    assert_eq!(stash::list(&r).len(), 1);
 }
 
 #[test]

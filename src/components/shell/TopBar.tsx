@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Archive,
   CaretDown,
   FolderOpen,
   FolderPlus,
@@ -17,6 +18,7 @@ import { Button } from "../ui/Button";
 import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
+import { errorText } from "../vcs/BranchDialogs";
 import type { Repository } from "../../types";
 
 /**
@@ -25,11 +27,21 @@ import type { Repository } from "../../types";
  * (DESIGN.md → Layout & App Shell → Top bar)
  */
 export function TopBar() {
-  const { repositories, current, currentId, setCurrent, browseRepository } = useRepository();
+  const { repositories, current, currentId, setCurrent, browseRepository, backupAllRepositories } =
+    useRepository();
   const { customTitleBar } = useWindowChrome();
   const [modal, setModal] = useState<
-    { kind: "create" } | { kind: "remove"; repo: Repository } | null
+    | { kind: "create" }
+    | { kind: "remove"; repo: Repository }
+    | { kind: "backup-all-result"; total: number; failed: string[] }
+    | null
   >(null);
+
+  const backupAll = async () => {
+    const failed = await backupAllRepositories();
+    if (failed === null) return; // canceled, or nothing to back up
+    setModal({ kind: "backup-all-result", total: repositories.length, failed });
+  };
   const showWindowControls = customTitleBar && inTauri();
 
   const items: MenuItem[] = repositories.map((repo) => ({
@@ -68,6 +80,13 @@ export function TopBar() {
       icon: <Plus size={15} weight="regular" />,
       onSelect: browseRepository,
     },
+    {
+      id: "backup-all-repositories",
+      label: "Back up all repositories…",
+      icon: <Archive size={15} weight="regular" />,
+      separator: true,
+      onSelect: backupAll,
+    },
   ];
 
   return (
@@ -89,7 +108,46 @@ export function TopBar() {
       {modal?.kind === "remove" && (
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
+      {modal?.kind === "backup-all-result" && (
+        <BackupAllResultModal
+          total={modal.total}
+          failed={modal.failed}
+          onClose={() => setModal(null)}
+        />
+      )}
     </header>
+  );
+}
+
+function BackupAllResultModal({
+  total,
+  failed,
+  onClose,
+}: {
+  total: number;
+  failed: string[];
+  onClose: () => void;
+}) {
+  const succeeded = total - failed.length;
+  return (
+    <Modal
+      title="Backup complete"
+      onClose={onClose}
+      footer={<Button onClick={onClose}>Close</Button>}
+    >
+      <p className="text-[13px] text-text">
+        {succeeded} of {total} repositor{total === 1 ? "y" : "ies"} backed up.
+      </p>
+      {failed.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-1 font-mono text-[12px] text-danger">
+          {failed.map((path) => (
+            <li key={path} className="truncate">
+              {path}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
   );
 }
 
@@ -147,6 +205,7 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState("");
   const [parent, setParent] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const pickParent = async () => {
     // No native picker outside the desktop shell.
@@ -158,9 +217,12 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
   const create = async () => {
     if (!name.trim() || !parent || busy) return;
     setBusy(true);
+    setError(null);
     try {
       await createRepository(parent, name);
       onClose();
+    } catch (e) {
+      setError(errorText(e));
     } finally {
       setBusy(false);
     }
@@ -199,6 +261,7 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
           Creates: {parent}/{name.trim()}
         </p>
       )}
+      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
     </Modal>
   );
 }
@@ -208,6 +271,9 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
   const [deleteFolder, setDeleteFolder] = useState(false);
   const [confirmPath, setConfirmPath] = useState("");
   const [busy, setBusy] = useState(false);
+  // Set only if a folder delete fell back to a permanent one (Recycle Bin unavailable) —
+  // then the modal stays open to surface that instead of closing silently.
+  const [fallbackWarning, setFallbackWarning] = useState(false);
 
   // Last two path segments (parent\repo) — enough to confirm intent without typing the full path
   const shortPath = repo.path.split(/[\\/]/).filter(Boolean).slice(-2).join("\\");
@@ -217,12 +283,31 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
     if (!canConfirm) return;
     setBusy(true);
     try {
-      await removeRepository(repo.id, deleteFolder);
-      onClose();
+      const usedTrash = await removeRepository(repo.id, deleteFolder);
+      if (deleteFolder && !usedTrash) {
+        setFallbackWarning(true);
+      } else {
+        onClose();
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  if (fallbackWarning) {
+    return (
+      <Modal
+        title={`“${repo.name}” removed`}
+        onClose={onClose}
+        footer={<Button onClick={onClose}>Close</Button>}
+      >
+        <p className="text-[13px] text-text">
+          The Recycle Bin wasn’t available, so the folder was deleted permanently instead of moved
+          there. It can’t be recovered from Explorer.
+        </p>
+      </Modal>
+    );
+  }
 
   return (
     <Modal
@@ -237,7 +322,7 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
             onClick={remove}
           >
             {deleteFolder ? <Trash size={14} /> : null}
-            {deleteFolder ? "Delete permanently" : "Remove from list"}
+            {deleteFolder ? "Delete folder" : "Remove from list"}
           </Button>
         </>
       }
@@ -267,9 +352,9 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
             className="mt-1 accent-danger"
           />
           <span>
-            Delete folder permanently
+            Delete folder
             <span className="block text-[11px] text-text-muted">
-              Deletes the entire folder and all its contents. This cannot be undone.
+              Moves the entire folder and all its contents to the Recycle Bin.
             </span>
           </span>
         </label>

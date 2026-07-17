@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+/content
+
+# Krita plugin (PyKrita bytecode)
+__pycache__/

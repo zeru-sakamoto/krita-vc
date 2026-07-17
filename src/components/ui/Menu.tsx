@@ -48,10 +48,13 @@ export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }:
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
-    document.addEventListener("pointerdown", onPointerDown);
+    // Capture phase: a modal's backdrop stops pointerdown from bubbling past its panel
+    // (so panel clicks don't also close the modal), which would otherwise swallow this
+    // listener before it ever saw the click.
+    document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown);
     return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [open]);
@@ -105,7 +108,7 @@ export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }:
   );
 
   return (
-    <div ref={rootRef} className="relative">
+    <div ref={rootRef} className="relative inline-block">
       <button
         type="button"
         aria-haspopup="menu"

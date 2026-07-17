@@ -12,6 +12,16 @@ pub enum KvcError {
     #[error("a .kvc repository already exists at {0}")]
     AlreadyRepo(PathBuf),
 
+    #[error(
+        "cannot create a repository here — {0} is already a .kvc repository above this folder"
+    )]
+    NestedRepo(PathBuf),
+
+    #[error(
+        "cannot create a repository here — {0} inside this folder is already a .kvc repository"
+    )]
+    ContainsRepo(PathBuf),
+
     #[error("corrupted or unreadable .kra archive: {0}")]
     CorruptZip(String),
 
@@ -48,6 +58,12 @@ pub enum KvcError {
 
     #[error("no such stash: {0}")]
     NoStash(String),
+
+    // A .kra layer merge (bringing a set-aside change back onto edited work) couldn't be done
+    // cleanly — the pop leaves the working tree and the stash untouched rather than write a file
+    // Krita can't open.
+    #[error("couldn't merge set-aside work: {0}")]
+    MergeFailed(String),
 
     #[error("no such branch: {0}")]
     NoBranch(String),

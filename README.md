@@ -53,14 +53,16 @@ files, where git's text-oriented delta model performs poorly.
 - **Storage housekeeping**: a "Clean up storage" action reclaims history unreachable from any
   branch tip or set-aside stash (mark-and-sweep GC), and the raster preview cache is
   size-budgeted with LRU pruning.
-- **Settings** (activity-bar gear). One place for user preferences: the Artist Mode toggle, a
-  **custom title bar** toggle (a frameless window with its own draggable title bar and window
-  controls, on by default; switch back to your OS's native frame any time, no restart needed), a
-  **theme selector** (8 color themes, including a true-black option, applied instantly via CSS,
-  with the visual-diff highlight color following the chosen theme's accent), the **author name**
-  signed on your versions, the **set-aside shelf** (every stash, with per-item remove and
-  remove-all), and per-repository **preview-cache size**, **compact-storage**, and
-  **low-memory diffs** options, plus "Clean up storage".
+- **Settings** (activity-bar gear). Organized into three left-hand category tabs: **Appearance**
+  (the Artist Mode toggle, a **custom title bar** toggle — a frameless window with its own
+  draggable title bar and window controls, on by default, switch back to your OS's native frame
+  any time, no restart needed — a **theme selector** with 8 color themes including a true-black
+  option, applied instantly via CSS, with the visual-diff highlight color following the chosen
+  theme's accent, and the **author name** signed on your versions), **Set-Aside** (every stash,
+  with per-item remove and remove-all), and **Storage** (per-repository **preview-cache size**,
+  **compact-storage**, and **low-memory diffs** options, plus "Clean up storage"). Backing up a
+  repository is its own one-click **zip-icon button** in the activity bar, right above the
+  Settings gear, so it doesn't require opening Settings at all.
 - **Artist Mode**: a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).
@@ -72,7 +74,9 @@ files, where git's text-oriented delta model performs poorly.
   loose files (per-file creates dominated large commits on Windows).
 - **Tracked file types**: the scanner only tracks files Krita VCS understands: `.kra` documents
   and the color-palette formats (`.gpl`, `.kpl`, `.aco`, `.ase`). Anything else in the folder is
-  left untouched and is never staged or committed.
+  left untouched and is never staged or committed. Krita's own backup (`*.kra~`) and autosave
+  (`*-autosave.kra`) artifacts are skipped too — the latter matters because it ends in `.kra`,
+  so a naive extension check would version your scratch state as a real document.
 - **`.kra` tile-delta engine**: `.kra` files are ZIP archives of per-layer tiles; the engine diffs
   and stores them at the tile level, so a small edit to one layer stores a small delta, not a whole
   new file.
@@ -138,6 +142,7 @@ src-tauri/src/ — Rust backend (crate krita_vc_lib)
 ├─ kra, tiles, raster                        — .kra parsing, tile store, raster/diff imaging
 ├─ palette                                   — .gpl/.kpl/.aco/.ase parsing + swatch diffing
 ├─ commands.rs                               — Tauri #[command] IPC surface
+├─ bin/kvc.rs                                — headless CLI over the same engine (Krita plugin)
 └─ lib.rs / main.rs                          — Tauri builder + entry point
 
 docs/          — developer documentation
@@ -147,19 +152,23 @@ krita-plugin/  — optional Krita docker plugin (see below)
 
 ## Krita plugin
 
-A companion "Version Control" docker for Krita itself: commit, quick-checkpoint, and
-branch-switch without alt-tabbing to this app. It's a small Python (PyKrita) plugin that
-shells out to `kvc`, a headless CLI built from the same Rust engine
-(`src-tauri/src/bin/kvc.rs`, no Tauri dependency), so the plugin and the desktop app
-always go through identical commit/branch code against the same `.kvc` store. See
+A companion "Version Control" docker for Krita itself: commit (with per-file ticks),
+quick-checkpoint, discard, set work aside and bring it back, and branch-switch without
+alt-tabbing to this app. It saves your open documents for you — on focus, on ⟳, and before
+every commit — so a version can't miss work still sitting in Krita's memory.
+
+It's a small Python (PyKrita) plugin that shells out to `kvc`, a headless CLI built from the
+same Rust engine (`src-tauri/src/bin/kvc.rs`, no Tauri dependency), so the plugin and the
+desktop app always go through identical commit/branch code against the same `.kvc` store.
+Browsing/restoring history, undo, merges and repo init stay in the desktop app. See
 [`krita-plugin/README.md`](krita-plugin/README.md) for build + install steps.
 
 ## Documentation
 
 - [`docs/`](docs/README.md): frontend architecture, the file-tracking / version-control backend,
   the visual diff viewer, and performance.
-- [`krita-plugin/README.md`](krita-plugin/README.md): the in-Krita commit docker: install,
-  usage, and troubleshooting.
+- [`krita-plugin/README.md`](krita-plugin/README.md): the in-Krita version-control docker:
+  install, usage, and troubleshooting.
 - [`DESIGN.md`](DESIGN.md): design tokens, components, and interaction spec.
 - [`CLAUDE.md`](CLAUDE.md): repo guidance and commands.
 

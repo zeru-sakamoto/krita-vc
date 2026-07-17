@@ -5,6 +5,7 @@ pub mod delta;
 pub mod error;
 pub mod gc;
 pub mod kra;
+pub mod merge;
 pub mod palette;
 pub mod raster;
 pub mod repo;
@@ -32,6 +33,8 @@ pub fn run() {
             commands::is_repository,
             commands::open_repository,
             commands::delete_repository,
+            commands::export_repository_zip,
+            commands::export_repositories_zip,
             commands::scan_repository,
             commands::commit_snapshot,
             commands::list_commits,

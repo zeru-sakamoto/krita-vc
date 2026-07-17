@@ -39,14 +39,16 @@ export function Modal({
         aria-modal="true"
         aria-label={title}
         onPointerDown={(e) => e.stopPropagation()}
-        className={`w-full ${maxWidthClassName} overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)`}
+        className={`flex w-full ${maxWidthClassName} max-h-[calc(100vh-2rem)] flex-col overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)`}
       >
-        <h2 className="border-b border-border px-4 py-3 text-[14px] font-medium text-text">
+        <h2 className="shrink-0 border-b border-border px-4 py-3 text-[14px] font-medium text-text">
           {title}
         </h2>
-        <div className="px-4 py-4">{children}</div>
+        <div className="min-h-0 flex-1 overflow-auto px-4 py-4">{children}</div>
         {footer && (
-          <div className="flex justify-end gap-2 border-t border-border px-4 py-3">{footer}</div>
+          <div className="flex shrink-0 justify-end gap-2 border-t border-border px-4 py-3">
+            {footer}
+          </div>
         )}
       </div>
     </div>

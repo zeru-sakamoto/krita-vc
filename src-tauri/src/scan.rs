@@ -1,6 +1,7 @@
 //! Working-tree scanner: classify each file against the committed index as
-//! untracked (`U`), modified (`M`), or deleted (`D`). Krita lock/autosave files
-//! (`*.kra~`) and the `.kvc/` directory are ignored, and only *supported* file types
+//! untracked (`U`), modified (`M`), or deleted (`D`). The `.kvc/` directory and Krita's
+//! backup file (`*.kra~`) are ignored by the walk, its autosave artifact
+//! (`*-autosave.kra`) by [`is_supported`], and only *supported* file types
 //! ([`is_supported`] — `.kra` + palette formats) are ever newly tracked.
 
 use crate::error::{io_at, KvcError, Result};
@@ -151,6 +152,12 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
 /// One lowercase pass (this runs per untracked file on scan — kept allocation-lean).
 pub fn is_supported(rel: &str) -> bool {
     let lower = rel.to_lowercase();
+    // Krita's autosave artifact ends in .kra but isn't the artist's document — tracking it would
+    // give scratch state its own chain shard. Here rather than in the scan walk (where the
+    // backup file is skipped) so an already-tracked one stays tracked.
+    if lower.ends_with("-autosave.kra") {
+        return false;
+    }
     [".kra", ".gpl", ".kpl", ".aco", ".ase"]
         .iter()
         .any(|ext| lower.ends_with(ext))

@@ -76,8 +76,9 @@ read-only preparation (`&self`) can run in parallel across streams; only the ser
   (`TrackedFile.size`/`mtime`, `repo::size_mtime`, nanosecond resolution) is assumed unchanged and
   never read or hashed. Big `.kra` files are the case this matters for.
 - **Tracking guardrail** (`scan::is_supported`) — only `.kra` and palette files (`.gpl`/`.kpl`/
-  `.aco`/`.ase`) are newly tracked; any other file is rejected on a single lowercased-extension
-  check instead of being read and blake3-hashed. The guard only runs for files **not already in
+  `.aco`/`.ase`) are newly tracked, and Krita's autosave artifact (`*-autosave.kra`) is rejected
+  even though it ends in `.kra`; any other file is rejected on a single lowercased-suffix check
+  instead of being read and blake3-hashed. The guard only runs for files **not already in
   the index** (`contains_key` short-circuits the `&&`), so a steady-state scan pays nothing for
   already-tracked files, and a project folder full of unsupported assets scans strictly faster than
   before (no per-file I/O for the ignored ones). One `to_lowercase` alloc per untracked file, kept

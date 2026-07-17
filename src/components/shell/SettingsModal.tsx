@@ -7,11 +7,13 @@ import { Menu } from "../ui/Menu";
 import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
-import { THEMES, useTheme } from "../../lib/theme";
+import { THEMES, useTheme, type ThemeId } from "../../lib/theme";
 import { useRepository, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useWindowChrome } from "../../lib/windowChrome";
 import type { Stash } from "../../types";
+
+type SettingsCategory = "appearance" | "stash" | "storage";
 
 const CACHE_PRESETS_MB = [128, 256, 512, 1024, 2048];
 
@@ -69,11 +71,166 @@ function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
   );
 }
 
-function SectionHeading({ children }: { children: React.ReactNode }) {
+function NoRepoFallback() {
+  return <p className="text-[12px] text-text-muted">Open a repository to see these settings.</p>;
+}
+
+function AppearanceSettings({
+  artistMode,
+  toggleArtistMode,
+  customTitleBar,
+  toggleWindowChrome,
+  authorName,
+  setAuthorName,
+  theme,
+  setTheme,
+}: {
+  artistMode: boolean;
+  toggleArtistMode: () => void;
+  customTitleBar: boolean;
+  toggleWindowChrome: () => void;
+  authorName: string;
+  setAuthorName: (name: string) => void;
+  theme: ThemeId;
+  setTheme: (id: ThemeId) => void;
+}) {
   return (
-    <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-text-muted">
-      {children}
-    </h3>
+    <>
+      <ToggleRow
+        label="Artist view"
+        detail="Plain-language labels and version numbers instead of the technical view."
+        active={artistMode}
+        onToggle={toggleArtistMode}
+      />
+      <ToggleRow
+        label="Custom title bar"
+        detail="Use krita-vc's own title bar instead of your operating system's native window frame."
+        active={customTitleBar}
+        onToggle={toggleWindowChrome}
+      />
+      <label className="mt-2 block">
+        <span className="mb-1 block text-[12px] text-text-muted">Your name</span>
+        <input
+          value={authorName}
+          onChange={(e) => setAuthorName(e.target.value)}
+          placeholder="You"
+          className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        />
+        <span className="mt-1 block text-[11px] text-text-muted">
+          Shown as the author of new versions.
+        </span>
+      </label>
+      <div className="mt-3">
+        <span className="mb-1 block text-[12px] text-text-muted">Theme</span>
+        <Menu
+          minWidth={200}
+          items={THEMES.map((t) => ({
+            id: t.id,
+            label: t.label,
+            icon: <ThemeChip bg={t.bg} accent={t.accent} />,
+            selected: t.id === theme,
+            onSelect: () => setTheme(t.id),
+          }))}
+          trigger={(open) => {
+            const cur = THEMES.find((t) => t.id === theme) ?? THEMES[0];
+            return (
+              <span
+                className={[
+                  "flex min-w-50 items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
+                  open ? "border-accent" : "border-border",
+                ].join(" ")}
+              >
+                <ThemeChip bg={cur.bg} accent={cur.accent} />
+                <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
+                <CaretDown size={12} weight="bold" className="shrink-0 text-text-muted" />
+              </span>
+            );
+          }}
+        />
+      </div>
+    </>
+  );
+}
+
+function StashSettings({
+  stashes,
+  onConfirmDrop,
+  onConfirmDropAll,
+}: {
+  stashes: Stash[];
+  onConfirmDrop: (s: Stash) => void;
+  onConfirmDropAll: () => void;
+}) {
+  return (
+    <StashShelf
+      stashes={stashes}
+      onConfirmDrop={onConfirmDrop}
+      onConfirmDropAll={onConfirmDropAll}
+    />
+  );
+}
+
+function StorageSettings({
+  config,
+  updateConfig,
+  onShowCleanup,
+}: {
+  config: ReturnType<typeof useRepoConfig>["config"];
+  updateConfig: ReturnType<typeof useRepoConfig>["update"];
+  onShowCleanup: () => void;
+}) {
+  return (
+    <>
+      <label className="mb-3 block">
+        <span className="mb-1 block text-[12px] text-text-muted">Preview cache size</span>
+        <select
+          value={config ? Math.round(config.cacheMaxBytes / (1024 * 1024)) : ""}
+          onChange={(e) =>
+            config &&
+            updateConfig({ ...config, cacheMaxBytes: Number(e.target.value) * 1024 * 1024 })
+          }
+          disabled={!config}
+          className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none! disabled:opacity-50"
+        >
+          {CACHE_PRESETS_MB.map((mb) => (
+            <option key={mb} value={mb}>
+              {mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-[11px] text-text-muted">
+          How much space diff previews may use on disk. Oldest previews are cleared first once you
+          go over — they regenerate automatically when needed again.
+        </span>
+      </label>
+
+      <ToggleRow
+        label="Compact storage for heavily-revised art"
+        detail="Shrinks version history for files with many small edits by 2–10x, at the
+          cost of a little extra time on each save and restore. Safe to turn on or off at
+          any point — past versions are unaffected either way."
+        active={config?.tilePixelDeltas ?? false}
+        onToggle={() =>
+          config && updateConfig({ ...config, tilePixelDeltas: !config.tilePixelDeltas })
+        }
+      />
+
+      <ToggleRow
+        label="Low-memory diffs"
+        detail="Loads each layer of a working-file preview one at a time instead of all at
+          once. Uses noticeably less memory on large files, in exchange for a little extra
+          time to open a preview. Helpful on low-end machines."
+        active={config?.lowMemoryDiff ?? false}
+        onToggle={() => config && updateConfig({ ...config, lowMemoryDiff: !config.lowMemoryDiff })}
+      />
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button onClick={onShowCleanup}>
+          <Broom size={14} />
+          Clean up storage…
+        </Button>
+      </div>
+    </>
   );
 }
 
@@ -88,6 +245,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [showCleanup, setShowCleanup] = useState(false);
   const [showDropAll, setShowDropAll] = useState(false);
   const [confirmDrop, setConfirmDrop] = useState<Stash | null>(null);
+  const [category, setCategory] = useState<SettingsCategory>("appearance");
+
+  const categories: { id: SettingsCategory; label: string }[] = [
+    { id: "appearance", label: "Appearance" },
+    { id: "stash", label: artistMode ? "Set-Aside" : "Stashes" },
+    { id: "storage", label: "Storage" },
+  ];
 
   return (
     <>
@@ -95,130 +259,61 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         title="Settings"
         onClose={onClose}
         footer={<Button onClick={onClose}>Done</Button>}
-        maxWidthClassName="max-w-lg"
+        maxWidthClassName="max-w-2xl"
       >
-        <section className="mb-5">
-          <SectionHeading>Appearance</SectionHeading>
-          <ToggleRow
-            label="Artist view"
-            detail="Plain-language labels and version numbers instead of the technical view."
-            active={artistMode}
-            onToggle={toggleArtistMode}
-          />
-          <ToggleRow
-            label="Custom title bar"
-            detail="Use krita-vc's own title bar instead of your operating system's native window frame."
-            active={customTitleBar}
-            onToggle={toggleWindowChrome}
-          />
-          <label className="mt-2 block">
-            <span className="mb-1 block text-[12px] text-text-muted">Your name</span>
-            <input
-              value={authorName}
-              onChange={(e) => setAuthorName(e.target.value)}
-              placeholder="You"
-              className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
-            />
-            <span className="mt-1 block text-[11px] text-text-muted">
-              Shown as the author of new versions.
-            </span>
-          </label>
-          <div className="mt-3">
-            <span className="mb-1 block text-[12px] text-text-muted">Theme</span>
-            <Menu
-              minWidth={200}
-              items={THEMES.map((t) => ({
-                id: t.id,
-                label: t.label,
-                icon: <ThemeChip bg={t.bg} accent={t.accent} />,
-                selected: t.id === theme,
-                onSelect: () => setTheme(t.id),
-              }))}
-              trigger={(open) => {
-                const cur = THEMES.find((t) => t.id === theme) ?? THEMES[0];
-                return (
-                  <span
-                    className={[
-                      "flex min-w-50 items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
-                      open ? "border-accent" : "border-border",
-                    ].join(" ")}
-                  >
-                    <ThemeChip bg={cur.bg} accent={cur.accent} />
-                    <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
-                    <CaretDown size={12} weight="bold" className="shrink-0 text-text-muted" />
-                  </span>
-                );
-              }}
-            />
-          </div>
-        </section>
-
-        {current && (
-          <section className="mb-5">
-            <SectionHeading>{artistMode ? "Set-aside shelf" : "Stashes"}</SectionHeading>
-            <StashShelf
-              stashes={stashes}
-              onConfirmDrop={setConfirmDrop}
-              onConfirmDropAll={() => setShowDropAll(true)}
-            />
-          </section>
-        )}
-
-        {current && (
-          <section>
-            <SectionHeading>This repository</SectionHeading>
-
-            <label className="mb-3 block">
-              <span className="mb-1 block text-[12px] text-text-muted">Preview cache size</span>
-              <select
-                value={config ? Math.round(config.cacheMaxBytes / (1024 * 1024)) : ""}
-                onChange={(e) =>
-                  config &&
-                  updateConfig({ ...config, cacheMaxBytes: Number(e.target.value) * 1024 * 1024 })
-                }
-                disabled={!config}
-                className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none disabled:opacity-50"
+        <div className="flex gap-5">
+          <nav className="flex w-32 shrink-0 flex-col gap-0.5">
+            {categories.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => setCategory(c.id)}
+                className={[
+                  "rounded-button border-l-2 px-2.5 py-1.5 text-left text-[13px] transition-colors",
+                  category === c.id
+                    ? "border-accent bg-accent/12 text-text"
+                    : "border-transparent text-text-muted hover:bg-white/5 hover:text-text",
+                ].join(" ")}
               >
-                {CACHE_PRESETS_MB.map((mb) => (
-                  <option key={mb} value={mb}>
-                    {mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`}
-                  </option>
-                ))}
-              </select>
-              <span className="mt-1 block text-[11px] text-text-muted">
-                How much space diff previews may use on disk. Oldest previews are cleared first once
-                you go over — they regenerate automatically when needed again.
-              </span>
-            </label>
-
-            <ToggleRow
-              label="Compact storage for heavily-revised art"
-              detail="Shrinks version history for files with many small edits by 2–10x, at the
-                cost of a little extra time on each save and restore. Safe to turn on or off at
-                any point — past versions are unaffected either way."
-              active={config?.tilePixelDeltas ?? false}
-              onToggle={() =>
-                config && updateConfig({ ...config, tilePixelDeltas: !config.tilePixelDeltas })
-              }
-            />
-
-            <ToggleRow
-              label="Low-memory diffs"
-              detail="Loads each layer of a working-file preview one at a time instead of all at
-                once. Uses noticeably less memory on large files, in exchange for a little extra
-                time to open a preview. Helpful on low-end machines."
-              active={config?.lowMemoryDiff ?? false}
-              onToggle={() =>
-                config && updateConfig({ ...config, lowMemoryDiff: !config.lowMemoryDiff })
-              }
-            />
-
-            <Button className="mt-3" onClick={() => setShowCleanup(true)}>
-              <Broom size={14} />
-              Clean up storage…
-            </Button>
-          </section>
-        )}
+                {c.label}
+              </button>
+            ))}
+          </nav>
+          <div className="min-w-0 flex-1">
+            {category === "appearance" && (
+              <AppearanceSettings
+                artistMode={artistMode}
+                toggleArtistMode={toggleArtistMode}
+                customTitleBar={customTitleBar}
+                toggleWindowChrome={toggleWindowChrome}
+                authorName={authorName}
+                setAuthorName={setAuthorName}
+                theme={theme}
+                setTheme={setTheme}
+              />
+            )}
+            {category === "stash" &&
+              (current ? (
+                <StashSettings
+                  stashes={stashes}
+                  onConfirmDrop={setConfirmDrop}
+                  onConfirmDropAll={() => setShowDropAll(true)}
+                />
+              ) : (
+                <NoRepoFallback />
+              ))}
+            {category === "storage" &&
+              (current ? (
+                <StorageSettings
+                  config={config}
+                  updateConfig={updateConfig}
+                  onShowCleanup={() => setShowCleanup(true)}
+                />
+              ) : (
+                <NoRepoFallback />
+              ))}
+          </div>
+        </div>
       </Modal>
       {showCleanup && <CleanupModal onClose={() => setShowCleanup(false)} />}
       {showDropAll && <DropAllStashesModal onClose={() => setShowDropAll(false)} />}

@@ -126,13 +126,56 @@ pub async fn open_repository(path: String) -> std::result::Result<(), String> {
     run(move || Repo::open(Path::new(&path)).map(|_| ())).await
 }
 
-/// Permanently delete a repository folder and everything in it (guarded by `is_repo`).
+/// Delete a repository folder and everything in it (guarded by `is_repo`), preferring the OS
+/// Recycle Bin. Returns `true` if the Recycle Bin was used, `false` if it fell back to a
+/// permanent delete.
 #[tauri::command]
-pub async fn delete_repository(path: String) -> std::result::Result<(), String> {
+pub async fn delete_repository(path: String) -> std::result::Result<bool, String> {
     run(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root)?;
         Repo::delete(root)
+    })
+    .await
+}
+
+/// Zip one repository's whole folder to `dest` — a manual, user-triggered backup (see
+/// `Repo::export_zip`). Read-only, so no `RepoLock`.
+#[tauri::command]
+pub async fn export_repository_zip(path: String, dest: String) -> std::result::Result<(), String> {
+    run(move || Repo::export_zip(Path::new(&path), Path::new(&dest))).await
+}
+
+/// Zip every repo in `paths` into `dest_dir`, one `<folder-name>-<date>.zip` each. Independent,
+/// user-picked folders — one failing (e.g. permission denied) shouldn't abort the rest, so
+/// failures are collected and returned instead of short-circuiting the whole batch.
+#[tauri::command]
+pub async fn export_repositories_zip(
+    paths: Vec<String>,
+    dest_dir: String,
+) -> std::result::Result<Vec<String>, String> {
+    run(move || {
+        let dest_dir = Path::new(&dest_dir);
+        let today = crate::repo::epoch_to_iso(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        let date = &today[..10];
+        let mut failed = Vec::new();
+        for path in &paths {
+            let root = Path::new(path);
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repository".to_string());
+            let dest = dest_dir.join(format!("{name}-{date}.zip"));
+            if Repo::export_zip(root, &dest).is_err() {
+                failed.push(path.clone());
+            }
+        }
+        Ok(failed)
     })
     .await
 }
@@ -682,9 +725,11 @@ pub async fn create_stash(
     .await
 }
 
-/// Bring a stash back into the working tree and take it off the shelf. Errors
-/// `KvcError::StashConflict` (message prefix `"stash conflict"`) if anything it touches has
-/// changed since — the frontend matches that prefix to offer a save-or-discard prompt.
+/// Bring a stash back into the working tree and take it off the shelf. A conflicting `.kra` (one
+/// edited since it was set aside) is *merged* — its set-aside layers fold into the working file —
+/// so this returns normally there; see [`crate::stash::pop`]. Errors `KvcError::StashConflict`
+/// (message prefix `"stash conflict"`, matched by the frontend for a save-or-discard prompt) only
+/// for a conflict that can't be merged — a non-`.kra` file or a stashed deletion onto edited work.
 #[tauri::command]
 pub async fn pop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
     run(move || {

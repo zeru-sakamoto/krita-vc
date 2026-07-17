@@ -28,7 +28,8 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 ## See also
 
 - [`../krita-plugin/README.md`](../krita-plugin/README.md) — the in-Krita "Version Control"
-  docker (commit/checkpoint/branch-switch without leaving Krita), built on the headless `kvc`
+  docker (commit, discard, set-aside, branch-switch without leaving Krita; it saves
+  your documents for you, since the engine only ever sees the disk), built on the headless `kvc`
   CLI (`src-tauri/src/bin/kvc.rs`) that reuses this engine with no Tauri dependency.
 - [`../DESIGN.md`](../DESIGN.md) — the visual + interaction spec the UI is built against.
 - [`../CLAUDE.md`](../CLAUDE.md) — repo guidance, commands, and Tauri architecture.
