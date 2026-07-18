@@ -5,6 +5,11 @@ import { layersBody, wrapSvg } from "../../lib/svgArt";
 // Theme-reactive: reads the active theme's `--color-accent` (global.css), not a fixed hex.
 const ACCENT = "var(--color-accent)";
 
+// Region labels are backend-supplied text spliced into an SVG string that's injected via
+// dangerouslySetInnerHTML downstream — escape the markup-significant characters first.
+const escapeXml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
 export type HighlightMode = "box" | "pixels";
 
 interface ArtCanvasProps {
@@ -56,7 +61,7 @@ function boxOverlay(diff: ArtDiff, regions: ChangeRegion[]): string {
         `M${x + arm} ${y + h} L${x} ${y + h} L${x} ${y + h - arm}`, // bottom-left
       ].join(" ");
       const label = r.label
-        ? `<text x="${x + 4}" y="${y + 14}" font-family="sans-serif" font-size="11" fill="${ACCENT}">${r.label}</text>`
+        ? `<text x="${x + 4}" y="${y + 14}" font-family="sans-serif" font-size="11" fill="${ACCENT}">${escapeXml(r.label)}</text>`
         : "";
       return (
         `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${ACCENT}" fill-opacity="0.12" ` +

@@ -113,7 +113,9 @@ pub(crate) fn store_change(
     }
 
     // Reuse the scan's buffer when it kept one; only over-budget files pay a re-read.
-    let abs = repo.root.join(&rel);
+    // Route through safe_join like every other on-disk path: `rel` is scan-derived and trusted,
+    // but this keeps the allow-list the single way a relpath becomes a filesystem path.
+    let abs = crate::repo::safe_join(&repo.root, &rel)?;
     let bytes = match bytes {
         Some(b) => b,
         None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,

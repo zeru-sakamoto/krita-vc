@@ -22,7 +22,7 @@
 
 use crate::error::{KvcError, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive};
 
@@ -230,8 +230,7 @@ fn repackage(
             if name == "maindoc.xml" {
                 zw.write_all(merged_maindoc.as_bytes())?;
             } else {
-                let mut buf = Vec::new();
-                f.read_to_end(&mut buf)?;
+                let buf = crate::repo::read_entry_capped(&mut f)?;
                 zw.write_all(&buf)?;
             }
         }
@@ -254,8 +253,7 @@ fn repackage(
                 continue;
             };
             let new_name = format!("{base_prefix}{new_fn}{}", &rest[split..]);
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
+            let buf = crate::repo::read_entry_capped(&mut f)?;
             zw.start_file(&new_name, opts(&new_name)).map_err(zip_err)?;
             zw.write_all(&buf)?;
         }
@@ -301,8 +299,7 @@ fn read_entry(zip_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     let mut f = zip
         .by_name(name)
         .map_err(|_| fail(&format!("missing {name}")))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
+    let buf = crate::repo::read_entry_capped(&mut f)?;
     Ok(buf)
 }
 
@@ -420,8 +417,7 @@ fn layer_content(kra: &[u8], image: &str, files: &HashSet<String>) -> Result<Vec
         };
         let split = rest.find(['.', '/']).unwrap_or(rest.len());
         if files.contains(&rest[..split]) {
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
+            let buf = crate::repo::read_entry_capped(&mut f)?;
             out.push(canon_entry(buf));
         }
     }

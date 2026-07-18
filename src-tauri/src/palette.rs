@@ -6,8 +6,6 @@
 //! Tauri-free on purpose (unit-tested directly). The command layer wraps [`diff`] into a
 //! serde DTO — see `commands.rs`.
 
-use std::io::Read;
-
 /// One named color, reduced to 8-bit sRGB.
 pub struct Swatch {
     pub name: String,
@@ -164,11 +162,8 @@ fn clamp8(v: i32) -> u8 {
 
 fn parse_kpl(bytes: &[u8]) -> Option<Palette> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
-    let mut xml = String::new();
-    zip.by_name("colorset.xml")
-        .ok()?
-        .read_to_string(&mut xml)
-        .ok()?;
+    let entry = zip.by_name("colorset.xml").ok()?;
+    let xml = String::from_utf8(crate::repo::read_entry_capped(entry).ok()?).ok()?;
     let doc = roxmltree::Document::parse(&xml).ok()?;
     let root = doc.root_element();
     let columns = root

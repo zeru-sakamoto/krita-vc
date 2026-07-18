@@ -33,14 +33,35 @@ class KvcError(Exception):
     pass
 
 
+_verified_paths = set()
+
+
+def _verified(path):
+    """True if `path` passes the kvc identity check, caching the answer per path. Auto-discovered
+    binaries (PATH / install dirs) go through here so a rogue `kvc` planted earlier on PATH isn't
+    run blindly; the check spawns kvc once per distinct path, then the result is remembered."""
+    if path in _verified_paths:
+        return True
+    try:
+        verify_binary(path)
+    except KvcError:
+        return False
+    _verified_paths.add(path)
+    return True
+
+
 def get_binary_path():
-    """Explicit user-set path first, then a short list of likely install locations."""
+    """Explicit user-set path first, then a short list of likely install locations.
+
+    The user-set path was already identity-checked by the file picker that stored it, so it's
+    trusted directly; auto-discovered candidates are verified before use (a failing check falls
+    through to the next candidate rather than running an unknown executable)."""
     saved = Krita.instance().readSetting(SETTINGS_GROUP, "kvcPath", "")
     if saved and os.path.isfile(saved):
         return saved
 
     found = shutil.which(_EXE)
-    if found:
+    if found and _verified(found):
         return found
 
     # The desktop app installs its own binaries alongside itself; check the common
@@ -49,7 +70,7 @@ def get_binary_path():
         if not base:
             continue
         candidate = os.path.join(base, "krita-vc", _EXE)
-        if os.path.isfile(candidate):
+        if os.path.isfile(candidate) and _verified(candidate):
             return candidate
 
     return None
@@ -130,6 +151,10 @@ def _exec(binary, args, timeout):
             [binary] + args,
             capture_output=True,
             text=True,
+            # kvc emits UTF-8 JSON; without this, text=True decodes with the Windows locale
+            # codepage (cp1252) and mangles non-ASCII repo paths / branch names / messages.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=_CREATION_FLAGS,
         )

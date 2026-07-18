@@ -6,6 +6,7 @@ import { inTauri } from "./tauri";
 import { clearSessionCaches } from "./repoData";
 import { readAuthorName, resolvedAuthor } from "./authorName";
 import { timed } from "./perf";
+import { useToast } from "./toast";
 
 /** Map a branch Tauri command to the Performance-report op label (unknowns pass through). */
 const BRANCH_OP: Record<string, string> = {
@@ -170,17 +171,28 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   const [saving, setSaving] = useState(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  const { show } = useToast();
 
   const setCurrent = useCallback((id: string) => setCurrentId(id), []);
 
   // Add (or re-select) a repo at `path`, initializing its `.kvc/` store if absent.
-  const addPath = useCallback(async (path: string) => {
-    const exists = await invoke<boolean>("is_repository", { path });
-    if (!exists) await invoke("init_repository", { path });
-    const repo: Repository = { id: path, name: basename(path), path };
-    setRepositories((prev) => (prev.some((r) => r.id === repo.id) ? prev : [...prev, repo]));
-    setCurrentId(repo.id);
-  }, []);
+  const addPath = useCallback(
+    async (path: string) => {
+      try {
+        const exists = await invoke<boolean>("is_repository", { path });
+        if (!exists) await invoke("init_repository", { path });
+      } catch (e) {
+        // Don't leave a rejected invoke as an unhandled rejection, and don't add a repo we
+        // failed to initialize — tell the user instead.
+        show(`Couldn't open that folder as a repository: ${String(e)}`, "error");
+        return;
+      }
+      const repo: Repository = { id: path, name: basename(path), path };
+      setRepositories((prev) => (prev.some((r) => r.id === repo.id) ? prev : [...prev, repo]));
+      setCurrentId(repo.id);
+    },
+    [show]
+  );
 
   const browseRepository = useCallback(async () => {
     // No native picker in a plain browser — repository management needs the desktop shell.
@@ -202,10 +214,15 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     async (id: string, deleteFolder: boolean) => {
       const repo = repositories.find((r) => r.id === id);
       if (!repo) return true;
-      const usedTrash =
-        deleteFolder && inTauri()
-          ? await invoke<boolean>("delete_repository", { path: repo.path })
-          : true;
+      let usedTrash = true;
+      if (deleteFolder && inTauri()) {
+        try {
+          usedTrash = await invoke<boolean>("delete_repository", { path: repo.path });
+        } catch (e) {
+          show(`Couldn't delete the repository folder: ${String(e)}`, "error");
+          usedTrash = false;
+        }
+      }
       setRepositories((prev) => {
         const next = prev.filter((r) => r.id !== id);
         setCurrentId((cur) => (cur === id ? (next[0]?.id ?? "") : cur));
@@ -213,7 +230,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       });
       return usedTrash;
     },
-    [repositories]
+    [repositories, show]
   );
 
   // Manual last-resort backup: zips the whole project folder (art + `.kvc/`) to a user-chosen

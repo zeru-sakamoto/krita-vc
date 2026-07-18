@@ -9,8 +9,8 @@ import { TourProvider } from "./lib/tour";
 
 function App() {
   return (
-    <RepositoryProvider>
-      <ToastProvider>
+    <ToastProvider>
+      <RepositoryProvider>
         <ThemeProvider>
           <ArtistModeProvider>
             <AuthorNameProvider>
@@ -22,8 +22,8 @@ function App() {
             </AuthorNameProvider>
           </ArtistModeProvider>
         </ThemeProvider>
-      </ToastProvider>
-    </RepositoryProvider>
+      </RepositoryProvider>
+    </ToastProvider>
   );
 }
 

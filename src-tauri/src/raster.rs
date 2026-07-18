@@ -19,6 +19,11 @@ const PLANE_G: usize = 1;
 const PLANE_R: usize = 2;
 const PLANE_A: usize = 3;
 
+/// Upper bound on a single tile's width/height. Krita writes fixed 64×64 tiles; this cap only
+/// exists to reject a hostile `.kra` whose tile header claims giant dims to force a huge decode
+/// allocation (`Vec::with_capacity(tw*th*4)` below).
+const MAX_TILE_DIM: usize = 1024;
+
 /// Decompress a liblzf stream into `expected` bytes. Returns `None` on any malformed input.
 pub fn lzf_decompress(data: &[u8], expected: usize) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(expected);
@@ -148,6 +153,9 @@ pub fn tile_from_planar(planar: &[u8]) -> Vec<u8> {
 /// Interleave a planar RGBA8 buffer (`tw*th*4`, planes B,G,R,A) into RGBA pixels.
 /// `None` on a length mismatch.
 pub fn planar_to_rgba(planar: &[u8], tw: usize, th: usize) -> Option<Vec<u8>> {
+    if tw > MAX_TILE_DIM || th > MAX_TILE_DIM {
+        return None; // same tile-dim cap as tile_to_rgba — bound the n*4 allocation.
+    }
     let n = tw * th;
     if planar.len() != n * 4 {
         return None;
@@ -166,6 +174,11 @@ pub fn planar_to_rgba(planar: &[u8], tw: usize, th: usize) -> Option<Vec<u8>> {
 pub fn tile_to_rgba(stored: &[u8], tw: usize, th: usize, pixelsize: usize) -> Option<Vec<u8>> {
     if pixelsize != 4 {
         return None; // RGBA8 only.
+    }
+    // Cap the dims before sizing the decode buffer: a hostile tile header can't drive a giant
+    // `with_capacity(tw*th*4)`. Krita's tiles are 64×64, so no real file trips this.
+    if tw == 0 || th == 0 || tw > MAX_TILE_DIM || th > MAX_TILE_DIM {
+        return None;
     }
     let planar = tile_planar(stored, tw * th * pixelsize)?;
     planar_to_rgba(&planar, tw, th)
@@ -942,6 +955,15 @@ mod tests {
         comp.push((4 << 5) | 0);
         comp.push(2);
         assert_eq!(lzf_decompress(&comp, 9).unwrap(), b"abcabcabc");
+    }
+
+    #[test]
+    fn tile_decode_rejects_oversized_dims() {
+        // A hostile tile header claiming giant dims must return None, never size a huge alloc.
+        assert!(tile_to_rgba(&[0u8; 4], 100_000, 100_000, 4).is_none());
+        assert!(planar_to_rgba(&[0u8; 4], 100_000, 100_000).is_none());
+        // A legit 64×64 tile still decodes.
+        assert!(tile_to_rgba(&[0u8; 64 * 64 * 4 + 1], 64, 64, 4).is_some());
     }
 
     #[test]

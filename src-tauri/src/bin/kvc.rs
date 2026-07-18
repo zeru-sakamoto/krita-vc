@@ -63,7 +63,12 @@ fn main() -> ExitCode {
     };
     let flags = parse_flags(&args[1..]);
 
-    let result = match cmd.as_str() {
+    // The plugin parses our stdout/stderr as JSON, so a panic must not escape as a plain-text
+    // Rust backtrace. Silence the default hook (it prints to stderr) and turn any unwinding
+    // panic — an engine `unwrap`/index on a corrupt store, say — into the same {"error":...}
+    // contract every other failure already uses.
+    std::panic::set_hook(Box::new(|_| {}));
+    let dispatch = std::panic::AssertUnwindSafe(|| match cmd.as_str() {
         "status" => run_status(&flags),
         "commit" => run_commit(&flags),
         "branches" => run_branches(&flags),
@@ -74,7 +79,15 @@ fn main() -> ExitCode {
         "stash-pop" => run_stash_pop(&flags),
         "stash-list" => run_stash_list(&flags),
         other => Err(format!("unknown command: {other}")),
-    };
+    });
+    let result = std::panic::catch_unwind(dispatch).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        Err(format!("internal error in kvc: {detail}"))
+    });
 
     match result {
         Ok(value) => {

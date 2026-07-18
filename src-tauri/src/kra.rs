@@ -9,7 +9,7 @@ use crate::repo::Repo;
 use crate::tiles::{self, Tile, TiledBlock};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -181,8 +181,7 @@ pub fn commit_kra(
                 }
             }
         }
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
+        let buf = crate::repo::read_entry_capped(&mut f)?;
         drop(f);
         chunk_bytes += buf.len() as u64;
         chunk.push(EntryWork::Fresh {
@@ -465,6 +464,13 @@ fn composite_pixels(
             let y = by as usize + row;
             let dst = (y * width as usize + bx as usize) * bpp;
             let src = row * bw * bpp;
+            // A tampered store could hand back a short block; bounds-check before the copy so a
+            // corrupt object is a clean error, not an out-of-bounds panic.
+            if src + bw * bpp > bytes.len() || dst + bw * bpp > canvas.len() {
+                return Err(crate::error::KvcError::BadTiles(
+                    "composite block out of bounds".into(),
+                ));
+            }
             canvas[dst..dst + bw * bpp].copy_from_slice(&bytes[src..src + bw * bpp]);
         }
     }
@@ -722,8 +728,7 @@ pub fn materialize_kra(
                         .collect();
                     if !wanted.is_empty() {
                         let mut f = zip.by_index(idx).map_err(zip_err)?;
-                        let mut buf = Vec::new();
-                        f.read_to_end(&mut buf)?;
+                        let buf = crate::repo::read_entry_capped(&mut f)?;
                         drop(f);
                         if tiles::is_tiled(&buf) {
                             for t in tiles::parse(&buf)?.tiles {
@@ -853,8 +858,7 @@ pub fn materialize_kra(
 pub fn read_entry(kra_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     let mut zip = ZipArchive::new(Cursor::new(kra_bytes)).map_err(zip_err)?;
     let mut f = zip.by_name(name).map_err(zip_err)?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
+    let buf = crate::repo::read_entry_capped(&mut f)?;
     Ok(buf)
 }
 
@@ -1512,8 +1516,7 @@ pub fn parse_working(file_bytes: &[u8], low_memory: bool) -> Result<WorkingKra> 
             continue;
         }
         let name = f.name().to_string();
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
+        let buf = crate::repo::read_entry_capped(&mut f)?;
         drop(f);
 
         if tiles::is_tiled(&buf) {

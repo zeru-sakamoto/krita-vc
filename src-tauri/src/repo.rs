@@ -48,6 +48,30 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Max bytes we'll inflate from a single archive entry — a decompression-bomb guard so a
+/// malicious `.kra`/`.kpl` can't turn one zip entry into gigabytes of RAM.
+// ponytail: fixed 2 GiB ceiling — well above any real single entry, far below an OOM bomb.
+// Derive it from canvas dims if a legitimate file ever trips it.
+pub const MAX_ARCHIVE_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Read an archive entry into memory with the [`MAX_ARCHIVE_ENTRY_BYTES`] cap. `take` bounds the
+/// actual read, so it doesn't trust the entry's declared (spoofable) uncompressed size.
+pub fn read_entry_capped(r: impl std::io::Read) -> Result<Vec<u8>> {
+    read_capped(r, MAX_ARCHIVE_ENTRY_BYTES)
+}
+
+fn read_capped(r: impl std::io::Read, cap: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(cap + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > cap {
+        return Err(KvcError::CorruptZip(
+            "archive entry is implausibly large (possible decompression bomb)".into(),
+        ));
+    }
+    Ok(buf)
+}
+
 /// Real OS-level exclusive lock over one `.kvc/` store (`.kvc/kvc.lock`, held via
 /// `File::try_lock`). The engine has no internal locking, so every mutating entry point — the
 /// desktop app's Tauri commands and the `kvc` CLI alike — takes this so a plugin commit can't
@@ -1089,6 +1113,16 @@ mod tests {
             safe_join(root, "sub/dir/art.kra").unwrap(),
             root.join("sub").join("dir").join("art.kra")
         );
+    }
+
+    #[test]
+    fn read_capped_enforces_the_limit() {
+        use std::io::Read;
+        // Under the cap: full content returned.
+        assert_eq!(read_capped(&b"hello"[..], 10).unwrap(), b"hello");
+        // Over the cap: a clean error, not an unbounded read (a decompression-bomb guard).
+        let big = std::io::repeat(1u8).take(50);
+        assert!(matches!(read_capped(big, 10), Err(KvcError::CorruptZip(_))));
     }
 
     #[test]

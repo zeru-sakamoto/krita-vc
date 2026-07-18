@@ -524,12 +524,14 @@ class VcDocker(DockWidget):
         self._set_busy(True)
         try:
             op()
+            # Reopen inside the busy window: _reopen closes/opens docs, which spins the Qt event
+            # loop; if busy were already cleared, the 1.5s poll and the focus-save handler could
+            # re-enter mid-reopen. (op() raising skips the reopen, as before.)
+            for path, (doc, _) in docs.items():
+                if kvc.stat_key(path) != before[path]:
+                    self._reopen(path, doc)
         finally:
             self._set_busy(False)
-
-        for path, (doc, _) in docs.items():
-            if kvc.stat_key(path) != before[path]:
-                self._reopen(path, doc)
         return True
 
     def _reopen(self, path, doc):
@@ -539,8 +541,14 @@ class VcDocker(DockWidget):
         if not os.path.exists(path):
             return  # a switch or discard can legitimately take the file away
         fresh = Krita.instance().openDocument(path)
+        if not fresh:
+            self._show_error(
+                f"Couldn't reopen {os.path.basename(path)} after the operation. "
+                "Open it again from disk — your work is saved there."
+            )
+            return
         window = Krita.instance().activeWindow()
-        if fresh and window:
+        if window:
             window.addView(fresh)
 
     def _require_repo(self):

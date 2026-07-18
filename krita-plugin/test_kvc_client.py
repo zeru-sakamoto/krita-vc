@@ -182,6 +182,42 @@ def test_stat_key_of_missing_file_is_none():
     assert kvc.stat_key(__file__) is not None
 
 
+def test_exec_requests_utf8_decoding():
+    # kvc emits UTF-8 JSON; a locale-codepage decode mangles non-ASCII branch names/messages.
+    captured = {}
+
+    def run(*args, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(stdout='{"ok": true}', stderr="", returncode=0)
+
+    subprocess.run = run
+    kvc._exec("kvc", ["status"], 30)
+    assert captured.get("encoding") == "utf-8", captured
+
+
+def test_autodiscovered_binary_must_verify():
+    # An auto-discovered kvc is identity-checked before use: a failing check isn't trusted, and
+    # a passing one is cached (verified once) so the poll doesn't respawn kvc every 1.5s.
+    kvc._verified_paths.clear()
+    real_verify = kvc.verify_binary
+    calls = []
+
+    def fake_verify(path):
+        calls.append(path)
+        if "bad" in path:
+            raise kvc.KvcError("not kvc")
+
+    kvc.verify_binary = fake_verify
+    try:
+        assert kvc._verified("/good/kvc") is True
+        assert kvc._verified("/good/kvc") is True  # cached: no second spawn
+        assert calls == ["/good/kvc"], calls
+        assert kvc._verified("/bad/kvc") is False  # a rogue binary is not run
+    finally:
+        kvc.verify_binary = real_verify
+        kvc._verified_paths.clear()
+
+
 if __name__ == "__main__":
     real = (kvc._exec, kvc.get_binary_path, subprocess.run)
     for name, fn in sorted(globals().items()):

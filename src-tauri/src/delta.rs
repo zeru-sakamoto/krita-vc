@@ -527,6 +527,11 @@ pub(crate) fn read_pack_header(path: &Path) -> Option<Vec<(String, u64, u32)>> {
         return None;
     }
     let idx_len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
+    // A corrupt header could claim a multi-GB index; the index bytes live in this same file, so
+    // idx_len can never legitimately exceed the file's length — reject rather than pre-allocate.
+    if idx_len as u64 > f.metadata().ok()?.len() {
+        return None;
+    }
     let mut idx_bytes = vec![0u8; idx_len];
     f.read_exact(&mut idx_bytes).ok()?;
     let plain = zstd::decode_all(&idx_bytes[..]).ok()?;
