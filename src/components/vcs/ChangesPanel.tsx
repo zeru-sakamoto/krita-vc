@@ -1,4 +1,4 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { ArrowCounterClockwise, CircleNotch, Minus, Plus } from "@phosphor-icons/react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Branch, WorkingChange } from "../../types";
@@ -138,6 +138,10 @@ export function ChangesPanel({
   const [confirmCommit, setConfirmCommit] = useState<"none" | "partial" | null>(null);
 
   const path = current?.path ?? null;
+
+  // A commit error is only meaningful for the repo/branch it happened on — otherwise it lingers
+  // (this component stays mounted across repo/branch switches) and misleadingly reads as live.
+  useEffect(() => setCommitError(null), [path, currentBranch.name]);
 
   const toggle = (path: string) =>
     setItems((prev) => prev.map((c) => (c.change.path === path ? { ...c, staged: !c.staged } : c)));

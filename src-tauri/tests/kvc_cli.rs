@@ -63,19 +63,25 @@ fn status_commit_roundtrip_and_lock() {
     let repo = krita_vc_lib::repo::Repo::open(root).unwrap();
     assert!(repo.commits.iter().any(|c| c.id == id));
 
-    // Normal commit releases the lock — no stale file left behind.
-    assert!(!root.join(".kvc/kvc.lock").exists());
+    // Normal commit releases the OS lock — the marker file itself may persist, but a fresh
+    // acquire succeeds immediately since nothing actually holds it anymore.
+    assert!(krita_vc_lib::repo::RepoLock::acquire(root, "testing").is_ok());
 
-    // A held lock blocks a concurrent commit with a clear error (checked before the tree
-    // is even scanned, so the working tree stays clean for the branch ops below).
-    std::fs::write(root.join(".kvc/kvc.lock"), b"").unwrap();
+    // A genuinely held lock (this test process holding the real OS lock, not just a leftover
+    // file) blocks a concurrent commit from the kvc subprocess with a clear error — checked
+    // before the tree is even scanned, so the working tree stays clean for the branch ops
+    // below.
+    let held = krita_vc_lib::repo::RepoLock::acquire(root, "testing").unwrap();
     let (ok, err) = kvc(
         root,
         &["commit", "--message", "blocked", "--author", "Zeru"],
     );
     assert!(!ok);
     assert!(err["error"].as_str().unwrap().contains("busy"));
-    std::fs::remove_file(root.join(".kvc/kvc.lock")).unwrap();
+    drop(held);
+
+    // Releasing it frees the lock immediately for the next writer.
+    assert!(krita_vc_lib::repo::RepoLock::acquire(root, "testing").is_ok());
 
     // Branch create/switch round-trip through the same lock-guarded path.
     let (ok, res) = kvc(root, &["create-branch", "--name", "feature"]);

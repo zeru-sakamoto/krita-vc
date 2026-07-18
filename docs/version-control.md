@@ -21,8 +21,11 @@ with no backend, the UI renders empty states).
                  the opt-in lowMemoryDiff flag (on-demand working-diff entry decode).
                  cacheMaxBytes + tilePixelDeltas + lowMemoryDiff are user-editable in the
                  Settings modal (get_repo_config/set_repo_config)
-  kvc.lock       advisory create-new lock file present only while a mutating operation runs
-                 (see Concurrency & locking); removed on completion
+  kvc.lock       real OS-level advisory lock (File::try_lock — LockFileEx/flock), held only
+                 while a mutating operation runs; content is irrelevant, and the file is never
+                 deleted — only the OS lock state matters (see Concurrency & locking)
+  kvc.lock.info  best-effort sidecar naming the current holder's operation ("committing",
+                 "switching branches"); rewritten on every acquire, never itself locked
   index.json     committed head per tracked file — drives the scanner
   chains/        per-tracked-file shards, each every stored version of that file's delta
                  streams (KVCC2-tagged zstd bincode, <blake3(relpath)[..16]>.bin, faulted in
@@ -77,15 +80,30 @@ date crate (`now_iso` / `epoch_to_iso`).
 
 ### Concurrency & locking
 
-The engine has no internal locking, so every **mutating** entry point takes an advisory,
-create-new file lock (`RepoLock`, `repo.rs` → `.kvc/kvc.lock`, released on drop) before touching
-the store: the desktop app's mutating Tauri commands (commit, branch create/switch/merge/delete,
-rollback, undo, restore, real cleanup, config write, delete) **and** the `kvc` CLI the Krita
-plugin shells out to share the same lock, so a plugin commit can't interleave with a desktop
-commit/switch/GC into a torn write. A second writer gets `KvcError::Locked` ("repository is
-busy") rather than corrupting state. Read-only commands (scan, history, diffs, dry-run cleanup)
-don't lock. A crash leaves a stale lock, which GC's `*.tmp`-style cleanup can sweep. It's an
-advisory create-new lock; upgrade to an OS flock only if a stale lock ever bites.
+The engine has no internal locking, so every **mutating** entry point takes a real OS-level
+advisory lock (`RepoLock`, `repo.rs` → `.kvc/kvc.lock`, held via `std::fs::File::try_lock` —
+`LockFileEx` on Windows, `flock` on Unix) before touching the store: the desktop app's mutating
+Tauri commands (commit, branch create/switch/merge/delete, rollback, undo, restore, real
+cleanup, config write, delete) **and** the `kvc` CLI the Krita plugin shells out to share the
+same lock, so a plugin commit can't interleave with a desktop commit/switch/GC into a torn
+write. Because the lock is OS-level rather than "the file exists", the OS itself releases it the
+moment the holding process's file handle closes — cleanly, on a panic-unwind drop, or on a
+crash/force-kill — so there is no stale-lock state to clean up: the very next `try_lock()` on an
+orphaned `kvc.lock` just succeeds. (An earlier create-new-marker-file scheme could get stuck
+forever if the holder never exited cleanly; an OS lock can't.)
+
+`RepoLock::acquire` takes a short present-participle `op` label ("committing", "switching
+branches", …) and writes it into `kvc.lock.info`, a small sidecar next to the lock — not into
+`kvc.lock` itself, because Windows enforces a locked byte range against *ordinary* reads too
+(unlike POSIX `flock`, which is purely advisory), so a blocked caller reading `kvc.lock` directly
+would fail with `ERROR_LOCK_VIOLATION`. The sidecar is never locked, so it's always readable. A
+second writer gets `KvcError::Locked` carrying a `"<repo> — <op> for <age>"` description
+(`lock_holder_description`: repo folder name from the path, the holder's op read back from
+`kvc.lock.info` — "writing" if unreadable/empty — and an age from the sidecar's mtime,
+`<60s`/`<60m`/else hours) instead of the bare "repository is busy" it used to be, so a blocked
+caller can tell a genuinely slow operation from one that's been stuck a suspiciously long time.
+Every call site names its own operation (see `commands.rs`/`bin/kvc.rs`). Read-only commands
+(scan, history, diffs, dry-run cleanup) don't lock.
 
 ### Path safety
 

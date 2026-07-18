@@ -1,6 +1,6 @@
 [package]
 name = "krita-vc"
-version = "0.3.0"
+version = "1.0.0"
 description = "Krita Version Control"
 authors = ["Zeru Sakamoto"]
 edition = "2021"

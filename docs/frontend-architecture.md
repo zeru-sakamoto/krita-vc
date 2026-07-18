@@ -144,7 +144,10 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   commits right away. Each row also has a **discard** button (reverts just that file to its last
   saved version, behind a confirm modal); the sidebar's `…` menu adds "Discard current changes"
   (all *unstaged* files at once — staged files are left alone), both backed by the repository
-  context's `discardChanges`. While a commit or discard is in flight the staging controls lock,
+  context's `discardChanges`. A failed commit's error message is local `commitError` state, reset
+  on repo or branch change (an effect keyed on `path`/`currentBranch.name`) — otherwise it outlives
+  the commit it belongs to and, since `ChangesPanel` stays mounted across repo/branch switches,
+  misleadingly reads as live on an unrelated one. While a commit or discard is in flight the staging controls lock,
   the commit button shows a spinner, the `StatusBar` shows an indeterminate progress bar (shared
   `saving` flag), and `BusyOverlay` blocks the app (`busyMessage`). The same `…` menu also holds
   the **set-aside** actions — see [Stashes](#stashes--setting-work-aside) below.

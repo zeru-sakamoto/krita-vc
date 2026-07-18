@@ -133,7 +133,7 @@ pub async fn open_repository(path: String) -> std::result::Result<(), String> {
 pub async fn delete_repository(path: String) -> std::result::Result<bool, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "deleting the repository")?;
         Repo::delete(root)
     })
     .await
@@ -194,7 +194,7 @@ pub async fn cleanup_repository(
         let _lock = if dry_run {
             None
         } else {
-            Some(RepoLock::acquire(root)?)
+            Some(RepoLock::acquire(root, "cleaning up storage")?)
         };
         let mut repo = Repo::open(root)?;
         crate::gc::collect_garbage(&mut repo, dry_run)
@@ -217,7 +217,7 @@ pub async fn set_repo_config(
 ) -> std::result::Result<(), String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "saving settings")?;
         let mut repo = Repo::open_light(root)?;
         repo.config.cache_max_bytes = cache_max_bytes;
         repo.config.tile_pixel_deltas = tile_pixel_deltas;
@@ -439,7 +439,7 @@ pub async fn commit_snapshot(
 ) -> std::result::Result<Commit, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "committing")?;
         let mut repo = Repo::open(root)?;
         commit::commit_selected(&mut repo, &message, &author, paths.as_deref())
     })
@@ -508,7 +508,7 @@ pub async fn create_branch(
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "creating a branch")?;
         let mut repo = if base.is_some() {
             Repo::open(root)?
         } else {
@@ -528,7 +528,7 @@ pub async fn switch_branch(
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "switching branches")?;
         let mut repo = Repo::open(root)?;
         crate::branch::switch_branch(&mut repo, &name)?;
         Ok(branch_dtos(&repo))
@@ -545,7 +545,7 @@ pub async fn merge_branch(
 ) -> std::result::Result<Commit, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "merging branches")?;
         let mut repo = Repo::open(root)?;
         crate::branch::merge_branch(&mut repo, &source, &author)
     })
@@ -559,7 +559,7 @@ pub async fn delete_branch(
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "deleting a branch")?;
         let mut repo = Repo::open_light(root)?;
         crate::branch::delete_branch(&mut repo, &name)?;
         Ok(branch_dtos(&repo))
@@ -608,7 +608,7 @@ pub async fn rollback_to_commit(
 ) -> std::result::Result<Commit, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "rolling back")?;
         let mut repo = Repo::open(root)?;
         match commit::rollback_to_commit(&mut repo, &commit_id, &author) {
             Err(crate::error::KvcError::Nothing) => Err(crate::error::KvcError::BadIndex(
@@ -625,7 +625,7 @@ pub async fn rollback_to_commit(
 pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "undoing the last commit")?;
         let mut repo = Repo::open(root)?;
         commit::undo_last_commit(&mut repo)
     })
@@ -640,7 +640,7 @@ pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit
 pub async fn discard_changes(path: String, paths: Vec<String>) -> std::result::Result<(), String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "discarding changes")?;
         let mut repo = Repo::open(root)?;
         let tip = repo
             .branches
@@ -716,7 +716,7 @@ pub async fn create_stash(
 ) -> std::result::Result<Vec<StashDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "setting work aside")?;
         // Full open: storing the stashed content writes streams, which a light repo forbids.
         let mut repo = Repo::open(root)?;
         crate::stash::create(&mut repo, &label, &author, paths.as_deref())?;
@@ -734,7 +734,7 @@ pub async fn create_stash(
 pub async fn pop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "bringing back set-aside work")?;
         let mut repo = Repo::open(root)?;
         crate::stash::pop(&mut repo, &id)?;
         Ok(stash_dtos(&repo))
@@ -746,7 +746,7 @@ pub async fn pop_stash(path: String, id: String) -> std::result::Result<Vec<Stas
 pub async fn drop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "removing set-aside work")?;
         let mut repo = Repo::open_light(root)?;
         crate::stash::drop_one(&mut repo, &id)?;
         Ok(stash_dtos(&repo))
@@ -758,7 +758,7 @@ pub async fn drop_stash(path: String, id: String) -> std::result::Result<Vec<Sta
 pub async fn drop_all_stashes(path: String) -> std::result::Result<usize, String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "clearing the shelf")?;
         let mut repo = Repo::open_light(root)?;
         crate::stash::drop_all(&mut repo)
     })
@@ -774,7 +774,7 @@ pub async fn restore_file(
 ) -> std::result::Result<(), String> {
     run(move || {
         let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root)?;
+        let _lock = RepoLock::acquire(root, "restoring a file")?;
         let repo = Repo::open(root)?;
         let bytes = commit::file_at_commit(&repo, &file, &commit_id)?;
         let target: PathBuf = crate::repo::safe_join(&repo.root, &file)?;

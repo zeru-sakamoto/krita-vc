@@ -95,9 +95,12 @@ failed.
   different target).
 - **"Krita VC tracks .kra documents"** — the active document is a `.png`/`.jpg`/etc. Only
   `.kra` files are versioned; save it as `.kra` inside the tracked folder first.
-- **"repository is busy (locked by another process)"** — the desktop app is mid-write, or
-  a previous commit/switch didn't exit cleanly and left `.kvc/kvc.lock` behind. Safe to
-  delete that file by hand as long as no other `kvc`/desktop-app write is actually in flight.
+- **"repository is busy (locked by another process): \<repo\> — \<operation\> for \<age\>"** —
+  the desktop app or another `kvc` invocation is genuinely mid-write right now; the message
+  names which repo, what it's doing, and how long. Just retry once it finishes. Nothing to
+  clean up by hand: the lock is a real OS-level lock, released automatically the instant the
+  other process's write ends — even if it crashed or was force-closed — so it can't get
+  permanently stuck the way an older version of this could.
 - **"Save (Ctrl+S) or undo your changes in … first"** — a discard/set-aside/switch would
   rewrite a file you have unsaved edits in. You shouldn't normally see this, since clicking
   into the docker saves; if you do, the auto-save failed (see the next entry).

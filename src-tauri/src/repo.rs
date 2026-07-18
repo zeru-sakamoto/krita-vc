@@ -48,32 +48,88 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// Advisory, best-effort exclusive lock over one `.kvc/` store (`.kvc/kvc.lock`, create-new).
-/// The engine has no internal locking, so every mutating entry point — the desktop app's Tauri
-/// commands and the `kvc` CLI alike — takes this so a plugin commit can't interleave with a
-/// desktop commit/switch/GC into a torn write. A crash leaves a stale lock; GC's stale-`*.tmp`
-/// style cleanup is the recovery path (the file is removed on drop in the normal case).
-// Advisory create-new lock; upgrade to fs2 flock only if a stale lock ever bites.
-pub struct RepoLock(PathBuf);
+/// Real OS-level exclusive lock over one `.kvc/` store (`.kvc/kvc.lock`, held via
+/// `File::try_lock`). The engine has no internal locking, so every mutating entry point — the
+/// desktop app's Tauri commands and the `kvc` CLI alike — takes this so a plugin commit can't
+/// interleave with a desktop commit/switch/GC into a torn write. Unlike a plain marker file,
+/// the OS releases this the moment the holding process's file handle closes — cleanly, on a
+/// panic-unwind drop, or on a crash/force-kill — so there is no "stale lock" state to clean up:
+/// the very next `try_lock()` on an orphaned file just succeeds.
+// The File is never read/written after acquire — it's held purely so its Drop (closing the
+// handle) releases the OS lock; the compiler can't see that use, hence the allow.
+pub struct RepoLock(#[allow(dead_code)] std::fs::File);
 
 impl RepoLock {
-    pub fn acquire(root: &Path) -> Result<Self> {
+    /// `op` is a short present-participle label ("committing", "switching branches") written
+    /// into the `kvc.lock.info` sidecar so a blocked caller's error can say what's holding it,
+    /// not just that something is. It goes in a *separate* file rather than `kvc.lock` itself
+    /// because Windows enforces a locked byte range against ordinary reads too (unlike POSIX
+    /// `flock`, which is purely advisory) — a blocked caller reading `kvc.lock` directly would
+    /// hit `ERROR_LOCK_VIOLATION`. The sidecar is never locked, so it's always readable.
+    pub fn acquire(root: &Path, op: &str) -> Result<Self> {
         let path = kvc_dir(root).join("kvc.lock");
-        match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
             .open(&path)
-        {
-            Ok(_) => Ok(RepoLock(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(KvcError::Locked),
-            Err(e) => Err(io_at(&path, e)),
+            .map_err(|e| io_at(&path, e))?;
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = write_lock_info(root, op); // best-effort; never blocks the acquire
+                Ok(RepoLock(file))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(KvcError::Locked(
+                lock_holder_description(root, &lock_info_path(root)),
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(io_at(&path, e)),
         }
     }
 }
+// No `impl Drop`: dropping `File` closes the handle, and the OS releases the lock along with
+// it — including when the process is killed, which is exactly the case a marker file can't.
 
-impl Drop for RepoLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+fn lock_info_path(root: &Path) -> PathBuf {
+    kvc_dir(root).join("kvc.lock.info")
+}
+
+/// Best-effort rewrite of the `kvc.lock.info` sidecar right after acquiring the real lock.
+fn write_lock_info(root: &Path, op: &str) -> std::io::Result<()> {
+    std::fs::write(lock_info_path(root), op)
+}
+
+/// Best-effort "<repo> — <op> for <age>" detail for a `Locked` error: which repo, what the
+/// other holder is doing (from the sidecar's contents), and how long it's been going (from
+/// the sidecar's mtime, rewritten on every successful acquire) — enough to tell a genuinely
+/// slow operation from one that's been stuck a suspiciously long time.
+fn lock_holder_description(root: &Path, info_path: &Path) -> String {
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let op = std::fs::read_to_string(info_path)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "writing".to_string());
+    let age = std::fs::metadata(info_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(format_age);
+    match age {
+        Some(age) => format!("{name} — {op} for {age}"),
+        None => format!("{name} — {op}"),
+    }
+}
+
+fn format_age(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
     }
 }
 

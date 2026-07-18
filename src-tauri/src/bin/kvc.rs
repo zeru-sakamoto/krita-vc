@@ -114,7 +114,7 @@ fn run_commit(flags: &HashMap<String, String>) -> Result<String, String> {
     let author = require(flags, "author")?;
     let only = paths_of(flags)?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock = RepoLock::acquire(root, "committing").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     // `only: None` is exactly commit_snapshot — it's a one-line delegate to this.
     let c = commit::commit_selected(&mut repo, message, author, only.as_deref())
@@ -144,7 +144,7 @@ fn run_switch(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let name = require(flags, "branch")?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock = RepoLock::acquire(root, "switching branches").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     branch::switch_branch(&mut repo, name).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "current": repo.branches.current }).to_string())
@@ -155,7 +155,7 @@ fn run_create_branch(flags: &HashMap<String, String>) -> Result<String, String> 
     let name = require(flags, "name")?;
     let base = flags.get("base").map(String::as_str);
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock = RepoLock::acquire(root, "creating a branch").map_err(|e| e.to_string())?;
     // Mirrors the Tauri command: a plain new-branch-at-tip only needs the light open;
     // basing on another branch materializes that branch's tree, which needs chains.
     let mut repo = if base.is_some() {
@@ -173,7 +173,7 @@ fn run_discard(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let only = paths_of(flags)?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock = RepoLock::acquire(root, "discarding changes").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     // discard_working_changes takes the tip rather than looking it up, same as the Tauri command.
     let tip = repo
@@ -193,7 +193,7 @@ fn run_stash(flags: &HashMap<String, String>) -> Result<String, String> {
     let label = flags.get("label").map(String::as_str).unwrap_or("");
     let only = paths_of(flags)?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock = RepoLock::acquire(root, "setting work aside").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     let s = stash::create(&mut repo, label, author, only.as_deref()).map_err(|e| e.to_string())?;
     Ok(json!({ "id": s.id, "label": s.label, "files": s.files.len() }).to_string())
@@ -203,7 +203,8 @@ fn run_stash_pop(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let id = require(flags, "id")?;
     let root = Path::new(repo_path);
-    let _lock = RepoLock::acquire(root).map_err(|e| e.to_string())?;
+    let _lock =
+        RepoLock::acquire(root, "bringing back set-aside work").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
     let s = stash::pop(&mut repo, id).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "id": s.id }).to_string())

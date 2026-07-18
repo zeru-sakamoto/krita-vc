@@ -89,8 +89,8 @@ pub enum KvcError {
     #[error("unsafe path outside the repository: {0}")]
     BadPath(String),
 
-    #[error("repository is busy (locked by another process)")]
-    Locked,
+    #[error("repository is busy (locked by another process): {0}")]
+    Locked(String),
 
     #[error(transparent)]
     Io(#[from] io::Error),
