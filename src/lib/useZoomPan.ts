@@ -6,14 +6,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * slider's two stacked layers), so before/after and the slider divider stay pixel-registered
  * under zoom + pan. Transform-origin is the pane's top-left (`0 0`); `tx`/`ty` are in CSS px.
  *
- * Pan is gated behind a modifier (middle-mouse, or space-held left-drag) so it never fights
- * the slider divider's plain left-drag. Wheel zooms toward the cursor.
+ * Pan works via middle-mouse or plain left-drag; the slider divider stops propagation on its
+ * own pointerdown so a drag started on it doesn't also pan the canvas underneath. Wheel zooms
+ * toward the cursor.
  *
  * The transform rides on the SVG-wrapping div (see ArtCanvas), never re-serialized into the
  * SVG string — so interaction stays on the compositor and the heavy inline-SVG DOM is untouched.
  */
 
-const MIN_SCALE = 1; // never below fit-to-pane
+const MIN_SCALE = 0.75; // fit-to-pane is 1; allow zooming out a bit further than that
 const MAX_SCALE = 16;
 const ZOOM_SENSITIVITY = 0.0015;
 
@@ -33,7 +34,7 @@ export interface UseZoomPan {
   onPointerDown: (e: React.PointerEvent) => void;
   onPointerMove: (e: React.PointerEvent) => void;
   onPointerUp: (e: React.PointerEvent) => void;
-  /** Cursor class for the pannable area (grab when space is held). */
+  /** Cursor class for the pannable area. */
   panCursor: string;
   /** Return to the object-contain fit view. */
   reset: () => void;
@@ -46,23 +47,6 @@ function clamp(v: number, lo: number, hi: number): number {
 export function useZoomPan(): UseZoomPan {
   const [z, setZ] = useState<ZoomState>(IDENTITY);
   const [panning, setPanning] = useState(false);
-
-  // Space-to-pan flag (tracked globally while the diff is mounted).
-  const [spaceHeld, setSpaceHeld] = useState(false);
-  useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      if (e.code === "Space") setSpaceHeld(true);
-    };
-    const up = (e: KeyboardEvent) => {
-      if (e.code === "Space") setSpaceHeld(false);
-    };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
-  }, []);
 
   // Drag state.
   const panningRef = useRef(false);
@@ -127,18 +111,14 @@ export function useZoomPan(): UseZoomPan {
     [schedule]
   );
 
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent) => {
-      const panButton = e.button === 1 || (e.button === 0 && spaceHeld);
-      if (!panButton) return; // leave plain left-drag for the slider divider
-      e.preventDefault();
-      panningRef.current = true;
-      setPanning(true);
-      lastRef.current = { x: e.clientX, y: e.clientY };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    },
-    [spaceHeld]
-  );
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0 && e.button !== 1) return; // left or middle only
+    e.preventDefault();
+    panningRef.current = true;
+    setPanning(true);
+    lastRef.current = { x: e.clientX, y: e.clientY };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }, []);
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
@@ -180,7 +160,7 @@ export function useZoomPan(): UseZoomPan {
     onPointerDown,
     onPointerMove,
     onPointerUp,
-    panCursor: panning ? "cursor-grabbing" : spaceHeld ? "cursor-grab" : "",
+    panCursor: panning ? "cursor-grabbing" : "cursor-grab",
     reset,
   };
 }

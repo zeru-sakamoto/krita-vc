@@ -38,7 +38,20 @@ import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
 import { useStashes, useWorkingChanges } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
+import { useTour } from "../../lib/tour";
 import type { Branch, Commit } from "../../types";
+
+// Tour steps that spotlight one row inside the (normally click-to-open) panel-options
+// menu — the tour forces the menu open for the duration of these steps since the
+// overlay blocks real clicks.
+const PANEL_OPTION_TOUR_IDS = new Set([
+  "panel-option-undo",
+  "panel-option-discard-all",
+  "panel-option-stash-staged",
+  "panel-option-stash-all",
+  "panel-option-stash-pop-latest",
+  "panel-option-stash-pick",
+]);
 
 const PANEL_TITLE: Record<ActivityView, string> = {
   changes: "Changes",
@@ -90,6 +103,8 @@ export function Sidebar({
     saving,
   } = useRepository();
   const { artistMode } = useArtistMode();
+  const { active: tourActive, step: tourStep } = useTour();
+  const forcePanelOptionsOpen = tourActive && PANEL_OPTION_TOUR_IDS.has(tourStep.tourId);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -175,12 +190,9 @@ export function Sidebar({
     storageKey: "krita-vc:sidebar-width",
   });
 
-  // Shared "panel options" menu (history + changes), in three groups: undo/discard, then
-  // setting work aside, then bringing it back. The first divider is the set-aside group's own
-  // `separator`; the second is the `footer` group's rule.
-  //
-  // Setting work aside acts on the working tree, so those rows are changes-only; bringing it
-  // back shows in both views, since you might well be looking at history when you want it back.
+  // Shared "panel options" menu (history + changes) — undo is common to both, but setting work
+  // aside and bringing it back both act on the working tree, so those rows (and the `footer`
+  // group's divider) are changes-only; History's menu is just undo.
   const openSetAside = (scope: StashScope, paths: string[] | null) => {
     setSwitchError(null);
     setSetAside({ scope, paths });
@@ -193,6 +205,7 @@ export function Sidebar({
             label: artistMode ? "Set aside staged files" : "Stash staged",
             icon: <StashIcon size={14} />,
             separator: true,
+            tourId: "panel-option-stash-staged",
             // Needs a commit to revert back to, same guard as undo.
             disabled: stagedPaths.length === 0 || commits.length === 0 || saving,
             onSelect: () => openSetAside("staged", stagedPaths),
@@ -201,6 +214,7 @@ export function Sidebar({
             id: "stash-all",
             label: artistMode ? "Set aside everything" : "Stash all",
             icon: <StashIcon size={14} />,
+            tourId: "panel-option-stash-all",
             disabled: workingItems.length === 0 || commits.length === 0 || saving,
             onSelect: () => openSetAside("all", null),
           },
@@ -218,6 +232,7 @@ export function Sidebar({
           : artistMode
             ? `${stashes.length} set aside`
             : `${stashes.length} ${stashes.length === 1 ? "stash" : "stashes"}`,
+      tourId: "panel-option-stash-pop-latest",
       disabled: stashes.length === 0 || saving,
       // The list is newest-first, so [0] is the latest.
       onSelect: () => void onPop(stashes[0].id),
@@ -226,6 +241,7 @@ export function Sidebar({
       id: "stash-pick",
       label: artistMode ? "Bring back…" : "Pop stash…",
       icon: <ListBullets size={14} />,
+      tourId: "panel-option-stash-pick",
       disabled: stashes.length === 0 || saving,
       onSelect: () => setPickStash(true),
     },
@@ -235,11 +251,13 @@ export function Sidebar({
     <Menu
       align="right"
       minWidth={200}
-      footer={stashFooter}
+      footer={view === "changes" ? stashFooter : undefined}
+      forceOpen={forcePanelOptionsOpen}
       trigger={(open) => (
         <span
           title="Panel options"
           aria-label="Panel options"
+          data-tour-id="panel-options"
           className={[
             "grid h-8 w-8 place-items-center rounded-button text-text-muted",
             "transition-colors hover:bg-white/5 hover:text-text",
@@ -254,6 +272,7 @@ export function Sidebar({
           id: "undo",
           label: artistMode ? "Undo the last version" : "Undo the last commit",
           icon: <ArrowUUpLeft size={14} />,
+          tourId: "panel-option-undo",
           disabled: commits.length === 0 || saving,
           onSelect: () => {
             setUndoError(null);
@@ -266,6 +285,7 @@ export function Sidebar({
                 id: "discard-all",
                 label: "Discard current changes",
                 icon: <ArrowCounterClockwise size={14} />,
+                tourId: "panel-option-discard-all",
                 disabled: unstagedPaths.length === 0 || saving,
                 onSelect: () => {
                   setDiscardAllError(null);
@@ -296,6 +316,7 @@ export function Sidebar({
                 spinning={scanning}
                 disabled={scanning}
                 onClick={refresh}
+                tourId="refresh"
               />
               {panelOptions}
             </>
@@ -311,6 +332,7 @@ export function Sidebar({
               <Menu
                 trigger={() => (
                   <span
+                    data-tour-id="history-branch"
                     className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-white/5"
                     title={artistMode ? "Choose which version line to view" : "Switch branch"}
                   >
@@ -340,12 +362,14 @@ export function Sidebar({
 
             {switchError && <p className="px-3 pt-2 text-[12px] text-danger">{switchError}</p>}
 
-            <CommitGraph
-              commits={commits}
-              selectedId={selectedId}
-              onSelect={onSelect}
-              branches={branches}
-            />
+            <div data-tour-id="history-versions">
+              <CommitGraph
+                commits={commits}
+                selectedId={selectedId}
+                onSelect={onSelect}
+                branches={branches}
+              />
+            </div>
           </>
         )}
 

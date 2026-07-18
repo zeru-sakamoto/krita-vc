@@ -157,7 +157,14 @@ export const ArtCanvas = memo(function ArtCanvas({
   return (
     <div
       className={[
-        "grid h-full w-full place-items-center overflow-hidden",
+        // Plain block, not `grid place-items-center`: the child below is unconditionally
+        // forced h-full/w-full anyway, and place-items-center's align-items:center stops it
+        // from stretching — its percentage height then resolves against its own aspect-ratio-
+        // driven size instead of this container's, so a portrait canvas silently overflows
+        // downward past the pane (visible whenever the width-driven height exceeds the
+        // actual available height — full-width swipe-slider panes hit this far more than
+        // split view's half-width panes, but a wide-enough split pane hits it too).
+        "h-full w-full overflow-hidden",
         // Checkerboard matte — transparency reads true, Krita-style.
         "bg-[repeating-conic-gradient(#1a1916_0%_25%,#222019_0%_50%)] bg-size-[16px_16px]",
         className,

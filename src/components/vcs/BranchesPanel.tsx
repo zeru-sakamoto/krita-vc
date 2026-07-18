@@ -131,6 +131,7 @@ export function BranchesPanel({
         type="button"
         onClick={() => setCreateOpen(true)}
         disabled={saving}
+        data-tour-id="branches-new"
         className="mx-3 mt-2 flex items-center gap-1.5 rounded-button px-1 py-1 text-[12px] text-text-muted transition-colors hover:bg-white/5 hover:text-text"
       >
         <Plus size={13} />

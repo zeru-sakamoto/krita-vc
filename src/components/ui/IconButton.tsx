@@ -12,6 +12,8 @@ interface IconButtonProps {
   /** Spin the icon (in-progress feedback, e.g. a rescan). */
   spinning?: boolean;
   onClick?: () => void;
+  /** Tour spotlight hook (`data-tour-id`) — see `src/lib/tour.tsx`. */
+  tourId?: string;
 }
 
 /**
@@ -26,6 +28,7 @@ export function IconButton({
   disabled = false,
   spinning = false,
   onClick,
+  tourId,
 }: IconButtonProps) {
   return (
     <button
@@ -35,6 +38,7 @@ export function IconButton({
       aria-pressed={active}
       disabled={disabled}
       onClick={onClick}
+      data-tour-id={tourId}
       className={[
         "grid h-8 w-8 place-items-center rounded-button text-text-muted",
         "transition-[transform,background-color] duration-100 ease-out",

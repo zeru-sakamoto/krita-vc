@@ -34,6 +34,7 @@ const Pane = memo(function Pane({
   diffOutline,
   regions,
   transform,
+  onWheel,
 }: {
   label: string;
   diff: ArtDiff;
@@ -45,13 +46,18 @@ const Pane = memo(function Pane({
   diffOutline?: string | null;
   regions?: ChangeRegion[];
   transform?: string;
+  onWheel?: (e: React.WheelEvent) => void;
 }) {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex h-6 shrink-0 items-center border-b border-border bg-surface px-2 text-[11px] font-medium uppercase text-text-muted">
         {label}
       </div>
-      <div className="min-h-0 flex-1">
+      {/* Wheel handler lives on this pane's own element (not the shared split-view container)
+          so the zoom pivot's cursor offset is measured against this pane's own rect — the
+          container spans both panes, which would double the effective width and bias the
+          pivot toward whichever pane is on the right. */}
+      <div className="min-h-0 flex-1" onWheel={onWheel}>
         <ArtCanvas
           diff={diff}
           layers={layers}
@@ -280,10 +286,12 @@ export function ArtDiffView({
 
               {/* Canvas — overflow-hidden, never auto: the SVG scales to fit its pane, so
                   scrolling could only ever crop the artwork. Wheel zooms toward the cursor;
-                  middle-mouse or space-drag pans (plain left-drag stays for the slider). */}
+                  middle-mouse or plain left-drag pans (the slider divider stops propagation on
+                  its own pointerdown so dragging it doesn't also pan). Wheel is NOT bound here
+                  in split view — see the per-Pane comment. */}
               <div
                 className={`relative min-h-0 flex-1 overflow-hidden ${zoom.panCursor}`}
-                onWheel={zoom.onWheel}
+                onWheel={viewMode === "slider" ? zoom.onWheel : undefined}
                 onPointerDown={zoom.onPointerDown}
                 onPointerMove={zoom.onPointerMove}
                 onPointerUp={zoom.onPointerUp}
@@ -296,6 +304,7 @@ export function ArtDiffView({
                       layers={layers}
                       state="before"
                       transform={zoom.transform}
+                      onWheel={zoom.onWheel}
                     />
                     <div className="w-px shrink-0 bg-border" />
                     <Pane
@@ -309,6 +318,7 @@ export function ArtDiffView({
                       diffOutline={overlay.diffOutline}
                       regions={overlay.regions}
                       transform={zoom.transform}
+                      onWheel={zoom.onWheel}
                     />
                   </div>
                 ) : (

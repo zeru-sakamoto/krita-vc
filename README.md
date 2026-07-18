@@ -65,6 +65,9 @@ files, where git's text-oriented delta model performs poorly.
   Settings gear, so it doesn't require opening Settings at all.
 - **Artist Mode**: a global toggle (default on) that swaps git/code jargon for plain language
   (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
+- **First-launch tour**: a one-time spotlight walkthrough of the whole shell — changes, history,
+  branches, performance, settings, and backup — shown automatically the first time you open a
+  repository. Replay it anytime from Settings → Appearance → "Replay tour".
 - A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).
 
 ## How it works
@@ -126,14 +129,15 @@ cargo test --release --test bench -- --ignored --nocapture   # performance basel
 src/
 ├─ components/
 │  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, SettingsModal,
-│  │            Sidebar, Inspector, StatusBar, BusyOverlay
+│  │            Sidebar, Inspector, StatusBar, BusyOverlay, TourOverlay (first-launch tour)
 │  ├─ vcs/     — diff viewer (DiffView, ArtDiffView, ArtCanvas, CompareSlider,
 │  │            LayerStackPanel, PaletteDiffView), commit graph, branch/changes panels,
 │  │            StashDialogs (set-aside prompts)
 │  ├─ ui/      — IconButton, Button, Menu, Modal
 │  └─ MainPanel.tsx
 ├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode +
-│  │            author-name contexts, shell detection (tauri.ts), SVG compositing, zoom/pan + resize hooks
+│  │            author-name + tour (tour.tsx) contexts, shell detection (tauri.ts), SVG
+│  │            compositing, zoom/pan + resize hooks
 ├─ styles/     — global.css (Tailwind v4 @theme tokens from DESIGN.md)
 └─ types.ts    — domain types (the frontend ↔ backend contract)
 

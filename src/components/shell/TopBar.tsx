@@ -95,12 +95,14 @@ export function TopBar() {
       {...(showWindowControls ? { "data-tauri-drag-region": true } : {})}
     >
       <img src="/logo.svg" alt="" className="h-5 w-5 shrink-0" />
-      <Menu
-        trigger={() => <RepoTrigger name={current?.name ?? "Open a repository…"} />}
-        items={items}
-        footer={footer}
-        minWidth={240}
-      />
+      <div data-tour-id="repo-switcher" className="flex items-center">
+        <Menu
+          trigger={() => <RepoTrigger name={current?.name ?? "Open a repository…"} />}
+          items={items}
+          footer={footer}
+          minWidth={240}
+        />
+      </div>
 
       {showWindowControls && <WindowControls />}
 

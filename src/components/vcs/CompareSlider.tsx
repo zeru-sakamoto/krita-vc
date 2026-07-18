@@ -67,6 +67,9 @@ export const CompareSlider = memo(function CompareSlider({
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
+      // Zoom-pan now pans on plain left-drag too; stop the drag from also reaching that
+      // handler on the shared canvas container, or the divider and the pan would fight.
+      e.stopPropagation();
       draggingRef.current = true;
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
       moveTo(e.clientX);

@@ -10,6 +10,7 @@ import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme, type ThemeId } from "../../lib/theme";
 import { useRepository, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
+import { useTour } from "../../lib/tour";
 import { useWindowChrome } from "../../lib/windowChrome";
 import type { Stash } from "../../types";
 
@@ -84,6 +85,7 @@ function AppearanceSettings({
   setAuthorName,
   theme,
   setTheme,
+  onReplayTour,
 }: {
   artistMode: boolean;
   toggleArtistMode: () => void;
@@ -93,6 +95,7 @@ function AppearanceSettings({
   setAuthorName: (name: string) => void;
   theme: ThemeId;
   setTheme: (id: ThemeId) => void;
+  onReplayTour: () => void;
 }) {
   return (
     <>
@@ -148,6 +151,9 @@ function AppearanceSettings({
           }}
         />
       </div>
+      <Button className="mt-3" onClick={onReplayTour}>
+        Replay tour
+      </Button>
     </>
   );
 }
@@ -240,6 +246,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { customTitleBar, toggle: toggleWindowChrome } = useWindowChrome();
   const { authorName, setAuthorName } = useAuthorName();
   const { theme, setTheme } = useTheme();
+  const { restart: restartTour } = useTour();
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
   const stashes = useStashes(current?.path ?? null, refreshNonce);
   const [showCleanup, setShowCleanup] = useState(false);
@@ -290,6 +297,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 setAuthorName={setAuthorName}
                 theme={theme}
                 setTheme={setTheme}
+                onReplayTour={() => {
+                  restartTour();
+                  onClose();
+                }}
               />
             )}
             {category === "stash" &&

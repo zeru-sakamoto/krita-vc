@@ -156,7 +156,10 @@ export function PerformancePanel() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* Summary card (fixed) */}
-      <div className="m-3 mb-2 shrink-0 rounded-panel border border-border bg-surface-2 p-3">
+      <div
+        className="m-3 mb-2 shrink-0 rounded-panel border border-border bg-surface-2 p-3"
+        data-tour-id="performance-stats"
+      >
         <div className="text-[11px] uppercase tracking-wide text-text-muted">
           {artistMode ? "Storage saved" : "Storage saved vs full copies"}
         </div>

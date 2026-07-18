@@ -87,6 +87,7 @@
   --z-toast: 50;
   --z-tooltip: 60;
   --z-blocking: 70;
+  --z-tour: 80;
 
   color-scheme: dark;
 }

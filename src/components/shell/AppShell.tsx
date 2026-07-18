@@ -6,9 +6,11 @@ import { Sidebar } from "./Sidebar";
 import { Inspector } from "./Inspector";
 import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
+import { TourOverlay } from "./TourOverlay";
 import { MainPanel } from "../MainPanel";
 import { IconButton } from "../ui/IconButton";
 import { useArtistMode } from "../../lib/artistMode";
+import { useTour } from "../../lib/tour";
 import { useRepository } from "../../lib/repository";
 import {
   useBranches,
@@ -58,6 +60,7 @@ function WelcomeShell() {
 
 function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
+  const { beginIfFirstTime } = useTour();
   const { refreshNonce } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
   const branches = useBranches(repo.path, refreshNonce);
@@ -71,6 +74,11 @@ function RepoShell({ repo }: { repo: Repository }) {
   // optional navigator id to seed that file's view with (e.g. jump straight to its palette).
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [selectedFocusId, setSelectedFocusId] = useState<string | undefined>(undefined);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- fire once per RepoShell mount only
+  useEffect(() => {
+    beginIfFirstTime();
+  }, []);
 
   // Keep a valid selection as history loads/changes (default to the newest commit).
   useEffect(() => {
@@ -192,6 +200,7 @@ function RepoShell({ repo }: { repo: Repository }) {
                 active={inspectorOpen}
                 size={18}
                 onClick={() => setInspectorOpen((v) => !v)}
+                tourId="inspector"
               />
             </div>
 
@@ -237,6 +246,7 @@ function RepoShell({ repo }: { repo: Repository }) {
         branch={currentBranch.name}
         commitCount={commits.length}
       />
+      <TourOverlay setActiveView={setActiveView} />
     </div>
   );
 }

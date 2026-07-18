@@ -213,10 +213,9 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   switch/merge), or jump to Changes. **Set-aside actions** sit in the `Sidebar` panel-options
   `Menu` as **three divider-separated groups**: undo/discard, then set-aside, then bring-back.
   `Menu` still has no submenus, but gained a `MenuItem.separator` flag (a `border-t` above that
-  row) since one `footer` group can only draw one rule and this needs two. Two set-aside rows,
-  changes-view only as they act on the working tree (staged files / everything, both gated on
-  `commits.length` — there's no committed state to revert to otherwise), plus two `footer`
-  bring-back rows shown in both views (latest, or a picker).
+  row) since one `footer` group can only draw one rule and this needs two. Set-aside and
+  bring-back (two rows each) are both **changes-view only**, since both act on the working tree —
+  History's panel-options menu is just undo.
   Dialogs live in `StashDialogs.tsx` (`SetAsideModal` label prompt, `PickStashModal`,
   `StashConflictModal` + `isStashConflictError`), fed by `useStashes` via `list_stashes`.
   The History sidebar has a live branch-switcher `Menu` (with a
@@ -286,6 +285,23 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   (`useArtistMode()`); label helpers in `src/lib/friendly.ts`. The audience is artists, so prefer
   friendly labels over git/code jargon in new UI, and gate any unavoidable technical detail behind
   Artist Mode being off. See [`docs/frontend-architecture.md`](docs/frontend-architecture.md#artist-mode).
+- **Application tour** — a first-launch, one-time spotlight walkthrough of the shell
+  (`src/lib/tour.tsx` `TourProvider`/`useTour`, `src/components/shell/TourOverlay.tsx`), fired via
+  `beginIfFirstTime()` (called once from `RepoShell` on mount) and gated on a `localStorage` flag
+  (`krita-vc:tour-completed`) — same context-plus-flag pattern as Artist Mode and the custom title
+  bar toggle. `TOUR_STEPS` is a flat, linear array (`{tourId, title, body, view?}`); a step with a
+  `view` drives `setActiveView` as a side effect so the tour can walk through Changes, History,
+  Branches, and Performance without the user switching tabs. Spotlight targets are plain
+  `data-tour-id` attributes (`IconButton`/`MenuItem` both take an optional `tourId` prop; a few
+  other targets carry `data-tour-id` directly) — no ref plumbing. The dim-with-a-hole effect is
+  four opaque `fixed` bands tiling the viewport around the target rect plus a fifth transparent
+  non-interactive div over the hole itself — deliberately not a box-shadow spread or an SVG mask,
+  both of which silently failed to paint in this WebView build. Steps that spotlight a row inside
+  the panel-options `Menu` force it open via a new `Menu.forceOpen` prop (ORed with the normal
+  click-toggled state so it never fights outside-click/Escape handling), since the overlay blocks
+  the real click that would otherwise open it. Replay anytime via Settings → Appearance →
+  "Replay tour" (`restart()`). See
+  [`docs/frontend-architecture.md`](docs/frontend-architecture.md#application-tour).
 
 All data flows through Tauri `invoke` keyed by the selected repository path; the component/prop
 boundaries (`Repository`, `DiffEntry`, `Commit` — incl. `parents` lineage — `Branch` incl. `tip`,

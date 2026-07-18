@@ -15,6 +15,8 @@ export interface MenuItem {
   disabled?: boolean;
   /** Draws a divider above this row, starting a new group. Matches the `footer` rule. */
   separator?: boolean;
+  /** Tour spotlight target — sets `data-tour-id` on this row's button. */
+  tourId?: string;
   onSelect: () => void;
 }
 
@@ -28,6 +30,10 @@ interface MenuProps {
   minWidth?: number;
   /** Which edge of the trigger the popover aligns to. Default "left". */
   align?: "left" | "right";
+  /** Holds the popover open regardless of click state — used by the product tour to
+   *  spotlight individual rows. ORed with the normal click-toggled state, so it never
+   *  needs to fight outside-click/Escape handling. */
+  forceOpen?: boolean;
 }
 
 /**
@@ -35,18 +41,26 @@ interface MenuProps {
  * Closes on outside click or Escape. Themed per DESIGN.md (surface-2 popover,
  * hairline border, panel radius, float shadow).
  */
-export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }: MenuProps) {
-  const [open, setOpen] = useState(false);
+export function Menu({
+  trigger,
+  items,
+  footer,
+  minWidth = 200,
+  align = "left",
+  forceOpen,
+}: MenuProps) {
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = forceOpen || internalOpen;
   const rootRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setInternalOpen(false);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") setInternalOpen(false);
     };
     // Capture phase: a modal's backdrop stops pointerdown from bubbling past its panel
     // (so panel clicks don't also close the modal), which would otherwise swallow this
@@ -71,9 +85,10 @@ export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }:
         type="button"
         role="menuitem"
         disabled={item.disabled}
+        data-tour-id={item.tourId}
         onClick={() => {
           item.onSelect();
-          setOpen(false);
+          setInternalOpen(false);
         }}
         className={[
           "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
@@ -114,7 +129,7 @@ export function Menu({ trigger, items, footer, minWidth = 200, align = "left" }:
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setInternalOpen((v) => !v)}
       >
         {trigger(open)}
       </button>

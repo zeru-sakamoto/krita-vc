@@ -43,7 +43,12 @@ export function MainPanel({
 }: MainPanelProps) {
   if (diff.length > 0) {
     return (
-      <main className="flex min-w-0 flex-1 flex-col bg-bg">
+      // min-h-0 is load-bearing: without it this flex column can inflate to fit its content
+      // instead of the stretched height from its row parent — the Swipe slider's frame sizes
+      // itself with `h-full` (a percentage, needing a genuinely resolved ancestor height), so
+      // it would silently overflow downward with only its top visible. Split view masks the
+      // same missing constraint because each Pane sizes via flex-1/min-h-0 instead.
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg">
         <DiffView
           entries={diff}
           repoPath={repoPath}
@@ -59,7 +64,7 @@ export function MainPanel({
   }
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col bg-bg">
+    <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg">
       <div className="grid flex-1 place-items-center text-text-muted">
         {loading ? (
           <div className="flex flex-col items-center gap-2">

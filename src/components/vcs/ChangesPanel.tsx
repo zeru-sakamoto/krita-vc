@@ -23,6 +23,7 @@ function Section({
   focusedFile,
   onFocusFile,
   onDiscardFile,
+  tourId,
 }: {
   title: string;
   items: WorkingChange[];
@@ -37,9 +38,10 @@ function Section({
   onFocusFile: (path: string) => void;
   /** Discard this one file's uncommitted changes. */
   onDiscardFile: (path: string) => void;
+  tourId?: string;
 }) {
   return (
-    <div>
+    <div data-tour-id={tourId}>
       <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
         <span className="flex items-center gap-2">
           {title}
@@ -200,7 +202,10 @@ export function ChangesPanel({
 
   return (
     <div className="flex flex-col">
-      <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-3 text-[11px] text-text-muted">
+      <div
+        data-tour-id="changes-branch"
+        className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-3 text-[11px] text-text-muted"
+      >
         Saving to
         <BranchBadge branch={currentBranch} />
       </div>
@@ -214,6 +219,7 @@ export function ChangesPanel({
         focusedFile={focusedFile}
         onFocusFile={onFocusFile}
         onDiscardFile={setConfirmDiscardPath}
+        tourId="changes-staged"
       />
       <div className="my-1 h-px bg-border" />
       <Section
@@ -226,6 +232,7 @@ export function ChangesPanel({
         focusedFile={focusedFile}
         onFocusFile={onFocusFile}
         onDiscardFile={setConfirmDiscardPath}
+        tourId="changes-unstaged"
       />
 
       {inTauri() && (
@@ -235,6 +242,7 @@ export function ChangesPanel({
             onChange={(e) => setMessage(e.target.value)}
             placeholder="Describe this version…"
             rows={2}
+            data-tour-id="commit-message"
             className="resize-none rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
           />
           {commitError && <p className="text-[11px] text-danger">{commitError}</p>}
@@ -242,6 +250,7 @@ export function ChangesPanel({
             type="button"
             onClick={commit}
             disabled={!message.trim() || items.length === 0 || saving}
+            data-tour-id="commit-button"
             className="flex items-center justify-center gap-1.5 rounded-button bg-accent/15 px-2 py-1.5 text-[12px] font-medium text-accent transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving && <CircleNotch size={13} className="animate-spin" />}

@@ -56,6 +56,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
             size={24}
             active={active === view}
             onClick={() => onChange(view)}
+            tourId={view}
           />
         ))}
       </div>
@@ -66,12 +67,14 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
           size={24}
           disabled={!current || !!busyMessage}
           onClick={doBackup}
+          tourId="backup"
         />
         <IconButton
           icon={GearSix}
           label="Settings"
           size={24}
           onClick={() => setSettingsOpen(true)}
+          tourId="settings"
         />
       </div>
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}

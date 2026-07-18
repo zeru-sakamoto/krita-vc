@@ -56,6 +56,10 @@ non-dismissible block shown whenever `busyMessage` on the repository context is 
 write op (commit, branch create/switch/merge/delete, rollback, undo, cleanup) sets a
 human-readable label before the call and clears it in a `finally`. Renders nothing when idle.
 
+[`TourOverlay`](../src/components/shell/TourOverlay.tsx) is the last child of `RepoShell`'s root
+element (`fixed inset-0`, so it still visually covers all four zones); it renders nothing when the
+tour isn't active. See [Application tour](#application-tour).
+
 [`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable panel container (24px title
 bar + scroll area) used by the Sidebar and Inspector.
 
@@ -298,6 +302,44 @@ Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cy
   theme switch, since the cached raster's actual color is never displayed). See the `ArtCanvas`
   section of [visual-diff-viewer.md](visual-diff-viewer.md).
 
+## Application tour
+
+A first-launch, one-time spotlight walkthrough of the shell — fired once and never again
+automatically.
+
+- [`src/lib/tour.tsx`](../src/lib/tour.tsx) (`TourProvider`/`useTour()`) holds a flat, linear
+  `TOUR_STEPS` array (`{tourId, title, body, view?}`, ~28 steps covering every zone) and a
+  `stepIndex` state machine (`next`/`back`/`skip`/`restart`/`beginIfFirstTime`). Completion is a
+  `localStorage` flag (`krita-vc:tour-completed`) — the same context-plus-flag pattern as Artist
+  Mode and the custom title bar toggle. `RepoShell` calls `beginIfFirstTime()` once on mount; it's
+  a no-op once the flag is set. A step with a `view` drives `setActiveView` as a side effect, so
+  the tour can walk the user through Changes, History, Branches, and Performance without them
+  switching tabs themselves.
+- [`TourOverlay`](../src/components/shell/TourOverlay.tsx) renders `null` when inactive. Spotlight
+  targets are plain `data-tour-id` attributes: `IconButton` and `Menu`'s `MenuItem` both take an
+  optional `tourId` prop that sets it, and a handful of other targets (the repo switcher, the
+  branch badge row, staged/unstaged sections, the commit-graph, the commit message/button) carry
+  `data-tour-id` directly on a wrapper — so no ref plumbing is needed to locate a step's target.
+  The dim-with-a-hole effect is **four plain opaque `fixed` bands** tiling the viewport around the
+  target rect (top/bottom/left/right) plus a fifth, transparent, non-interactive div over the hole
+  itself so it never intercepts clicks — deliberately not a box-shadow spread or an SVG mask, both
+  of which silently failed to paint in this WebView build. Rect coordinates are rounded to whole
+  pixels so the four independently-positioned bands agree on the same integer boundary (raw floats
+  from `getBoundingClientRect()` risked a hairline seam between adjoining bands). The callout card
+  anchors beside the target for ActivityBar rows and rows inside an open dropdown (whichever edge
+  of the target has room to grow into, so a card near the bottom of the window never clips past
+  it), and below the target otherwise, clamped so it never pushes past the right edge either.
+- Steps that spotlight a row **inside** the panel-options `Menu` (undo, discard, and the four
+  set-aside/bring-back rows) need that menu open while the overlay is blocking the real click that
+  would normally open it — [`Menu`](../src/components/ui/Menu.tsx) gained a `forceOpen` prop (ORed
+  with its normal click-toggled state, so it never fights outside-click/Escape handling), driven
+  by `Sidebar`'s `PANEL_OPTION_TOUR_IDS` set.
+- Arrow Left/Right step back/forward as well as the card's Back/Next buttons. A press-and-hold
+  "Skip" button (`HoldToSkip`, 300ms hold) guards against a single stray click dismissing the
+  whole tour.
+- Replay anytime via Settings → Appearance → "Replay tour" (`useTour().restart()`, jumps back to
+  step 0 without touching the completion flag until the tour reaches its end again).
+
 ## Component map
 
 ```
@@ -319,6 +361,8 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 └─ StatusBar
 
 BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is set)
+
+RepoShell also renders TourOverlay as its own last child (see Application tour)
 ```
 
 `StashDialogs.tsx` (`SetAsideModal`, `PickStashModal`, `StashConflictModal`) is shared between
@@ -326,7 +370,8 @@ BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is 
 reuses its `stashTitle`/`stashSummary` helpers for the set-aside shelf rows.
 
 The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `ArtistModeProvider` →
-`AuthorNameProvider` → `WindowChromeProvider` (all mounted in [`App.tsx`](../src/App.tsx)).
+`AuthorNameProvider` → `WindowChromeProvider` → `TourProvider` (all mounted in
+[`App.tsx`](../src/App.tsx)).
 
 Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (flat Krita-style),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
@@ -345,4 +390,6 @@ stashes),
 [`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `paletteName`,
 `assetKind`, `statusVerb`, `layerTypeLabel`, `layerChangeLabel`,
 `versionNumbers`/`versionLabel`),
-[`src/lib/format.ts`](../src/lib/format.ts) (timestamps).
+[`src/lib/format.ts`](../src/lib/format.ts) (timestamps),
+[`src/lib/tour.tsx`](../src/lib/tour.tsx) (the first-launch tour's step list + state machine —
+see [Application tour](#application-tour)).

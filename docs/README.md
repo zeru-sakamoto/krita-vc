@@ -12,8 +12,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 ## Contents
 
 - [**Frontend architecture**](frontend-architecture.md) — app shell, the four zones, state
-  ownership, the component map, **Artist Mode** (the global friendly-labels toggle), and the
-  **theme selector** (color themes + the theme-reactive diff highlight).
+  ownership, the component map, **Artist Mode** (the global friendly-labels toggle), the
+  **theme selector** (color themes + the theme-reactive diff highlight), and the
+  **application tour** (the first-launch spotlight walkthrough).
 - [**File tracking & version control**](version-control.md) — the Rust backend: the `.kvc/` store,
   the scanner, commits, branches (create/switch/merge), stashes (setting work aside),
   delta-chain storage, the `.kra` tile engine, and the Tauri commands.
