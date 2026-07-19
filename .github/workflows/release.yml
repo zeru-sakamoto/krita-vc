@@ -1,0 +1,55 @@
+name: Release build
+
+# Manual only: run from the Actions tab (or `gh workflow run release.yml`) when you're ready
+# to cut a release. Builds Windows, macOS (universal), and Linux and opens a draft GitHub
+# Release with all installers attached for review before publishing.
+#
+# Signing/notarization is intentionally not configured (no certs in this repo yet) — builds
+# are unsigned, so macOS shows a Gatekeeper prompt and Windows a SmartScreen prompt on first
+# launch. To add signing later, add the relevant secrets and pass them via `env:`/`with:` on
+# the tauri-action step below; see https://v2.tauri.app/distribute/sign/.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+          - platform: ubuntu-22.04
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Krita VC v__VERSION__"
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
