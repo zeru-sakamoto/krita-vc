@@ -23,6 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 /content
+/download
+/scripts/download-release.ps1
 
 # Krita plugin (PyKrita bytecode)
 __pycache__/
