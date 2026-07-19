@@ -44,6 +44,17 @@ jobs:
 
       - run: npm ci
 
+      - name: Build universal kvc CLI sidecar
+        if: matrix.platform == 'macos-latest'
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin kvc --target aarch64-apple-darwin
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin kvc --target x86_64-apple-darwin
+          mkdir -p src-tauri/target/universal-apple-darwin/release
+          lipo -create \
+            src-tauri/target/aarch64-apple-darwin/release/kvc \
+            src-tauri/target/x86_64-apple-darwin/release/kvc \
+            -output src-tauri/target/universal-apple-darwin/release/kvc
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
