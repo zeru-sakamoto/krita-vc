@@ -1,0 +1,22 @@
+name: Notify site of published release
+
+# Fires the moment a release goes from draft to published (either by
+# manually publishing the draft that release.yml opens, or a release
+# created already-published). Pings kvc-site so it can pull the new
+# installers and bump its version automatically.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger kvc-site release sync
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          gh api repos/zeru-sakamoto/kvc-site/dispatches \
+            -f event_type=krita-vc-release \
+            -F "client_payload[tag]=${{ github.event.release.tag_name }}"

@@ -2,7 +2,9 @@ name: Release build
 
 # Manual only: run from the Actions tab (or `gh workflow run release.yml`) when you're ready
 # to cut a release. Builds Windows, macOS (universal), and Linux and opens a draft GitHub
-# Release with all installers attached for review before publishing.
+# Release with all installers attached for review before publishing. Also re-zips the Krita
+# plugin (krita-plugin/kritavc.desktop + krita-plugin/kritavc/) fresh from source and attaches
+# it as kritavc-plugin.zip, so the release always ships the plugin in sync with the app.
 #
 # Signing/notarization is intentionally not configured (no certs in this repo yet) — builds
 # are unsigned, so macOS shows a Gatekeeper prompt and Windows a SmartScreen prompt on first
@@ -69,3 +71,16 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Runs once (not once per matrix leg) since all three legs upload to the same
+      # release/tag and `zip` isn't reliably available on windows-latest.
+      - name: Attach plugin zip to release
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          TAG="app-v${VERSION}"
+          cd krita-plugin
+          zip -r kritavc-plugin.zip kritavc.desktop kritavc
+          gh release upload "$TAG" kritavc-plugin.zip --repo zeru-sakamoto/krita-vc --clobber
