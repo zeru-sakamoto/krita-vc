@@ -2071,8 +2071,10 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "trash",
  "walkdir",
+ "windows-sys 0.59.0",
  "zip",
  "zstd",
 ]

@@ -1,6 +1,7 @@
 pub mod branch;
 pub mod commands;
 pub mod commit;
+pub mod cpu;
 pub mod delta;
 pub mod error;
 pub mod gc;
@@ -61,6 +62,7 @@ pub fn run() {
             commands::get_repo_config,
             commands::set_repo_config,
             commands::repo_storage_stats,
+            commands::set_cpu_budget,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

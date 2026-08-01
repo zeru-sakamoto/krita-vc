@@ -63,22 +63,31 @@ fn main() -> ExitCode {
     };
     let flags = parse_flags(&args[1..]);
 
+    // The plugin spawns us from inside Krita, often while Krita is painting — so unlike the
+    // desktop app we have no idle moment to work in. Drop the whole process below normal before
+    // touching the engine; `cpu::install` below adds the thread budget on top.
+    krita_vc_lib::cpu::lower_process_priority();
+
     // The plugin parses our stdout/stderr as JSON, so a panic must not escape as a plain-text
     // Rust backtrace. Silence the default hook (it prints to stderr) and turn any unwinding
     // panic — an engine `unwrap`/index on a corrupt store, say — into the same {"error":...}
     // contract every other failure already uses.
     std::panic::set_hook(Box::new(|_| {}));
-    let dispatch = std::panic::AssertUnwindSafe(|| match cmd.as_str() {
-        "status" => run_status(&flags),
-        "commit" => run_commit(&flags),
-        "branches" => run_branches(&flags),
-        "switch" => run_switch(&flags),
-        "create-branch" => run_create_branch(&flags),
-        "discard" => run_discard(&flags),
-        "stash" => run_stash(&flags),
-        "stash-pop" => run_stash_pop(&flags),
-        "stash-list" => run_stash_list(&flags),
-        other => Err(format!("unknown command: {other}")),
+    // `install` sits *inside* catch_unwind so a panic on a rayon worker still becomes the
+    // {"error":...} JSON contract rather than escaping as a backtrace.
+    let dispatch = std::panic::AssertUnwindSafe(|| {
+        krita_vc_lib::cpu::install(|| match cmd.as_str() {
+            "status" => run_status(&flags),
+            "commit" => run_commit(&flags),
+            "branches" => run_branches(&flags),
+            "switch" => run_switch(&flags),
+            "create-branch" => run_create_branch(&flags),
+            "discard" => run_discard(&flags),
+            "stash" => run_stash(&flags),
+            "stash-pop" => run_stash_pop(&flags),
+            "stash-list" => run_stash_list(&flags),
+            other => Err(format!("unknown command: {other}")),
+        })
     });
     let result = std::panic::catch_unwind(dispatch).unwrap_or_else(|payload| {
         let detail = payload
@@ -103,6 +112,22 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The branch list as both `status` and `branches` report it — one helper so the two shapes
+/// can't drift.
+fn branch_list(repo: &Repo) -> Vec<serde_json::Value> {
+    repo.branches
+        .branches
+        .iter()
+        .map(|(name, tip)| {
+            json!({
+                "name": name,
+                "tip": (!tip.is_empty()).then(|| tip.clone()),
+                "current": *name == repo.branches.current,
+            })
+        })
+        .collect()
+}
+
 fn run_status(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
@@ -111,10 +136,12 @@ fn run_status(flags: &HashMap<String, String>) -> Result<String, String> {
         .iter()
         .map(|c| json!({ "path": c.rel, "status": c.status }))
         .collect();
-    // Stash count rides along so the plugin's 1.5s poll needn't spawn a third process —
-    // open_light already read the shelf.
+    // Stash count and the branch list ride along so the plugin's 1.5s poll needs exactly one
+    // process: `open_light` already read the shelf and branches.json, so both are free here,
+    // whereas a second `kvc branches` spawn would re-parse the whole commit log to get them.
     Ok(json!({
         "branch": repo.branches.current,
+        "branches": branch_list(&repo),
         "changes": changes,
         "stashes": repo.stashes.stashes.len(),
     })
@@ -138,19 +165,7 @@ fn run_commit(flags: &HashMap<String, String>) -> Result<String, String> {
 fn run_branches(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
-    let branches: Vec<_> = repo
-        .branches
-        .branches
-        .iter()
-        .map(|(name, tip)| {
-            json!({
-                "name": name,
-                "tip": (!tip.is_empty()).then(|| tip.clone()),
-                "current": *name == repo.branches.current,
-            })
-        })
-        .collect();
-    Ok(json!({ "current": repo.branches.current, "branches": branches }).to_string())
+    Ok(json!({ "current": repo.branches.current, "branches": branch_list(&repo) }).to_string())
 }
 
 fn run_switch(flags: &HashMap<String, String>) -> Result<String, String> {

@@ -152,22 +152,32 @@ export const LayerStackPanel = memo(function LayerStackPanel({
 
   // Prefer the backend's real composite (mergedimage.png) for the thumb — one small image
   // instead of concatenating every layer's raster markup (mirrors the canvas's preference).
-  const compositeThumb = useMemo(() => {
+  // Split in two so the common branch doesn't depend on `diff.layers`: that array is
+  // reallocated on every streamed layer, and listing it here rebuilt (and re-decoded) this
+  // thumb per arrival even though the branch that runs never reads it.
+  const imageThumb = useMemo(() => {
     const img = diff.afterImage ?? diff.beforeImage;
-    if (img != null) {
-      const composite: ArtLayer = {
-        id: COMPOSITE_ID,
-        name: "Composite",
-        opacity: 100,
-        blendMode: "normal",
-        change: "modified",
-        before: null,
-        after: img,
-      };
-      return compositeSvg([composite], "after", diff.width, diff.height);
-    }
-    return compositeSvg(diff.layers, "after", diff.width, diff.height);
-  }, [diff.afterImage, diff.beforeImage, diff.layers, diff.width, diff.height]);
+    if (img == null) return null;
+    const composite: ArtLayer = {
+      id: COMPOSITE_ID,
+      name: "Composite",
+      opacity: 100,
+      blendMode: "normal",
+      change: "modified",
+      before: null,
+      after: img,
+    };
+    return compositeSvg([composite], "after", diff.width, diff.height);
+  }, [diff.afterImage, diff.beforeImage, diff.width, diff.height]);
+
+  // Fallback when there's no mergedimage.png: stack the layers, which really does change as
+  // they stream in.
+  const stackThumb = useMemo(
+    () => (imageThumb != null ? null : compositeSvg(diff.layers, "after", diff.width, diff.height)),
+    [imageThumb, diff.layers, diff.width, diff.height]
+  );
+
+  const compositeThumb = imageThumb ?? stackThumb!;
 
   return (
     <div className="flex w-50 shrink-0 flex-col border-r border-border bg-surface">

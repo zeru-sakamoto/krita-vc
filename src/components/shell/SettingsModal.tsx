@@ -12,6 +12,7 @@ import { useRepository, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
 import { useWindowChrome } from "../../lib/windowChrome";
+import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
 import type { Stash } from "../../types";
 
 type SettingsCategory = "appearance" | "stash" | "storage";
@@ -176,6 +177,34 @@ function StashSettings({
   );
 }
 
+/**
+ * App-global, unlike everything else in the Storage tab — so it renders outside the
+ * repo gate below and is labelled as applying everywhere.
+ */
+function CpuBudgetRow() {
+  const { budget, setBudget } = useCpuBudget();
+  const hint = CPU_BUDGETS.find((b) => b.percent === budget)?.hint ?? "";
+  return (
+    <label className="mb-3 block">
+      <span className="mb-1 block text-[12px] text-text-muted">Background CPU use</span>
+      <select
+        value={budget}
+        onChange={(e) => setBudget(Number(e.target.value))}
+        className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none!"
+      >
+        {CPU_BUDGETS.map((b) => (
+          <option key={b.percent} value={b.percent}>
+            {b.label}
+          </option>
+        ))}
+      </select>
+      <span className="mt-1 block text-[11px] text-text-muted">
+        {hint}. Applies to every repository.
+      </span>
+    </label>
+  );
+}
+
 function StorageSettings({
   config,
   updateConfig,
@@ -313,16 +342,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               ) : (
                 <NoRepoFallback />
               ))}
-            {category === "storage" &&
-              (current ? (
-                <StorageSettings
-                  config={config}
-                  updateConfig={updateConfig}
-                  onShowCleanup={() => setShowCleanup(true)}
-                />
-              ) : (
-                <NoRepoFallback />
-              ))}
+            {category === "storage" && (
+              <>
+                <CpuBudgetRow />
+                {current ? (
+                  <StorageSettings
+                    config={config}
+                    updateConfig={updateConfig}
+                    onShowCleanup={() => setShowCleanup(true)}
+                  />
+                ) : (
+                  <NoRepoFallback />
+                )}
+              </>
+            )}
           </div>
         </div>
       </Modal>

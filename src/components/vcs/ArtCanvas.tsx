@@ -157,7 +157,23 @@ export const ArtCanvas = memo(function ArtCanvas({
           : boxOverlay(diff, regions ?? []);
     }
     return wrapSvg(body, diff.width, diff.height);
-  }, [layers, state, overlay, highlightMode, diff, diffImage, diffOutline, regions]);
+    // `diff` is destructured into the three scalars actually read (path, width, height — see
+    // pixelOverlay/boxOverlay/wrapSvg) rather than listed whole. The object identity changes on
+    // every streamed layer while those three never do, and depending on it rebuilt this
+    // multi-MB string — and forced React to replace the whole inline-SVG subtree, re-decoding
+    // its base64 rasters — once per arriving layer, per canvas.
+  }, [
+    layers,
+    state,
+    overlay,
+    highlightMode,
+    diff.path,
+    diff.width,
+    diff.height,
+    diffImage,
+    diffOutline,
+    regions,
+  ]);
 
   return (
     <div

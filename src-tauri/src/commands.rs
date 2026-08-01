@@ -25,15 +25,40 @@ pub struct WorkingChange {
 }
 
 /// Run blocking engine work off the UI thread, flattening both join and engine errors.
+///
+/// The `cpu::install` wrap is the *entire* integration point for CPU budgeting: every command
+/// funnels through here, and nested `par_iter`s inherit the installing pool, so this one line
+/// keeps the whole engine inside its thread budget and at below-normal priority.
 async fn run<T, F>(f: F) -> std::result::Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(f)
+    tauri::async_runtime::spawn_blocking(move || crate::cpu::install(f))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+}
+
+/// `run`, plus a slot from the heavy-operation semaphore held for the whole call.
+///
+/// For commands that write, or that decode a whole document (diffs and layer streams). Cheap
+/// reads deliberately keep using plain `run` so a `list_commits` never queues behind a diff.
+async fn run_heavy<T, F>(f: F) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let _permit = crate::cpu::heavy_permit().await;
+    run(f).await
+}
+
+/// Percent of logical cores the engine may use (10-100). App-global, not per-repo — the
+/// frontend persists it and pushes it here on startup and on change.
+#[tauri::command]
+pub async fn set_cpu_budget(percent: u8) -> std::result::Result<(), String> {
+    crate::cpu::set_budget(percent);
+    Ok(())
 }
 
 // --- kvcimg raster delivery ---------------------------------------------------------------
@@ -143,7 +168,7 @@ pub async fn delete_repository(path: String) -> std::result::Result<bool, String
 /// `Repo::export_zip`). Read-only, so no `RepoLock`.
 #[tauri::command]
 pub async fn export_repository_zip(path: String, dest: String) -> std::result::Result<(), String> {
-    run(move || Repo::export_zip(Path::new(&path), Path::new(&dest))).await
+    run_heavy(move || Repo::export_zip(Path::new(&path), Path::new(&dest))).await
 }
 
 /// Zip every repo in `paths` into `dest_dir`, one `<folder-name>-<date>.zip` each. Independent,
@@ -154,7 +179,7 @@ pub async fn export_repositories_zip(
     paths: Vec<String>,
     dest_dir: String,
 ) -> std::result::Result<Vec<String>, String> {
-    run(move || {
+    run_heavy(move || {
         let dest_dir = Path::new(&dest_dir);
         let today = crate::repo::epoch_to_iso(
             std::time::SystemTime::now()
@@ -188,7 +213,7 @@ pub async fn cleanup_repository(
     path: String,
     dry_run: bool,
 ) -> std::result::Result<crate::gc::GcReport, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         // The real sweep deletes objects; a dry run only reads, so it needn't block writers.
         let _lock = if dry_run {
@@ -437,7 +462,7 @@ pub async fn commit_snapshot(
     author: String,
     paths: Option<Vec<String>>,
 ) -> std::result::Result<Commit, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "committing")?;
         let mut repo = Repo::open(root)?;
@@ -506,7 +531,7 @@ pub async fn create_branch(
     name: String,
     base: Option<String>,
 ) -> std::result::Result<Vec<BranchDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "creating a branch")?;
         let mut repo = if base.is_some() {
@@ -526,7 +551,7 @@ pub async fn switch_branch(
     path: String,
     name: String,
 ) -> std::result::Result<Vec<BranchDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "switching branches")?;
         let mut repo = Repo::open(root)?;
@@ -543,7 +568,7 @@ pub async fn merge_branch(
     source: String,
     author: String,
 ) -> std::result::Result<Commit, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "merging branches")?;
         let mut repo = Repo::open(root)?;
@@ -557,7 +582,7 @@ pub async fn delete_branch(
     path: String,
     name: String,
 ) -> std::result::Result<Vec<BranchDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "deleting a branch")?;
         let mut repo = Repo::open_light(root)?;
@@ -576,7 +601,7 @@ pub async fn layer_diff(
     old_commit: String,
     new_commit: String,
 ) -> std::result::Result<Vec<LayerDiff>, String> {
-    run(move || {
+    run_heavy(move || {
         let repo = Repo::open(Path::new(&path))?;
         // Pull just maindoc.xml out of each side's manifest — rebuilding the whole archive
         // (every tile of every layer) for one small entry dominated this command's cost.
@@ -606,7 +631,7 @@ pub async fn rollback_to_commit(
     commit_id: String,
     author: String,
 ) -> std::result::Result<Commit, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "rolling back")?;
         let mut repo = Repo::open(root)?;
@@ -623,7 +648,7 @@ pub async fn rollback_to_commit(
 /// Undo the last commit, keeping working-tree changes. Returns the new head (or null).
 #[tauri::command]
 pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "undoing the last commit")?;
         let mut repo = Repo::open(root)?;
@@ -638,7 +663,7 @@ pub async fn undo_last_commit(path: String) -> std::result::Result<Option<Commit
 /// is a UI-only concept the backend doesn't track).
 #[tauri::command]
 pub async fn discard_changes(path: String, paths: Vec<String>) -> std::result::Result<(), String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "discarding changes")?;
         let mut repo = Repo::open(root)?;
@@ -714,7 +739,7 @@ pub async fn create_stash(
     author: String,
     paths: Option<Vec<String>>,
 ) -> std::result::Result<Vec<StashDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "setting work aside")?;
         // Full open: storing the stashed content writes streams, which a light repo forbids.
@@ -732,7 +757,7 @@ pub async fn create_stash(
 /// for a conflict that can't be merged — a non-`.kra` file or a stashed deletion onto edited work.
 #[tauri::command]
 pub async fn pop_stash(path: String, id: String) -> std::result::Result<Vec<StashDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "bringing back set-aside work")?;
         let mut repo = Repo::open(root)?;
@@ -772,7 +797,7 @@ pub async fn restore_file(
     file: String,
     commit_id: String,
 ) -> std::result::Result<(), String> {
-    run(move || {
+    run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "restoring a file")?;
         let repo = Repo::open(root)?;
@@ -1526,7 +1551,7 @@ pub async fn commit_diff(
     path: String,
     commit_id: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let repo = Repo::open(Path::new(&path))?;
         // Register only after the path is confirmed to be a real repo, so a failed open never
         // adds a root to the kvcimg scheme's allowlist.
@@ -1564,7 +1589,7 @@ pub async fn commit_layers(
     file: String,
     on_layer: tauri::ipc::Channel<LayerDto>,
 ) -> std::result::Result<(), String> {
-    run(move || {
+    run_heavy(move || {
         let repo = Repo::open(Path::new(&path))?;
         // Register only after the path is confirmed to be a real repo, so a failed open never
         // adds a root to the kvcimg scheme's allowlist.
@@ -1645,7 +1670,7 @@ pub async fn working_diff(
     path: String,
     file: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
-    run(move || {
+    run_heavy(move || {
         let repo = Repo::open(Path::new(&path))?;
         // Register only after the path is confirmed to be a real repo, so a failed open never
         // adds a root to the kvcimg scheme's allowlist.
@@ -1727,7 +1752,7 @@ pub async fn working_layers(
     file: String,
     on_layer: tauri::ipc::Channel<LayerDto>,
 ) -> std::result::Result<(), String> {
-    run(move || {
+    run_heavy(move || {
         if !file.to_lowercase().ends_with(".kra") {
             return Ok(());
         }

@@ -70,6 +70,122 @@ The `prepare_stream`/`commit_prepared` split (`delta.rs`) is the general shape t
 read-only preparation (`&self`) can run in parallel across streams; only the serial fold
 (`&mut self`) touches shared state.
 
+## CPU headroom (`cpu.rs`)
+
+Everything else in this document argues for **throughput** — finish the operation as fast as
+possible. That is the wrong default on the machines this app is actually for. Rayon's *global*
+pool is sized to `num_cpus`, so with the 17 `par_iter` sites above (nested three deep on both hot
+paths) a commit or a diff pinned every logical core at normal priority. On a 2-4 core laptop that
+starves Krita — which is frequently the very thing that triggered the commit, via the plugin —
+along with the browser and the rest of the desktop. Being 20% faster is worth nothing if the
+artist can't draw while it happens.
+
+So the engine runs on **its own pool**, not rayon's global one:
+
+- **Below-normal worker threads.** `ThreadPoolBuilder::start_handler` drops each worker to
+  `THREAD_PRIORITY_BELOW_NORMAL` once, at birth (Windows, via `windows-sys`; a no-op elsewhere,
+  with `libc::nice` noted as the upgrade path). This is the part that does the real work — the OS
+  scheduler then always preempts us in favour of Krita's paint thread, so even at 100% budget the
+  desktop stays responsive. It costs nothing when the machine is otherwise idle, which is the
+  whole point of a priority hint over a hard cap.
+- **A thread-count budget**, default **75%** of logical cores (8 → 6, 4 → 3, 2 → 1), minimum 1.
+  Belt to the priority suspenders, and the knob an artist can actually reason about.
+  User-facing in Settings → Storage as **"Background CPU use"** (Gentle 50 / Balanced 75 / Full
+  speed 100); app-global rather than per-repo, since the pool is process-wide and two open
+  repositories would otherwise fight over it. Persisted in `localStorage`
+  (`src/lib/cpuBudget.tsx`, same shape as `windowChrome.tsx`) and pushed down via
+  `set_cpu_budget`. Changing it swaps in a fresh pool — in-flight work finishes on the old one,
+  which drops with its last `Arc`, so no restart is needed.
+
+We build our own pool rather than calling `build_global()` precisely because the global pool can
+only be initialized once and the budget is a live setting.
+
+**The integration is one line.** Every Tauri command funnels through `commands::run`, and nested
+`par_iter`s inherit the installing pool, so wrapping that one closure in `cpu::install` puts the
+entire engine — all three nesting levels, blake3's `update_rayon` included — inside the budget.
+No call site knows this exists. A unit test in `cpu.rs` pins the nesting behaviour, since that
+inheritance is the load-bearing assumption.
+
+Measure the tradeoff with `cpu_budget_sweep` in `tests/bench.rs` (`cargo test --release --test
+bench -- --ignored --nocapture`), which times a first commit and a cold layer raster at 100/75/50.
+Measured on a 4-core Windows machine (single run, so treat small deltas as noise):
+
+```text
+budget      threads        commit        raster
+100               4         2.46s         1.43s   (baseline)
+75                3         2.02s         1.27s   (-18% / -11%)
+50                2         2.56s         1.26s   ( +4% /  -12%)
+```
+
+The headline is that **headroom is close to free here**: 75% was not slower than 100%, and even
+halving the pool cost ~4% on commit and nothing measurable on the raster. Both paths are limited
+by I/O and serial spine work (the zip walk, the chain fold) as much as by parallel throughput, so
+the last cores were buying little. That is what justifies 75% as the default rather than 100% —
+but it is one machine, and a many-core box with fast storage would show a real cost, which is
+exactly why the setting exists.
+
+### The `kvc` CLI lowers its whole process
+
+`cpu::lower_process_priority` (`SetPriorityClass`, the process-wide sibling of the per-thread
+hint) is called once at the top of `kvc.rs::main`, and the dispatch runs inside `cpu::install`.
+The CLI needs *more* protection than the desktop app, not less: the plugin spawns it **inside
+Krita's process tree while Krita is painting**, so it has no idle moment to work in, and its main
+thread does engine work directly rather than only feeding rayon workers. `install` sits inside the
+existing `catch_unwind`, so a panic on a worker still becomes the `{"error":...}` JSON contract.
+
+### Concurrent heavy operations are capped at two
+
+Cores are bounded by the pool; **memory was not**. Every command gets its own `spawn_blocking`
+(tokio's default cap is 512 threads) and each heavy op carries its own 64 MB
+`RESTORE_CHUNK_BUDGET`. Critically, **cancelling a diff in the UI does not cancel the backend** —
+`useArtLayers`' cleanup only sets a flag that makes `onmessage` drop messages, while Rust
+rasterizes every layer to completion — so clicking quickly through history stacked unbounded work.
+
+`cpu::heavy_permit` is a 2-permit `tokio::sync::Semaphore`; `commands::run_heavy` takes one and
+holds it for the call. Two covers the normal "one view in flight, one incoming" case with no added
+latency. Cheap reads (`list_commits`, `list_branches`, config getters) deliberately keep plain
+`run`, so they never queue behind a diff. The permit is always acquired **outside** `RepoLock`, so
+there's no lock-order hazard — and two queued commits now serialize instead of the second failing
+with `Locked`.
+
+### The plugin poll spawns one process, not two
+
+`vc_docker.py`'s 1.5 s timer called both `kvc status` and `kvc branches`, each a synchronous
+`subprocess.run` on Krita's GUI thread. On Windows the spawn dominates, and the second one was
+pure duplication: both call `Repo::open_light` (which parses the whole `commits.log`), and
+`run_status` **already had `repo.branches` in memory** — it emitted `branches.current` and the
+docker threw it away.
+
+`run_status` now emits the full `branches` list too, at zero extra I/O, sharing a `branch_list`
+helper with `run_branches` so the two shapes can't drift (`kvc_cli.rs` asserts they match). This
+follows the precedent already set by the `stashes` count. The poll reads both from the one result.
+`refresh()` also returns early when the docker isn't visible, below the page-selection block so
+document switching stays instant — the only early-out with no correctness argument to make, since
+a `doc.modified()`-based one would be actively wrong (a document goes *un*-modified exactly when a
+save creates the change the poll must notice).
+
+### Streamed layers no longer re-render everything
+
+Each arriving layer set `{ layers: new Map(received) }`. The `ArtLayer` objects inside were
+already identity-stable — the churn was introduced downstream, and three memos that should have
+held missed, costing 3 full SVG rebuilds plus 3 `dangerouslySetInnerHTML` subtree replacements
+(re-parse + base64 raster re-decode) per arrival. Worst in **Composite view, the default**, where
+both canvases render `mergedimage.png` — which never changes during streaming — and rebuilt it
+anyway.
+
+Fixed by narrowing three dependency arrays, with no behaviour change and no added latency:
+`ArtDiffView` lifts the composite layer into its own memo keyed on `diff.beforeImage`/`afterImage`
+(memoizing the one-element *array*, not just the object — the outer memo still re-runs, and a
+fresh `[composite]` would defeat the point); `ArtCanvas`'s `compositeSvg` depends on
+`diff.path`/`width`/`height` instead of the whole `diff`; `LayerStackPanel` splits `compositeThumb`
+so the branch that runs doesn't depend on `diff.layers`. Composite view now rebuilds zero times
+while layers stream.
+
+`overlay` and `pendingIds` still miss every flush and are left alone on purpose — their outputs
+are consumed as stable field references and booleans, so the miss costs an allocation and nothing
+downstream. Throttling the flush to a fixed interval was also rejected: once the deps hold it buys
+nothing and makes layers pop in visibly chunkier.
+
 ## Skipping work entirely
 
 - **Scanner fast path** (`scan.rs`) — a tracked file whose size+mtime still match the index
@@ -357,7 +473,8 @@ optimization while our own crate stays at `opt-level = 1` for tolerable rebuild 
 builds use thin LTO for a faster binary without paying full-LTO link times.
 
 `blake3 = { version = "1", features = ["rayon"] }` enables the parallel hashing path described
-above.
+above. `windows-sys` (Windows-only, one feature) exists solely for `SetThreadPriority` — the
+stdlib has no thread-priority API and the CPU headroom section above depends on it.
 
 ## Ceilings / deferred (ponytail)
 

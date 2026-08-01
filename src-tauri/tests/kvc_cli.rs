@@ -102,6 +102,14 @@ fn status_commit_roundtrip_and_lock() {
         .map(|b| b["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"main") && names.contains(&"feature"));
+
+    // `status` carries the same branch list, which is what lets the plugin's 1.5s poll spawn
+    // one process instead of two. Both come from `branch_list`, so this pins them together —
+    // if they ever drift the docker's branch menu silently goes wrong.
+    let (ok, status) = kvc(root, &["status"]);
+    assert!(ok);
+    assert_eq!(status["branch"], branches["current"]);
+    assert_eq!(status["branches"], branches["branches"]);
 }
 
 /// The staging + set-aside surface the Krita docker drives. Field names and the `--paths`

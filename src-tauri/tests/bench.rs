@@ -556,3 +556,87 @@ fn composite_commit_growth() {
         mb(rebuilt.len() as u64)
     );
 }
+
+/// What CPU headroom costs. The engine caps its rayon pool to a percentage of logical cores
+/// (`cpu::set_budget`) so a commit doesn't pin every core and stall Krita/the browser — this
+/// puts a wall-clock number on that tradeoff instead of leaving it a guess.
+///
+/// The two dominant CPU paths are timed per budget: a first commit (zip walk → tile decompose
+/// → bsdiff/zstd/blake3) and a cold layer raster (chain replay → LZF decode → downscale → PNG).
+#[test]
+#[ignore = "benchmark — run manually in release mode with --nocapture"]
+fn cpu_budget_sweep() {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    println!("logical cores: {cores}\n");
+    println!(
+        "{:<10} {:>8}  {:>12}  {:>12}",
+        "budget", "threads", "commit", "raster"
+    );
+
+    let mut baseline: Option<(f64, f64)> = None;
+    for percent in [100u8, 75, 50] {
+        krita_vc_lib::cpu::set_budget(percent);
+
+        // A fresh repo per budget: reusing one would let the previous run's object store
+        // dedup the next run's tiles away and time nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        repo::Repo::init(root).unwrap();
+        let mut r = repo::Repo::open(root).unwrap();
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let layers: Vec<Vec<(i64, i64, Vec<u8>)>> =
+            (0..LAYERS).map(|_| full_grid(&mut rng)).collect();
+        std::fs::write(root.join("art.kra"), doc(&layers)).unwrap();
+
+        // install(), not a bare call: that's how commands::run enters the pool in the real
+        // app, and it's what makes the nested par_iters honour the budget.
+        let t = Instant::now();
+        let c = krita_vc_lib::cpu::install(|| {
+            commit::commit_snapshot(&mut r, "initial", "bench").unwrap()
+        });
+        let commit_s = t.elapsed().as_secs_f64();
+
+        let hash = c
+            .files
+            .iter()
+            .find(|f| f.path == "art.kra")
+            .unwrap()
+            .content
+            .clone()
+            .unwrap();
+        let m = kra::load_manifest(&r, "art.kra", &hash).unwrap();
+        let px = TILE_GRID * 64;
+        let t = Instant::now();
+        krita_vc_lib::cpu::install(|| {
+            kra::layer_raster(
+                &r,
+                "art.kra",
+                &m,
+                "img",
+                "layer0",
+                px,
+                px,
+                &delta::TileCache::new(),
+            )
+            .unwrap()
+        });
+        let raster_s = t.elapsed().as_secs_f64();
+
+        let threads = (cores * percent as usize / 100).max(1);
+        match baseline {
+            None => {
+                baseline = Some((commit_s, raster_s));
+                println!("{percent:<10} {threads:>8}  {commit_s:>11.2}s  {raster_s:>11.2}s   (baseline)");
+            }
+            Some((bc, br)) => println!(
+                "{percent:<10} {threads:>8}  {commit_s:>11.2}s  {raster_s:>11.2}s   ({:+.0}% / {:+.0}%)",
+                (commit_s / bc - 1.0) * 100.0,
+                (raster_s / br - 1.0) * 100.0
+            ),
+        }
+    }
+    // Leave the process on the shipping default rather than whatever ran last.
+    krita_vc_lib::cpu::set_budget(krita_vc_lib::cpu::DEFAULT_BUDGET);
+}

@@ -148,27 +148,39 @@ export function ArtDiffView({
     return new Set(diff.layers.filter((l) => !fetchedLayers?.has(l.id)).map((l) => l.id));
   }, [diff, fetchedLayers, layersLoading]);
 
+  // Keyed on `diff`, not `effectiveDiff`: the composite images ship with the first commit_diff
+  // and never stream, so this object must keep its identity while layers arrive. Built from
+  // `effectiveDiff` it was reallocated on every streamed layer, which cost the Composite view —
+  // the default — a full canvas re-serialize + innerHTML reparse per layer, for identical output.
+  // The one-element *array* is memoized, not just the layer object: `layers` below re-runs
+  // whenever a layer streams in, and returning a fresh `[composite]` each time would defeat
+  // the whole point by handing ArtCanvas a new prop identity anyway.
+  const compositeLayers = useMemo<ArtDiff["layers"] | null>(() => {
+    if (diff.beforeImage === undefined && diff.afterImage === undefined) return null;
+    return [
+      {
+        id: COMPOSITE_ID,
+        name: "Composite",
+        opacity: 100,
+        blendMode: "normal",
+        change: "modified",
+        before: diff.beforeImage ?? null,
+        after: diff.afterImage ?? null,
+      },
+    ];
+  }, [diff.beforeImage, diff.afterImage]);
+
   const layers = useMemo(() => {
     if (selectedId === COMPOSITE_ID) {
       // Prefer the backend's real composite (mergedimage.png) over stacking layers, so the
       // composite is correct even if some layers can't be rastered.
-      if (effectiveDiff.beforeImage !== undefined || effectiveDiff.afterImage !== undefined) {
-        const composite: ArtDiff["layers"][number] = {
-          id: COMPOSITE_ID,
-          name: "Composite",
-          opacity: 100,
-          blendMode: "normal",
-          change: "modified",
-          before: effectiveDiff.beforeImage ?? null,
-          after: effectiveDiff.afterImage ?? null,
-        };
-        return [composite];
-      }
+      if (compositeLayers) return compositeLayers;
+      // No composite image: stack the layers instead, which genuinely does change per arrival.
       return effectiveDiff.layers;
     }
     const found = effectiveDiff.layers.find((l) => l.id === selectedId);
     return found ? [found] : effectiveDiff.layers;
-  }, [effectiveDiff, selectedId]);
+  }, [compositeLayers, effectiveDiff.layers, selectedId]);
 
   // The change-highlight source follows the selection: the whole-file composite highlight for the
   // Composite view, or the selected layer's *own* highlight (so its outline hugs only that layer's

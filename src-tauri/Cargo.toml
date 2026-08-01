@@ -56,6 +56,14 @@ thiserror = "2"
 png = "0.17"
 bincode = "1"
 trash = "5.2.6"
+# Already in the tree via tauri, which re-exports Mutex/RwLock but not Semaphore and whose own
+# docs say to reach for tokio directly when a type is missing. Only `sync` is needed.
+tokio = { version = "1", features = ["sync"] }
+
+# Only for SetThreadPriority — the stdlib has no thread-priority API, and running our rayon
+# workers below normal is what keeps Krita responsive while we commit (see src/cpu.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -79,7 +79,9 @@ section below), an **author name** (`authorName.tsx`, persisted to `localStorage
 Aside** (the shelf: every stash with its origin branch + age; per-row remove and remove-all,
 confirms rendered as *sibling* modals per the `CleanupModal` pattern — `Modal` has no portal), and
 **Storage** (per-repo `cacheMaxBytes` + `tilePixelDeltas` knobs — `get_repo_config`/`set_repo_config`
-→ `Repo::save_config`, a config-only write — plus "Clean up storage"). Backing up a repository
+→ `Repo::save_config`, a config-only write — plus "Clean up storage", plus the one **app-global**
+setting in that tab, **"Background CPU use"** — see the CPU headroom note below; it renders
+*outside* the tab's repo gate so it's reachable with no repository open). Backing up a repository
 (`backupRepository` in `repository.tsx`, zips the project via `export_repository_zip`) is **not**
 in Settings — it's its own one-click zip-icon `IconButton` in `ActivityBar.tsx`, directly above
 the Settings gear, wired to a small global toast (`lib/toast.tsx`, `ToastProvider`/`useToast`,
@@ -105,11 +107,40 @@ outside the shell or on a cache-write failure they fall back to base64 data URLs
 Non-`.kra` diffs are still minimal. Rust tests live in `src-tauri/tests/`; the frontend has no test
 runner yet — if you add one, update this file.
 
+**CPU headroom** (`cpu.rs`): the engine deliberately does **not** take the whole machine. Rayon's
+global pool would size to `num_cpus`, and with 17 `par_iter` sites nested three deep on both hot
+paths (diff: layers → tiles → downscale rows; commit: entries → tiles → bsdiff/zstd/blake3) a
+commit pinned every core at normal priority — starving Krita, which is often the very thing that
+triggered the commit via the plugin. So we build **our own pool**: workers are born at
+below-normal priority (`start_handler` → `SetThreadPriority`, Windows-only via `windows-sys`, no-op
+elsewhere — this is the part that actually keeps the desktop responsive), sized to a user-set
+percentage of logical cores (default 75%, min 1). The integration is **one line** —
+`commands::run` is the single funnel for every command and nested `par_iter`s inherit the
+installing pool, so wrapping that closure in `cpu::install` covers the entire engine; a unit test
+pins that inheritance because everything depends on it. The budget is app-global (the pool is
+process-wide), so it lives in `localStorage` via `src/lib/cpuBudget.tsx` → `set_cpu_budget`, **not**
+in the per-repo `Config`. Changing it swaps in a fresh pool with no restart. `cpu_budget_sweep` in
+`tests/bench.rs` measures what the cap costs. Three things ride along with it:
+the **`kvc` CLI** calls `cpu::lower_process_priority` (`SetPriorityClass`) and installs the pool
+too — it needs it *more* than the app, since the plugin spawns it inside Krita's process tree
+mid-paint; **concurrent heavy ops are capped at two** (`cpu::heavy_permit`, a
+`tokio::sync::Semaphore`, taken by `commands::run_heavy` — cheap reads keep plain `run` so they
+never queue behind a diff), because cancelling a diff in the UI does *not* cancel the backend and
+rapid history clicking otherwise stacked unbounded 64 MB decode buffers; and the **plugin poll
+spawns one process per tick, not two** — `kvc status` now also emits the branch list, free because
+`open_light` already parsed `branches.json` (shared `branch_list` helper with `run_branches`,
+pinned equal by `kvc_cli.rs`), and `refresh()` returns early when the docker isn't visible.
+On the frontend, three memo dep arrays are deliberately *narrower* than the values they close over
+(`ArtDiffView`'s composite layer, `ArtCanvas`'s `compositeSvg`, `LayerStackPanel`'s
+`compositeThumb`) — streamed layers reallocate `diff`/`diff.layers` every arrival while the fields
+those memos actually read never change, and depending on the whole object rebuilt multi-MB SVG
+strings per layer. Don't "fix" them back to exhaustive deps. See
+[`docs/performance.md`](docs/performance.md).
+
 Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
 control (the backend), the visual diff viewer, [performance](docs/performance.md) (why the
-control (the backend), the visual diff viewer, [performance](docs/performance.md) (why the
-`.kra` diff path is fast: staged/streamed loading, rayon parallelism, the `.kvc/cache/` raster
-cache, raster downscaling, and the dev/release build profile), and the
+`.kra` diff path is fast: staged/streamed loading, rayon parallelism, CPU headroom, the
+`.kvc/cache/` raster cache, raster downscaling, and the dev/release build profile), and the
 [performance report](docs/performance-report.md) (the **Performance** tab: client-side operation
 timing + per-version storage-saved-vs-full-copy metrics).
 

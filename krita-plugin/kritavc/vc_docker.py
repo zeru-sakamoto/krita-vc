@@ -296,6 +296,16 @@ class VcDocker(DockWidget):
         self.stack.setCurrentIndex(PAGE_MAIN)
         self.repo_label.setText(os.path.basename(self.repo_root))
 
+        # Nothing above this point spawns a process, so document/repo switching stays instant
+        # even while hidden. Below it we'd pay a `kvc` spawn on Krita's UI thread — pointless
+        # when the docker is tabbed behind another or collapsed, since nothing it would update
+        # is on screen. The next tick after it becomes visible restores truth, and the user
+        # can't click our buttons while they can't see them, so `_shown_paths` can't go stale
+        # underneath a write. Deliberately not keyed on doc.modified(): a document goes
+        # *un*-modified exactly when a save creates the change the poll needs to notice.
+        if self.visibleRegion().isEmpty():
+            return
+
         if dirty:
             # Mostly seen while painting — focusing this panel saves. It means the canvas is
             # ahead of the changelist below.
@@ -304,8 +314,10 @@ class VcDocker(DockWidget):
             self.status_label.setText("✓ Saved")
 
         try:
+            # One spawn per tick, not two: `status` carries the branch list as well, and it's
+            # free there (open_light already parsed branches.json). A separate `kvc branches`
+            # re-parsed the whole commit log in a second process for data we already had.
             result = kvc.status(self.repo_root)
-            branch_result = kvc.branches(self.repo_root)
         except kvc.KvcError as e:
             self._show_error(str(e))
             self.commit_button.setEnabled(False)
@@ -316,7 +328,7 @@ class VcDocker(DockWidget):
         changes = result.get("changes") or []
         self.stash_count = result.get("stashes") or 0
         self._populate_changes(changes)
-        self._populate_branch_menu(branch_result)
+        self._populate_branch_menu(result)
         self._populate_options_menu(len(changes))
 
         # Not gated on `dirty`: committing saves first. Nothing ticked commits nothing though,
@@ -366,8 +378,10 @@ class VcDocker(DockWidget):
         paths = [p for p in (self._shown_paths or []) if p in self.checked]
         return None if len(paths) == len(self._shown_paths or []) else paths
 
-    def _populate_branch_menu(self, branch_result):
-        self.branch_button.setText(f"⌥ {branch_result.get('current') or '?'} ▾")
+    def _populate_branch_menu(self, result):
+        # Fed the `status` result, which names the current branch `branch` (`kvc branches` calls
+        # the same value `current`); the `branches` list is identical in both.
+        self.branch_button.setText(f"⌥ {result.get('branch') or '?'} ▾")
 
         old_menu = self.branch_button.menu()
         if old_menu is not None and old_menu.isVisible():
@@ -378,7 +392,7 @@ class VcDocker(DockWidget):
         # Rebuilt every refresh (branch list can change from outside Krita too) — drop
         # the previous menu explicitly, setMenu() alone doesn't delete the old one.
         menu = QMenu(self.branch_button)
-        for b in branch_result.get("branches") or []:
+        for b in result.get("branches") or []:
             if b.get("current") or not b.get("name"):
                 continue
             action = menu.addAction(b["name"])
