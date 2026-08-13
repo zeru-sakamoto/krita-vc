@@ -227,6 +227,19 @@ pub async fn cleanup_repository(
     .await
 }
 
+/// Read-only integrity check: missing objects, broken chains, dangling branch tips, unreadable
+/// commit-log lines, unparseable packs. Takes no lock — it only reads, like the cleanup dry run.
+#[tauri::command]
+pub async fn check_repository(
+    path: String,
+) -> std::result::Result<crate::check::CheckReport, String> {
+    run_heavy(move || {
+        let repo = Repo::open(Path::new(&path))?;
+        crate::check::check_repository(&repo)
+    })
+    .await
+}
+
 /// Settings knobs a user can see/edit for this repo (cache budget, tile pixel deltas).
 #[tauri::command]
 pub async fn get_repo_config(path: String) -> std::result::Result<Config, String> {
@@ -800,10 +813,12 @@ pub async fn restore_file(
     run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "restoring a file")?;
-        let repo = Repo::open(root)?;
+        let mut repo = Repo::open(root)?;
+        // Verified rebuild: these bytes replace a file in the working tree.
+        repo.verify_reads = true;
         let bytes = commit::file_at_commit(&repo, &file, &commit_id)?;
         let target: PathBuf = crate::repo::safe_join(&repo.root, &file)?;
-        std::fs::write(&target, bytes).map_err(|e| crate::error::io_at(&target, e))?;
+        crate::repo::write_file_atomic(&target, &bytes)?;
         Ok(())
     })
     .await

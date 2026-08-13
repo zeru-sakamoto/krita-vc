@@ -91,6 +91,11 @@ interface RepositoryValue {
    * plain browser or with no repository selected.
    */
   cleanupRepository: (dryRun: boolean) => Promise<CleanupReport | null>;
+  /**
+   * Read-only integrity check over the stored history. Writes nothing, so it never raises the
+   * busy overlay. Null in a plain browser or with no repository selected.
+   */
+  checkRepository: () => Promise<CheckReport | null>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
@@ -114,6 +119,13 @@ export interface CleanupReport {
   bytesReclaimed: number;
   /** Preview images freed (regenerable — pruned to budget / stale-filter wipe). */
   cacheBytesReclaimed: number;
+}
+
+/** Shape returned by the `check_repository` Tauri command (serde camelCase). */
+export interface CheckReport {
+  commitsChecked: number;
+  objectsChecked: number;
+  problems: { kind: string; detail: string }[];
 }
 
 function joinPath(parent: string, name: string): string {
@@ -486,6 +498,17 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     [current, refresh]
   );
 
+  // No `busyMessage`: the check only reads, so there's nothing for a stray click to race.
+  const checkRepository = useCallback(async (): Promise<CheckReport | null> => {
+    if (!inTauri() || !current) return null;
+    setSaving(true);
+    try {
+      return await invoke<CheckReport>("check_repository", { path: current.path });
+    } finally {
+      setSaving(false);
+    }
+  }, [current]);
+
   const value = useMemo<RepositoryValue>(
     () => ({
       repositories,
@@ -509,6 +532,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       mergeBranch,
       deleteBranch,
       cleanupRepository,
+      checkRepository,
       refreshNonce,
       refresh,
       saving,
@@ -540,6 +564,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       mergeBranch,
       deleteBranch,
       cleanupRepository,
+      checkRepository,
       refreshNonce,
       refresh,
       saving,

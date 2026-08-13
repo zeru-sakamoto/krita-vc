@@ -197,3 +197,34 @@ fn staged_commit_stash_and_discard() {
     assert!(!ok);
     assert!(err["error"].as_str().unwrap().contains("bad --paths"));
 }
+
+/// `check` is read-only and reports findings as a *successful* run — `{"error":...}` on stderr
+/// means the check itself broke, and the plugin can't tell those apart otherwise.
+#[test]
+fn check_reports_findings_without_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    krita_vc_lib::repo::Repo::init(root).unwrap();
+    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
+    let (ok, _) = kvc(root, &["commit", "--message", "first", "--author", "Zeru"]);
+    assert!(ok);
+
+    let (ok, report) = kvc(root, &["check"]);
+    assert!(ok);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["problems"].as_array().unwrap().len(), 0);
+    assert!(report["objectsChecked"].as_u64().unwrap() > 0);
+
+    let hash = krita_vc_lib::repo::hash_bytes(b"hello world");
+    std::fs::remove_file(
+        root.join(".kvc/objects")
+            .join(&hash[..2])
+            .join(format!("{hash}.full")),
+    )
+    .unwrap();
+
+    let (ok, report) = kvc(root, &["check"]);
+    assert!(ok, "a repo with problems is still a successful check run");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["problems"][0]["kind"], "missingObject");
+}

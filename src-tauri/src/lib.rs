@@ -1,4 +1,5 @@
 pub mod branch;
+pub mod check;
 pub mod commands;
 pub mod commit;
 pub mod cpu;
@@ -59,6 +60,7 @@ pub fn run() {
             commands::working_diff,
             commands::working_layers,
             commands::cleanup_repository,
+            commands::check_repository,
             commands::get_repo_config,
             commands::set_repo_config,
             commands::repo_storage_stats,

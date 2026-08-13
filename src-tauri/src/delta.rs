@@ -227,7 +227,7 @@ impl Repo {
     }
 
     /// Whether `name` already exists in the store, loose (sharded or legacy flat) or packed.
-    fn object_exists(&self, name: &str) -> bool {
+    pub(crate) fn object_exists(&self, name: &str) -> bool {
         let objects = self.objects_dir();
         objects.join(&name[..2]).join(name).exists()
             || objects.join(name).exists()
@@ -252,7 +252,10 @@ impl Repo {
     /// Rebuild the exact bytes for version `hash` of `key`, walking the patch chain back
     /// to its full snapshot. Integrity is guaranteed at write time (every patch is
     /// round-trip-verified in `prepare_stream`, objects are content-addressed), so the
-    /// read path skips re-hashing — it's the hottest loop in the visual diff.
+    /// read path skips re-hashing — it's the hottest loop in the visual diff. That reasoning
+    /// covers engine bugs but not bit rot or a failing disk, so the paths that write the result
+    /// into the working tree set [`Repo::verify_reads`] and pay one blake3 pass per object;
+    /// recursion means the whole patch chain gets verified link by link.
     pub fn reconstruct(&self, key: &str, hash: &str) -> Result<Vec<u8>> {
         let chain = self
             .chains
@@ -273,6 +276,9 @@ impl Repo {
                 out
             }
         };
+        if self.verify_reads && crate::repo::hash_bytes(&bytes) != hash {
+            return Err(KvcError::Corrupt(format!("{key}@{hash}")));
+        }
         Ok(bytes)
     }
 
@@ -310,6 +316,9 @@ impl Repo {
                 out
             }
         };
+        if self.verify_reads && crate::repo::hash_bytes(&bytes) != hash {
+            return Err(KvcError::Corrupt(format!("{key}@{hash}")));
+        }
         memo.insert(hash.to_string(), bytes.clone());
         Ok(bytes)
     }
@@ -362,7 +371,18 @@ pub(crate) fn write_loose(objects: &Path, name: &str, data: &[u8]) -> Result<()>
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
-    std::fs::write(&path, data).map_err(|e| io_at(&path, e))
+    // Temp-then-rename, because the dedup above trusts *existence*: a plain write interrupted by
+    // a crash would leave a truncated file under a name that claims a hash it doesn't have, and
+    // every later commit storing that content would skip the write and trust it forever. No
+    // fsync — this is the commit hot path (thousands of tiny objects), and an unsynced object is
+    // harmless given `save()`'s ordering: tips land last, so a lost object is only an orphan.
+    // A crash leftover is swept by GC, which deletes anything in `objects/` it can't name.
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, data).map_err(|e| io_at(&tmp, e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io_at(&path, e)
+    })
 }
 
 /// Read a loose object, preferring the sharded path; repos from before sharding keep their flat

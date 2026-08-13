@@ -34,6 +34,12 @@ pub enum KvcError {
     #[error("corrupted repository index: {0}")]
     BadIndex(String),
 
+    // A stored object rebuilt to bytes that don't hash to the name it was filed under — bit rot,
+    // a failing disk, or something outside the app editing `.kvc/`. Distinct from `MissingObject`:
+    // the data is there, it's just not what it claims to be.
+    #[error("corrupted stored object: {0}")]
+    Corrupt(String),
+
     #[error("permission denied accessing {0}")]
     PermissionDenied(PathBuf),
 

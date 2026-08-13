@@ -2,7 +2,7 @@
 //! No Tauri dependency: built for out-of-process callers (the Krita plugin) that need
 //! to commit/scan/branch without going through the desktop app's IPC.
 //!
-//! Usage: kvc <status|commit|branches|switch|create-branch|discard|stash|stash-pop|stash-list>
+//! Usage: kvc <status|commit|branches|switch|create-branch|discard|stash|stash-pop|stash-list|check>
 //!            --repo <path> [flags...]
 //! Every subcommand prints one JSON object to stdout on success, or
 //! `{"error": "..."}` to stderr with a non-zero exit code on failure.
@@ -86,6 +86,7 @@ fn main() -> ExitCode {
             "stash" => run_stash(&flags),
             "stash-pop" => run_stash_pop(&flags),
             "stash-list" => run_stash_list(&flags),
+            "check" => run_check(&flags),
             other => Err(format!("unknown command: {other}")),
         })
     });
@@ -166,6 +167,24 @@ fn run_branches(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
     let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
     Ok(json!({ "current": repo.branches.current, "branches": branch_list(&repo) }).to_string())
+}
+
+/// Read-only integrity check. Takes no lock, and a repository *with* problems is still a
+/// successful run — `{"error":...}` on stderr means "the check itself failed", so reporting
+/// findings that way would be a lie the plugin can't tell apart from a crash.
+fn run_check(flags: &HashMap<String, String>) -> Result<String, String> {
+    let repo_path = require(flags, "repo")?;
+    let repo = Repo::open(Path::new(repo_path)).map_err(|e| e.to_string())?;
+    let report = krita_vc_lib::check::check_repository(&repo).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "ok": report.ok(),
+        "commitsChecked": report.commits_checked,
+        "objectsChecked": report.objects_checked,
+        "problems": report.problems.iter()
+            .map(|p| json!({ "kind": p.kind, "detail": p.detail }))
+            .collect::<Vec<_>>(),
+    })
+    .to_string())
 }
 
 fn run_switch(flags: &HashMap<String, String>) -> Result<String, String> {

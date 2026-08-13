@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Broom, CaretDown, Trash } from "@phosphor-icons/react";
+import { Broom, CaretDown, ShieldCheck, Trash } from "@phosphor-icons/react";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
@@ -8,7 +8,7 @@ import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme, type ThemeId } from "../../lib/theme";
-import { useRepository, type CleanupReport } from "../../lib/repository";
+import { useRepository, type CheckReport, type CleanupReport } from "../../lib/repository";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
 import { useWindowChrome } from "../../lib/windowChrome";
@@ -209,10 +209,12 @@ function StorageSettings({
   config,
   updateConfig,
   onShowCleanup,
+  onShowCheck,
 }: {
   config: ReturnType<typeof useRepoConfig>["config"];
   updateConfig: ReturnType<typeof useRepoConfig>["update"];
   onShowCleanup: () => void;
+  onShowCheck: () => void;
 }) {
   return (
     <>
@@ -264,6 +266,10 @@ function StorageSettings({
           <Broom size={14} />
           Clean up storage…
         </Button>
+        <Button onClick={onShowCheck}>
+          <ShieldCheck size={14} />
+          Check for problems…
+        </Button>
       </div>
     </>
   );
@@ -279,6 +285,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
   const stashes = useStashes(current?.path ?? null, refreshNonce);
   const [showCleanup, setShowCleanup] = useState(false);
+  const [showCheck, setShowCheck] = useState(false);
   const [showDropAll, setShowDropAll] = useState(false);
   const [confirmDrop, setConfirmDrop] = useState<Stash | null>(null);
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -350,6 +357,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     config={config}
                     updateConfig={updateConfig}
                     onShowCleanup={() => setShowCleanup(true)}
+                    onShowCheck={() => setShowCheck(true)}
                   />
                 ) : (
                   <NoRepoFallback />
@@ -360,6 +368,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </div>
       </Modal>
       {showCleanup && <CleanupModal onClose={() => setShowCleanup(false)} />}
+      {showCheck && <CheckModal onClose={() => setShowCheck(false)} />}
       {showDropAll && <DropAllStashesModal onClose={() => setShowDropAll(false)} />}
       {confirmDrop && <DropStashModal stash={confirmDrop} onClose={() => setConfirmDrop(null)} />}
     </>
@@ -530,6 +539,79 @@ function formatBytes(n: number): string {
   if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   if (n >= 1024) return `${Math.round(n / 1024)} KB`;
   return `${n} B`;
+}
+
+/** Backend problem kinds in plain language — the raw `detail` follows as the technical line. */
+const PROBLEM_LABEL: Record<string, string> = {
+  missingObject: "Missing stored data",
+  brokenChain: "A version can't be rebuilt",
+  danglingTip: "A branch points at a version that isn't there",
+  badLogLine: "The history file is damaged",
+  badPack: "A storage bundle is unreadable",
+};
+
+/**
+ * "Check for problems": a read-only pass over stored history, run once on open. It changes
+ * nothing, so there's no confirm step — it either reports all clear or lists what it found.
+ */
+function CheckModal({ onClose }: { onClose: () => void }) {
+  const { checkRepository } = useRepository();
+  const [report, setReport] = useState<CheckReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    checkRepository()
+      .then((r) => {
+        if (!cancelled) setReport(r);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [checkRepository]);
+
+  return (
+    <Modal
+      title="Check for problems"
+      onClose={onClose}
+      footer={<Button onClick={onClose}>Done</Button>}
+    >
+      <p className="mb-2 text-[13px] text-text">
+        Looks over every version in your history and confirms the stored data behind it is still
+        there. Nothing is changed or removed.
+      </p>
+      {error && <p className="text-[12px] text-danger">{error}</p>}
+      {!error && report == null && <p className="text-[12px] text-text-muted">Checking…</p>}
+      {!error && report != null && report.problems.length === 0 && (
+        <p className="text-[13px] text-text">
+          All clear — {report.commitsChecked} version{report.commitsChecked === 1 ? "" : "s"} and{" "}
+          {report.objectsChecked} stored piece{report.objectsChecked === 1 ? "" : "s"} checked out
+          fine.
+        </p>
+      )}
+      {!error && report != null && report.problems.length > 0 && (
+        <>
+          <p className="text-[13px] text-text">
+            Found {report.problems.length} problem{report.problems.length === 1 ? "" : "s"}. Your
+            current artwork on disk is untouched — restore from a backup if any version won't open.
+          </p>
+          <ul className="mt-2 max-h-60 space-y-1.5 overflow-y-auto">
+            {report.problems.map((p, i) => (
+              <li key={i} className="rounded-button bg-surface-2 px-2 py-1.5">
+                <span className="block text-[12px] text-text">
+                  {PROBLEM_LABEL[p.kind] ?? p.kind}
+                </span>
+                <span className="block break-all text-[11px] text-text-muted">{p.detail}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </Modal>
+  );
 }
 
 /**

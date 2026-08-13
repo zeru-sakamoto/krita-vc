@@ -291,6 +291,8 @@ pub fn materialize_tree(
     current: &BTreeMap<String, CommittedFile>,
     target: &BTreeMap<String, CommittedFile>,
 ) -> Result<()> {
+    // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
+    repo.verify_reads = true;
     for (path, f) in target {
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
@@ -300,7 +302,7 @@ pub fn materialize_tree(
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        crate::repo::write_file_atomic(&abs, &bytes)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
@@ -345,6 +347,8 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
     let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
     let current = current_tree(repo);
+    // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
+    repo.verify_reads = true;
 
     let mut files: Vec<CommittedFile> = Vec::new();
 
@@ -359,7 +363,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        crate::repo::write_file_atomic(&abs, &bytes)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
@@ -466,6 +470,8 @@ pub fn discard_working_changes(
     if selected.is_empty() {
         return Err(KvcError::Nothing);
     }
+    // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
+    repo.verify_reads = true;
 
     for change in selected {
         let abs = safe_join(&repo.root, &change.rel)?;
@@ -484,7 +490,7 @@ pub fn discard_working_changes(
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        std::fs::write(&abs, &bytes).map_err(|e| io_at(&abs, e))?;
+        crate::repo::write_file_atomic(&abs, &bytes)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));

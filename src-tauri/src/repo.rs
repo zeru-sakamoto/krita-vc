@@ -669,6 +669,13 @@ pub struct Repo {
     /// `config` was migrated on load — the next `save()` persists it (saves otherwise never
     /// touch `config.json`).
     config_dirty: bool,
+    /// Re-hash every object [`Repo::reconstruct`] rebuilds and refuse a mismatch. In-memory only
+    /// and off by default — deliberately **not** a user config knob. Turned on by the operations
+    /// that write reconstructed bytes into the working tree (switch, rollback, discard, stash
+    /// pop, restore-file), where a silently-wrong byte becomes the artist's file. Left off for
+    /// diffs and previews: that's the hot loop the app is tuned around, and a wrong pixel in a
+    /// preview is not data loss.
+    pub verify_reads: bool,
 }
 
 impl Repo {
@@ -792,6 +799,7 @@ impl Repo {
             commits_persisted: persisted,
             commits_rewrite: migrate,
             config_dirty,
+            verify_reads: false,
         })
     }
 
@@ -819,6 +827,7 @@ impl Repo {
             commits_persisted: persisted,
             commits_rewrite: migrate,
             config_dirty,
+            verify_reads: false,
         })
     }
 
@@ -885,6 +894,12 @@ impl Repo {
                 .open(&log)
                 .map_err(|e| io_at(&log, e))?;
             f.write_all(&lines).map_err(|e| io_at(&log, e))?;
+            // Fsync the append, not just the state files: `save()`'s "tips go last" ordering is
+            // only an ordering if this line is on the platter before `branches.json` names it.
+            // Unsynced, a power cut could land the fsynced tip over a log append still in cache —
+            // a dangling tip, the one failure this whole ordering exists to prevent. One fsync of
+            // a few hundred bytes per commit.
+            f.sync_all().map_err(|e| io_at(&log, e))?;
             self.commits_persisted = self.commits.len();
         }
         Ok(())
@@ -904,14 +919,62 @@ impl Repo {
     }
 }
 
-/// Atomic write: bytes to a temp file in the same dir, then rename over the target
-/// (Rust's `fs::rename` replaces the destination on Windows and POSIX).
+/// Atomic **and durable** write: bytes to a temp file in the same dir, fsync, then rename over
+/// the target (Rust's `fs::rename` replaces the destination on Windows and POSIX). Without the
+/// fsync the rename can land while the temp's contents are still in the page cache, so a power
+/// cut yields a zero-length `branches.json` — atomic against a process crash, not against the
+/// machine dying.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| io_at(&tmp, e))?;
+    sync_write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
+    sync_parent_dir(path);
     Ok(())
 }
+
+/// Atomic + durable write for a **working-tree** file (the artist's actual art). Same shape as
+/// [`write_atomic`], with the temp suffix *appended* rather than substituted: `with_extension`
+/// would collapse `a.kra` and `a.gpl` onto one temp path, and `.kvctmp` can never match
+/// `scan::is_supported`, so the scanner ignores a crash leftover instead of tracking it.
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".kvctmp");
+    let tmp = PathBuf::from(name);
+    if let Err(e) = sync_write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_at(path, e));
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Write and `fsync` one file. `sync_all` (metadata included) rather than `sync_data`: the file
+/// is brand new, so its size is part of what has to survive.
+fn sync_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = std::fs::File::create(path).map_err(|e| io_at(path, e))?;
+    f.write_all(bytes).map_err(|e| io_at(path, e))?;
+    f.sync_all().map_err(|e| io_at(path, e))?;
+    Ok(())
+}
+
+/// Fsync the directory holding `path` so the rename itself is durable. POSIX only — on Windows
+/// the rename is journaled by the filesystem and a directory handle can't be opened for sync
+/// without `FILE_FLAG_BACKUP_SEMANTICS`. Best-effort: a failure here doesn't invalidate the write.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// Compact (not pretty) — `.kvc/` JSON is machine state; pretty-printing scaled
 /// badly with history size back when chains were JSON too.

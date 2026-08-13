@@ -516,6 +516,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `pop_stash(path, id)` | Bring a stash back into the working tree and drop it from the shelf. Errors `"stash conflict: …"` if anything it holds is dirty (the frontend matches that prefix). Returns the shelf. |
 | `drop_stash(path, id)` / `drop_all_stashes(path)` | Remove stashes without restoring them; storage is reclaimed by the next `cleanup_repository`. |
 | `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip **or stash**. `dryRun` reports what would be freed without deleting anything. |
+| `check_repository(path)` | Read-only integrity check: missing objects, broken chains, dangling branch tips, undecodable commit-log lines, unreadable packs. Takes no lock and writes nothing; findings come back in the report, not as an error. |
 | `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |

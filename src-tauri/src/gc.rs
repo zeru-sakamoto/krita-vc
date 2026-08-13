@@ -56,9 +56,25 @@ mod tests {
     }
 }
 
-/// Collect everything unreachable from the current branch tips. With `dry_run` the report is
-/// computed but nothing is written or deleted.
-pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
+/// What the reachability walk found: live commits and the `(stream key, content hash)` pairs
+/// they reference, with patch bases closed over.
+pub(crate) struct Marks {
+    /// Commit ids reachable from some branch tip.
+    pub reachable: HashSet<String>,
+    /// Every live stream version, patch bases included.
+    pub marked: HashSet<(String, String)>,
+    /// Manifests that wouldn't load — only ever non-empty in `tolerant` mode.
+    pub problems: Vec<(String, String)>,
+    /// Every chain, handed back rather than re-exported: `export_all` re-reads and decodes every
+    /// shard on disk, and both callers need it right after the walk.
+    pub all: Chains,
+}
+
+/// The mark half of mark-and-sweep, shared with [`crate::check`]. `tolerant` is the whole
+/// difference between the two callers: GC must fail hard on a manifest it can't load (sweeping
+/// on a partial mark would delete live data), while `check` exists precisely to *report* that
+/// and keep walking.
+pub(crate) fn mark_live(repo: &Repo, tolerant: bool) -> Result<Marks> {
     // --- mark: reachable commits --------------------------------------------------------
     let mut reachable: HashSet<String> = HashSet::new();
     for tip in repo.branches.branches.values().filter(|t| !t.is_empty()) {
@@ -72,6 +88,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     let mut manifest_memo: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let mut live: HashSet<(String, String)> = HashSet::new();
+    let mut problems: Vec<(String, String)> = Vec::new();
     // Stashes are roots too, not just branch tips: a stash's content is referenced by nothing in
     // `commits.log`, so without this the sweep below would delete the chains and objects behind
     // every set-aside — the work would be unrecoverable. Their files are `CommittedFile`s stored
@@ -86,8 +103,11 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         let Some(content) = &f.content else { continue };
         if f.is_kra {
             live.insert((kra::manifest_stream_key(&f.path), content.clone()));
-            let manifest = kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo)?;
-            live.extend(kra::referenced_streams(&f.path, &manifest));
+            match kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo) {
+                Ok(manifest) => live.extend(kra::referenced_streams(&f.path, &manifest)),
+                Err(e) if tolerant => problems.push((f.path.clone(), e.to_string())),
+                Err(e) => return Err(e),
+            }
         } else {
             live.insert((format!("file:{}", f.path), content.clone()));
         }
@@ -110,6 +130,24 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
             queue.push((key, base));
         }
     }
+
+    Ok(Marks {
+        reachable,
+        marked,
+        problems,
+        all,
+    })
+}
+
+/// Collect everything unreachable from the current branch tips. With `dry_run` the report is
+/// computed but nothing is written or deleted.
+pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
+    let Marks {
+        reachable,
+        marked,
+        all,
+        ..
+    } = mark_live(repo, false)?;
 
     // --- sweep plan: chains + live object names ------------------------------------------
     let mut new_chains = Chains::default();

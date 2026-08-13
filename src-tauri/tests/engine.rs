@@ -3289,3 +3289,134 @@ fn stash_dtos_are_newest_first() {
     assert_eq!(dtos[0].changes[0].status, "M");
     assert_eq!(dtos[0].branch, "main");
 }
+
+// --- data integrity ---------------------------------------------------------------------
+
+/// The working tree is written temp-then-rename, so a failed write can never leave the artist's
+/// file half-replaced. In-process we can't kill a write mid-flight, so pin the observable
+/// contract instead: success replaces cleanly, failure leaves the target byte-intact, and
+/// neither leaves a `.kvctmp` behind for the scanner to trip over.
+#[test]
+fn working_tree_writes_are_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let target = root.join("art.kra");
+    std::fs::write(&target, b"original").unwrap();
+    repo::write_file_atomic(&target, b"replaced").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"replaced");
+    assert!(!root.join("art.kra.kvctmp").exists(), "temp must be gone");
+
+    // A directory in the way makes the rename fail — the interesting half.
+    let blocked = root.join("blocked.kra");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("inner"), b"keep me").unwrap();
+    assert!(repo::write_file_atomic(&blocked, b"nope").is_err());
+    assert!(blocked.is_dir(), "target must survive a failed write");
+    assert_eq!(std::fs::read(blocked.join("inner")).unwrap(), b"keep me");
+    assert!(
+        !root.join("blocked.kra.kvctmp").exists(),
+        "temp must be cleaned up"
+    );
+}
+
+/// A damaged object in the store must never be written into the working tree. The restore paths
+/// re-hash what they rebuild (`Repo::verify_reads`); the diff path deliberately doesn't, and this
+/// pins both halves — the second assert is what keeps the check off the hot loop.
+#[test]
+fn corrupt_object_is_refused_on_restore_but_not_on_the_diff_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"the real palette").unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+
+    // Small first version = a full zstd snapshot named by blake3 of the file bytes. Replace its
+    // payload with a *valid* frame holding different content: it decodes fine, so only a hash
+    // check can catch it.
+    let hash = repo::hash_bytes(b"the real palette");
+    let obj = root
+        .join(".kvc/objects")
+        .join(&hash[..2])
+        .join(format!("{hash}.full"));
+    assert!(obj.is_file(), "expected a loose full snapshot at {obj:?}");
+    std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+
+    // Restore path: refuses, and leaves the working file exactly as it was.
+    std::fs::write(root.join("a.gpl"), b"my unsaved edit").unwrap();
+    let mut r2 = repo::Repo::open(root).unwrap();
+    let err = commit::discard_working_changes(&mut r2, &c1.id, None).unwrap_err();
+    assert!(
+        matches!(err, KvcError::Corrupt(_)),
+        "expected Corrupt, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("a.gpl")).unwrap(),
+        b"my unsaved edit"
+    );
+
+    // Diff path: same object, no verification, no error — a wrong pixel in a preview is not data
+    // loss, and this is the loop the app is tuned around.
+    let r3 = repo::Repo::open(root).unwrap();
+    assert_eq!(
+        commit::file_at_commit(&r3, "a.gpl", &c1.id).unwrap(),
+        b"tampered"
+    );
+}
+
+/// `check` answers "is my history intact?" — it must be silent on a healthy repo and name the
+/// three failures that make history unreachable.
+#[test]
+fn check_reports_missing_objects_and_dangling_tips() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    std::fs::write(
+        root.join("art.kra"),
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            ("img/layers/layer1", tiled(&[(0, 0, b"tileAAAA")])),
+        ]),
+    )
+    .unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+
+    let clean = check::check_repository(&r).unwrap();
+    assert!(clean.ok(), "healthy repo reported {:?}", clean.problems);
+    assert!(clean.commits_checked >= 2 && clean.objects_checked > 0);
+
+    // Delete one live object.
+    let hash = repo::hash_bytes(b"base-a");
+    let obj = root
+        .join(".kvc/objects")
+        .join(&hash[..2])
+        .join(format!("{hash}.full"));
+    std::fs::remove_file(&obj).unwrap();
+    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    assert!(!report.ok());
+    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+    assert_eq!(report.problems[0].kind, "missingObject");
+
+    // A branch tip naming a version that isn't in the log — the state that makes every commit
+    // on that branch unreachable.
+    let mut r2 = repo::Repo::open(root).unwrap();
+    r2.branches
+        .branches
+        .insert("main".to_string(), "nosuchcommit".to_string());
+    r2.save_branches().unwrap();
+    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    assert!(report.problems.iter().any(|p| p.kind == "danglingTip"));
+
+    // Damage in the middle of the commit log is reported, not silently truncated away.
+    let log = root.join(".kvc/commits.log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines[0] = "{not json";
+    std::fs::write(&log, lines.join("\n")).unwrap();
+    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    assert!(report.problems.iter().any(|p| p.kind == "badLogLine"));
+}

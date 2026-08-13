@@ -128,6 +128,8 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
     // The committed tree the set-aside version diverged from — the merge base for a conflicting
     // `.kra`, so only its added/modified layers fold in (not every unchanged one).
     let committed = commit::current_tree(repo);
+    // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
+    repo.verify_reads = true;
     let mut actions = Vec::with_capacity(stash.files.len());
     for f in &stash.files {
         let abs = safe_join(&repo.root, &f.path)?;
@@ -165,7 +167,7 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
                 if let Some(parent) = abs.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
                 }
-                std::fs::write(abs, bytes).map_err(|e| io_at(abs, e))?;
+                crate::repo::write_file_atomic(abs, bytes)?;
             }
         }
     }

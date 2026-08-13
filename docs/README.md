@@ -15,9 +15,21 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   ownership, the component map, **Artist Mode** (the global friendly-labels toggle), the
   **theme selector** (color themes + the theme-reactive diff highlight), and the
   **application tour** (the first-launch spotlight walkthrough).
-- [**File tracking & version control**](version-control.md) — the Rust backend: the `.kvc/` store,
-  the scanner, commits, branches (create/switch/merge), stashes (setting work aside),
-  delta-chain storage, the `.kra` tile engine, and the Tauri commands.
+- [**Backend architecture**](backend-architecture.md) — the Rust crate's structural map: module
+  layout, the request flow from a Tauri command or the `kvc` CLI into the engine and back, the
+  concurrency model (`RepoLock` + the CPU-budgeted pool), the two binaries that share one crate,
+  and the third-party crates in use with their licenses.
+- [**File tracking & version control**](version-control.md) — the Rust backend's *feature*
+  behavior: the `.kvc/` store, the scanner, commits, branches (create/switch/merge), stashes
+  (setting work aside), delta-chain storage, the `.kra` tile engine, and the Tauri commands.
+- [**Data integrity**](data-integrity.md) — the measures the engine already applies to avoid
+  losing an artist's work: the cross-process repo lock, atomic + fsynced writes and save
+  ordering, write-time patch verification, verified reads on the restore paths, the read-only
+  repository check, the GC safety model, stash ordering invariants, and the input-validation caps
+  at the trust boundaries.
+- [**Data integrity — gaps**](data-integrity-gaps.md) — the companion list of defenses that
+  aren't in place yet (no previous-generation copy of `branches.json`, no bit-rot scrub, no
+  cleanup quarantine, unverified backups), with a suggested order.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,
