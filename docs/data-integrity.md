@@ -18,6 +18,7 @@ companion list of what is *not* yet done is [`data-integrity-gaps.md`](data-inte
 | **No stale-lock state.** The lock is released by the OS when the holding process's handle closes — cleanly, on a panic unwind, or on a force-kill. There is deliberately no `impl Drop` and no marker file to clean up. | `repo.rs` — `RepoLock` |
 | **Lock attribution.** A `kvc.lock.info` sidecar records a present-participle label (`"committing"`, `"switching branches"`) and its mtime gives the age, so a blocked caller's `Locked` error says *what* is holding the repo and *for how long*. The sidecar is a separate, never-locked file because Windows enforces a locked byte range against ordinary reads. | `repo.rs` — `write_lock_info`, `lock_holder_description` |
 | **Reads take no lock**, by design — `status`, `branches`, `stash-list` — so the Krita plugin's 1.5 s poll never contends with, or blocks, a write. | `bin/kvc.rs` |
+| **User-facing reads re-check for a stale snapshot.** `branches.json` carries a `generation` counter bumped on every write (`Repo::save`/`Repo::save_branches`); `list_commits`, `commit_diff`, `working_diff` and `list_branches` re-read just that counter before and after, retrying (bounded) if a write landed mid-read — a cheap `branches.json`-sized re-read, not a doubled full read. Deliberately **not** applied to the CLI's poll trio above, which must stay exactly as cheap as before: the race this closes is narrow and benign (a stale-but-consistent snapshot, never corruption — `write_atomic`'s rename is already the atomicity boundary), so it's worth closing on paths the artist actually looks at but not worth taxing the poll for. | `repo.rs` — `Branches::generation`; `commands.rs` — `read_consistent` |
 | **Heavy operations capped at two concurrently** (`cpu::heavy_permit`, a tokio semaphore taken by `commands::run_heavy`). Cancelling a diff in the UI does *not* cancel the backend, and rapid history clicking otherwise stacked unbounded 64 MB decode buffers. | `cpu.rs`, `commands.rs` |
 | **Full-screen busy overlay** during every write op (commit, switch, merge, create/delete branch, rollback, undo, cleanup) so a stray click can't race a file rewrite. | `src/components/shell/BusyOverlay.tsx` |
 
@@ -35,6 +36,7 @@ companion list of what is *not* yet done is [`data-integrity-gaps.md`](data-inte
 | **Append-only commit log.** A commit appends one JSON line; the log is only rewritten when history was genuinely truncated (undo, GC), flagged via `note_commits_truncated`. No O(history) rewrite on the hot path, so the crash window per commit is one line. | `repo.rs` — `flush_commits` |
 | **Torn-line tolerance on load.** A partial trailing line in `commits.log` (crash mid-append) is dropped on read and flags a rewrite so the fragment is scrubbed rather than appended onto. | `repo.rs` — `read_commits` |
 | **Narrow flushes for narrow edits.** `save_config`, `save_branches`, `save_stashes` exist so an `open_light` repo (partial in-memory state) never rewrites `index`/`commits` from state it didn't fully load. | `repo.rs` |
+| **One previous generation kept for small state files.** `index.json`, `branches.json` and `stashes.json` each get a sibling `.bak` — the pre-write copy, taken before every write — and a decode failure on open falls back to it instead of refusing to open the repo at all; the primary self-heals on the next save. `branches.json` is the single point of failure for the whole repository (lose it and every commit is unreachable, still on disk but nothing points at it), so this is cheap insurance for kilobyte-scale files. | `repo.rs` — `write_json_with_backup`, `read_json_with_backup` |
 | **Stale `*.tmp` sweep.** Crash leftovers from interrupted atomic writes are found and reclaimed by the cleanup pass — nothing else ever removes them. | `gc.rs` — `stale_tmp_files` |
 | **Legacy formats retire only after the new one lands.** The chains monolith is deleted only once every shard is written; `commits.json` only once `commits.log` is safely in place. There is no window without valid state. | `repo.rs` — `ChainStore::flush`, `flush_commits` |
 
@@ -51,6 +53,7 @@ companion list of what is *not* yet done is [`data-integrity-gaps.md`](data-inte
 | **Verified reads where a bad byte becomes the artist's file.** Write-time verification covers engine bugs but not bit rot, a failing disk, or something outside the app editing `.kvc/`. So the operations that write reconstructed bytes into the working tree — switch, rollback, discard, stash pop, restore-file — set `Repo::verify_reads` and re-hash every object `reconstruct` rebuilds, refusing with `Corrupt` on a mismatch. `reconstruct` recurses along the patch chain, so the whole chain is verified link by link. | `repo.rs` — `verify_reads`; `delta.rs` — `reconstruct` |
 | **Off for diffs and previews, deliberately.** That's the hottest loop in the app, and a wrong pixel in a preview is not data loss. A test pins both halves — the restore refuses, the diff path still returns. | `tests/engine.rs` |
 | **Restores from disk are checked against the manifest.** The incremental `.kra` path lifts unchanged zip entries and tiles straight out of the working file, but only when the entry's **crc32 + uncompressed size** match what the manifest recorded at commit time; a pre-crc `(0,0)` manifest is never trusted, and any mismatch falls back to the full store rebuild. | `kra.rs` — `materialize_kra` |
+| **Pixel-exact, not byte-exact, on restore — and that's documented, not just implied.** The composite (`mergedimage.png`) is re-encoded from content-addressed pixel blocks and tile entries are rewritten deflate-fast, so a restored `.kra` is deliberately not byte-identical to what Krita originally saved — a restore cannot be verified by comparing file hashes. What the store guarantees is **pixel** equality, which is why it's pinned by a regression test rather than left implicit: an artist depending on byte-exact round-trips (external tooling, signatures) would otherwise be surprised. | `kra.rs` — `materialize_kra`; `tests/engine.rs` — `composite_tiles_dedup_and_pixel_roundtrip` |
 
 ## 4. Garbage collection that can't eat live data
 
@@ -67,6 +70,8 @@ harmless. Reclaiming is an explicit, user-triggered "Clean up storage".
 | **Dry-run first.** The Settings confirm modal is powered by a real dry run, so the user approves the actual numbers. | `gc.rs`, `SettingsModal` |
 | **Pack rewrites gated at >25% dead** (with a unit test on the gate), and kept dead bytes are excluded from the report — the report states what the run actually frees. | `gc.rs` — `worth_rewriting` |
 | **Cache reclaim is reported separately** (`cacheBytesReclaimed`) because the raster cache is regenerable and its loss is not a data loss. | `gc.rs` |
+| **Sweep victims are quarantined, not deleted.** Dead loose objects and dead/rewritten packs move to `.kvc/trash/<timestamp>/` (a same-volume `rename` — the same cost class as the delete it replaces) instead of being unlinked outright. If the reachability logic is ever wrong, or cleanup runs right after a branch delete (an ordinary sequence), the data stays recoverable by hand instead of gone with no remote to re-fetch from. | `gc.rs` — `quarantine` |
+| **Quarantined trash ages out on its own.** Trash run-directories older than 14 days are permanently pruned on the next *real* cleanup (never during a dry run), reported separately as `trashBytesPruned` — bounded, self-pruning retention rather than unbounded growth. | `gc.rs` — `prune_trash` |
 
 ## 4b. Checking that history is intact
 
@@ -83,7 +88,8 @@ precisely to report it and keep walking). It takes no lock and writes nothing.
 | **A corrupt pack is named directly.** Everywhere else in the engine an unparseable pack is silently skipped, turning real corruption into a confusing `MissingObject` per contained object. | `check.rs`, `delta.rs` — `read_pack_header` |
 | **Findings are a successful run.** Both the Tauri command and `kvc check` report problems in the normal result; `{"error": …}` means the check itself failed, and the Krita plugin can't tell those apart otherwise. | `commands.rs` — `check_repository`; `bin/kvc.rs` — `run_check` |
 | **Surfaced next to "Clean up storage"** in Settings → Storage, as "Check for problems…". Read-only, so it raises no busy overlay. | `SettingsModal.tsx` — `CheckModal` |
-| **Deliberately not included:** re-hashing every stored object (a full bit-rot scrub is IO over the whole store) and any `--repair` mode. Detection was the part that was missing. | — |
+| **Opt-in bit-rot scrub.** `check_repository`/`kvc check` take a `scrub` flag (off by default, never run automatically — it's IO over the whole store) that additionally re-hashes every live version's content, via the same `Repo::reconstruct_cached` + `Repo::verify_reads` machinery the restore path already uses — a walk over the objects, not new verification logic. One bad version doesn't stop the walk (`corruptContent` problems accumulate). Reachable from Settings → Storage → "Check for problems…" → "Also read back every version (slower)", or `kvc check --scrub true`. | `check.rs` — `check_repository(repo, scrub)` |
+| **Still deliberately not included:** any `--repair` mode. Detection is the part this covers. | — |
 
 ## 5. Working-tree safety
 
@@ -96,7 +102,7 @@ precisely to report it and keep walking). It takes no lock and writes nothing.
 | **Switch rewrites only what differs.** Files whose committed content hash matches are never read, reconstructed, or rewritten — less IO means a smaller window in which a crash can damage anything. | `commit.rs` — `materialize_tree` |
 | **Staging is explicit, and partial staging is confirmed.** Committing with nothing staged, or with a partial selection, raises a confirm modal before anything is captured. | `ChangesPanel.tsx` |
 | **Discard is behind a confirm.** With the plugin's auto-save, discard is the only thing between the artist and losing saved-but-uncommitted work (the reopen takes the undo history with it). | `krita-plugin/`, `ChangesPanel.tsx` |
-| **One-click backup.** `export_repository_zip` zips the whole project (working tree + `.kvc/`) from the activity bar, with a toast reporting where it landed. | `commands.rs`, `ActivityBar.tsx` |
+| **One-click, verified backup.** `export_repository_zip` zips the whole project (working tree + `.kvc/`) from the activity bar, with a toast reporting where it landed. The finished archive carries a `MANIFEST.json` (repo name, branch, tip commit, timestamp, app version) and is reopened and checked — entry count, manifest readability — before success is reported, so a truncated or otherwise bad backup is never reported as good. Settings → Storage shows a "last backed up N days ago" hint so a stale backup doesn't go unnoticed. | `repo.rs` — `Repo::export_zip`, `verify_zip`; `commands.rs`, `ActivityBar.tsx`, `SettingsModal.tsx` |
 
 ## 6. Stash ordering invariants
 
@@ -174,3 +180,27 @@ shape the Krita plugin parses. Plus, for the measures above:
   deleted object, a dangling tip, and a damaged commit-log line.
 - `check_reports_findings_without_failing` (`kvc_cli.rs`) — problems come back as a successful
   run, not as `{"error": …}`.
+- `branches_json_corruption_recovers_from_backup`, `index_json_corruption_recovers_from_backup`,
+  `stashes_json_corruption_recovers_from_backup`,
+  `open_fails_cleanly_when_primary_and_backup_both_corrupt` — the `.bak` fallback recovers from a
+  corrupt primary, and still fails cleanly (not a panic) when both copies are bad.
+- `cleanup_moves_dead_objects_to_trash_instead_of_deleting`,
+  `cleanup_moves_dead_packs_to_trash`, `dry_run_cleanup_never_touches_trash`,
+  `prune_trash_removes_dirs_older_than_cutoff`, `prune_trash_leaves_dirs_within_cutoff` — sweep
+  victims land in `.kvc/trash/`, a dry run never touches it, and aging-out is exercised by moving
+  the cutoff rather than faking a directory's mtime.
+- `check_scrub_detects_corrupted_loose_object`, `check_scrub_detects_corrupted_pack_entry`,
+  `check_scrub_off_by_default_skips_content_hash`,
+  `check_scrub_reports_multiple_corruptions_without_aborting` — the same tampered-but-valid-zstd
+  trick as `corrupt_object_is_refused_on_restore_but_not_on_the_diff_path`, this time proving
+  `scrub` catches what presence-only `check` can't, stays off by default, and doesn't abort on the
+  first bad version.
+- `export_zip_round_trips_into_a_reopenable_repo` — extended to assert `MANIFEST.json`'s fields;
+  `verify_zip_rejects_entry_count_mismatch` / `verify_zip_rejects_missing_manifest` unit-test the
+  reopen-and-check step directly against a hand-built bad archive.
+- `generation_bumps_on_every_branches_write` — every `branches.json` write path bumps it;
+  `read_consistent_retries_when_a_write_lands_mid_read` /
+  `read_consistent_gives_up_after_max_attempts_and_returns_last_result` simulate a write landing
+  mid-read by mutating real on-disk state from inside the wrapped closure.
+- `composite_tiles_dedup_and_pixel_roundtrip` — the pre-existing test that already pinned gap #9's
+  guarantee (pixel-exact, not byte-exact, composite round-trips).

@@ -171,6 +171,29 @@ fn zip_err(e: zip::result::ZipError) -> KvcError {
     KvcError::CorruptZip(e.to_string())
 }
 
+/// Reopen a just-written zip and confirm it's actually readable before the caller reports
+/// success: every entry landed, and — if one was written — `MANIFEST.json` is present and
+/// parses. A backup nobody can verify isn't a backup. Split out from [`Repo::export_zip`] so the
+/// verification itself is directly unit-testable against a hand-built bad archive.
+fn verify_zip(dest: &Path, expected_entries: usize, expect_manifest: bool) -> Result<()> {
+    let readback = std::fs::File::open(dest).map_err(|e| io_at(dest, e))?;
+    let mut za = zip::ZipArchive::new(readback).map_err(zip_err)?;
+    if za.len() != expected_entries {
+        return Err(KvcError::CorruptZip(format!(
+            "backup verification failed: wrote {expected_entries} entries, archive has {}",
+            za.len()
+        )));
+    }
+    if expect_manifest {
+        let mut mf = za.by_name("MANIFEST.json").map_err(zip_err)?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut mf, &mut buf).map_err(|e| io_at(dest, e))?;
+        serde_json::from_slice::<BackupManifest>(&buf)
+            .map_err(|e| KvcError::CorruptZip(format!("unreadable backup manifest: {e}")))?;
+    }
+    Ok(())
+}
+
 pub fn kvc_dir(root: &Path) -> PathBuf {
     root.join(KVC_DIR)
 }
@@ -603,6 +626,11 @@ pub struct Stashes {
 pub struct Branches {
     pub current: String,
     pub branches: BTreeMap<String, String>,
+    /// Bumped on every write (see [`Repo::save`]/[`Repo::save_branches`]) — lets a long read spot
+    /// a write that landed mid-read and discard/retry rather than report a torn snapshot.
+    /// `#[serde(default)]` so a pre-existing `branches.json` without this field just starts at 0.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl Default for Branches {
@@ -612,6 +640,7 @@ impl Default for Branches {
         Branches {
             current: "main".to_string(),
             branches,
+            generation: 0,
         }
     }
 }
@@ -676,6 +705,18 @@ pub struct Repo {
     /// diffs and previews: that's the hot loop the app is tuned around, and a wrong pixel in a
     /// preview is not data loss.
     pub verify_reads: bool,
+}
+
+/// Written into a backup zip as `MANIFEST.json` (see [`Repo::export_zip`]) so a recovered
+/// archive is self-describing without needing the app to inspect it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    repo_name: String,
+    branch: String,
+    tip_commit: String,
+    timestamp: String,
+    app_version: String,
 }
 
 impl Repo {
@@ -743,14 +784,32 @@ impl Repo {
     /// backup for the user to move to their own cloud storage or an external drive. It's the
     /// only thing that helps against loss the app can't intervene in (the project folder deleted
     /// outside the app, disk failure, external corruption): extracting the zip anywhere and
-    /// Browsing to it "just works" since [`is_repo`] only checks for `.kvc/config.json`.
+    /// Browsing to it "just works" since [`is_repo`] only checks for `.kvc/config.json`. Carries
+    /// a `MANIFEST.json` entry (repo name, branch, tip commit, timestamp, app version) so a
+    /// recovered zip is self-describing, and the finished archive is reopened and checked (entry
+    /// count + manifest readability) before reporting success — an unverified backup is not
+    /// actually a backup.
     pub fn export_zip(root: &Path, dest: &Path) -> Result<()> {
         if !Self::is_repo(root) {
             return Err(KvcError::NotARepo(root.to_path_buf()));
         }
+        // Best-effort: a repo whose branch state can't be loaded still gets backed up, just
+        // without the manifest — the zip itself is the thing that must never silently fail.
+        let manifest = Self::open_light(root).ok().map(|r| BackupManifest {
+            repo_name: root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            branch: r.branches.current.clone(),
+            tip_commit: r.branches.tip().unwrap_or("").to_string(),
+            timestamp: now_iso(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
         let file = std::fs::File::create(dest).map_err(|e| io_at(dest, e))?;
         let mut zw = ZipWriter::new(file);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut entry_count = 0usize;
         for entry in walkdir::WalkDir::new(root) {
             let entry = entry.map_err(walk_err)?;
             if !entry.file_type().is_file() {
@@ -766,9 +825,17 @@ impl Repo {
             zw.start_file(rel, opts).map_err(zip_err)?;
             let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
             zw.write_all(&bytes)?;
+            entry_count += 1;
+        }
+        if let Some(manifest) = &manifest {
+            let bytes =
+                serde_json::to_vec(manifest).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+            zw.start_file("MANIFEST.json", opts).map_err(zip_err)?;
+            zw.write_all(&bytes)?;
+            entry_count += 1;
         }
         zw.finish().map_err(zip_err)?;
-        Ok(())
+        verify_zip(dest, entry_count, manifest.is_some())
     }
 
     /// Validate `.kvc/` and load its state. Chains load lazily per shard; only a repo still
@@ -790,7 +857,7 @@ impl Repo {
         Ok(Repo {
             root: root.to_path_buf(),
             config,
-            index: read_json(&kvc.join("index.json"))?,
+            index: read_json_with_backup(&kvc.join("index.json"))?,
             chains,
             packs: crate::delta::Packs::default(),
             commits,
@@ -818,7 +885,7 @@ impl Repo {
         Ok(Repo {
             root: root.to_path_buf(),
             config,
-            index: read_json(&kvc.join("index.json"))?,
+            index: read_json_with_backup(&kvc.join("index.json"))?,
             chains: ChainStore::empty(chains_dir(root)),
             packs: crate::delta::Packs::default(),
             commits,
@@ -858,13 +925,14 @@ impl Repo {
             write_json(&kvc.join("config.json"), &self.config)?;
             self.config_dirty = false;
         }
-        write_json(&kvc.join("index.json"), &self.index)?;
+        write_json_with_backup(&kvc.join("index.json"), &self.index)?;
         if self.chains.has_dirty() {
             self.chains.flush(&kvc)?;
         }
         self.flush_commits(&kvc)?;
-        write_json(&kvc.join("branches.json"), &self.branches)?;
-        write_json(&kvc.join("stashes.json"), &self.stashes)?;
+        self.branches.generation = self.branches.generation.wrapping_add(1);
+        write_json_with_backup(&kvc.join("branches.json"), &self.branches)?;
+        write_json_with_backup(&kvc.join("stashes.json"), &self.stashes)?;
         Ok(())
     }
 
@@ -907,15 +975,16 @@ impl Repo {
 
     /// Flush only `branches.json` — safe on a [`Repo::open_light`] repo, where a full
     /// [`Repo::save`] rewrites index/commits from possibly-partial state.
-    pub fn save_branches(&self) -> Result<()> {
-        write_json(&kvc_dir(&self.root).join("branches.json"), &self.branches)
+    pub fn save_branches(&mut self) -> Result<()> {
+        self.branches.generation = self.branches.generation.wrapping_add(1);
+        write_json_with_backup(&kvc_dir(&self.root).join("branches.json"), &self.branches)
     }
 
     /// Flush only `stashes.json` — same reasoning as [`Repo::save_branches`]: dropping a stash
     /// runs on an `open_light` repo, where a full [`Repo::save`] would rewrite index/commits from
     /// possibly-partial state.
     pub fn save_stashes(&self) -> Result<()> {
-        write_json(&kvc_dir(&self.root).join("stashes.json"), &self.stashes)
+        write_json_with_backup(&kvc_dir(&self.root).join("stashes.json"), &self.stashes)
     }
 }
 
@@ -981,6 +1050,47 @@ fn sync_parent_dir(_path: &Path) {}
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value).map_err(|e| KvcError::BadIndex(e.to_string()))?;
     write_atomic(path, &bytes)
+}
+
+/// `<path>` with `.bak` appended (not substituted — mirrors [`write_file_atomic`]'s `.kvctmp`
+/// suffix, so `branches.json` and a hypothetical `branches.json`-named art file, if one ever
+/// existed, wouldn't collide).
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".bak");
+    PathBuf::from(name)
+}
+
+/// [`write_json`], but first best-effort copies the *current* on-disk file to `<path>.bak` — one
+/// previous generation of insurance for the handful of small state files (`index.json`,
+/// `branches.json`, `stashes.json`) whose loss is unrecoverable (there's no remote to re-fetch
+/// from). The backup copy isn't itself atomic/fsynced: a crash mid-copy just leaves a stale or
+/// torn `.bak`, and the *primary* file (untouched at that point) is what the next save's copy
+/// step refreshes it from — never a regression from today's zero-backup state.
+fn write_json_with_backup<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if path.is_file() {
+        let _ = std::fs::copy(path, backup_path(path));
+    }
+    write_json(path, value)
+}
+
+/// [`read_json`], falling back to `<path>.bak` on a **decode** failure only — a missing primary
+/// file is a different problem (some callers treat "absent" as a valid empty-state default) and
+/// shouldn't silently resurrect a stale backup instead of surfacing that. Mirrors `read_commits`'
+/// "degrade, don't propagate garbage" shape for the one-shot whole-file case.
+fn read_json_with_backup<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    match read_json(path) {
+        Err(KvcError::BadIndex(_)) => {
+            let bak = backup_path(path);
+            if bak.is_file() {
+                if let Ok(v) = read_json(&bak) {
+                    return Ok(v);
+                }
+            }
+            read_json(path)
+        }
+        other => other,
+    }
 }
 
 /// Chain shard format tag. Bincode is not self-describing, so dropping `Version.object`
@@ -1084,10 +1194,22 @@ fn read_chains(kvc: &Path) -> Result<Chains> {
 fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
     let path = kvc.join("branches.json");
     if path.is_file() {
-        read_json(&path)
+        read_json_with_backup(&path)
     } else {
         Ok(Branches::migrated(commits))
     }
+}
+
+/// Read just `branches.json`'s generation counter — for a cheap before/after staleness check
+/// around a read command, without paying for a full [`Repo::open_light`] (which also re-reads
+/// `commits.log`, the part that actually scales with history). A missing `branches.json` (a
+/// pre-branching repo) reads as generation 0, same as a fresh one.
+pub fn read_branches_generation(root: &Path) -> Result<u64> {
+    let path = kvc_dir(root).join("branches.json");
+    if !path.is_file() {
+        return Ok(0);
+    }
+    read_json_with_backup::<Branches>(&path).map(|b| b.generation)
 }
 
 /// An absent `stashes.json` is an empty shelf — that's the whole migration for repos that
@@ -1095,7 +1217,7 @@ fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
 fn read_stashes(kvc: &Path) -> Result<Stashes> {
     let path = kvc.join("stashes.json");
     if path.is_file() {
-        read_json(&path)
+        read_json_with_backup(&path)
     } else {
         Ok(Stashes::default())
     }
@@ -1144,6 +1266,12 @@ pub fn now_iso() -> String {
     epoch_to_iso(secs)
 }
 
+/// [`now_iso`] with `:` replaced by `-` — a valid directory/file name on Windows, which
+/// forbids colons outside a drive letter.
+pub fn now_iso_filesafe() -> String {
+    now_iso().replace(':', "-")
+}
+
 /// Unix epoch seconds -> ISO-8601 UTC. Civil-from-days (Howard Hinnant) algorithm.
 pub fn epoch_to_iso(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
@@ -1186,6 +1314,58 @@ mod tests {
         // Over the cap: a clean error, not an unbounded read (a decompression-bomb guard).
         let big = std::io::repeat(1u8).take(50);
         assert!(matches!(read_capped(big, 10), Err(KvcError::CorruptZip(_))));
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        for (name, data) in entries {
+            zw.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn verify_zip_accepts_matching_entry_count_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.zip");
+        let manifest = serde_json::to_vec(&BackupManifest {
+            repo_name: "r".into(),
+            branch: "main".into(),
+            tip_commit: String::new(),
+            timestamp: now_iso(),
+            app_version: "1.1.0".into(),
+        })
+        .unwrap();
+        write_test_zip(&path, &[("a.gpl", b"data"), ("MANIFEST.json", &manifest)]);
+
+        assert!(verify_zip(&path, 2, true).is_ok());
+    }
+
+    #[test]
+    fn verify_zip_rejects_entry_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.zip");
+        write_test_zip(&path, &[("a.gpl", b"data")]);
+
+        // The archive really has one entry — claiming two must fail, not silently pass.
+        assert!(matches!(
+            verify_zip(&path, 2, false),
+            Err(KvcError::CorruptZip(_))
+        ));
+    }
+
+    #[test]
+    fn verify_zip_rejects_missing_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.zip");
+        write_test_zip(&path, &[("a.gpl", b"data")]);
+
+        assert!(matches!(
+            verify_zip(&path, 1, true),
+            Err(KvcError::CorruptZip(_))
+        ));
     }
 
     #[test]

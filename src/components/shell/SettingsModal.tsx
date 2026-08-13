@@ -216,6 +216,7 @@ function StorageSettings({
   onShowCleanup: () => void;
   onShowCheck: () => void;
 }) {
+  const { current } = useRepository();
   return (
     <>
       <label className="mb-3 block">
@@ -271,6 +272,10 @@ function StorageSettings({
           Check for problems…
         </Button>
       </div>
+      <span className="mt-2 block text-[11px] text-text-muted">
+        {backupAgeLabel(current?.lastBackupAt)} There's no cloud sync — a backup is the only copy
+        that survives your disk failing.
+      </span>
     </>
   );
 }
@@ -541,6 +546,15 @@ function formatBytes(n: number): string {
   return `${n} B`;
 }
 
+/** "Last backup: ..." hint for the Storage tab's zip-icon backup action (in the activity bar). */
+function backupAgeLabel(lastBackupAt: string | undefined): string {
+  if (!lastBackupAt) return "You haven't backed up this repository yet.";
+  const days = Math.floor((Date.now() - new Date(lastBackupAt).getTime()) / 86_400_000);
+  if (days <= 0) return "Last backed up today.";
+  if (days === 1) return "Last backed up 1 day ago.";
+  return `Last backed up ${days} days ago.`;
+}
+
 /** Backend problem kinds in plain language — the raw `detail` follows as the technical line. */
 const PROBLEM_LABEL: Record<string, string> = {
   missingObject: "Missing stored data",
@@ -548,6 +562,7 @@ const PROBLEM_LABEL: Record<string, string> = {
   danglingTip: "A branch points at a version that isn't there",
   badLogLine: "The history file is damaged",
   badPack: "A storage bundle is unreadable",
+  corruptContent: "Stored data doesn't match what it should be",
 };
 
 /**
@@ -558,6 +573,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
   const { checkRepository } = useRepository();
   const [report, setReport] = useState<CheckReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [scrubbing, setScrubbing] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -572,6 +588,15 @@ function CheckModal({ onClose }: { onClose: () => void }) {
       cancelled = true;
     };
   }, [checkRepository]);
+
+  const runFullCheck = () => {
+    setScrubbing(true);
+    setError(null);
+    checkRepository(true)
+      .then((r) => setReport(r))
+      .catch((e) => setError(String(e)))
+      .finally(() => setScrubbing(false));
+  };
 
   return (
     <Modal
@@ -589,7 +614,10 @@ function CheckModal({ onClose }: { onClose: () => void }) {
         <p className="text-[13px] text-text">
           All clear — {report.commitsChecked} version{report.commitsChecked === 1 ? "" : "s"} and{" "}
           {report.objectsChecked} stored piece{report.objectsChecked === 1 ? "" : "s"} checked out
-          fine.
+          fine
+          {report.scrubPerformed
+            ? `, including a full read-back of all ${report.versionsScrubbed} of them.`
+            : "."}
         </p>
       )}
       {!error && report != null && report.problems.length > 0 && (
@@ -609,6 +637,11 @@ function CheckModal({ onClose }: { onClose: () => void }) {
             ))}
           </ul>
         </>
+      )}
+      {!error && report != null && !report.scrubPerformed && (
+        <Button className="mt-3" disabled={scrubbing} onClick={runFullCheck}>
+          {scrubbing ? "Reading back every version…" : "Also read back every version (slower)"}
+        </Button>
       )}
     </Modal>
   );

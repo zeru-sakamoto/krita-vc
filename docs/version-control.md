@@ -36,12 +36,21 @@ with no backend, the UI renders empty states).
   commits.log    the commit log, JSON-lines (oldest-first, append-order = topological
                  order): a commit appends one line — O(1) instead of rewriting the whole
                  history; undo/GC rewrite it. Legacy commits.json migrates on first save
-  branches.json  branch name → tip commit id, plus the current branch (written after the
-                 log, so a torn log append is never a dangling tip)
+  branches.json  branch name → tip commit id, the current branch, and a `generation`
+                 counter bumped on every write (written after the log, so a torn log
+                 append is never a dangling tip)
   stashes.json   the set-aside shelf: work parked off to the side of history (see Stashes
                  below). Written last, for the same reason branches.json is — a stash record
                  must never outlive the chain content it points at. Absent = empty shelf,
                  which is the whole migration for repos that predate stashing
+  index.json.bak, branches.json.bak, stashes.json.bak
+                 one previous generation of each — the pre-write copy, kept for exactly
+                 these three small, unrecoverable-if-lost files; a decode failure on open
+                 falls back to the `.bak` rather than refusing to open the repo
+  trash/<timestamp>/
+                 quarantined GC victims (see "Clean up storage" below) — objects and packs
+                 moved here instead of deleted, auto-pruned after 14 days on the next real
+                 cleanup
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff),
                  sharded 256-way (objects/<hash[..2]>/, flat legacy paths still read); a
                  commit with ≥32 new objects writes them as one objects/pack/<hash>.pack
@@ -61,16 +70,22 @@ content-addressed and dedup on any re-commit). The user-facing **"Clean up stora
 (`cleanup_repository`, mark-and-sweep in [`gc.rs`](../src-tauri/src/gc.rs)) reclaims everything
 unreachable from any branch tip **or stash** (a stash is referenced by nothing in the commit log,
 so it has to be rooted explicitly or a cleanup would destroy set-aside work): unreachable commits
-leave the log, dead chain versions leave
-their shards, dead loose objects are deleted, and packs are dropped (fully dead) or rewritten
-with survivors only when >25% dead (below that, rewriting costs more IO than it frees). A live
-patch's whole chain back to its full snapshot counts as reachable. GC also prunes the raster
-cache to its budget (reported separately as `cacheBytesReclaimed` — regenerable previews),
-sweeps stale `*.tmp` crash leftovers, and consolidates ≥8 sub-4 MB live packs into one.
-State files are rewritten before any object is deleted, so a crash mid-sweep only leaves
+leave the log, dead chain versions leave their shards, and dead loose objects and dead/rewritten
+packs are **quarantined** — moved to `.kvc/trash/<timestamp>/` (a same-volume rename, not a
+delete) rather than unlinked outright, so a wrong reachability call or a cleanup run right after a
+branch delete stays recoverable by hand. A partially-dead pack is rewritten with survivors only
+when >25% dead (below that, rewriting costs more IO than it frees) and the old pack is quarantined
+same as a fully-dead one. A live patch's whole chain back to its full snapshot counts as
+reachable. Quarantined trash runs older than 14 days are permanently pruned on the next *real*
+cleanup (never during a dry run), reported separately as `trashBytesPruned`. GC also prunes the
+raster cache to its budget (reported separately as `cacheBytesReclaimed` — regenerable previews),
+sweeps stale `*.tmp` crash leftovers (those *are* hard-deleted — torn writes, not recoverable-once
+data), and consolidates ≥8 sub-4 MB live packs into one.
+State files are rewritten before any object is quarantined, so a crash mid-sweep only leaves
 re-collectable orphans. A `dry_run` mode reports what a real pass would free without touching
-anything — the frontend runs it on modal open, then confirms before the real pass. See
-[performance.md](performance.md#storage-reclamation-gcrs) for the full mark-and-sweep writeup.
+anything (and never touches trash) — the frontend runs it on modal open, then confirms before the
+real pass. See [performance.md](performance.md#storage-reclamation-gcrs) for the full
+mark-and-sweep writeup.
 
 State is loaded into a `Repo` struct (`Repo::open`), mutated in memory, then flushed with
 `Repo::save`. State writes are **atomic** (write to a `*.tmp` sibling, then `rename` over the
@@ -104,6 +119,15 @@ second writer gets `KvcError::Locked` carrying a `"<repo> — <op> for <age>"` d
 caller can tell a genuinely slow operation from one that's been stuck a suspiciously long time.
 Every call site names its own operation (see `commands.rs`/`bin/kvc.rs`). Read-only commands
 (scan, history, diffs, dry-run cleanup) don't lock.
+
+Since reads take no lock, a read can in principle land mid-write and see a partially-updated
+snapshot. `branches.json` carries a `generation` counter bumped on every write; the four read
+commands whose staleness would actually be user-visible — `list_commits`, `commit_diff`,
+`working_diff`, `list_branches` — re-read just that counter before and after (`read_consistent` in
+`commands.rs`) and retry (bounded) if it moved, rather than a doubled full re-read. The `kvc` CLI's
+poll trio (`status`/`branches`/`stash-list`) deliberately skips this and stays exactly as cheap as
+before — the race is narrow and benign (a stale-but-consistent snapshot, never corruption), so it
+wasn't worth taxing a 1.5 s poll for.
 
 ### Path safety
 
@@ -515,8 +539,8 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `create_stash(path, label, author, paths?)` | Set aside working-tree changes and revert those files; `paths` restricts it to those relative paths (the frontend passes its staged selection), omitted/`null` sets aside everything dirty. Returns the shelf. Needs `Repo::open` — storing content writes streams, which a light repo forbids. |
 | `pop_stash(path, id)` | Bring a stash back into the working tree and drop it from the shelf. Errors `"stash conflict: …"` if anything it holds is dirty (the frontend matches that prefix). Returns the shelf. |
 | `drop_stash(path, id)` / `drop_all_stashes(path)` | Remove stashes without restoring them; storage is reclaimed by the next `cleanup_repository`. |
-| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip **or stash**. `dryRun` reports what would be freed without deleting anything. |
-| `check_repository(path)` | Read-only integrity check: missing objects, broken chains, dangling branch tips, undecodable commit-log lines, unreadable packs. Takes no lock and writes nothing; findings come back in the report, not as an error. |
+| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip **or stash**. Victims are quarantined to `.kvc/trash/`, not deleted outright (auto-pruned after 14 days). `dryRun` reports what would be freed without touching anything. |
+| `check_repository(path, scrub)` | Read-only integrity check: missing objects, broken chains, dangling branch tips, undecodable commit-log lines, unreadable packs. Takes no lock and writes nothing; findings come back in the report, not as an error. `scrub` (default off) additionally re-hashes every live version's content — IO over the whole store, never run automatically. |
 | `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
@@ -527,7 +551,7 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
 | `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
 | `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
-| `export_repository_zip(path, dest)` | Zip the whole repository folder (art files + `.kvc/`) to `dest`. Manual backup — see [Backup & recovery](#backup--recovery). |
+| `export_repository_zip(path, dest)` | Zip the whole repository folder (art files + `.kvc/`) to `dest`, plus a `MANIFEST.json` (repo, branch, tip, timestamp, app version); reopens the archive and verifies it (entry count, manifest readable) before reporting success. Manual backup — see [Backup & recovery](#backup--recovery). |
 | `export_repositories_zip(paths, destDir)` | Zip every repo in `paths` into `destDir`, one `<folder-name>-<date>.zip` each. Returns the paths that failed rather than aborting the batch on one bad repo. |
 
 ## Backup & recovery
@@ -550,9 +574,14 @@ the two ways a repository can be lost:
   a path the user picks via a native Save dialog — the same `.kra` files plus full version
   history, ready to move to an external drive or the user's own cloud storage. **"Back up all
   repositories…"** in the repository switcher menu (`export_repositories_zip`) does the same for
-  every known repo into one chosen destination folder. Recovery is just extraction: since
-  `Repo::is_repo` only checks that `.kvc/config.json` exists, unzipping a backup anywhere and
-  pointing Browse at it reopens it as a fully working repository — no dedicated "restore" command.
+  every known repo into one chosen destination folder. An unverified backup isn't a backup: the
+  finished archive carries a `MANIFEST.json` (repo name, branch, tip commit, timestamp, app
+  version) and `Repo::export_zip` reopens it and checks the entry count and manifest readability
+  before reporting success, rather than trusting `zw.finish()` alone. Settings → Storage shows a
+  "last backed up N days ago" hint (`Repository.lastBackupAt`, persisted client-side) so a stale
+  backup doesn't go unnoticed. Recovery is just extraction: since `Repo::is_repo` only checks that
+  `.kvc/config.json` exists, unzipping a backup anywhere and pointing Browse at it reopens it as a
+  fully working repository — no dedicated "restore" command.
 
 ## Frontend integration
 

@@ -171,15 +171,20 @@ fn run_branches(flags: &HashMap<String, String>) -> Result<String, String> {
 
 /// Read-only integrity check. Takes no lock, and a repository *with* problems is still a
 /// successful run — `{"error":...}` on stderr means "the check itself failed", so reporting
-/// findings that way would be a lie the plugin can't tell apart from a crash.
+/// findings that way would be a lie the plugin can't tell apart from a crash. `--scrub true`
+/// additionally re-hashes every live version's content (IO over the whole store) — default off.
 fn run_check(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
-    let repo = Repo::open(Path::new(repo_path)).map_err(|e| e.to_string())?;
-    let report = krita_vc_lib::check::check_repository(&repo).map_err(|e| e.to_string())?;
+    let scrub = flags.get("scrub").map(String::as_str) == Some("true");
+    let mut repo = Repo::open(Path::new(repo_path)).map_err(|e| e.to_string())?;
+    let report =
+        krita_vc_lib::check::check_repository(&mut repo, scrub).map_err(|e| e.to_string())?;
     Ok(json!({
         "ok": report.ok(),
         "commitsChecked": report.commits_checked,
         "objectsChecked": report.objects_checked,
+        "scrubPerformed": report.scrub_performed,
+        "versionsScrubbed": report.versions_scrubbed,
         "problems": report.problems.iter()
             .map(|p| json!({ "kind": p.kind, "detail": p.detail }))
             .collect::<Vec<_>>(),

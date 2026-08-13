@@ -24,6 +24,8 @@ export interface Repository {
   name: string;
   /** Absolute filesystem path. */
   path: string;
+  /** ISO timestamp of the last successful `backupRepository()` call, if any. */
+  lastBackupAt?: string;
 }
 
 export interface Commit {

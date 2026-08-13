@@ -93,9 +93,10 @@ interface RepositoryValue {
   cleanupRepository: (dryRun: boolean) => Promise<CleanupReport | null>;
   /**
    * Read-only integrity check over the stored history. Writes nothing, so it never raises the
-   * busy overlay. Null in a plain browser or with no repository selected.
+   * busy overlay. Null in a plain browser or with no repository selected. `scrub` (default off)
+   * additionally re-hashes every live version's content — IO over the whole store.
    */
-  checkRepository: () => Promise<CheckReport | null>;
+  checkRepository: (scrub?: boolean) => Promise<CheckReport | null>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
@@ -116,15 +117,22 @@ export interface CleanupReport {
   commitsRemoved: number;
   versionsRemoved: number;
   objectsDeleted: number;
+  /** Bytes moved out of the live store this run — quarantined to `.kvc/trash/`, not yet gone. */
   bytesReclaimed: number;
   /** Preview images freed (regenerable — pruned to budget / stale-filter wipe). */
   cacheBytesReclaimed: number;
+  /** Bytes permanently freed by aging quarantined trash out past its retention window. */
+  trashBytesPruned: number;
 }
 
 /** Shape returned by the `check_repository` Tauri command (serde camelCase). */
 export interface CheckReport {
   commitsChecked: number;
   objectsChecked: number;
+  /** Whether a full content scrub was requested for this run. */
+  scrubPerformed: boolean;
+  /** Live versions re-hashed (only non-zero when `scrubPerformed`). */
+  versionsScrubbed: number;
   problems: { kind: string; detail: string }[];
 }
 
@@ -261,6 +269,8 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       setBusyMessage("Backing up repository — please wait…");
       try {
         await invoke("export_repository_zip", { path: repo.path, dest });
+        const lastBackupAt = new Date().toISOString();
+        setRepositories((prev) => prev.map((r) => (r.id === id ? { ...r, lastBackupAt } : r)));
         return dest;
       } finally {
         setBusyMessage(null);
@@ -499,15 +509,18 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   // No `busyMessage`: the check only reads, so there's nothing for a stray click to race.
-  const checkRepository = useCallback(async (): Promise<CheckReport | null> => {
-    if (!inTauri() || !current) return null;
-    setSaving(true);
-    try {
-      return await invoke<CheckReport>("check_repository", { path: current.path });
-    } finally {
-      setSaving(false);
-    }
-  }, [current]);
+  const checkRepository = useCallback(
+    async (scrub = false): Promise<CheckReport | null> => {
+      if (!inTauri() || !current) return null;
+      setSaving(true);
+      try {
+        return await invoke<CheckReport>("check_repository", { path: current.path, scrub });
+      } finally {
+        setSaving(false);
+      }
+    },
+    [current]
+  );
 
   const value = useMemo<RepositoryValue>(
     () => ({

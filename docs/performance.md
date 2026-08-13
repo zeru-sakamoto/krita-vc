@@ -369,14 +369,19 @@ design — content-addressed orphans are harmless), so a long-lived repo only gr
 user-facing "Clean up storage" action (`cleanup_repository`, mark-and-sweep in `gc.rs`)
 reclaims everything unreachable from any branch tip **or stash** (stashes are rooted explicitly —
 nothing in the commit log references them): unreachable commits leave the log, dead
-chain versions leave their shards, dead loose objects are deleted, and packs are dropped
-(fully dead) or rewritten with survivors only — but only when **>25 % of the pack is dead**
-(`worth_rewriting`): rewriting rereads every survivor, so reclaiming a few KB from a big pack
-would cost more IO than it frees, and kept dead bytes are excluded from the report. Patch
-**bases are closed over** — a live patch keeps its whole chain back to the full snapshot.
-State files are rewritten **before** any object is deleted, so a crash mid-sweep leaves only
-re-collectable orphans, never a dangling reference. A dry-run mode powers the confirmation
-dialog ("about N MB can be freed").
+chain versions leave their shards, and dead loose objects and dead/rewritten packs are
+**quarantined** to `.kvc/trash/<timestamp>/` (a same-volume rename — the same cost class as the
+delete it replaces) rather than unlinked outright, so a wrong reachability call or a cleanup right
+after a branch delete stays recoverable by hand. A partially-dead pack is rewritten with
+survivors only — but only when **>25 % of the pack is dead** (`worth_rewriting`): rewriting
+rereads every survivor, so reclaiming a few KB from a big pack would cost more IO than it frees,
+and kept dead bytes are excluded from the report; the old pack is then quarantined same as a
+fully-dead one. Patch **bases are closed over** — a live patch keeps its whole chain back to the
+full snapshot. State files are rewritten **before** any object is quarantined, so a crash
+mid-sweep leaves only re-collectable orphans, never a dangling reference. Quarantined trash older
+than 14 days is permanently pruned on the next *real* cleanup (never a dry run), reported
+separately as `trashBytesPruned` — bounded retention, not unbounded growth. A dry-run mode powers
+the confirmation dialog ("about N MB can be freed") and never touches trash.
 
 GC also handles three things reachability can't see: the **raster cache** is pruned to its
 budget unconditionally (and wiped whole when its `.filter-version` marker mismatches

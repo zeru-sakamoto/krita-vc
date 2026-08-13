@@ -580,7 +580,7 @@ fn delete_guarded_then_removes() {
 #[test]
 fn export_zip_round_trips_into_a_reopenable_repo() {
     let dir = tempfile::tempdir().unwrap();
-    seeded_repo(&dir);
+    let r = seeded_repo(&dir);
     let root = dir.path();
 
     // Destination lives outside `root` — zipping into a folder being walked would grow forever.
@@ -599,6 +599,14 @@ fn export_zip_round_trips_into_a_reopenable_repo() {
     assert_eq!(r2.commits.len(), 1);
     assert_eq!(std::fs::read(extracted.join("a.gpl")).unwrap(), b"base-a");
     assert_eq!(std::fs::read(extracted.join("b.gpl")).unwrap(), b"base-b");
+
+    // The manifest describes the backup so a recovered zip is self-describing.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(extracted.join("MANIFEST.json")).unwrap()).unwrap();
+    assert_eq!(manifest["branch"], "main");
+    assert_eq!(manifest["tipCommit"], r.commits[0].id);
+    assert_eq!(manifest["appVersion"], env!("CARGO_PKG_VERSION"));
+    assert!(manifest["timestamp"].as_str().unwrap().ends_with('Z'));
 }
 
 // --- maindoc.xml layer metadata diff ---------------------------------------------------
@@ -1600,6 +1608,102 @@ fn migration_missing_branches_json() {
     assert!(root.join(".kvc/branches.json").is_file());
 }
 
+/// Gap #10: `branches.json`'s generation counter must bump on every write that touches it,
+/// through every write path — `save()`, `save_branches()` — so a read command can tell a write
+/// landed mid-read and retry instead of returning a torn snapshot.
+#[test]
+fn generation_bumps_on_every_branches_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+
+    let g0 = repo::read_branches_generation(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+    assert_eq!(r.branches.generation, g0);
+
+    // A full save() (the commit path) bumps it.
+    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    let g1 = repo::read_branches_generation(root).unwrap();
+    assert!(g1 > g0, "commit's save() must bump the generation");
+    assert_eq!(
+        r.branches.generation, g1,
+        "in-memory copy matches what was written"
+    );
+
+    // save_branches() (the open_light mutator path — branch create/switch) bumps it too.
+    branch::create_branch(&mut r, "idea", None).unwrap();
+    let g2 = repo::read_branches_generation(root).unwrap();
+    assert!(g2 > g1, "save_branches() must bump the generation too");
+}
+
+#[test]
+fn branches_json_corruption_recovers_from_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let r = seeded_repo(&dir);
+    drop(r);
+
+    // One commit's save() already backed up init's branches.json to branches.json.bak before
+    // overwriting it with the post-commit tip.
+    assert!(root.join(".kvc/branches.json.bak").is_file());
+    std::fs::write(root.join(".kvc/branches.json"), b"{not json").unwrap();
+
+    let r2 = repo::Repo::open(root).unwrap();
+    assert_eq!(
+        r2.branches.current, "main",
+        "a corrupt primary should fall back to the previous generation, not fail to open"
+    );
+}
+
+#[test]
+fn index_json_corruption_recovers_from_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let r = seeded_repo(&dir);
+    drop(r);
+
+    assert!(root.join(".kvc/index.json.bak").is_file());
+    std::fs::write(root.join(".kvc/index.json"), b"{not json").unwrap();
+
+    let r2 = repo::Repo::open(root).unwrap();
+    // The backup is the pre-commit (empty) index — recovery is "don't fail to open", not
+    // byte-perfect restoration of the corrupted generation.
+    assert!(r2.index.files.is_empty());
+}
+
+#[test]
+fn stashes_json_corruption_recovers_from_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    // stashes.json is written for the first time by the seeding commit's save() — a second save
+    // is needed before a `.bak` generation exists to fall back to.
+    std::fs::write(root.join("a.gpl"), b"v2").unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    drop(r);
+
+    assert!(root.join(".kvc/stashes.json.bak").is_file());
+    std::fs::write(root.join(".kvc/stashes.json"), b"{not json").unwrap();
+
+    let r2 = repo::Repo::open(root).unwrap();
+    assert!(r2.stashes.stashes.is_empty());
+}
+
+#[test]
+fn open_fails_cleanly_when_primary_and_backup_both_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let r = seeded_repo(&dir);
+    drop(r);
+
+    assert!(root.join(".kvc/branches.json.bak").is_file());
+    std::fs::write(root.join(".kvc/branches.json"), b"{not json").unwrap();
+    std::fs::write(root.join(".kvc/branches.json.bak"), b"{also not json").unwrap();
+
+    assert!(matches!(repo::Repo::open(root), Err(KvcError::BadIndex(_))));
+}
+
 #[test]
 fn undo_respects_branch_tip() {
     let dir = tempfile::tempdir().unwrap();
@@ -1976,6 +2080,144 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
     std::fs::write(root.join("art.kra"), mk(b"tileDDDD", b"x4")).unwrap();
     commit::commit_snapshot(&mut r, "post-gc", "t").unwrap();
     assert!(scan::scan(&r).unwrap().is_empty());
+}
+
+/// True if `dir` (or anything under it) contains at least one regular file.
+fn any_file_under(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let p = e.path();
+                p.is_file() || (p.is_dir() && any_file_under(&p))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Gap #5: a real cleanup must quarantine dead objects into `.kvc/trash/`, not unlink them —
+/// so a bad reachability call, or cleanup run right after a branch delete, stays recoverable.
+#[test]
+fn cleanup_moves_dead_objects_to_trash_instead_of_deleting() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    std::fs::write(
+        root.join("a.gpl"),
+        b"v2, different enough to store its own object",
+    )
+    .unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    // Undoing c2 drops it from the log — its stored version is now referenced by nothing.
+    commit::undo_last_commit(&mut r).unwrap();
+
+    let report = gc::collect_garbage(&mut r, false).unwrap();
+    assert!(
+        report.objects_deleted > 0,
+        "expected c2's orphaned object to be swept"
+    );
+
+    let trash = root.join(".kvc/trash");
+    assert!(trash.is_dir(), "quarantined objects land in .kvc/trash");
+    let runs: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
+    assert_eq!(runs.len(), 1, "one run directory for this cleanup");
+    assert!(
+        any_file_under(&runs[0].path()),
+        "the orphaned object was moved into trash, not deleted"
+    );
+}
+
+/// Same as above, but for a whole dead pack file (large commits pack instead of writing loose
+/// objects) — the fully-dead-pack branch of the sweep must quarantine too.
+#[test]
+fn cleanup_moves_dead_packs_to_trash() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // 40 distinct tiles (> PACK_MIN_OBJECTS) packs into one file, per
+    // `large_commit_packs_objects_and_reconstructs`.
+    let tiles_v1: Vec<(i64, i64, Vec<u8>)> = (0..40i64)
+        .map(|i| (i * 64, 0, vec![i as u8; 300 + i as usize]))
+        .collect();
+    let refs: Vec<(i64, i64, &[u8])> = tiles_v1
+        .iter()
+        .map(|(x, y, d)| (*x, *y, d.as_slice()))
+        .collect();
+    let kra = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&refs)),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra).unwrap();
+    commit::commit_snapshot(&mut r, "packed", "t").unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.join(".kvc/objects/pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count(),
+        1,
+        "the tile batch must have packed"
+    );
+
+    // Undo strands the whole commit — the pack backing it is now 100% dead.
+    commit::undo_last_commit(&mut r).unwrap();
+    let report = gc::collect_garbage(&mut r, false).unwrap();
+    assert!(report.objects_deleted > 0);
+
+    assert_eq!(
+        std::fs::read_dir(root.join(".kvc/objects/pack"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count(),
+        0,
+        "the dead pack must be gone from objects/pack"
+    );
+    let trash = root.join(".kvc/trash");
+    let runs: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
+    assert_eq!(runs.len(), 1);
+    let quarantined_pack = std::fs::read_dir(runs[0].path().join("pack"))
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(
+        quarantined_pack, 1,
+        "the dead pack landed in trash, not deleted"
+    );
+}
+
+/// A dry run reports what it would reclaim without moving anything — trash must stay untouched.
+#[test]
+fn dry_run_cleanup_never_touches_trash() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+    std::fs::write(
+        root.join("a.gpl"),
+        b"v2, different enough to store its own object",
+    )
+    .unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    commit::undo_last_commit(&mut r).unwrap();
+
+    let report = gc::collect_garbage(&mut r, true).unwrap();
+    assert!(report.dry_run && report.bytes_reclaimed > 0);
+    assert!(
+        !root.join(".kvc/trash").exists(),
+        "dry run must not create or populate a trash run"
+    );
 }
 
 // --- objects layout: sharded writes, flat legacy reads -----------------------------------
@@ -3385,7 +3627,7 @@ fn check_reports_missing_objects_and_dangling_tips() {
     .unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
 
-    let clean = check::check_repository(&r).unwrap();
+    let clean = check::check_repository(&mut r, false).unwrap();
     assert!(clean.ok(), "healthy repo reported {:?}", clean.problems);
     assert!(clean.commits_checked >= 2 && clean.objects_checked > 0);
 
@@ -3396,7 +3638,7 @@ fn check_reports_missing_objects_and_dangling_tips() {
         .join(&hash[..2])
         .join(format!("{hash}.full"));
     std::fs::remove_file(&obj).unwrap();
-    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
     assert!(!report.ok());
     assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
     assert_eq!(report.problems[0].kind, "missingObject");
@@ -3408,7 +3650,7 @@ fn check_reports_missing_objects_and_dangling_tips() {
         .branches
         .insert("main".to_string(), "nosuchcommit".to_string());
     r2.save_branches().unwrap();
-    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
     assert!(report.problems.iter().any(|p| p.kind == "danglingTip"));
 
     // Damage in the middle of the commit log is reported, not silently truncated away.
@@ -3417,6 +3659,160 @@ fn check_reports_missing_objects_and_dangling_tips() {
     let mut lines: Vec<&str> = text.lines().collect();
     lines[0] = "{not json";
     std::fs::write(&log, lines.join("\n")).unwrap();
-    let report = check::check_repository(&repo::Repo::open(root).unwrap()).unwrap();
+    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
     assert!(report.problems.iter().any(|p| p.kind == "badLogLine"));
+}
+
+/// Gap #8: the default (non-scrub) check is presence-only — it must stay silent about a valid
+/// zstd frame holding the wrong content, since only a hash check can catch that. `scrub: true`
+/// is what closes the gap, and it's opt-in.
+#[test]
+fn check_scrub_off_by_default_skips_content_hash() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+
+    // Healthy repo: scrubbing reports what it verified.
+    let scrubbed = check::check_repository(&mut r, true).unwrap();
+    assert!(scrubbed.ok(), "{:?}", scrubbed.problems);
+    assert!(scrubbed.scrub_performed);
+    assert!(scrubbed.versions_scrubbed > 0);
+
+    // Tamper a loose object with a *valid* zstd frame holding different content — it decodes
+    // fine, so `object_exists` alone can't catch it.
+    let hash = repo::hash_bytes(b"base-a");
+    let obj = root
+        .join(".kvc/objects")
+        .join(&hash[..2])
+        .join(format!("{hash}.full"));
+    std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+
+    let plain = check::check_repository(&mut r, false).unwrap();
+    assert!(
+        plain.ok(),
+        "default check must not notice a content-level tamper: {:?}",
+        plain.problems
+    );
+    assert!(!plain.scrub_performed);
+    assert_eq!(plain.versions_scrubbed, 0);
+}
+
+/// A tampered loose object (valid zstd, wrong content) is exactly what `scrub` exists to catch.
+#[test]
+fn check_scrub_detects_corrupted_loose_object() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"the real palette").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+
+    let hash = repo::hash_bytes(b"the real palette");
+    let obj = root
+        .join(".kvc/objects")
+        .join(&hash[..2])
+        .join(format!("{hash}.full"));
+    assert!(obj.is_file());
+    std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+
+    let mut r2 = repo::Repo::open(root).unwrap();
+    let scrubbed = check::check_repository(&mut r2, true).unwrap();
+    assert!(!scrubbed.ok(), "scrub must catch the tampered object");
+    assert!(scrubbed.problems.iter().any(|p| p.kind == "corruptContent"));
+}
+
+/// Same as the loose-object case, but for a packed entry — large batches store as one pack file
+/// instead of loose objects, and scrub must reach into it too.
+#[test]
+fn check_scrub_detects_corrupted_pack_entry() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    // 40 distinct tiles (> PACK_MIN_OBJECTS) pack into one file, per
+    // `large_commit_packs_objects_and_reconstructs`.
+    let tiles_v1: Vec<(i64, i64, Vec<u8>)> = (0..40i64)
+        .map(|i| (i * 64, 0, vec![i as u8; 300 + i as usize]))
+        .collect();
+    let refs: Vec<(i64, i64, &[u8])> = tiles_v1
+        .iter()
+        .map(|(x, y, d)| (*x, *y, d.as_slice()))
+        .collect();
+    let kra = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(255)),
+        ("img/layers/layer1", tiled(&refs)),
+    ]);
+    std::fs::write(root.join("art.kra"), &kra).unwrap();
+    commit::commit_snapshot(&mut r, "packed", "t").unwrap();
+
+    let pack_path = std::fs::read_dir(root.join(".kvc/objects/pack"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "pack"))
+        .unwrap();
+
+    // Corrupt the payload region in place — same overall length (header + index untouched), so
+    // the pack still parses and every offset still lands where it should; only content changes.
+    let mut bytes = std::fs::read(&pack_path).unwrap();
+    let idx_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let payload_start = 5 + 4 + idx_len;
+    for b in &mut bytes[payload_start..payload_start + 32] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&pack_path, &bytes).unwrap();
+
+    let mut r2 = repo::Repo::open(root).unwrap();
+    let plain = check::check_repository(&mut r2, false).unwrap();
+    assert!(
+        plain.ok(),
+        "presence-only check must not notice a content-level tamper: {:?}",
+        plain.problems
+    );
+
+    let scrubbed = check::check_repository(&mut r2, true).unwrap();
+    assert!(!scrubbed.ok(), "scrub must catch the corrupted pack entry");
+    assert!(scrubbed.problems.iter().any(|p| p.kind == "corruptContent"));
+}
+
+/// One bad version must not stop the scrub from finding the next one.
+#[test]
+fn check_scrub_reports_multiple_corruptions_without_aborting() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo::Repo::init(root).unwrap();
+    let mut r = repo::Repo::open(root).unwrap();
+
+    std::fs::write(root.join("a.gpl"), b"palette one").unwrap();
+    std::fs::write(root.join("b.gpl"), b"palette two").unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
+
+    for content in [b"palette one".as_slice(), b"palette two".as_slice()] {
+        let hash = repo::hash_bytes(content);
+        let obj = root
+            .join(".kvc/objects")
+            .join(&hash[..2])
+            .join(format!("{hash}.full"));
+        std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+    }
+
+    let mut r2 = repo::Repo::open(root).unwrap();
+    let scrubbed = check::check_repository(&mut r2, true).unwrap();
+    let corrupt_count = scrubbed
+        .problems
+        .iter()
+        .filter(|p| p.kind == "corruptContent")
+        .count();
+    assert_eq!(
+        corrupt_count, 2,
+        "both corruptions must surface, not just the first: {:?}",
+        scrubbed.problems
+    );
 }

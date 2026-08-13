@@ -23,13 +23,17 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   behavior: the `.kvc/` store, the scanner, commits, branches (create/switch/merge), stashes
   (setting work aside), delta-chain storage, the `.kra` tile engine, and the Tauri commands.
 - [**Data integrity**](data-integrity.md) — the measures the engine already applies to avoid
-  losing an artist's work: the cross-process repo lock, atomic + fsynced writes and save
-  ordering, write-time patch verification, verified reads on the restore paths, the read-only
-  repository check, the GC safety model, stash ordering invariants, and the input-validation caps
-  at the trust boundaries.
+  losing an artist's work: the cross-process repo lock, a `branches.json` generation counter that
+  lets user-facing reads detect a stale snapshot, atomic + fsynced writes and save ordering (plus
+  a previous-generation `.bak` for the small state files), write-time patch verification, verified
+  reads on the restore paths, the read-only repository check (with an opt-in full-store bit-rot
+  scrub), the GC safety model (quarantine-to-trash instead of outright delete), verified
+  self-describing backups, stash ordering invariants, and the input-validation caps at the trust
+  boundaries.
 - [**Data integrity — gaps**](data-integrity-gaps.md) — the companion list of defenses that
-  aren't in place yet (no previous-generation copy of `branches.json`, no bit-rot scrub, no
-  cleanup quarantine, unverified backups), with a suggested order.
+  aren't in place yet: an append-only audit trail of destructive operations, the plugin verifying
+  its reopen matched disk, a pack self-check beyond its name, and a disk-space precheck before a
+  write.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,

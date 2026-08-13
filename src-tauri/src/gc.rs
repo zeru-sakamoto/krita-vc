@@ -9,12 +9,12 @@
 //! leaves only re-collectable orphans, never a reference to missing data.
 
 use crate::commit::ancestors;
-use crate::error::Result;
+use crate::error::{io_at, Result};
 use crate::kra;
 use crate::repo::{kvc_dir, Chains, Repo};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -24,13 +24,21 @@ pub struct GcReport {
     pub commits_removed: usize,
     /// Chain versions dropped across all streams.
     pub versions_removed: usize,
-    /// Loose object files + whole pack files deleted (rewritten packs count once).
+    /// Loose object files + whole pack files quarantined (rewritten packs count once).
     pub objects_deleted: usize,
+    /// Bytes that left the live store this run — quarantined to `.kvc/trash/`, not yet
+    /// permanently gone (see `trash_bytes_pruned`).
     pub bytes_reclaimed: u64,
     /// Raster-cache bytes freed (regenerable previews: over-budget entries pruned, plus a
     /// full wipe when the cache's filter version is stale).
     pub cache_bytes_reclaimed: u64,
+    /// Bytes permanently freed by aging quarantined trash out past its retention window.
+    pub trash_bytes_pruned: u64,
 }
+
+/// Retention window for quarantined GC victims: long enough to notice and recover from a bad
+/// cleanup by hand, short enough that trash doesn't grow unbounded between cleanup runs.
+const TRASH_MAX_AGE_DAYS: u64 = 14;
 
 /// Rewrite a partially-dead pack only when more than a quarter of it is dead — rewriting a
 /// pack rereads and rewrites every survivor, so reclaiming a few KB from a big pack costs
@@ -48,11 +56,59 @@ const CONSOLIDATE_MAX_PACK_BYTES: u64 = 4 << 20;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn rewrite_gate_over_quarter_dead() {
         assert!(!super::worth_rewriting(0, 100));
         assert!(!super::worth_rewriting(25, 100), "25% dead: keep the pack");
         assert!(super::worth_rewriting(26, 100), ">25% dead: rewrite");
+    }
+
+    #[test]
+    fn quarantine_preserves_relative_path_and_moves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        let trash = dir.path().join("trash/run1");
+        std::fs::create_dir_all(objects.join("ab")).unwrap();
+        let victim = objects.join("ab").join("hash.full");
+        std::fs::write(&victim, b"data").unwrap();
+
+        quarantine(&trash, &objects, &victim).unwrap();
+
+        assert!(!victim.exists(), "the original must be gone, not copied");
+        assert_eq!(
+            std::fs::read(trash.join("ab").join("hash.full")).unwrap(),
+            b"data"
+        );
+    }
+
+    #[test]
+    fn prune_trash_leaves_dirs_within_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let kvc = dir.path().join(".kvc");
+        let run = kvc.join("trash").join("run1");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("f"), b"12345").unwrap();
+
+        // A cutoff before this run's mtime: nothing is old enough to prune yet.
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert_eq!(prune_trash(&kvc, cutoff), 0);
+        assert!(run.exists(), "trash within retention survives cleanup");
+    }
+
+    #[test]
+    fn prune_trash_removes_dirs_older_than_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let kvc = dir.path().join(".kvc");
+        let run = kvc.join("trash").join("run1");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("f"), b"12345").unwrap();
+
+        // A cutoff after this run's mtime: it's expired.
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        assert_eq!(prune_trash(&kvc, cutoff), 5, "reports the bytes it freed");
+        assert!(!run.exists(), "expired trash run is permanently pruned");
     }
 }
 
@@ -244,6 +300,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         objects_deleted: dead_loose.len(),
         bytes_reclaimed: dead_loose.iter().map(|(_, len)| len).sum(),
         cache_bytes_reclaimed: 0,
+        trash_bytes_pruned: 0,
     };
     for p in &pack_plans {
         if p.live == 0 {
@@ -274,18 +331,20 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     repo.chains.rewrite_all(&kvc_dir(&repo.root), new_chains)?;
     repo.save()?;
 
-    // --- delete loose ---------------------------------------------------------------------
+    // --- quarantine loose (moved to .kvc/trash/, not deleted outright — see gap #5) --------
+    let kvc = kvc_dir(&repo.root);
+    let trash_dir = trash_run_dir(&kvc);
     for (path, _) in &dead_loose {
-        let _ = std::fs::remove_file(path);
+        let _ = quarantine(&trash_dir, &objects, path);
     }
 
-    // --- delete / rewrite packs ------------------------------------------------------------
+    // --- quarantine / rewrite packs ---------------------------------------------------------
     for p in &pack_plans {
         if p.live == 0 {
-            let _ = std::fs::remove_file(&p.path);
+            let _ = quarantine(&trash_dir, &objects, &p.path);
         } else if worth_rewriting(p.dead_bytes, p.total) {
             // Rewrite with survivors only; write the new pack (or loose files for a small
-            // remainder) before deleting the old one, so a crash never loses live objects.
+            // remainder) before quarantining the old one, so a crash never loses live objects.
             let survivors: Vec<(String, Vec<u8>)> = p
                 .entries
                 .iter()
@@ -303,7 +362,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
                     crate::delta::write_loose(&objects, name, bytes)?;
                 }
             }
-            let _ = std::fs::remove_file(&p.path);
+            let _ = quarantine(&trash_dir, &objects, &p.path);
         }
     }
     repo.packs.invalidate();
@@ -311,7 +370,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     // --- consolidate small surviving packs into one (fragmentation, not reclamation) -------
     consolidate_small_packs(repo)?;
 
-    // --- stale temp files -------------------------------------------------------------------
+    // --- stale temp files: crash leftovers, not reachable-once data, no recovery value -----
     for (path, _) in &stale_tmp {
         let _ = std::fs::remove_file(path);
     }
@@ -321,7 +380,81 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     cache_freed += crate::raster::cache_prune(&cache_dir, repo.config.cache_max_bytes);
     report.cache_bytes_reclaimed = cache_freed;
 
+    // --- age out quarantined trash past its retention window --------------------------------
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_MAX_AGE_DAYS * 86_400);
+    report.trash_bytes_pruned = prune_trash(&kvc, cutoff);
+
     Ok(report)
+}
+
+/// Where this cleanup run's quarantined objects/packs land — `.kvc/trash/<now>/`. Only
+/// referenced lazily by [`quarantine`], which creates it (and its subdirectories) on first use,
+/// so a cleanup with nothing to reclaim never creates an empty trash run.
+fn trash_run_dir(kvc: &Path) -> PathBuf {
+    kvc.join("trash").join(crate::repo::now_iso_filesafe())
+}
+
+/// Move `victim` (an absolute path under `objects_root`) into `trash_dir`, preserving its path
+/// relative to `objects_root` (`objects/ab/<hash>.full` -> `trash/<ts>/ab/<hash>.full`) so two
+/// quarantined objects never collide on name. `rename` is the same cost class as the
+/// `remove_file` it replaces — same-volume, metadata-only.
+fn quarantine(trash_dir: &Path, objects_root: &Path, victim: &Path) -> Result<()> {
+    let rel = victim.strip_prefix(objects_root).unwrap_or(victim);
+    let dest = trash_dir.join(rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+    }
+    std::fs::rename(victim, &dest).map_err(|e| io_at(victim, e))?;
+    Ok(())
+}
+
+/// Sum of all file sizes under `dir`, recursively — used to report bytes freed by pruning.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                total += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// Permanently remove trash run-dirs older than `cutoff`. Only called on a real (non-dry-run)
+/// cleanup, after the sweep — a dry run must never touch trash. Takes an explicit cutoff instant
+/// (rather than computing "now minus the retention window" internally) so the aging logic is
+/// testable without faking a directory's mtime — the caller just moves the cutoff instead.
+fn prune_trash(kvc: &Path, cutoff: std::time::SystemTime) -> u64 {
+    let trash = kvc.join("trash");
+    let Ok(rd) = std::fs::read_dir(&trash) else {
+        return 0;
+    };
+    let mut freed = 0u64;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let expired = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|modified| modified < cutoff);
+        if expired {
+            freed += dir_size(&p);
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    freed
 }
 
 /// `*.tmp` leftovers of `write_atomic`/`write_pack` interrupted by a crash — never cleaned by

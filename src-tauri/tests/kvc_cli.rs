@@ -228,3 +228,36 @@ fn check_reports_findings_without_failing() {
     assert_eq!(report["ok"], false);
     assert_eq!(report["problems"][0]["kind"], "missingObject");
 }
+
+/// `--scrub true` re-hashes stored content and catches what presence-only `check` can't: a
+/// valid-but-wrong object. Default (no `--scrub`) stays silent about the same tamper.
+#[test]
+fn check_scrub_flag_reports_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    krita_vc_lib::repo::Repo::init(root).unwrap();
+    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
+    let (ok, _) = kvc(root, &["commit", "--message", "first", "--author", "Zeru"]);
+    assert!(ok);
+
+    let hash = krita_vc_lib::repo::hash_bytes(b"hello world");
+    let obj = root
+        .join(".kvc/objects")
+        .join(&hash[..2])
+        .join(format!("{hash}.full"));
+    std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+
+    let (ok, report) = kvc(root, &["check"]);
+    assert!(ok);
+    assert_eq!(
+        report["ok"], true,
+        "default check must not notice a content-level tamper"
+    );
+    assert_eq!(report["scrubPerformed"], false);
+
+    let (ok, report) = kvc(root, &["check", "--scrub", "true"]);
+    assert!(ok, "a repo with problems is still a successful check run");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["scrubPerformed"], true);
+    assert_eq!(report["problems"][0]["kind"], "corruptContent");
+}

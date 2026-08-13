@@ -53,6 +53,29 @@ where
     run(f).await
 }
 
+/// Call `f`, rechecking `branches.json`'s generation counter (bumped on every write, see
+/// `Repo::save`/`Repo::save_branches`) before and after — if it moved, a write landed mid-read
+/// and `f`'s result could be a torn snapshot, so retry (bounded). Every attempt still racing is
+/// a narrow, benign window (a write mid-read, not corruption — `write_atomic`'s rename is
+/// already the atomicity boundary), so the last attempt is returned rather than erroring the UI
+/// over it. Only worth wrapping around read commands whose staleness is user-visible (history,
+/// diffs, branch list) — the CLI's poll trio (`status`/`branches`/`stash-list`) must stay
+/// exactly as cheap as before and never calls this.
+fn read_consistent<T>(root: &Path, f: impl Fn() -> Result<T>) -> Result<T> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let before = crate::repo::read_branches_generation(root).unwrap_or(0);
+        let result = f()?;
+        let after = crate::repo::read_branches_generation(root).unwrap_or(0);
+        if before == after {
+            return Ok(result);
+        }
+        last = Some(result);
+    }
+    Ok(last.expect("loop runs MAX_ATTEMPTS >= 1 times"))
+}
+
 /// Percent of logical cores the engine may use (10-100). App-global, not per-repo — the
 /// frontend persists it and pushes it here on startup and on change.
 #[tauri::command]
@@ -229,13 +252,17 @@ pub async fn cleanup_repository(
 
 /// Read-only integrity check: missing objects, broken chains, dangling branch tips, unreadable
 /// commit-log lines, unparseable packs. Takes no lock — it only reads, like the cleanup dry run.
+/// `scrub` (default off) additionally re-hashes every live version's content — IO over the whole
+/// store, so it's routed through `run_heavy` same as the rest of check, but only ever runs on
+/// explicit request, never from the plugin's poll.
 #[tauri::command]
 pub async fn check_repository(
     path: String,
+    scrub: bool,
 ) -> std::result::Result<crate::check::CheckReport, String> {
     run_heavy(move || {
-        let repo = Repo::open(Path::new(&path))?;
-        crate::check::check_repository(&repo)
+        let mut repo = Repo::open(Path::new(&path))?;
+        crate::check::check_repository(&mut repo, scrub)
     })
     .await
 }
@@ -489,17 +516,20 @@ pub async fn commit_snapshot(
 #[tauri::command]
 pub async fn list_commits(path: String) -> std::result::Result<Vec<Commit>, String> {
     run(move || {
-        let repo = Repo::open_light(Path::new(&path))?;
-        let reach = match repo.branches.tip() {
-            Some(tip) => commit::ancestors(&repo.commits, tip),
-            None => return Ok(Vec::new()),
-        };
-        Ok(repo
-            .commits
-            .iter()
-            .filter(|c| reach.contains(&c.id))
-            .cloned()
-            .collect())
+        let root = Path::new(&path);
+        read_consistent(root, || {
+            let repo = Repo::open_light(root)?;
+            let reach = match repo.branches.tip() {
+                Some(tip) => commit::ancestors(&repo.commits, tip),
+                None => return Ok(Vec::new()),
+            };
+            Ok(repo
+                .commits
+                .iter()
+                .filter(|c| reach.contains(&c.id))
+                .cloned()
+                .collect())
+        })
     })
     .await
 }
@@ -529,8 +559,11 @@ fn branch_dtos(repo: &Repo) -> Vec<BranchDto> {
 #[tauri::command]
 pub async fn list_branches(path: String) -> std::result::Result<Vec<BranchDto>, String> {
     run(move || {
-        let repo = Repo::open_light(Path::new(&path))?;
-        Ok(branch_dtos(&repo))
+        let root = Path::new(&path);
+        read_consistent(root, || {
+            let repo = Repo::open_light(root)?;
+            Ok(branch_dtos(&repo))
+        })
     })
     .await
 }
@@ -1567,27 +1600,30 @@ pub async fn commit_diff(
     commit_id: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run_heavy(move || {
-        let repo = Repo::open(Path::new(&path))?;
-        // Register only after the path is confirmed to be a real repo, so a failed open never
-        // adds a root to the kvcimg scheme's allowlist.
-        register_served_repo(&path);
-        let commit = repo
-            .commits
-            .iter()
-            .find(|c| c.id == commit_id)
-            .cloned()
-            .ok_or_else(|| KvcError::NoCommit(commit_id.clone()))?;
-        let parent_tree = commit
-            .parents
-            .first()
-            .and_then(|p| commit::tree_at_commit(&repo.commits, p))
-            .unwrap_or_default();
+        let root = Path::new(&path);
+        read_consistent(root, || {
+            let repo = Repo::open(root)?;
+            // Register only after the path is confirmed to be a real repo, so a failed open
+            // never adds a root to the kvcimg scheme's allowlist.
+            register_served_repo(&path);
+            let commit = repo
+                .commits
+                .iter()
+                .find(|c| c.id == commit_id)
+                .cloned()
+                .ok_or_else(|| KvcError::NoCommit(commit_id.clone()))?;
+            let parent_tree = commit
+                .parents
+                .first()
+                .and_then(|p| commit::tree_at_commit(&repo.commits, p))
+                .unwrap_or_default();
 
-        Ok(commit
-            .files
-            .iter()
-            .flat_map(|f| diff_entry(&repo, f, parent_tree.get(&f.path), false))
-            .collect())
+            Ok(commit
+                .files
+                .iter()
+                .flat_map(|f| diff_entry(&repo, f, parent_tree.get(&f.path), false))
+                .collect())
+        })
     })
     .await
 }
@@ -1686,74 +1722,77 @@ pub async fn working_diff(
     file: String,
 ) -> std::result::Result<Vec<DiffEntryDto>, String> {
     run_heavy(move || {
-        let repo = Repo::open(Path::new(&path))?;
-        // Register only after the path is confirmed to be a real repo, so a failed open never
-        // adds a root to the kvcimg scheme's allowlist.
-        register_served_repo(&path);
-        if !file.to_lowercase().ends_with(".kra") {
+        let root = Path::new(&path);
+        read_consistent(root, || {
+            let repo = Repo::open(root)?;
+            // Register only after the path is confirmed to be a real repo, so a failed open
+            // never adds a root to the kvcimg scheme's allowlist.
+            register_served_repo(&path);
+            if !file.to_lowercase().ends_with(".kra") {
+                let old = last_committed(&repo, &file);
+                let status = if old.is_some() { "M" } else { "A" };
+                if crate::palette::is_palette(&file) {
+                    let abs = crate::repo::safe_join(&repo.root, &file)?;
+                    let new_bytes = std::fs::read(&abs).ok();
+                    let old_bytes = old
+                        .as_ref()
+                        .and_then(|o| o.content.as_deref())
+                        .and_then(|h| repo.reconstruct(&format!("file:{}", file), h).ok());
+                    if let Some(dto) =
+                        palette_dto(&file, status, old_bytes.as_deref(), new_bytes.as_deref())
+                    {
+                        return Ok(vec![DiffEntryDto::Palette(dto)]);
+                    }
+                }
+                return Ok(vec![text_entry(&CommittedFile {
+                    path: file.clone(),
+                    status: status.into(),
+                    content: None,
+                    is_kra: false,
+                    file_hash: None,
+                    original_size: 0,
+                })]);
+            }
+            // Parse the working `.kra` once, then run the art diff and the embedded-palette diff
+            // off the same source (mirrors `diff_entry`'s committed path). `working_art_dto`
+            // stays for the raster-streaming `working_layers`.
+            let art_text = || {
+                text_entry(&CommittedFile {
+                    path: file.clone(),
+                    status: "M".into(),
+                    content: None,
+                    is_kra: true,
+                    file_hash: None,
+                    original_size: 0,
+                })
+            };
+            let abs = crate::repo::safe_join(&repo.root, &file)?;
+            let Ok(bytes) = std::fs::read(&abs) else {
+                return Ok(vec![art_text()]);
+            };
+            let Ok(working) = kra::parse_working(&bytes, repo.config.low_memory_diff) else {
+                return Ok(vec![art_text()]);
+            };
+            let new_src = kra::KraSource::Working(&working);
             let old = last_committed(&repo, &file);
             let status = if old.is_some() { "M" } else { "A" };
-            if crate::palette::is_palette(&file) {
-                let abs = crate::repo::safe_join(&repo.root, &file)?;
-                let new_bytes = std::fs::read(&abs).ok();
-                let old_bytes = old
-                    .as_ref()
-                    .and_then(|o| o.content.as_deref())
-                    .and_then(|h| repo.reconstruct(&format!("file:{}", file), h).ok());
-                if let Some(dto) =
-                    palette_dto(&file, status, old_bytes.as_deref(), new_bytes.as_deref())
-                {
-                    return Ok(vec![DiffEntryDto::Palette(dto)]);
-                }
-            }
-            return Ok(vec![text_entry(&CommittedFile {
-                path: file.clone(),
-                status: status.into(),
-                content: None,
-                is_kra: false,
-                file_hash: None,
-                original_size: 0,
-            })]);
-        }
-        // Parse the working `.kra` once, then run the art diff and the embedded-palette diff off
-        // the same source (mirrors `diff_entry`'s committed path). `working_art_dto` stays for the
-        // raster-streaming `working_layers`.
-        let art_text = || {
-            text_entry(&CommittedFile {
-                path: file.clone(),
-                status: "M".into(),
-                content: None,
-                is_kra: true,
-                file_hash: None,
-                original_size: 0,
-            })
-        };
-        let abs = crate::repo::safe_join(&repo.root, &file)?;
-        let Ok(bytes) = std::fs::read(&abs) else {
-            return Ok(vec![art_text()]);
-        };
-        let Ok(working) = kra::parse_working(&bytes, repo.config.low_memory_diff) else {
-            return Ok(vec![art_text()]);
-        };
-        let new_src = kra::KraSource::Working(&working);
-        let old = last_committed(&repo, &file);
-        let status = if old.is_some() { "M" } else { "A" };
-        let Ok(art) = art_diff_dto(&repo, &file, status, &new_src, old.as_ref(), false, None)
-        else {
-            return Ok(vec![art_text()]);
-        };
-        let old_manifest = old
-            .as_ref()
-            .and_then(|o| o.content.as_deref())
-            .and_then(|h| kra::load_manifest(&repo, &file, h).ok());
-        let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
-        let mut out = vec![DiffEntryDto::Art(art)];
-        out.extend(
-            kra_palette_dtos(&repo, &file, &new_src, old_src.as_ref())
-                .into_iter()
-                .map(DiffEntryDto::Palette),
-        );
-        Ok(out)
+            let Ok(art) = art_diff_dto(&repo, &file, status, &new_src, old.as_ref(), false, None)
+            else {
+                return Ok(vec![art_text()]);
+            };
+            let old_manifest = old
+                .as_ref()
+                .and_then(|o| o.content.as_deref())
+                .and_then(|h| kra::load_manifest(&repo, &file, h).ok());
+            let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
+            let mut out = vec![DiffEntryDto::Art(art)];
+            out.extend(
+                kra_palette_dtos(&repo, &file, &new_src, old_src.as_ref())
+                    .into_iter()
+                    .map(DiffEntryDto::Palette),
+            );
+            Ok(out)
+        })
     })
     .await
 }
@@ -1792,7 +1831,50 @@ pub async fn working_layers(
 
 #[cfg(test)]
 mod tests {
-    use super::palette_logical_key;
+    use super::{palette_logical_key, read_consistent};
+
+    #[test]
+    fn read_consistent_retries_when_a_write_lands_mid_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::repo::Repo::init(root).unwrap();
+
+        let calls = std::cell::Cell::new(0u32);
+        let result = read_consistent(root, || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                // Simulate a concurrent writer landing mid-read: a real generation bump, so
+                // the after-check sees it moved and retries.
+                let mut r = crate::repo::Repo::open(root).unwrap();
+                r.save_branches().unwrap();
+            }
+            Ok(n)
+        });
+        assert_eq!(result.unwrap(), 1, "must retry once the race is detected");
+        assert_eq!(calls.get(), 2, "exactly one retry, not more");
+    }
+
+    #[test]
+    fn read_consistent_gives_up_after_max_attempts_and_returns_last_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::repo::Repo::init(root).unwrap();
+
+        let calls = std::cell::Cell::new(0u32);
+        let result = read_consistent(root, || {
+            let n = calls.get();
+            calls.set(n + 1);
+            // Always race: every attempt sees a fresh write, so before != after every time.
+            let mut r = crate::repo::Repo::open(root).unwrap();
+            r.save_branches().unwrap();
+            Ok(n)
+        });
+        // Bounded retries, then gives up and returns the last attempt's result rather than
+        // looping forever or erroring the caller over a benign race.
+        assert_eq!(calls.get(), 3);
+        assert_eq!(result.unwrap(), 2);
+    }
 
     #[test]
     fn palette_logical_key_collapses_format_and_version_duplicates() {

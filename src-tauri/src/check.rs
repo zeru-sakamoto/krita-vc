@@ -5,18 +5,19 @@
 //! [`crate::gc`] does (via the shared [`crate::gc::mark_live`]) and reports what's broken instead
 //! of deleting what isn't reachable. Takes no lock, writes nothing.
 //!
-//! Deliberately **not** here: re-hashing every stored object. That's IO over the whole store, and
-//! the corruption that actually reaches an artist's file is caught on the restore path itself
-//! (`Repo::verify_reads`). A full scrub belongs behind its own opt-in if it's ever wanted.
+//! An opt-in **scrub** (`scrub: true`) additionally re-hashes every live version's content —
+//! IO over the whole store, so it's never run automatically, only on explicit request (Settings
+//! → Storage → "Check for problems…" or `kvc check --scrub true`). It reuses `Repo::reconstruct_
+//! cached` + `Repo::verify_reads` exactly as the restore path does — no new hashing logic.
 
-use crate::error::Result;
+use crate::error::{KvcError, Result};
 use crate::repo::{kvc_dir, Commit, Repo};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
-    /// `missingObject` | `brokenChain` | `danglingTip` | `badLogLine` | `badPack`
+    /// `missingObject` | `brokenChain` | `danglingTip` | `badLogLine` | `badPack` | `corruptContent`
     pub kind: String,
     pub detail: String,
 }
@@ -27,6 +28,10 @@ pub struct CheckReport {
     pub commits_checked: usize,
     /// Live stream versions whose backing object was looked for.
     pub objects_checked: usize,
+    /// Whether `scrub` was requested for this run.
+    pub scrub_performed: bool,
+    /// Live versions re-hashed (only non-zero when `scrub_performed`).
+    pub versions_scrubbed: usize,
     pub problems: Vec<Problem>,
 }
 
@@ -43,7 +48,7 @@ fn problem(kind: &str, detail: String) -> Problem {
     }
 }
 
-pub fn check_repository(repo: &Repo) -> Result<CheckReport> {
+pub fn check_repository(repo: &mut Repo, scrub: bool) -> Result<CheckReport> {
     let mut problems: Vec<Problem> = Vec::new();
 
     // --- branch tips point at commits that exist -----------------------------------------
@@ -89,7 +94,14 @@ pub fn check_repository(repo: &Repo) -> Result<CheckReport> {
         problems.push(problem("brokenChain", format!("{path}: {err}")));
     }
 
+    // Scrubbing needs `verify_reads` on for the duration — restore it afterward regardless of
+    // what it was (it's always `false` on a freshly-opened `Repo`, but don't assume that).
+    let prior_verify_reads = repo.verify_reads;
+    repo.verify_reads = scrub;
+    let mut scrub_memo: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
     let mut objects_checked = 0usize;
+    let mut versions_scrubbed = 0usize;
     for (key, hash) in &marks.marked {
         let version = marks
             .all
@@ -109,8 +121,21 @@ pub fn check_repository(repo: &Repo) -> Result<CheckReport> {
                 "missingObject",
                 format!("{} (needed by {key})", v.object_name()),
             ));
+            continue;
+        }
+        if scrub {
+            match repo.reconstruct_cached(key, hash, &mut scrub_memo) {
+                Ok(_) => versions_scrubbed += 1,
+                Err(KvcError::Corrupt(detail)) => {
+                    problems.push(problem("corruptContent", detail));
+                }
+                Err(e) => {
+                    problems.push(problem("corruptContent", format!("{key}@{hash}: {e}")));
+                }
+            }
         }
     }
+    repo.verify_reads = prior_verify_reads;
 
     // --- packs parse ----------------------------------------------------------------------
     // An unparseable pack is skipped everywhere else in the engine, which turns real corruption
@@ -138,6 +163,8 @@ pub fn check_repository(repo: &Repo) -> Result<CheckReport> {
     Ok(CheckReport {
         commits_checked: marks.reachable.len(),
         objects_checked,
+        scrub_performed: scrub,
+        versions_scrubbed,
         problems,
     })
 }

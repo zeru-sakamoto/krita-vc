@@ -107,7 +107,12 @@ Two independent mechanisms, solving different problems:
   the only serialization point. Released automatically when the holding process's file handle
   closes, even on a crash, so there's no stale-lock state. A present-participle label
   (`"committing"`, `"switching branches"`) is written to a `kvc.lock.info` sidecar on acquire so a
-  blocked caller's error names what's holding it. Read-only commands take no lock.
+  blocked caller's error names what's holding it. Read-only commands take no lock — except the
+  four whose staleness is user-visible (`list_commits`, `commit_diff`, `working_diff`,
+  `list_branches`), which re-check a `generation` counter on `branches.json` before/after and
+  retry (bounded) if a write landed mid-read (`commands.rs` — `read_consistent`); the `kvc` CLI's
+  poll trio (`status`/`branches`/`stash-list`) is deliberately excluded and stays lock-free and
+  recheck-free.
 - **`cpu.rs`**'s budgeted pool + `heavy_permit` semaphore — not correctness, but headroom: caps
   how much of the machine and how much concurrent memory the engine takes, so a commit or diff
   doesn't starve Krita (which triggered it) or stack unbounded 64 MB decode buffers when the UI

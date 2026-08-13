@@ -349,6 +349,7 @@ automatically.
 AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ TopBar ─ Menu (repository switcher)
 ├─ ActivityBar ─ SettingsModal (gear) ─┬─ CleanupModal ("Clean up storage…")
+│                                       ├─ CheckModal ("Check for problems…", opt-in full scrub)
 │                                       └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
 ├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │                         ├─ changes  → ChangesPanel ─ FileStatusChip
