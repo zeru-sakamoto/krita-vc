@@ -385,6 +385,21 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_MAX_AGE_DAYS * 86_400);
     report.trash_bytes_pruned = prune_trash(&kvc, cutoff);
 
+    let tip = repo.branches.tip().map(str::to_string);
+    let _ = crate::ops_log::append(
+        repo,
+        "cleanup",
+        tip.as_deref(),
+        tip.as_deref(),
+        Some(format!(
+            "reclaimed {} bytes ({} objects, {} versions, {} commits)",
+            report.bytes_reclaimed,
+            report.objects_deleted,
+            report.versions_removed,
+            commits_removed
+        )),
+    );
+
     Ok(report)
 }
 

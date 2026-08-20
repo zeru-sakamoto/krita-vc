@@ -3758,11 +3758,12 @@ fn check_scrub_detects_corrupted_pack_entry() {
         .find(|p| p.extension().is_some_and(|x| x == "pack"))
         .unwrap();
 
-    // Corrupt the payload region in place — same overall length (header + index untouched), so
-    // the pack still parses and every offset still lands where it should; only content changes.
+    // Corrupt the payload region in place — same overall length (header + index + body-length
+    // field untouched), so the pack still parses and every offset still lands where it should;
+    // only content changes.
     let mut bytes = std::fs::read(&pack_path).unwrap();
     let idx_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
-    let payload_start = 5 + 4 + idx_len;
+    let payload_start = 5 + 4 + idx_len + 8; // KVCP2: magic + idx_len + index + u64 body_len
     for b in &mut bytes[payload_start..payload_start + 32] {
         *b ^= 0xFF;
     }

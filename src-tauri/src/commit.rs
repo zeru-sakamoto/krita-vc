@@ -35,6 +35,9 @@ pub fn commit_selected(
     // `commit_kra` and skip re-inflating unchanged zip entries.
     let prev_tree = current_tree(repo);
 
+    let needed: u64 = changes.iter().map(|c| c.size).sum();
+    crate::diskspace::check_available(repo, needed)?;
+
     let mut files = Vec::new();
     for change in changes {
         let rel = change.rel.clone();
@@ -291,6 +294,12 @@ pub fn materialize_tree(
     current: &BTreeMap<String, CommittedFile>,
     target: &BTreeMap<String, CommittedFile>,
 ) -> Result<()> {
+    let needed: u64 = target
+        .iter()
+        .filter(|(path, f)| current.get(*path).map(|c| &c.content) != Some(&f.content))
+        .map(|(_, f)| f.original_size)
+        .sum();
+    crate::diskspace::check_available(repo, needed)?;
     // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
     repo.verify_reads = true;
     for (path, f) in target {
@@ -347,6 +356,12 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
     let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
     let current = current_tree(repo);
+    let needed: u64 = target
+        .iter()
+        .filter(|(path, f)| current.get(*path).map(|c| &c.content) != Some(&f.content))
+        .map(|(_, f)| f.original_size)
+        .sum();
+    crate::diskspace::check_available(repo, needed)?;
     // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
     repo.verify_reads = true;
 
@@ -470,6 +485,7 @@ pub fn discard_working_changes(
     if selected.is_empty() {
         return Err(KvcError::Nothing);
     }
+    let selected_count = selected.len();
     // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
     repo.verify_reads = true;
 
@@ -504,7 +520,15 @@ pub fn discard_working_changes(
             },
         );
     }
-    repo.save()
+    repo.save()?;
+    let _ = crate::ops_log::append(
+        repo,
+        "discard",
+        Some(tip_id),
+        Some(tip_id),
+        Some(format!("{} file(s)", selected_count)),
+    );
+    Ok(())
 }
 
 /// Discard uncommitted changes and reset the working tree to `tip_id` — no new commit.
@@ -619,6 +643,13 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
         .tip()
         .and_then(|t| repo.commits.iter().find(|c| c.id == t))
         .cloned();
+    let _ = crate::ops_log::append(
+        repo,
+        "undo",
+        Some(&tip_id),
+        new_tip.as_ref().map(|c| c.id.as_str()),
+        Some(format!("undid \"{}\"", last.message)),
+    );
     Ok(new_tip)
 }
 

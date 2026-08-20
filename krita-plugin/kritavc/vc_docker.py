@@ -538,17 +538,21 @@ class VcDocker(DockWidget):
         self._set_busy(True)
         try:
             op()
+            # Post-op snapshot, taken once — the same instant _reopen's later re-check compares
+            # against, so a file that changes again mid-reopen (another process, a stray autosave)
+            # is caught instead of silently handing the artist a stale document.
+            after = {path: kvc.stat_key(path) for path in docs}
             # Reopen inside the busy window: _reopen closes/opens docs, which spins the Qt event
             # loop; if busy were already cleared, the 1.5s poll and the focus-save handler could
             # re-enter mid-reopen. (op() raising skips the reopen, as before.)
             for path, (doc, _) in docs.items():
-                if kvc.stat_key(path) != before[path]:
-                    self._reopen(path, doc)
+                if after[path] != before[path]:
+                    self._reopen(path, doc, after[path])
         finally:
             self._set_busy(False)
         return True
 
-    def _reopen(self, path, doc):
+    def _reopen(self, path, doc, expected_stat):
         doc.setBatchmode(True)
         doc.setModified(False)  # nothing to lose: _rebuild_docs refused to run if there was
         doc.close()
@@ -559,6 +563,12 @@ class VcDocker(DockWidget):
             self._show_error(
                 f"Couldn't reopen {os.path.basename(path)} after the operation. "
                 "Open it again from disk — your work is saved there."
+            )
+            return
+        if kvc.stat_key(path) != expected_stat:
+            self._show_error(
+                f"{os.path.basename(path)} changed again while reopening — "
+                "close and reopen it to be sure you're seeing the latest version."
             )
             return
         window = Krita.instance().activeWindow()

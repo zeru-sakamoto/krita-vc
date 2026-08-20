@@ -407,15 +407,21 @@ fn read_loose(objects: &Path, name: &str) -> Result<Vec<u8>> {
 
 // --- pack files ---------------------------------------------------------------------------
 // One commit's new objects, batched into a single file. Format:
-// `KVCP1` | u32-LE index length | zstd(bincode(Vec<(name, rel_offset, len)>)) | payloads.
-// Offsets are relative to the end of the index; the file is named by the blake3 of its index
-// (which names every contained object), written temp-then-rename.
+// `KVCP2` | u32-LE index length | zstd(bincode(Vec<(name, rel_offset, len)>)) | u64-LE body
+// length | payloads. Offsets are relative to the end of the index; the file is named by the
+// blake3 of its index (which names every contained object), written temp-then-rename.
+//
+// `body_len` is a self-check: it lets a truncated pack (interrupted copy, bad backup restore)
+// be recognized as corrupt at header-parse time instead of surfacing as garbage bytes — or a
+// `MissingObject` for every entry after it — when something later tries to read out of it.
+// `KVCP1` (no body length) is still read as before, unchecked — old packs are never rewritten.
 
 /// Batches below this stay loose — dedup behavior stays file-observable for small commits and
 /// tests, and a pack of three tiles wouldn't pay for its indirection.
 pub const PACK_MIN_OBJECTS: usize = 32;
 
 const PACK_MAGIC: &[u8; 5] = b"KVCP1";
+const PACK_MAGIC_V2: &[u8; 5] = b"KVCP2";
 
 pub(crate) fn pack_dir(objects: &Path) -> std::path::PathBuf {
     objects.join("pack")
@@ -479,6 +485,7 @@ impl Packs {
             bincode::serialize(&index).map_err(|e| KvcError::BadIndex(e.to_string()))?;
         let idx_bytes = zstd::encode_all(&idx_plain[..], 1)?;
         let pack_name = crate::repo::hash_bytes(&idx_bytes);
+        let body_len: u64 = objs.iter().map(|(_, data)| data.len() as u64).sum();
 
         let dir = pack_dir(objects);
         std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
@@ -488,9 +495,10 @@ impl Packs {
             {
                 let file = std::fs::File::create(&tmp).map_err(|e| io_at(&tmp, e))?;
                 let mut w = std::io::BufWriter::new(file);
-                w.write_all(PACK_MAGIC)?;
+                w.write_all(PACK_MAGIC_V2)?;
                 w.write_all(&(idx_bytes.len() as u32).to_le_bytes())?;
                 w.write_all(&idx_bytes)?;
+                w.write_all(&body_len.to_le_bytes())?;
                 for (_, data) in objs {
                     w.write_all(data)?;
                 }
@@ -502,7 +510,7 @@ impl Packs {
         // Keep the in-memory index coherent for reads later in this session. `make_mut`
         // copy-on-writes if a reader still holds a snapshot Arc (stale snapshots are safe:
         // they just miss the objects this pack added, same as before it was written).
-        let payload_base = (PACK_MAGIC.len() + 4 + idx_bytes.len()) as u64;
+        let payload_base = (PACK_MAGIC.len() + 4 + idx_bytes.len() + 8) as u64;
         {
             let mut guard = self.0.lock().unwrap();
             let arc = guard.get_or_insert_with(|| std::sync::Arc::new(load_pack_indexes(objects)));
@@ -537,26 +545,43 @@ fn load_pack_indexes(objects: &Path) -> PackIndex {
     map
 }
 
-/// Parse one pack's header, returning entries with **absolute** file offsets.
+/// Parse one pack's header, returning entries with **absolute** file offsets. `KVCP2` packs
+/// additionally get their declared body length checked against the file's real length — a
+/// truncated pack is rejected here (skipped, same as any other unparseable header) rather than
+/// surfacing later as `MissingObject`/garbage bytes for whatever it happened to still contain.
 pub(crate) fn read_pack_header(path: &Path) -> Option<Vec<(String, u64, u32)>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 9];
     f.read_exact(&mut head).ok()?;
-    if &head[..5] != PACK_MAGIC {
-        return None;
-    }
+    let v2 = match &head[..5] {
+        m if m == PACK_MAGIC => false,
+        m if m == PACK_MAGIC_V2 => true,
+        _ => return None,
+    };
     let idx_len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
+    let file_len = f.metadata().ok()?.len();
     // A corrupt header could claim a multi-GB index; the index bytes live in this same file, so
     // idx_len can never legitimately exceed the file's length — reject rather than pre-allocate.
-    if idx_len as u64 > f.metadata().ok()?.len() {
+    if idx_len as u64 > file_len {
         return None;
     }
     let mut idx_bytes = vec![0u8; idx_len];
     f.read_exact(&mut idx_bytes).ok()?;
     let plain = zstd::decode_all(&idx_bytes[..]).ok()?;
     let entries: Vec<(String, u64, u32)> = bincode::deserialize(&plain).ok()?;
-    let base = (9 + idx_len) as u64;
+    let base = if v2 {
+        let mut body_len_bytes = [0u8; 8];
+        f.read_exact(&mut body_len_bytes).ok()?;
+        let body_len = u64::from_le_bytes(body_len_bytes);
+        let header_len = 9 + idx_len as u64 + 8;
+        if file_len - header_len != body_len {
+            return None;
+        }
+        header_len
+    } else {
+        (9 + idx_len) as u64
+    };
     Some(
         entries
             .into_iter()

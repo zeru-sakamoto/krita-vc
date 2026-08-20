@@ -98,6 +98,9 @@ pub enum KvcError {
     #[error("repository is busy (locked by another process): {0}")]
     Locked(String),
 
+    #[error("not enough free disk space: this needs about {needed} bytes, {available} available")]
+    InsufficientDiskSpace { needed: u64, available: u64 },
+
     #[error(transparent)]
     Io(#[from] io::Error),
 }

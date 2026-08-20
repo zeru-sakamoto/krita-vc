@@ -249,10 +249,23 @@ pub fn delete_branch(repo: &mut Repo, name: &str) -> Result<()> {
     if name == repo.branches.current {
         return Err(KvcError::DeleteCurrent);
     }
-    if repo.branches.branches.remove(name).is_none() {
+    let Some(old_tip) = repo.branches.branches.remove(name) else {
         return Err(KvcError::NoBranch(name.to_string()));
-    }
-    repo.save_branches()
+    };
+    repo.save_branches()?;
+    let old_tip = if old_tip.is_empty() {
+        None
+    } else {
+        Some(old_tip.as_str())
+    };
+    let _ = crate::ops_log::append(
+        repo,
+        "branch_delete",
+        old_tip,
+        None,
+        Some(format!("deleted \"{name}\"")),
+    );
+    Ok(())
 }
 
 fn ensure_clean(repo: &Repo) -> Result<()> {

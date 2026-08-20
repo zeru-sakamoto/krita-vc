@@ -204,3 +204,14 @@ shape the Krita plugin parses. Plus, for the measures above:
   mid-read by mutating real on-disk state from inside the wrapped closure.
 - `composite_tiles_dedup_and_pixel_roundtrip` — the pre-existing test that already pinned gap #9's
   guarantee (pixel-exact, not byte-exact, composite round-trips).
+
+## 11. Audit trail, pack self-check, and a disk-space preflight
+
+The last of the former gap list (P2 — `data-integrity-gaps.md`'s old #11–#14).
+
+| Measure | Where |
+| --- | --- |
+| **`.kvc/ops.log`.** Undo, discard, cleanup and branch-delete each append one JSON-lines record (branch, tip before/after, a short detail string) — the "my work disappeared" trail those four had none of before. Same append-then-`sync_all` shape as `commits.log`, size-capped at 2 MB with truncate-oldest rotation (checked, not scheduled, so the common append path never pays for it). Support/recovery only — nothing in the app reads it back. | `ops_log.rs` |
+| **Pack self-check.** New packs (`KVCP2`) carry an explicit body-length field alongside the existing index; `read_pack_header` rejects a pack whose declared length doesn't match its real file size, the same way it already rejects an unparseable header — so a truncated pack surfaces as the existing `badPack` check finding instead of `MissingObject`/garbage bytes once something tries to read out of it. Old `KVCP1` packs are still read exactly as before; nothing is rewritten. | `delta.rs` — `read_pack_header`, `Packs::write_pack` |
+| **Disk-space preflight.** `commit_selected`, `rollback_to_commit`, and the shared `materialize_tree` (switch/create-branch/merge) sum the bytes they're about to write and refuse up front — `InsufficientDiskSpace` — if the volume has less than double that free (covers `write_file_atomic`'s brief old-file/new-file overlap). Windows-only (`GetDiskFreeSpaceExW`, mirroring `cpu.rs`'s platform-gated style); elsewhere, or if the syscall fails, the check is skipped rather than blocking a write it can't evaluate. | `diskspace.rs` |
+| **Plugin reopen re-check.** `_rebuild_docs` takes a stat snapshot right after the op runs, and `_reopen` re-checks it against the file *after* `openDocument` succeeds — if something changed the file again during the reopen window (another process, a stray autosave), the docker surfaces a loud status-label error instead of silently handing back a stale document. | `krita-plugin/kritavc/vc_docker.py` — `_rebuild_docs`, `_reopen` |
