@@ -377,7 +377,7 @@ The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `Artis
 `AuthorNameProvider` → `WindowChromeProvider` → `TourProvider` (all mounted in
 [`App.tsx`](../src/App.tsx)).
 
-Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (flat Krita-style),
+Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (tactile icon chip),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
 outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStatusChip.tsx),
 [`BranchBadge`](../src/components/vcs/BranchBadge.tsx).

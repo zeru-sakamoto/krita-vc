@@ -18,7 +18,40 @@ shared state across sessions: what's in scope, and which screens are done.
 - **Open:** everything else — layout, typography, spacing, radii, shadows, motion, iconography,
   and component patterns.
 
+## Foundation — done
+
+The app-wide style pass landed before any screen work: **framed bento** (one continuous chrome
+frame, closed on all four sides; Sidebar / Main / Inspector as raised cards in a recessed well),
+**tactile depth** (everything raised, sinks on press), and **glass only on surfaces that float
+over content**. Density: 8px gutters · 14px panel radius · 8px control radius · 22px well radius
+(concentric with the panel radius + gutter, so the frame's corners curve as one continuous piece
+instead of meeting at right angles).
+
+What it changed, and what every screen below now inherits:
+
+| Area | Change |
+|---|---|
+| Tokens | New radii incl. `--radius-well`; `--shadow-raised`/`-pressed`/`-well`; glass + scrim tokens; `--color-state-*` overlays. Five utility classes: `.raised` `.tactile` `.inset-well` `.glass` `.row-selected` |
+| Shell | Frame + rounded well + three cards, closed ring on all four sides; all inter-panel borders removed; resize handle is now the gutter; activity-bar icons spaced to match the well's rhythm |
+| Primitives | `Button` and `IconButton` are tactile (icon chips replace the old flat/borderless pattern); `Menu`, `Modal`, toast are glass |
+| Overlays | One `--scrim` token replaces three hardcoded blacks (also fixes light themes) |
+| Cleanup | Side-stripe selection idiom removed at all 7 sites; `bg-white/5` tokenized app-wide |
+
+Three follow-up passes on top of the initial foundation drop (frame corner fillets, icon spacing,
+closing the right edge of the ring) are folded into the table above — `DESIGN.md` reflects the
+current shipped state, not the history of how it got there.
+
+**Read `DESIGN.md` before starting any row below.** Screens must share this system, not vary from
+it — if a screen needs something the system doesn't have, amend `DESIGN.md` first.
+
+**Status note:** every row below is still `Not started`. The foundation pass touched these files'
+outer surfaces (elevation, radii, spacing) but not their interiors — that's the work still to
+come, one screen at a time.
+
 ## Screen checklist
+
+Rows below are about each screen's **interior**. Their surfaces, radii, elevation, selection and
+hover states already come from the foundation.
 
 ### Shell (`src/components/shell/`)
 
@@ -64,11 +97,15 @@ shared state across sessions: what's in scope, and which screens are done.
 
 ### UI primitives (`src/components/ui/`)
 
+Unlike the screens above, these four got a real redesign as part of the foundation pass (not just
+inherited tokens) — they're the actual chokepoints the tactile/glass direction was built through.
+Reopen a row only if a later screen surfaces something these don't already cover.
+
 | Status | Screen | File | Notes |
 |---|---|---|---|
-| Not started | Button | `Button.tsx` | Default / primary / destructive |
-| Not started | Icon button | `IconButton.tsx` | Flat icon button |
-| Not started | Menu | `Menu.tsx` | Dropdown menu |
-| Not started | Modal | `Modal.tsx` | Themed dialog shell |
+| Done | Button | `Button.tsx` | Tactile — raised, sinks on `:active`. Default / primary / destructive |
+| Done | Icon button | `IconButton.tsx` | Raised icon chip, was flat/borderless; toggled-on = pressed look |
+| Done | Menu | `Menu.tsx` | Glass dropdown |
+| Done | Modal | `Modal.tsx` | Glass dialog + `.scrim` backdrop, now uses `--radius-modal`/`--shadow-modal` |
 
 Status values: `Not started` · `In progress` · `Done`.

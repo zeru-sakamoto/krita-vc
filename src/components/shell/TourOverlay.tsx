@@ -71,10 +71,11 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
   const vw = window.innerWidth;
   const vh = window.innerHeight;
 
-  const dim = "rgba(0,0,0,0.6)";
+  // Deliberately the flat scrim token, not the `.scrim` class: these are four
+  // tiled bands, and per-band backdrop sampling would show seams where they meet.
   const bandStyle = (s: React.CSSProperties): React.CSSProperties => ({
     position: "fixed",
-    background: dim,
+    background: "var(--scrim)",
     ...s,
   });
 
@@ -134,7 +135,7 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
 
       <div
         style={calloutStyle}
-        className="fixed w-72 rounded-panel border border-border bg-surface-2 p-3 shadow-(--shadow-float)"
+        className="glass fixed w-72 rounded-panel p-3 shadow-(--shadow-float)"
       >
         <h2 className="text-[13px] font-medium text-text">{step.title}</h2>
         <p className="mt-1 text-[12px] leading-relaxed text-text-muted">{step.body}</p>
@@ -147,7 +148,7 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
               <button
                 type="button"
                 onClick={back}
-                className="rounded-button px-2 py-1 text-[12px] text-text-muted hover:bg-white/5 hover:text-text"
+                className="rounded-button px-2 py-1 text-[12px] text-text-muted hover:bg-state-hover hover:text-text"
               >
                 Back
               </button>
@@ -155,7 +156,7 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
             <button
               type="button"
               onClick={next}
-              className="rounded-button bg-accent px-2.5 py-1 text-[12px] font-medium text-white hover:bg-accent/90"
+              className="tactile rounded-button bg-accent px-2.5 py-1 text-[12px] font-medium text-bg hover:brightness-110"
             >
               {stepIndex + 1 >= totalSteps ? "Done" : "Next"}
             </button>
@@ -189,7 +190,7 @@ function HoldToSkip({ onSkip }: { onSkip: () => void }) {
       onPointerUp={cancelHold}
       onPointerLeave={cancelHold}
       title="Press and hold to skip the tour"
-      className="fixed bottom-4 right-4 flex items-center gap-1.5 rounded-button border border-border bg-surface-2 px-2.5 py-1.5 text-[12px] text-text-muted hover:text-text"
+      className="glass fixed bottom-4 right-4 flex items-center gap-1.5 rounded-button px-2.5 py-1.5 text-[12px] text-text-muted hover:text-text"
     >
       <svg width="20" height="20" viewBox="0 0 20 20" className="-rotate-90">
         <circle

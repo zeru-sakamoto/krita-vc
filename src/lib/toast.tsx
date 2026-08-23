@@ -36,7 +36,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       {toast && (
         <div
           role="status"
-          className="fixed bottom-4 right-4 z-(--z-toast) flex max-w-sm items-start gap-2 rounded-panel border border-border bg-surface-2 px-3 py-2.5 text-[13px] text-text shadow-(--shadow-float)"
+          className="glass fixed bottom-4 right-4 z-(--z-toast) flex max-w-sm items-start gap-2 rounded-panel px-3 py-2.5 text-[13px] text-text shadow-(--shadow-float)"
         >
           {toast.variant === "error" ? (
             <WarningCircle size={16} className="mt-0.5 shrink-0 text-danger" />

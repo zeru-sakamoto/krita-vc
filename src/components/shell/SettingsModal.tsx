@@ -45,13 +45,13 @@ function ToggleRow({
       <span
         aria-hidden
         className={[
-          "relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors duration-200",
-          active ? "bg-accent" : "bg-surface-3 ring-1 ring-inset ring-border",
+          "inset-well relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors duration-200",
+          active ? "bg-accent" : "bg-surface-3",
         ].join(" ")}
       >
         <span
           className={[
-            "absolute left-0.5 top-1/2 size-4 -translate-y-1/2 rounded-full bg-white shadow-sm transition-transform duration-200 ease-out",
+            "raised absolute left-0.5 top-1/2 size-4 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
             active ? "translate-x-4" : "translate-x-0",
           ].join(" ")}
         />
@@ -65,7 +65,7 @@ function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
   return (
     <span
       aria-hidden
-      className="flex size-4 shrink-0 items-center justify-center rounded-button ring-1 ring-inset ring-black/25"
+      className="flex size-4 shrink-0 items-center justify-center rounded-button ring-1 ring-inset ring-border"
       style={{ backgroundColor: bg }}
     >
       <span className="size-1.5 rounded-full" style={{ backgroundColor: accent }} />
@@ -118,7 +118,7 @@ function AppearanceSettings({
           value={authorName}
           onChange={(e) => setAuthorName(e.target.value)}
           placeholder="You"
-          className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
         />
         <span className="mt-1 block text-[11px] text-text-muted">
           Shown as the author of new versions.
@@ -140,7 +140,7 @@ function AppearanceSettings({
             return (
               <span
                 className={[
-                  "flex min-w-50 items-center gap-2 rounded-button border bg-surface-2 px-2 py-1.5 text-[13px] text-text",
+                  "tactile flex min-w-50 items-center gap-2 rounded-button border bg-surface-3 px-2 py-1.5 text-[13px] text-text",
                   open ? "border-accent" : "border-border",
                 ].join(" ")}
               >
@@ -190,7 +190,7 @@ function CpuBudgetRow() {
       <select
         value={budget}
         onChange={(e) => setBudget(Number(e.target.value))}
-        className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none!"
+        className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none!"
       >
         {CPU_BUDGETS.map((b) => (
           <option key={b.percent} value={b.percent}>
@@ -228,7 +228,7 @@ function StorageSettings({
             updateConfig({ ...config, cacheMaxBytes: Number(e.target.value) * 1024 * 1024 })
           }
           disabled={!config}
-          className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none! disabled:opacity-50"
+          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none! disabled:opacity-50"
         >
           {CACHE_PRESETS_MB.map((mb) => (
             <option key={mb} value={mb}>
@@ -317,10 +317,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 type="button"
                 onClick={() => setCategory(c.id)}
                 className={[
-                  "rounded-button border-l-2 px-2.5 py-1.5 text-left text-[13px] transition-colors",
+                  "rounded-button px-2.5 py-1.5 text-left text-[13px] transition-colors",
                   category === c.id
-                    ? "border-accent bg-accent/12 text-text"
-                    : "border-transparent text-text-muted hover:bg-white/5 hover:text-text",
+                    ? "row-selected text-text"
+                    : "text-text-muted hover:bg-state-hover hover:text-text",
                 ].join(" ")}
               >
                 {c.label}

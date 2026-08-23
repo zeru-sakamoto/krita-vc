@@ -1,3 +1,8 @@
+/* Hallmark · genre: atmospheric · macrostructure: Bento Grid
+ * design-system: DESIGN.md · designed-as-app
+ * pre-emit critique: P5 H4 E5 S5 R4 V4
+ */
+
 @import "tailwindcss";
 
 /* Self-hosted fonts (offline-safe for the desktop app) */
@@ -23,6 +28,13 @@
   --color-text-muted: #7a7570;
   --color-danger: #c84b31;
 
+  /* Interaction overlays. Tokenized so the two light themes can flip them to
+     dark tints — a white overlay is invisible on a white surface, which is
+     what the old hardcoded `bg-white/5` did there. */
+  --color-state-hover: rgba(255, 255, 255, 0.05);
+  --color-state-active: rgba(255, 255, 255, 0.08);
+  --color-state-selected: color-mix(in srgb, var(--color-accent) 12%, transparent);
+
   /* Status colors (fg variants used for text/icons) */
   --color-success: #3a7d44;
   --color-success-fg: #6fcf97;
@@ -41,15 +53,20 @@
   --font-ui: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", monospace;
 
-  /* Border radius (Krita near-square corners) */
-  --radius-button: 3px;
-  --radius-panel: 4px;
-  --radius-badge: 2px;
-  --radius-modal: 6px;
+  /* Border radius — bento, balanced density */
+  --radius-button: 8px;
+  --radius-panel: 14px;
+  --radius-badge: 6px;
+  --radius-modal: 16px;
+  /* The recessed well's corners. = --radius-panel (14) + the 8px gutter, so the
+     frame's inner curve stays concentric with the card corners nested inside it,
+     and the chrome bars read as one continuous border instead of three strips
+     meeting at right angles. */
+  --radius-well: 22px;
 
-  /* Elevation — floating elements only */
-  --shadow-float: 0 4px 16px rgba(0, 0, 0, 0.5);
-  --shadow-modal: 0 8px 32px rgba(0, 0, 0, 0.7);
+  /* Elevation — floating elements only. See the elevation model in :root. */
+  --shadow-float: 0 6px 20px var(--shadow-tint), 0 1px 3px var(--shadow-tint);
+  --shadow-modal: 0 16px 48px var(--shadow-tint), 0 2px 8px var(--shadow-tint);
 
   /* Indeterminate progress bar (StatusBar, while a commit is saving) */
   --animate-indeterminate: indeterminate 1.1s ease-in-out infinite;
@@ -89,6 +106,38 @@
   --z-blocking: 70;
   --z-tour: 80;
 
+  /* --- Elevation model ------------------------------------------------
+   * Depth on dark comes from the palette's own lightness ladder
+   * (bg well -> surface card -> surface-2 header -> surface-3 control)
+   * plus a hairline top highlight and a TIGHT dark shadow. Deliberately
+   * not a soft colored halo around cards: that "shadow-glow on dark" look
+   * is the single most recognizable generated-UI tell, and it also reads
+   * badly against the diff canvas.
+   * -------------------------------------------------------------------- */
+  --edge-light: rgba(255, 255, 255, 0.06);
+  --shadow-tint: rgba(0, 0, 0, 0.45);
+
+  --shadow-raised:
+    inset 0 1px 0 var(--edge-light), 0 1px 2px var(--shadow-tint), 0 2px 6px var(--shadow-tint);
+  --shadow-pressed: inset 0 1px 3px var(--shadow-tint), inset 0 -1px 0 var(--edge-light);
+  --shadow-well: inset 0 2px 5px var(--shadow-tint), inset 0 -1px 0 var(--edge-light);
+
+  /* --- Glass ----------------------------------------------------------
+   * Only for surfaces that float OVER content (menus, modals, toasts,
+   * blocking overlays) — there the blur communicates depth. Bento cards
+   * sit on a flat well with nothing behind them, so glass there would be
+   * decoration, not depth. See DESIGN.md § Glass.
+   * -------------------------------------------------------------------- */
+  --glass-bg: color-mix(in srgb, var(--color-surface-2) 72%, transparent);
+  --glass-border: color-mix(in srgb, var(--color-text) 10%, transparent);
+  --glass-blur: 14px;
+
+  /* One scrim for every blocking overlay. Kept a dark tint in light themes
+     too (just weaker) — deriving it from --color-bg would wash out instead
+     of dim. */
+  --scrim: rgba(0, 0, 0, 0.55);
+  --scrim-blur: 3px;
+
   color-scheme: dark;
 }
 
@@ -96,8 +145,9 @@
  * Color themes — each overrides the @theme `--color-*` vars the
  * Tailwind utilities read via var(). Charcoal is the default and
  * lives in @theme above (no block here). Dark themes override only
- * the identity tokens; status/diff cascade from :root. Studio Light
- * overrides those too and flips color-scheme.
+ * the identity tokens; status/diff/elevation cascade from :root.
+ * The light themes additionally flip the elevation + overlay tints,
+ * which are the only mode-dependent tokens.
  * `data-theme` is stamped on <html> by lib/theme.tsx.
  * ============================================================ */
 html[data-theme="krita-blue"] {
@@ -158,6 +208,10 @@ html[data-theme="true-black"] {
   --color-text: #f2f2f2;
   --color-text-muted: #8a8a8a;
   --color-danger: #ff5c5c;
+  /* Near-zero lightness ladder — lean harder on the highlight to keep the
+     bento cards separable from the well. */
+  --edge-light: rgba(255, 255, 255, 0.1);
+  --shadow-tint: rgba(0, 0, 0, 0.8);
 }
 
 html[data-theme="charcoal-light"] {
@@ -181,6 +235,11 @@ html[data-theme="charcoal-light"] {
   --color-diff-add-fg: #1f7a3a;
   --color-diff-del: #f7dcdc;
   --color-diff-del-fg: #b3261e;
+  --color-state-hover: rgba(0, 0, 0, 0.05);
+  --color-state-active: rgba(0, 0, 0, 0.08);
+  --edge-light: rgba(255, 255, 255, 0.9);
+  --shadow-tint: rgba(90, 74, 54, 0.16);
+  --scrim: rgba(0, 0, 0, 0.35);
   /* See studio-light note — diff overlays tuned for dark. */
 }
 
@@ -205,6 +264,11 @@ html[data-theme="studio-light"] {
   --color-diff-add-fg: #1f7a3a;
   --color-diff-del: #f7dcdc;
   --color-diff-del-fg: #b3261e;
+  --color-state-hover: rgba(0, 0, 0, 0.05);
+  --color-state-active: rgba(0, 0, 0, 0.08);
+  --edge-light: rgba(255, 255, 255, 0.9);
+  --shadow-tint: rgba(40, 48, 70, 0.14);
+  --scrim: rgba(0, 0, 0, 0.35);
   /* diff-viewer changed-pixel mask/hatch overlays were tuned for
      dark; functional here but not re-tuned. Refine if it reads poorly. */
 }
@@ -246,6 +310,69 @@ button:not(:disabled),
 }
 
 /* ============================================================
+ * Surface idioms
+ *
+ * These live here rather than as repeated class strings because they are
+ * used across every panel and control, and because they must beat Tailwind's
+ * utilities layer — an unlayered rule does that without !important. Anything
+ * setting box-shadow on the same element should use these, not shadow-*.
+ * ============================================================ */
+
+/* A bento card or any non-interactive surface lifted off the well. */
+.raised {
+  box-shadow: var(--shadow-raised);
+}
+
+/* An interactive control: raised at rest, physically sinks when held.
+   `data-pressed` carries the same look for toggled-on controls. */
+.tactile {
+  box-shadow: var(--shadow-raised);
+}
+.tactile:active:not(:disabled):not([aria-disabled="true"]),
+.tactile[data-pressed="true"] {
+  box-shadow: var(--shadow-pressed);
+}
+/* Disabled controls lie flat — nothing to press. Handled here rather than with
+   a `disabled:shadow-none` utility, which would lose to this unlayered rule. */
+.tactile:disabled,
+.tactile[aria-disabled="true"] {
+  box-shadow: none;
+}
+
+/* Carved into the surface — inputs, toggle tracks, slider tracks. */
+.inset-well {
+  box-shadow: var(--shadow-well);
+}
+
+/* Selected row. Replaces the old `border-l-2 border-accent` stripe, which is
+   a recognizable generated-UI tell and fought the graph rail on commit cards. */
+.row-selected {
+  background: var(--color-state-selected);
+  box-shadow: var(--shadow-pressed);
+}
+
+/* Frosted surface for things that float OVER content. Opaque by default; the
+   blur is an upgrade so an unsupported WebView degrades to a solid panel
+   rather than a transparent one. (This build is known to silently drop some
+   compositing features — see TourOverlay.tsx.) */
+.glass {
+  background: var(--color-surface-2);
+  border: 1px solid var(--glass-border);
+}
+.scrim {
+  background: var(--scrim);
+}
+@supports (backdrop-filter: blur(1px)) {
+  .glass {
+    background: var(--glass-bg);
+    backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+  }
+  .scrim {
+    backdrop-filter: blur(var(--scrim-blur));
+  }
+}
+
+/* ============================================================
  * Focus ring — exactly per DESIGN.md (instant, never animated)
  * ============================================================ */
 :focus-visible {
@@ -280,6 +407,10 @@ button:not(:disabled),
 
 /* ============================================================
  * Reduced motion — collapse to <=150ms opacity-only crossfade
+ *
+ * Note this also strips the transition off the tactile press states. That is
+ * fine and intended: the pressed look is a :active *style*, not an animation,
+ * so it still appears instantly — only the easing between them is dropped.
  * ============================================================ */
 @media (prefers-reduced-motion: reduce) {
   *,

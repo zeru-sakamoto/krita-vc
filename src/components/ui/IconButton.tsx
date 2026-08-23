@@ -17,8 +17,12 @@ interface IconButtonProps {
 }
 
 /**
- * Flat Krita-style icon button: borderless, no chrome until hover.
- * (DESIGN.md → VCS Component Patterns → Tool Button → Flat icon button)
+ * Raised icon chip: sits proud of its surface, sinks when held.
+ * Toggled-on is the *pressed* look rather than a tint — a switch that stays
+ * held down reads as on without needing color to say it.
+ * Note this deliberately replaces Krita's flat no-chrome-until-hover button;
+ * see DESIGN.md → Krita Design Influence for why that was reversed.
+ * (DESIGN.md → VCS Component Patterns → Tool Button → Icon chip)
  */
 export function IconButton({
   icon: IconCmp,
@@ -39,12 +43,13 @@ export function IconButton({
       disabled={disabled}
       onClick={onClick}
       data-tour-id={tourId}
+      data-pressed={active ? "true" : undefined}
       className={[
-        "grid h-8 w-8 place-items-center rounded-button text-text-muted",
-        "transition-[transform,background-color] duration-100 ease-out",
-        "hover:bg-white/5 hover:text-text active:scale-[0.97] active:bg-white/8",
-        "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent",
-        active ? "bg-accent/12 text-text" : "",
+        "tactile grid h-8 w-8 place-items-center rounded-button bg-surface-2",
+        "transition-[transform,background-color,box-shadow,color] duration-100 ease-out",
+        "hover:bg-surface-3 hover:text-text active:translate-y-px",
+        "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface-2",
+        active ? "text-accent" : "text-text-muted",
       ].join(" ")}
     >
       <IconCmp size={size} weight="regular" className={spinning ? "animate-spin" : undefined} />

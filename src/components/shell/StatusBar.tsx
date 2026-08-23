@@ -25,13 +25,15 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
   const { artistMode } = useArtistMode();
   const { saving } = useRepository();
   return (
-    <footer className="relative flex h-6 shrink-0 items-center justify-between border-t border-border bg-surface px-3 text-[11px] text-text-muted">
+    <footer className="relative flex h-6 shrink-0 items-center justify-between bg-surface px-3 text-[11px] text-text-muted">
       {/* Indeterminate save progress — only while a commit is being written */}
       {saving && (
         <div
           role="progressbar"
           aria-label="Saving version"
-          className="absolute inset-x-0 -top-px h-0.5 overflow-hidden"
+          // top-0, not -top-px: the border this used to straddle is gone now
+          // that the status bar is a seamless edge of the chrome frame.
+          className="absolute inset-x-0 top-0 h-0.5 overflow-hidden"
         >
           <div className="h-full w-2/5 animate-indeterminate rounded-full bg-accent" />
         </div>

@@ -260,7 +260,7 @@ export function Sidebar({
           data-tour-id="panel-options"
           className={[
             "grid h-8 w-8 place-items-center rounded-button text-text-muted",
-            "transition-colors hover:bg-white/5 hover:text-text",
+            "transition-colors hover:bg-state-hover hover:text-text",
             open ? "bg-white/5 text-text" : "",
           ].join(" ")}
         >
@@ -333,7 +333,7 @@ export function Sidebar({
                 trigger={() => (
                   <span
                     data-tour-id="history-branch"
-                    className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-white/5"
+                    className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-state-hover"
                     title={artistMode ? "Choose which version line to view" : "Switch branch"}
                   >
                     <BranchBadge branch={currentBranch} />
@@ -389,15 +389,19 @@ export function Sidebar({
         {view === "performance" && <PerformancePanel />}
       </DockerPanel>
 
-      {/* Resize handle */}
+      {/* Resize handle — the bento gutter itself. Fills the 8px gap to the next
+          card and stays invisible until reached for, so nothing draws a line
+          between cards that the spacing already communicates. */}
       <div
         role="separator"
         aria-orientation="vertical"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        className={`absolute right-0 top-0 z-(--z-panel) h-full w-1 translate-x-1/2 ${cursorClass} bg-border transition-colors hover:bg-accent`}
-      />
+        className={`group absolute -right-2 top-0 z-(--z-panel) flex h-full w-2 items-center justify-center ${cursorClass}`}
+      >
+        <div className="h-10 w-0.5 rounded-full bg-transparent transition-colors group-hover:bg-accent" />
+      </div>
 
       {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}
       {saveFirst && (

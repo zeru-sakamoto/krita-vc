@@ -15,7 +15,7 @@ export function BusyOverlay() {
     <div
       role="alert"
       aria-live="assertive"
-      className="fixed inset-0 z-(--z-blocking) grid place-items-center bg-black/60"
+      className="scrim fixed inset-0 z-(--z-blocking) grid place-items-center"
     >
       <div className="flex flex-col items-center gap-3 text-text">
         <CircleNotch size={28} className="animate-spin text-accent" />

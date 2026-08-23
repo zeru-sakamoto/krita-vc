@@ -31,7 +31,7 @@ export function Modal({
 
   return (
     <div
-      className="fixed inset-0 z-(--z-modal) grid place-items-center bg-black/50 p-4"
+      className="scrim fixed inset-0 z-(--z-modal) grid place-items-center p-4"
       onPointerDown={onClose}
     >
       <div
@@ -39,7 +39,7 @@ export function Modal({
         aria-modal="true"
         aria-label={title}
         onPointerDown={(e) => e.stopPropagation()}
-        className={`flex w-full ${maxWidthClassName} max-h-[calc(100vh-2rem)] flex-col overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)`}
+        className={`glass flex w-full ${maxWidthClassName} max-h-[calc(100vh-2rem)] flex-col overflow-hidden rounded-modal shadow-(--shadow-modal)`}
       >
         <h2 className="shrink-0 border-b border-border px-4 py-3 text-[14px] font-medium text-text">
           {title}

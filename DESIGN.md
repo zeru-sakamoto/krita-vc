@@ -1,37 +1,46 @@
 # Design Spec — Krita VCS
 
 > Frontend design reference for the Tauri desktop application.
-> Aesthetic direction: **dark studio tool** — like Krita's own UI, but more structured. Ink, canvas, and precision.
+> Aesthetic direction: **tactile bento studio** — a dark creative tool rebuilt as soft, raised
+> panels in a framed grid. Ink, canvas, and precision, with weight you can feel under the cursor.
 
 ---
 
 ## Redesign in progress
 
-A screen-by-screen UI/UX redesign is underway, tracked in [`REDESIGN.md`](REDESIGN.md). Scope:
+A screen-by-screen UI/UX redesign is underway, tracked in [`REDESIGN.md`](REDESIGN.md).
+
+**The foundation pass has landed.** The app-wide style — framed bento layout, tactile elevation,
+and purposeful glass — is described throughout this document and is now the locked system. Every
+screen redesign must *share* it rather than vary from it; a screen that drifts from this file is
+the bug, not the exception.
 
 - **Locked / out of scope:** the **Color Palette** section below and the theme system (see its
   note) — colors do not change.
-- **Open for revision:** everything else in this doc — Typography, Spacing, Border Radius,
-  Shadow & Elevation, Motion System, Interaction States, Icon System, Layout & App Shell, and the
-  VCS Component Patterns. As each screen is redone, update the relevant section here in place so
-  this doc keeps matching the shipped UI.
+- **Settled by the foundation pass:** Border Radius, Shadow & Elevation, Glass, Interaction
+  States, Layout & App Shell, and the button / slider / status-bar patterns. Amend them here first
+  if a screen genuinely needs something different — never override locally.
+- **Still open per screen:** the interiors of the individual panels (changes list, history graph,
+  diff viewer, layer stack, palette diff, performance tab, dialog bodies), plus Typography,
+  Spacing, Motion and Icon System if a screen turns up a real need.
 
 ---
 
 ## Design Configuration
 
 ```
-/* Hallmark · genre: atmospheric · tone: dark-studio-tool
- * DESIGN_VARIANCE: 4 · MOTION_INTENSITY: 3 · VISUAL_DENSITY: 7
+/* Hallmark · genre: atmospheric · tone: tactile-bento-studio
+ * macrostructure: Bento Grid · design-system: DESIGN.md · designed-as-app
+ * DESIGN_VARIANCE: 5 · MOTION_INTENSITY: 3 · VISUAL_DENSITY: 7
  */
 ```
 
 | Setting            | Value | Rationale                                                    |
 |--------------------|-------|--------------------------------------------------------------|
 | Genre              | Atmospheric | Dark creative tool — Krita/Blender/VS Code Dark+ family |
-| `DESIGN_VARIANCE`  | 4     | Structured and precise; not expressive                       |
+| `DESIGN_VARIANCE`  | 5     | Bento + tactile depth is more expressive than flat panels, still structured |
 | `MOTION_INTENSITY` | 3     | VCS operations are frequent — over-animating adds friction   |
-| `VISUAL_DENSITY`   | 7     | File trees, diffs, commit logs demand compact, readable layout |
+| `VISUAL_DENSITY`   | 7     | File trees, diffs, commit logs demand compact, readable layout — the bento gutters are 8px for exactly this reason |
 
 ---
 
@@ -41,15 +50,24 @@ Krita VCS is built for Krita users. These design patterns are adopted directly f
 
 | Krita Pattern | How We Apply It |
 |---|---|
-| **Flat icon buttons** | Toolbar/docker buttons are borderless with no background by default; `--state-hover` overlay appears only on hover |
-| **1px panel dividers** | All panel-to-panel borders are exactly 1px `--border` — no elevation or shadows between docked panels |
-| **Near-square corners** | Border radii reduced (3px buttons, 4px panels) to match Krita's sharper, tool-focused aesthetic |
 | **Orange accent** | `--accent #E07B39` directly matches Krita's branded "Dark Orange" official theme variant |
-| **Docker metaphor** | App shell uses the docker/panel paradigm: compact 24px title bars, tab strips for grouped panels |
-| **Canvas as distinct zone** | The main working area uses `--bg` (darkest), no border, clearly distinct from surrounding panels |
+| **Docker metaphor** | App shell uses the docker/panel paradigm: compact title bars, one panel per zone |
+| **Canvas as distinct zone** | The main working area uses `--bg` (darkest) inside its card, clearly distinct from the panel chrome around it |
 | **Icon-first interactions** | Primary tool actions are icon buttons; text labels are secondary and optional |
 | **Breeze icon compatibility** | Phosphor Icons `regular` weight is a thin-outline SVG style that matches Krita/KDE Breeze icons |
 | **Dense information layout** | Small type (11-13px), compact spacing, high density — matches Krita's information-rich panels |
+
+### Deliberately reversed
+
+Three Krita patterns this spec used to inherit were dropped in the bento redesign. They are listed
+here rather than deleted, because "why doesn't this look like Krita" is a fair question to ask of
+this file later.
+
+| Was | Now | Why |
+|---|---|---|
+| **Flat icon buttons** — borderless, no background until hover | Raised icon chips that sink on press; toggled-on *is* the pressed look | The tactile direction is the point of the redesign. Depth also carries toggle state without spending the accent color on it. |
+| **1px panel dividers** — every panel seam a 1px `--border`, never shadow | 8px gutters and card elevation; no borders between zones | Spacing already communicates separation. Drawing a line *and* leaving a gap says the same thing twice. |
+| **Near-square corners** — 3px buttons, 4px panels | 8px controls, 14px panels | Bento reads as a grid of distinct tiles, which needs real corner radius. |
 
 **Identity retained:** Warm dark base palette (`#131210` family with brown-gray undertones) is our own identity, distinct from Krita's neutral grays. The orange accent is shared; the warmth is ours.
 
@@ -148,27 +166,85 @@ Base unit: `4px`
 
 ## Border Radius
 
-Krita uses near-square corners — sharper than typical web apps. These values match that aesthetic.
+Bento tiles need real corners. Calibrated at the "balanced" density step — enough rounding to read
+as distinct cards, not so much that the 900×600 minimum window loses a list row to it.
 
-| Context            | Value  |
-|--------------------|--------|
-| Buttons, inputs    | `3px`  |
-| Cards, panels      | `4px`  |
-| Badges, tags       | `2px`  |
-| Modals             | `6px`  |
+| Context            | Token             | Value  |
+|--------------------|-------------------|--------|
+| Buttons, inputs    | `--radius-button` | `8px`  |
+| Cards, panels      | `--radius-panel`  | `14px` |
+| Badges, tags       | `--radius-badge`  | `6px`  |
+| Modals             | `--radius-modal`  | `16px` |
+| The recessed well  | `--radius-well`   | `22px` |
+
+Bento gutter: **8px** (`gap-2` / `p-2`). Every zone gap and the well's inset use this one value.
+
+`--radius-well` is **derived, not chosen**: `14px (--radius-panel) + 8px (gutter) = 22px`. Nesting
+radii concentrically means the frame's inner curve runs exactly parallel to the card corners
+sitting 8px inside it. If either the panel radius or the gutter changes, this must change with
+them — a well radius that isn't `panel + gutter` makes the curves converge or diverge at the
+corners, which is visible immediately.
 
 ---
 
 ## Shadow & Elevation
 
-Krita separates panels with 1px `--border` lines, not shadows. **Shadows are reserved for floating/detached windows only** — never between docked panels.
+Depth is **tactile, not glowing**. Three things stack to make a surface read as raised on a dark
+palette, in this order of importance:
 
-| Token             | Value                            | Usage                                     |
-|-------------------|----------------------------------|-------------------------------------------|
-| `--shadow-float`  | `0 4px 16px rgba(0,0,0,0.5)`    | Dropdowns, popovers, context menus        |
-| `--shadow-modal`  | `0 8px 32px rgba(0,0,0,0.7)`    | Dialogs, drawers, full overlays           |
+1. **A lightness step on the existing palette ladder.** `--bg` (recessed well) → `--surface`
+   (card) → `--surface-2` (card header, raised chip) → `--surface-3` (raised control). This does
+   most of the work; the shadows only sharpen it.
+2. **A hairline top highlight** (`--edge-light`, ~6% white) — the lit edge of a physical object.
+3. **A tight, dark, close-in shadow** (`--shadow-tint`).
 
-> Panel-to-panel separation always uses a 1px `--border` rule — not shadow. This matches Krita's flat panel aesthetic.
+> **Never a soft colored halo around a card.** A wide glowing box-shadow on a dark surface is the
+> most recognizable generated-UI tell, and it smears against the diff canvas. Shadows here are
+> tight and neutral; if a surface isn't reading as raised, take another lightness step before
+> reaching for more blur radius.
+
+| Token              | Role                                                        |
+|--------------------|-------------------------------------------------------------|
+| `--shadow-raised`  | Bento cards, raised controls at rest                        |
+| `--shadow-pressed` | `:active`, and the toggled-on state of any switch-like control |
+| `--shadow-well`    | Carved-in surfaces: inputs, toggle tracks, slider tracks    |
+| `--shadow-float`   | Dropdowns, popovers, toasts                                 |
+| `--shadow-modal`   | Dialogs and full overlays                                   |
+
+Applied through five utility classes in `global.css` — `.raised`, `.tactile`, `.inset-well`,
+`.glass`, `.row-selected` — rather than repeated class strings. **These are unlayered CSS, so they
+beat Tailwind's utilities layer**: never put a `shadow-*` utility on an element that already
+carries one of them, and never try to cancel one with `disabled:shadow-none` (handled inside
+`.tactile` instead).
+
+Only `--edge-light`, `--shadow-tint` and `--scrim` are mode-dependent; the two light themes and
+True Black override them, everything else derives.
+
+---
+
+## Glass
+
+Frosted translucency is allowed **only on surfaces that float over content**, where the blur is
+what communicates depth:
+
+| Surface | Glass? |
+|---|---|
+| Menus, dropdowns, popovers | Yes |
+| Modals and their scrim | Yes |
+| Toasts | Yes |
+| Blocking overlay (`BusyOverlay`) | Yes |
+| Tour callout + skip chip | Yes |
+| **Bento cards** (Sidebar / Main / Inspector) | **No** |
+| **Chrome frame** (TopBar / ActivityBar / StatusBar) | **No** |
+| **Tour dim bands** | **No** — four tiled rectangles; per-band backdrop sampling seams at the joins |
+
+The cards sit on a flat well with nothing behind them, so glass there would blur a solid color —
+decoration, not depth. It would also put a blur pass over the streaming `.kra` layer canvas, which
+is the app's hottest paint path.
+
+`.glass` is **opaque by default** and upgrades to `backdrop-filter` inside
+`@supports (backdrop-filter: blur(1px))`. This build has silently dropped compositing features
+before (see `TourOverlay.tsx`), so the fallback is the guaranteed path, not the exception.
 
 ---
 
@@ -235,11 +311,12 @@ Full 8-state system required for every interactive element.
 
 | State        | Visual Treatment                                                         |
 |--------------|--------------------------------------------------------------------------|
-| `default`    | Base token values                                                        |
-| `hover`      | `--state-hover` overlay (5% white) on background                        |
+| `default`    | Base token values + `--shadow-raised` on anything interactive            |
+| `hover`      | One lightness step up (`--state-hover` overlay, or surface-2 → surface-3) |
 | `focus`      | 2px `--accent` ring at 50% opacity, 2px offset (see focus ring spec)    |
-| `active`     | `--state-active` overlay (8% white) + `scale(0.97)` on `--dur-instant`  |
-| `disabled`   | 40% opacity, `cursor: not-allowed`, no hover/active response             |
+| `active`     | `--shadow-pressed` + `translateY(1px)` on `--dur-instant` — it sinks, it doesn't shrink |
+| `pressed`    | Toggled-on controls hold `--shadow-pressed` (`data-pressed="true"`) + accent icon |
+| `disabled`   | 40% opacity, shadow removed (lies flat), `cursor: not-allowed`, no hover/active response |
 | `loading`    | Spinner replaces content label, pointer-events none                      |
 | `error`      | `--danger` border + text, `--danger` at 15% opacity background          |
 | `success`    | `--success` fg + border, transient — returns to default after 1.5s      |
@@ -290,29 +367,58 @@ Use one icon family per project. Do not mix Phosphor with Lucide or any other se
 
 ## Layout & App Shell
 
-Desktop-only application. No mobile breakpoints.
+**Framed bento.** The window is one continuous `--surface` **chrome frame**. TopBar, ActivityBar
+and StatusBar are seamless *zones within that frame* — no borders between them, none at the window
+edge. Everything else is a recessed `--bg` **well** with `--radius-well` corners, and the three
+content zones float inside it as raised bento cards, 8px in from the well's edge.
 
-**Minimum window size:** 900 × 600px
+**The well's rounded corners are what make the frame read as one piece.** Where two bars meet, the
+frame material curves through the corner instead of forming a right angle, so the top bar, left
+rail and status bar look like one border wrapping the app rather than three strips that happen to
+touch. It's a single `rounded-well` on the well container — the frame simply shows through behind
+it.
+
+The frame is a **closed ring**. TopBar, ActivityBar and StatusBar supply three of the four sides;
+the fourth is a plain 8px strip of `--surface` down the right edge (an `mr-2` on the well — no
+component lives there, it's just frame material). Without it the chrome reads as a C open to the
+right and the two right-hand corners curve into nothing.
+
+Frame thickness varies by side — 36px top, 48px left, 24px bottom, 8px right — because three sides
+are functional and one is not. What stays uniform is the **well's 8px inset**: every card sits 8px
+from the well's edge on all four sides, matching the 8px card-to-card gutter.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Top bar (36px) — repository switcher                                      │
-├──────────┬──────────────────────┬──────────────────────┬───────────────┤
-│ Activity │ Sidebar              │ Main Panel           │ Inspector     │
-│  48px    │  240–320px resizable │  flex: 1             │  280px toggle │
-│  fixed   │  file tree, branches │  diff, commit canvas │  commit meta  │
-└──────────┴──────────────────────┴──────────────────────┴───────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│  TopBar (36px) — repository switcher                          │  ← frame
+├────┬────────────────────────────────────────────────────────┬─┤
+│ A  ╭────────────────────────────────────────────────────────╮ │
+│ c  │ ╭──────────╮ ╭──────────────────╮ ╭─────────────────╮  │ │
+│ t  │ │ Sidebar  │ │ Main Panel       │ │ Inspector       │  │ │
+│ 48 │ ╰──────────╯ ╰──────────────────╯ ╰─────────────────╯  │ │
+│    ╰────────────────────────────────────────────────────────╯ │
+├────┴────────────────────────────────────────────────────────┴─┤
+│  StatusBar (24px)                                             │  ← frame
+└───────────────────────────────────────────────────────────────┘
+     └ frame ┘└──── well (--bg), 22px corners, 8px inset ────┘└8┘
 ```
 
-| Zone            | Width          | Content                                     |
-|-----------------|----------------|---------------------------------------------|
-| Top bar         | full width, 36px | Repository switcher (folder the user designated) |
-| Activity bar    | 48px fixed     | Icon-only vertical strip, leftmost          |
-| Sidebar         | 240–320px, resizable | File tree, branch list, history        |
-| Main panel      | `flex: 1`      | Primary workspace — diff view, commit canvas |
-| Inspector panel | 280px, toggleable | Commit details, layer metadata, blame    |
+`WelcomeShell` carries the same ring with `mx-2 mb-2`, since it has no activity bar or status bar
+to supply the left and bottom edges.
 
-Panel borders use `--border`. Active/focused panel has no special indicator beyond content context.
+| Zone            | Layer  | Width          | Content                                     |
+|-----------------|--------|----------------|---------------------------------------------|
+| Top bar         | frame  | full width, 36px | Repository switcher (folder the user designated) |
+| Activity bar    | frame  | 48px fixed     | Icon-only vertical strip, leftmost          |
+| Status bar      | frame  | full width, 24px | Active file, branch, commit count         |
+| Sidebar         | card   | 240–320px, resizable | File tree, branch list, history        |
+| Main panel      | card   | `flex: 1`      | Primary workspace — diff view, commit canvas |
+| Inspector panel | card   | 280px, toggleable | Commit details, layer metadata, blame    |
+
+Cards carry `--radius-panel` + `.raised` + `overflow-hidden` (so a card header's fill follows the
+top corners) and never a border. **Nothing draws a line between two cards** — the 8px gutter
+already says it.
+
+Desktop-only application. No mobile breakpoints. **Minimum window size:** 900 × 600px.
 
 **Repository switcher (top bar):** a flat button — folder icon + repo name + caret — opening a
 dropdown menu of local repositories plus an "Add repository…" action. Local-only: no fetch/push/sync
@@ -323,29 +429,28 @@ active repo row shows a check in `--accent`. Closes on outside-click or Escape.
 
 Krita users navigate a docker-based UI. Panels in Krita VCS follow the same conventions.
 
-**Docker title bar** (24px height):
-- Background: `--surface-2`
+**Docker title bar** (36px height) — the card header:
+- Background: `--surface-2` (one lightness step above the card body)
 - Label: 11px, weight 500, `--text-muted`, uppercase
 - Right side: 16px action icons (collapse, close, options)
-- Bottom border: 1px `--border`
+- Bottom border: 1px `--border` — the one border that survives, because it divides *inside* a
+  single card rather than between two of them
 
 **Docker tab strip** (28px height, when panels are grouped):
 - Inactive tab: `--surface` background, `--text-muted` label
 - Active tab: `--surface-2` background, `--text` label, 2px `--accent` bottom border
 - Tab padding: `sm` horizontal (8px)
 
-**Panel dividers:**
-- Always 1px `--border` between any two panels
-- No shadow, no elevation — flat separators only
+**Panel dividers:** none. Cards are separated by the 8px gutter and their own elevation. A border
+between two cards double-states the separation and reintroduces the flat-panel look the bento
+replaced.
 
-**Resize handle:**
-- 4px draggable strip at resizable panel edges
-- Default: `--border` color
-- Hover/drag: `--accent` color
-- **Vertical edge** (column resize, `cursor-col-resize`): sidebar width. **Horizontal edge** (row
-  resize, `cursor-row-resize`): the art-diff canvas height — drag up/down; the height is clamped and
-  the inner content scrolls when shrunk so it never overflows. Both use the shared `useResize` hook
-  and persist to `localStorage`.
+**Resize handle — the gutter is the handle:**
+- Fills the full 8px gutter between two cards (`cursor-col-resize`)
+- Invisible at rest; a short 2px `--accent` pill fades in centered on hover
+- **Vertical edge** (column resize): sidebar width. **Horizontal edge** (row resize,
+  `cursor-row-resize`): the art-diff canvas height — clamped, with inner content scrolling when
+  shrunk so it never overflows. Both use the shared `useResize` hook and persist to `localStorage`.
 
 ### Canvas Area
 
@@ -367,7 +472,7 @@ The main working area — where diffs, commit graphs, and file previews are disp
 | Property       | Value                                                  |
 |----------------|--------------------------------------------------------|
 | Background     | `--surface` default / `--state-hover` overlay on hover |
-| Selected state | `--state-selected` background (the graph rail carries the lineage; no left border) |
+| Selected state | `.row-selected` — `--state-selected` background + `--shadow-pressed`, so the row sits *into* the panel. The graph rail carries the lineage; never a left border |
 | Hash           | `mono` scale, `--text-muted`, 12px                    |
 | Message        | `body` scale, `--text`, 13px                          |
 | Timestamp      | `caption` scale, `--text-muted`, 11px                 |
@@ -423,35 +528,44 @@ Single-letter indicator, right-aligned in the tree row, mono 11px.
 | `R`    | Renamed    | `--info` fg (`#56B4E9`)    |
 | `C`    | Conflicted | `--accent`                 |
 
-### Tool Button (Krita-style flat icon button)
+### Tool Button (tactile icon chip)
 
-Two distinct button types — a critical Krita design pattern:
+Two distinct button types. Both are tactile; they differ in whether they carry a text label.
 
-**Flat icon button** (toolbar / docker actions):
-| State    | Background                       | Border | Notes                         |
-|----------|----------------------------------|--------|-------------------------------|
-| default  | transparent                      | none   | No visual chrome until hover  |
-| hover    | `--state-hover` overlay          | none   |                               |
-| active/checked | `--state-selected` overlay | none   | Toggled tool state            |
-| focus    | `--accent` focus ring (2px)      | none   |                               |
-| disabled | transparent, 40% opacity         | none   |                               |
+**Icon chip** (toolbar / docker actions):
+| State    | Background      | Elevation           | Icon            |
+|----------|-----------------|---------------------|-----------------|
+| default  | `--surface-2`   | `--shadow-raised`   | `--text-muted`  |
+| hover    | `--surface-3`   | `--shadow-raised`   | `--text`        |
+| active (held) | `--surface-3` | `--shadow-pressed` + `translateY(1px)` | `--text` |
+| checked  | `--surface-2`   | `--shadow-pressed` (held down) | `--accent` |
+| focus    | —               | `--accent` focus ring (2px) | —       |
+| disabled | `--surface-2`   | none (lies flat), 40% opacity | —     |
 
 - Hit target: 32×32px minimum
 - Icon: 20px centered
 - No text label by default (tooltip on hover provides context)
+- Checked state is carried by **depth first, color second** — the chip stays held down and the icon
+  goes accent. Never a filled accent background; that spends the accent on chrome.
+- **Spacing:** chips sit 8px apart — the same value as the bento gutter, so the activity rail keeps
+  the shell's rhythm. The rail's vertical padding is 8px too, which lands the first chip's top edge
+  and the last chip's bottom edge exactly on the card edges across the gutter. Chips need this room;
+  at the 2px they inherited from the old borderless buttons they read as one jammed stack of tiles.
 
 **Text action button** (OK / Cancel / confirm dialogs):
-| State    | Background               | Border      | Text       |
-|----------|--------------------------|-------------|------------|
-| default  | `--surface-3`            | `--border` 1px | `--text` |
-| hover    | `--state-hover` overlay  | `--border` 1px | `--text` |
-| active   | `--state-active` overlay | `--border` 1px | `--text` |
-| primary  | `--accent`               | none        | `--bg`     |
-| disabled | 40% opacity              | `--border` 1px | `--text-muted` |
+| State    | Background               | Elevation          | Text       |
+|----------|--------------------------|--------------------|------------|
+| default  | `--surface-3`            | `--shadow-raised`  | `--text`   |
+| hover    | `--state-hover` overlay  | `--shadow-raised`  | `--text`   |
+| active   | —                        | `--shadow-pressed` + `translateY(1px)` | `--text` |
+| primary  | `--accent`               | `--shadow-raised`  | `--bg`     |
+| disabled | 40% opacity              | none (lies flat)   | `--text-muted` |
+
+Borderless — the elevation defines the edge.
 
 **Destructive button** (Delete / Reset / Discard):
-- Default: `--surface-3` background, `--border` border
-- Hover: `--danger` at 15% opacity background, `--danger` border, `--danger` text
+- Default: `--surface-3` background, raised
+- Hover: `--danger` at 15% opacity background, `--danger` text
 
 ### Slider / Range Control
 
@@ -460,10 +574,10 @@ Used for numeric properties — opacity, threshold, offset. Common in creative t
 | Element | Value |
 |---|---|
 | Track height | 4px |
-| Track background | `--surface-3` |
+| Track background | `--surface-3` + `--shadow-well` (carved in) |
 | Fill color | `--accent` |
 | Thumb size | 12px circle |
-| Thumb fill | `--accent` |
+| Thumb fill | `--accent`, `--shadow-raised` (sits proud of the track) |
 | Thumb border | 2px `--bg` (for contrast against fill) |
 | Label position | Left: property name (`label` scale, 11px); right: current value (mono 11px) |
 | Keyboard behavior | Arrow keys: ±1 unit; Shift+Arrow: ±10 units |
@@ -475,8 +589,8 @@ Single bar fixed at the bottom of the app shell.
 | Property | Value |
 |---|---|
 | Height | 24px |
-| Background | `--surface` |
-| Top border | 1px `--border` |
+| Background | `--surface` — the frame's bottom edge, continuous with the activity bar |
+| Top border | None (it is the frame, not a panel against one) |
 | Font | `caption` scale (11px, `--text-muted`) |
 | Left zone | Active file name, modification indicator (`·` prefix for unsaved) |
 | Right zone | Branch name, commit count |
@@ -507,6 +621,8 @@ Single bar fixed at the bottom of the app shell.
 - VCS operations (commit, stage, checkout) are instant — no animation.
 - Use `--state-hover` / `--state-active` overlays rather than separate hover color tokens; this keeps surfaces composable across all elevation levels.
 - Icon color always inherits from surrounding text — never set icon color independently.
-- **Flat over elevated** — panels are separated by 1px `--border` lines, never by shadows. Shadows only appear on floating elements (dropdowns, modals).
-- **Borderless icon buttons** in toolbars and docker headers — no border, no background until hover. This is Krita's primary interactive pattern and what users expect in a creative tool.
-- **Two button types, never mixed** — flat icon buttons for tool actions; bordered text buttons for dialog confirmations. Never put text labels on flat icon buttons or icon-only content on text action buttons.
+- **Elevated over flat** — cards are separated by 8px gutters and their own depth, never by a border. A border between two cards states the separation twice.
+- **Depth before color** — when something needs to read as selected, active, or held, reach for `--shadow-pressed` and a lightness step first. Spend the accent on the one dominant action per view, not on chrome.
+- **No side stripes** — a selected row is `.row-selected` (tinted + pressed), never a thick accent border on one edge. That pattern is a well-known generated-UI tell and it fights the history graph's rail.
+- **Two button types, never mixed** — icon chips for tool actions; text buttons for dialog confirmations. Never put text labels on an icon chip or icon-only content on a text action button.
+- **Never mix `.raised` / `.tactile` / `.inset-well` with a `shadow-*` utility** on the same element — they are unlayered CSS and will win silently.

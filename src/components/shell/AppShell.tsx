@@ -23,8 +23,13 @@ import { versionLabel, versionNumbers, assetName } from "../../lib/friendly";
 import type { Repository } from "../../types";
 
 /**
- * Root application shell — owns layout + view state, wires the four zones
- * (Activity bar | Sidebar | Main | Inspector) plus the bottom status bar.
+ * Root application shell — owns layout + view state.
+ *
+ * Framed bento: the root div is one continuous `bg-surface` chrome frame, and
+ * TopBar / ActivityBar / StatusBar are seamless zones within it (no borders
+ * between them, none at the window edge). Everything else is a recessed
+ * `bg-bg` well, inset 8px on all four sides so the frame closes visually on
+ * the right too, holding the Sidebar / Main / Inspector cards.
  * Splits on the selected repository so `RepoShell`'s data hooks always have
  * a real path; with no repository yet, a welcome state points at the switcher.
  * (DESIGN.md → Layout & App Shell)
@@ -42,10 +47,12 @@ export function AppShell() {
 /** Fresh install / empty list: just the top bar and a pointer to it. */
 function WelcomeShell() {
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-text">
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-surface text-text">
       <TopBar />
-      <div className="grid min-h-0 flex-1 place-items-center">
-        <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+      {/* mx-2 mb-2 — same closed frame as RepoShell; there's no activity bar or
+          status bar here, so the margin supplies all three missing edges. */}
+      <div className="mx-2 mb-2 grid min-h-0 flex-1 place-items-center rounded-well bg-bg p-2">
+        <div className="raised flex max-w-sm flex-col items-center gap-3 rounded-panel bg-surface px-8 py-10 text-center">
           <FolderOpen size={40} className="text-text-muted" />
           <h1 className="text-[15px] font-medium">No repository yet</h1>
           <p className="text-[13px] leading-relaxed text-text-muted">
@@ -139,14 +146,17 @@ function RepoShell({ repo }: { repo: Repository }) {
       : "Select a commit to view its diff.";
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-text">
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-surface text-text">
       <TopBar />
 
-      {/* Horizontal zones */}
+      {/* Horizontal zones — ActivityBar is the frame's left edge; everything
+          right of it is the recessed well holding the bento cards. */}
       <div className="flex min-h-0 flex-1">
         <ActivityBar active={activeView} onChange={setActiveView} />
 
-        <div className="flex min-w-0 flex-1 border-l border-border">
+        {/* mr-2 leaves an 8px strip of frame down the right edge, so the chrome
+            closes into a full ring instead of a C open to the right. */}
+        <div className="mr-2 flex min-w-0 flex-1 gap-2 rounded-well bg-bg p-2">
           <Sidebar
             view={activeView}
             commits={commits}
@@ -159,8 +169,9 @@ function RepoShell({ repo }: { repo: Repository }) {
             onShowChanges={() => setActiveView("changes")}
           />
 
-          <div className="flex min-w-0 flex-1 flex-col border-l border-border">
-            {/* Toolbar — commit context (left) + inspector toggle (right) */}
+          <div className="raised flex min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
+            {/* Card header — commit context (left) + inspector toggle (right).
+                Matches DockerPanel's header so every card reads the same. */}
             <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
               {inChanges ? (
                 showWorking ? (
@@ -204,39 +215,38 @@ function RepoShell({ repo }: { repo: Repository }) {
               />
             </div>
 
-            <div className="flex min-h-0 flex-1">
-              <MainPanel
-                diff={diff}
-                error={diffError}
-                loading={diffLoading}
-                emptyHint={emptyHint}
-                repoPath={repo.path}
-                commitId={inChanges ? null : selectedId}
-                working={showWorking}
-                nonce={refreshNonce}
-                onFocus={setFocus}
-                selectedFile={selectedFile}
-                focusId={selectedFocusId}
-              />
-              {inspectorOpen && (
-                <Inspector
-                  commit={inChanges ? null : selectedCommit}
-                  version={selectedVersion}
-                  entries={diff}
-                  focus={focus}
-                  working={inChanges}
-                  focusedFile={focusedFile}
-                  isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
-                  onClose={() => setInspectorOpen(false)}
-                  selectedFile={selectedFile}
-                  onSelectFile={(path, focusId) => {
-                    setSelectedFile(path);
-                    setSelectedFocusId(focusId);
-                  }}
-                />
-              )}
-            </div>
+            <MainPanel
+              diff={diff}
+              error={diffError}
+              loading={diffLoading}
+              emptyHint={emptyHint}
+              repoPath={repo.path}
+              commitId={inChanges ? null : selectedId}
+              working={showWorking}
+              nonce={refreshNonce}
+              onFocus={setFocus}
+              selectedFile={selectedFile}
+              focusId={selectedFocusId}
+            />
           </div>
+
+          {inspectorOpen && (
+            <Inspector
+              commit={inChanges ? null : selectedCommit}
+              version={selectedVersion}
+              entries={diff}
+              focus={focus}
+              working={inChanges}
+              focusedFile={focusedFile}
+              isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
+              onClose={() => setInspectorOpen(false)}
+              selectedFile={selectedFile}
+              onSelectFile={(path, focusId) => {
+                setSelectedFile(path);
+                setSelectedFocusId(focusId);
+              }}
+            />
+          )}
         </div>
       </div>
 

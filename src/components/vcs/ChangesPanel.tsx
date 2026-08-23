@@ -52,7 +52,7 @@ function Section({
             type="button"
             onClick={onToggleAll}
             disabled={disabled}
-            className="rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-white/5 hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+            className="rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
           >
             {action === "stage" ? "Stage all" : "Unstage all"}
           </button>
@@ -64,7 +64,7 @@ function Section({
             key={change.path}
             className={[
               "group flex items-center gap-2 px-3 py-1",
-              change.path === focusedFile ? "bg-accent/12" : "hover:bg-white/5",
+              change.path === focusedFile ? "row-selected" : "hover:bg-state-hover",
             ].join(" ")}
           >
             <FileStatusChip status={change.status} />
@@ -82,7 +82,7 @@ function Section({
               aria-label="Discard changes to this file"
               onClick={() => onDiscardFile(change.path)}
               disabled={disabled}
-              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-white/5 hover:text-danger group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
+              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-state-hover hover:text-danger group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <ArrowCounterClockwise size={12} />
             </button>
@@ -92,7 +92,7 @@ function Section({
               aria-label={action === "stage" ? "Stage file" : "Unstage file"}
               onClick={() => onToggle(change.path)}
               disabled={disabled}
-              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-white/5 hover:text-text group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
+              className="grid h-5 w-5 shrink-0 place-items-center rounded-button text-text-muted opacity-0 transition-opacity hover:bg-state-hover hover:text-text group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {action === "stage" ? <Plus size={13} /> : <Minus size={13} />}
             </button>
@@ -247,7 +247,7 @@ export function ChangesPanel({
             placeholder="Describe this version…"
             rows={2}
             data-tour-id="commit-message"
-            className="resize-none rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+            className="resize-none inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
           />
           {commitError && <p className="text-[11px] text-danger">{commitError}</p>}
           <button

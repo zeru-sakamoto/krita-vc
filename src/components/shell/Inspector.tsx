@@ -160,7 +160,7 @@ export function Inspector({
   };
 
   return (
-    <div className="flex h-full w-70 shrink-0 flex-col border-l border-border">
+    <div className="raised flex h-full w-70 shrink-0 flex-col overflow-hidden rounded-panel bg-surface">
       {/* Single header row — py-1.5, aligns with the "Modified Hero" file header */}
       <div className="flex shrink-0 items-center border-b border-border bg-surface-2 px-3 py-2 h-8">
         <span className="flex-1 text-[11px] font-medium uppercase tracking-wide text-text-muted">
@@ -232,10 +232,8 @@ export function Inspector({
                       type="button"
                       onClick={() => onSelectFile(c.path, undefined)}
                       className={[
-                        "flex w-full items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
-                        selectedFile === c.path
-                          ? "border-accent bg-accent/12"
-                          : "border-transparent hover:bg-white/5",
+                        "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
+                        selectedFile === c.path ? "row-selected" : "hover:bg-state-hover",
                       ].join(" ")}
                     >
                       <FileStatusChip status={c.status} />
@@ -253,10 +251,10 @@ export function Inspector({
                         type="button"
                         onClick={() => onSelectFile(c.path, PALETTE_ID)}
                         className={[
-                          "ml-4 flex items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
+                          "ml-4 flex items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
                           focus?.path === c.path && focus?.id === PALETTE_ID
-                            ? "border-accent bg-accent/12"
-                            : "border-transparent hover:bg-white/5",
+                            ? "row-selected"
+                            : "hover:bg-state-hover",
                         ].join(" ")}
                       >
                         <PaletteIcon size={12} className="shrink-0 text-text-muted" />
@@ -281,10 +279,8 @@ export function Inspector({
                           type="button"
                           onClick={() => onSelectFile(c.path, undefined)}
                           className={[
-                            "flex w-full items-center gap-2 rounded-button border-l-2 px-1 py-1 text-left transition-colors",
-                            selectedFile === c.path
-                              ? "border-accent bg-accent/12"
-                              : "border-transparent hover:bg-white/5",
+                            "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
+                            selectedFile === c.path ? "row-selected" : "hover:bg-state-hover",
                           ].join(" ")}
                         >
                           <FileStatusChip status={c.status} />

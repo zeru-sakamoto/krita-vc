@@ -38,7 +38,7 @@ export const CommitCard = memo(function CommitCard({
       className={[
         "block w-full py-2.5 px-3 text-left",
         "transition-colors duration-100 ease-out",
-        selected ? "bg-accent/12" : "hover:bg-white/5",
+        selected ? "row-selected" : "hover:bg-state-hover",
       ].join(" ")}
     >
       <div className="flex items-baseline justify-between gap-2">

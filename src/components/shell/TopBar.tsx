@@ -60,7 +60,7 @@ export function TopBar() {
           e.stopPropagation();
           setModal({ kind: "remove", repo });
         }}
-        className="grid h-5 w-5 place-items-center rounded-button text-text-muted hover:bg-white/5 hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted"
+        className="grid h-5 w-5 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted"
       >
         <X size={13} />
       </button>
@@ -91,7 +91,7 @@ export function TopBar() {
 
   return (
     <header
-      className="flex h-9 shrink-0 items-center gap-1.5 border-b border-border bg-surface px-2"
+      className="flex h-9 shrink-0 items-center gap-1.5 bg-surface px-2"
       {...(showWindowControls ? { "data-tauri-drag-region": true } : {})}
     >
       <img src="/logo.svg" alt="" className="h-5 w-5 shrink-0" />
@@ -163,7 +163,7 @@ function WindowControls() {
         title="Minimize"
         aria-label="Minimize"
         onClick={() => win.minimize()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-white/5 hover:text-text"
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
       >
         <Minus size={13} />
       </button>
@@ -172,7 +172,7 @@ function WindowControls() {
         title="Maximize"
         aria-label="Maximize"
         onClick={() => win.toggleMaximize()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-white/5 hover:text-text"
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
       >
         <Square size={11} />
       </button>
@@ -181,7 +181,7 @@ function WindowControls() {
         title="Close"
         aria-label="Close"
         onClick={() => win.close()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-danger hover:text-white"
+        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-danger hover:text-bg"
       >
         <X size={13} />
       </button>
@@ -193,7 +193,7 @@ function RepoTrigger({ name }: { name: string }) {
   return (
     <span
       title="Switch repository"
-      className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[13px] text-text transition-colors hover:bg-white/5"
+      className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[13px] text-text transition-colors hover:bg-state-hover"
     >
       <FolderOpen size={15} weight="regular" className="text-text-muted" />
       <span className="max-w-55 truncate font-medium">{name}</span>
@@ -249,11 +249,11 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder="my-illustration"
-        className="mb-3 w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mb-3 w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
       />
       <label className="mb-1 block text-[12px] text-text-muted">Location</label>
       <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 truncate rounded-button border border-border bg-surface-2 px-2 py-1.5 font-mono text-[12px] text-text">
+        <span className="min-w-0 flex-1 truncate inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text">
           {parent ? `${parent}` : <span className="text-text-muted">No folder chosen</span>}
         </span>
         <Button onClick={pickParent}>Choose…</Button>
@@ -372,7 +372,7 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
             value={confirmPath}
             onChange={(e) => setConfirmPath(e.target.value)}
             placeholder={shortPath}
-            className="w-full rounded-button border border-border bg-surface-2 px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger focus:outline-none"
+            className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger focus:outline-none"
           />
         </div>
       )}

@@ -114,7 +114,7 @@ export function SetAsideModal({
         }}
         placeholder={artistMode ? "What's this? (optional)" : "message (optional)"}
         autoFocus
-        className="mt-3 w-full rounded-button border border-border bg-surface-2 px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
       />
       {count != null && (
         <p className="mt-2 text-[11px] text-text-muted">
@@ -160,7 +160,7 @@ export function PickStashModal({
               type="button"
               disabled={saving}
               onClick={() => onPick(s.id)}
-              className="flex w-full flex-col items-start gap-0.5 rounded-button px-2 py-1.5 text-left transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+              className="flex w-full flex-col items-start gap-0.5 rounded-button px-2 py-1.5 text-left transition-colors hover:bg-state-hover disabled:cursor-not-allowed disabled:opacity-40"
             >
               <span className="truncate text-[13px] text-text">{stashTitle(s)}</span>
               <span className="truncate text-[11px] text-text-muted">{stashSummary(s)}</span>

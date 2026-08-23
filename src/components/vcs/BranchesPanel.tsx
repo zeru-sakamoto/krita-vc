@@ -92,8 +92,8 @@ export function BranchesPanel({
                       : `Switch to ${b.name}`
                   }
                   className={[
-                    "flex w-full items-center gap-2 border-l-2 px-3 py-1.5 text-left transition-colors",
-                    active ? "border-accent bg-accent/12" : "border-transparent hover:bg-white/5",
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors",
+                    active ? "row-selected" : "hover:bg-state-hover",
                   ].join(" ")}
                 >
                   <BranchBadge branch={b} />
@@ -132,7 +132,7 @@ export function BranchesPanel({
         onClick={() => setCreateOpen(true)}
         disabled={saving}
         data-tour-id="branches-new"
-        className="mx-3 mt-2 flex items-center gap-1.5 rounded-button px-1 py-1 text-[12px] text-text-muted transition-colors hover:bg-white/5 hover:text-text"
+        className="mx-3 mt-2 flex items-center gap-1.5 rounded-button px-1 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text"
       >
         <Plus size={13} />
         {artistMode ? "New version line" : "New branch"}

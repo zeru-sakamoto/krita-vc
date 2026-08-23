@@ -92,7 +92,7 @@ export function Menu({
         }}
         className={[
           "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
-          "transition-colors hover:bg-white/5",
+          "transition-colors hover:bg-state-hover",
           "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent",
           item.selected ? "text-accent" : "text-text",
         ].join(" ")}
@@ -140,7 +140,7 @@ export function Menu({
           role="menu"
           style={{ minWidth }}
           className={[
-            "absolute top-[calc(100%+4px)] z-(--z-modal) overflow-hidden rounded-panel border border-border bg-surface-2 shadow-(--shadow-float)",
+            "glass absolute top-[calc(100%+4px)] z-(--z-modal) overflow-hidden rounded-panel shadow-(--shadow-float)",
             align === "right" ? "right-0" : "left-0",
           ].join(" ")}
         >

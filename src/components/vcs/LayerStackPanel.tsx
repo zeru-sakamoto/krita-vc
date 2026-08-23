@@ -54,8 +54,8 @@ function Row({ selected, onClick, children }: RowProps) {
       type="button"
       onClick={onClick}
       className={[
-        "flex w-full items-center gap-2 border-l-2 px-2 py-1.5 text-left transition-colors",
-        selected ? "border-accent bg-accent/12" : "border-transparent hover:bg-white/5",
+        "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
+        selected ? "row-selected" : "hover:bg-state-hover",
       ].join(" ")}
     >
       {children}

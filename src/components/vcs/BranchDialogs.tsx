@@ -79,7 +79,7 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
         }}
         placeholder={artistMode ? "e.g. new-hair-color" : "branch name"}
         autoFocus
-        className="mt-3 w-full rounded-button border border-border bg-surface-2 px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
       />
       {branches.length > 1 && (
         <label className="mt-3 block text-[12px] text-text-muted">
@@ -88,7 +88,7 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
             value={base ?? currentName ?? ""}
             onChange={(e) => setBase(e.target.value)}
             disabled={saving}
-            className="mt-1 w-full rounded-button border border-border bg-surface-2 px-2.5 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none"
+            className="mt-1 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none"
           >
             {branches.map((b) => (
               <option key={b.name} value={b.name}>

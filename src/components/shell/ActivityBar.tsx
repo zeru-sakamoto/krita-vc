@@ -46,8 +46,10 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
   };
 
   return (
-    <nav className="flex w-12 shrink-0 flex-col items-center border-r border-border bg-surface py-1.5">
-      <div className="flex flex-col items-center gap-0.5">
+    // py-2 matches the well's padding, so the first chip's top edge and the last
+    // chip's bottom edge land exactly on the card edges across the gutter.
+    <nav className="flex w-12 shrink-0 flex-col items-center bg-surface py-2">
+      <div className="flex flex-col items-center gap-2">
         {ITEMS.map(({ view, icon, label }) => (
           <IconButton
             key={view}
@@ -60,7 +62,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
           />
         ))}
       </div>
-      <div className="mt-auto flex flex-col items-center gap-0.5">
+      <div className="mt-auto flex flex-col items-center gap-2">
         <IconButton
           icon={FileZip}
           label="Back up this repository…"
