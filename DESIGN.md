@@ -5,6 +5,19 @@
 
 ---
 
+## Redesign in progress
+
+A screen-by-screen UI/UX redesign is underway, tracked in [`REDESIGN.md`](REDESIGN.md). Scope:
+
+- **Locked / out of scope:** the **Color Palette** section below and the theme system (see its
+  note) — colors do not change.
+- **Open for revision:** everything else in this doc — Typography, Spacing, Border Radius,
+  Shadow & Elevation, Motion System, Interaction States, Icon System, Layout & App Shell, and the
+  VCS Component Patterns. As each screen is redone, update the relevant section here in place so
+  this doc keeps matching the shipped UI.
+
+---
+
 ## Design Configuration
 
 ```
@@ -59,6 +72,13 @@ Krita VCS is built for Krita users. These design patterns are adopted directly f
 | `--danger`     | `#C84B31` | `oklch(50% 0.18 28)`   | Destructive actions, error states      |
 
 > `--accent` is derived from Krita's orange branding. Use sparingly — one dominant interactive element per view.
+
+**Locked for the redesign.** These are the default (`charcoal`) tokens. The app also ships 8
+selectable color themes, each overriding the base tokens via `html[data-theme="…"]` in
+`src/styles/global.css` (stamped by `src/lib/theme.tsx`): `charcoal` (default, shown above),
+`krita-blue`, `electric-cyan`, `sunset-coral`, `tokyo-night`, `true-black` (all dark), plus
+`charcoal-light` and `studio-light` (light — flip `color-scheme` and also override the status/diff
+colors below). None of the 8 themes change as part of this redesign.
 
 ### Interaction Overlays
 
