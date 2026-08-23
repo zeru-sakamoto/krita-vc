@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
+import { Select } from "../ui/Menu";
 import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
 import { useBranches } from "../../lib/repoData";
@@ -79,25 +80,25 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
         }}
         placeholder={artistMode ? "e.g. new-hair-color" : "branch name"}
         autoFocus
-        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
       />
       {branches.length > 1 && (
-        <label className="mt-3 block text-[12px] text-text-muted">
-          {artistMode ? "Start from" : "Base branch"}
-          <select
+        <div className="mt-3">
+          <span className="mb-1 block text-[12px] text-text-muted">
+            {artistMode ? "Start from" : "Base branch"}
+          </span>
+          <Select
             value={base ?? currentName ?? ""}
-            onChange={(e) => setBase(e.target.value)}
+            onChange={setBase}
             disabled={saving}
-            className="mt-1 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none"
-          >
-            {branches.map((b) => (
-              <option key={b.name} value={b.name}>
-                {b.name}
-                {b.kind === "current" ? (artistMode ? " (where you are now)" : " (current)") : ""}
-              </option>
-            ))}
-          </select>
-        </label>
+            options={branches.map((b) => ({
+              value: b.name,
+              label:
+                b.name +
+                (b.kind === "current" ? (artistMode ? " (where you are now)" : " (current)") : ""),
+            }))}
+          />
+        </div>
       )}
       {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
     </Modal>

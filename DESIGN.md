@@ -429,7 +429,7 @@ active repo row shows a check in `--accent`. Closes on outside-click or Escape.
 
 Krita users navigate a docker-based UI. Panels in Krita VCS follow the same conventions.
 
-**Docker title bar** (36px height) — the card header:
+**Docker title bar** (40px height) — the card header:
 - Background: `--surface-2` (one lightness step above the card body)
 - Label: 11px, weight 500, `--text-muted`, uppercase
 - Right side: 16px action icons (collapse, close, options)

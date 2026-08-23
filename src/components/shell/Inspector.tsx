@@ -161,8 +161,9 @@ export function Inspector({
 
   return (
     <div className="raised flex h-full w-70 shrink-0 flex-col overflow-hidden rounded-panel bg-surface">
-      {/* Single header row — py-1.5, aligns with the "Modified Hero" file header */}
-      <div className="flex shrink-0 items-center border-b border-border bg-surface-2 px-3 py-2 h-8">
+      {/* Header row — h-10/pl-3 pr-1, matches DockerPanel and the main panel card header so
+          every top panel button sits at the same height and edge inset. */}
+      <div className="flex h-10 shrink-0 items-center border-b border-border bg-surface-2 pl-3 pr-1">
         <span className="flex-1 text-[11px] font-medium uppercase tracking-wide text-text-muted">
           {working ? "Changes" : artistMode ? "Version" : "Commit"}
         </span>

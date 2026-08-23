@@ -1,9 +1,18 @@
 import { useEffect, useState } from "react";
-import { Broom, CaretDown, ShieldCheck, Trash } from "@phosphor-icons/react";
+import {
+  Archive,
+  Broom,
+  CaretDown,
+  Cpu,
+  Gauge,
+  HardDrive,
+  ShieldCheck,
+  Trash,
+} from "@phosphor-icons/react";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
-import { Menu } from "../ui/Menu";
+import { Menu, Select } from "../ui/Menu";
 import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
@@ -15,16 +24,18 @@ import { useWindowChrome } from "../../lib/windowChrome";
 import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
 import type { Stash } from "../../types";
 
-type SettingsCategory = "appearance" | "stash" | "storage";
+type SettingsCategory = "appearance" | "stash" | "performance" | "storage";
 
 const CACHE_PRESETS_MB = [128, 256, 512, 1024, 2048];
 
 function ToggleRow({
+  icon,
   label,
   detail,
   active,
   onToggle,
 }: {
+  icon?: React.ReactNode;
   label: string;
   detail?: string;
   active: boolean;
@@ -36,26 +47,29 @@ function ToggleRow({
       role="switch"
       aria-checked={active}
       onClick={onToggle}
-      className="flex w-full items-start justify-between gap-3 rounded-button py-1.5 text-left"
+      className="flex w-full flex-col gap-0.5 rounded-button py-1.5 text-left"
     >
-      <span className="min-w-0 text-[13px] text-text">
-        {label}
-        {detail && <span className="mt-0.5 block text-[11px] text-text-muted">{detail}</span>}
-      </span>
-      <span
-        aria-hidden
-        className={[
-          "inset-well relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors duration-200",
-          active ? "bg-accent" : "bg-surface-3",
-        ].join(" ")}
-      >
+      <span className="flex w-full items-start justify-between gap-3">
+        <span className="flex min-w-0 items-center gap-2 text-[13px] text-text">
+          {icon && <span className="shrink-0 text-text-muted">{icon}</span>}
+          {label}
+        </span>
         <span
+          aria-hidden
           className={[
-            "raised absolute left-0.5 top-1/2 size-4 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
-            active ? "translate-x-4" : "translate-x-0",
+            "inset-well relative h-5 w-9 shrink-0 rounded-full transition-colors duration-200",
+            active ? "bg-accent" : "bg-surface-3",
           ].join(" ")}
-        />
+        >
+          <span
+            className={[
+              "raised absolute left-0.5 top-1/2 size-4 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
+              active ? "translate-x-4" : "translate-x-0",
+            ].join(" ")}
+          />
+        </span>
       </span>
+      {detail && <span className="block text-[11px] text-text-muted">{detail}</span>}
     </button>
   );
 }
@@ -118,7 +132,7 @@ function AppearanceSettings({
           value={authorName}
           onChange={(e) => setAuthorName(e.target.value)}
           placeholder="You"
-          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
         />
         <span className="mt-1 block text-[11px] text-text-muted">
           Shown as the author of new versions.
@@ -178,30 +192,47 @@ function StashSettings({
 }
 
 /**
- * App-global, unlike everything else in the Storage tab — so it renders outside the
+ * App-global, unlike everything else in the Performance tab — so it renders outside the
  * repo gate below and is labelled as applying everywhere.
  */
 function CpuBudgetRow() {
   const { budget, setBudget } = useCpuBudget();
   const hint = CPU_BUDGETS.find((b) => b.percent === budget)?.hint ?? "";
   return (
-    <label className="mb-3 block">
-      <span className="mb-1 block text-[12px] text-text-muted">Background CPU use</span>
-      <select
+    <div className="mb-3">
+      <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
+        <Cpu size={13} />
+        Background CPU use
+      </span>
+      <Select
         value={budget}
-        onChange={(e) => setBudget(Number(e.target.value))}
-        className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none!"
-      >
-        {CPU_BUDGETS.map((b) => (
-          <option key={b.percent} value={b.percent}>
-            {b.label}
-          </option>
-        ))}
-      </select>
+        onChange={setBudget}
+        options={CPU_BUDGETS.map((b) => ({ value: b.percent, label: b.label }))}
+      />
       <span className="mt-1 block text-[11px] text-text-muted">
         {hint}. Applies to every repository.
       </span>
-    </label>
+    </div>
+  );
+}
+
+function PerformanceSettings({
+  config,
+  updateConfig,
+}: {
+  config: ReturnType<typeof useRepoConfig>["config"];
+  updateConfig: ReturnType<typeof useRepoConfig>["update"];
+}) {
+  return (
+    <ToggleRow
+      icon={<Gauge size={15} />}
+      label="Low-memory diffs"
+      detail="Loads each layer of a working-file preview one at a time instead of all at
+        once. Uses noticeably less memory on large files, in exchange for a little extra
+        time to open a preview. Helpful on low-end machines."
+      active={config?.lowMemoryDiff ?? false}
+      onToggle={() => config && updateConfig({ ...config, lowMemoryDiff: !config.lowMemoryDiff })}
+    />
   );
 }
 
@@ -219,30 +250,28 @@ function StorageSettings({
   const { current } = useRepository();
   return (
     <>
-      <label className="mb-3 block">
-        <span className="mb-1 block text-[12px] text-text-muted">Preview cache size</span>
-        <select
-          value={config ? Math.round(config.cacheMaxBytes / (1024 * 1024)) : ""}
-          onChange={(e) =>
-            config &&
-            updateConfig({ ...config, cacheMaxBytes: Number(e.target.value) * 1024 * 1024 })
-          }
+      <div className="mb-3">
+        <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
+          <HardDrive size={13} />
+          Preview cache size
+        </span>
+        <Select
+          value={config ? Math.round(config.cacheMaxBytes / (1024 * 1024)) : CACHE_PRESETS_MB[0]}
+          onChange={(mb) => config && updateConfig({ ...config, cacheMaxBytes: mb * 1024 * 1024 })}
           disabled={!config}
-          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text focus:border-accent focus:outline-none focus-visible:outline-none! disabled:opacity-50"
-        >
-          {CACHE_PRESETS_MB.map((mb) => (
-            <option key={mb} value={mb}>
-              {mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`}
-            </option>
-          ))}
-        </select>
+          options={CACHE_PRESETS_MB.map((mb) => ({
+            value: mb,
+            label: mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`,
+          }))}
+        />
         <span className="mt-1 block text-[11px] text-text-muted">
           How much space diff previews may use on disk. Oldest previews are cleared first once you
           go over — they regenerate automatically when needed again.
         </span>
-      </label>
+      </div>
 
       <ToggleRow
+        icon={<Archive size={15} />}
         label="Compact storage for heavily-revised art"
         detail="Shrinks version history for files with many small edits by 2–10x, at the
           cost of a little extra time on each save and restore. Safe to turn on or off at
@@ -251,15 +280,6 @@ function StorageSettings({
         onToggle={() =>
           config && updateConfig({ ...config, tilePixelDeltas: !config.tilePixelDeltas })
         }
-      />
-
-      <ToggleRow
-        label="Low-memory diffs"
-        detail="Loads each layer of a working-file preview one at a time instead of all at
-          once. Uses noticeably less memory on large files, in exchange for a little extra
-          time to open a preview. Helpful on low-end machines."
-        active={config?.lowMemoryDiff ?? false}
-        onToggle={() => config && updateConfig({ ...config, lowMemoryDiff: !config.lowMemoryDiff })}
       />
 
       <div className="mt-3 flex flex-wrap gap-2">
@@ -298,6 +318,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const categories: { id: SettingsCategory; label: string }[] = [
     { id: "appearance", label: "Appearance" },
     { id: "stash", label: artistMode ? "Set-Aside" : "Stashes" },
+    { id: "performance", label: "Performance" },
     { id: "storage", label: "Storage" },
   ];
 
@@ -354,21 +375,27 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               ) : (
                 <NoRepoFallback />
               ))}
-            {category === "storage" && (
+            {category === "performance" && (
               <>
                 <CpuBudgetRow />
                 {current ? (
-                  <StorageSettings
-                    config={config}
-                    updateConfig={updateConfig}
-                    onShowCleanup={() => setShowCleanup(true)}
-                    onShowCheck={() => setShowCheck(true)}
-                  />
+                  <PerformanceSettings config={config} updateConfig={updateConfig} />
                 ) : (
                   <NoRepoFallback />
                 )}
               </>
             )}
+            {category === "storage" &&
+              (current ? (
+                <StorageSettings
+                  config={config}
+                  updateConfig={updateConfig}
+                  onShowCleanup={() => setShowCleanup(true)}
+                  onShowCheck={() => setShowCheck(true)}
+                />
+              ) : (
+                <NoRepoFallback />
+              ))}
           </div>
         </div>
       </Modal>

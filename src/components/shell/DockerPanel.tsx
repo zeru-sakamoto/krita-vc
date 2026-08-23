@@ -11,7 +11,7 @@ interface DockerPanelProps {
 }
 
 /**
- * Reusable docker panel: 36px title bar + content area.
+ * Reusable docker panel: 40px title bar + content area.
  * Also the bento card — rounded, raised off the well, clipping its own
  * content so the header's fill follows the top corners.
  * (DESIGN.md → Layout & App Shell → Docker / Panel System)
@@ -30,7 +30,7 @@ export function DockerPanel({
         className,
       ].join(" ")}
     >
-      <header className="flex h-9 shrink-0 items-center justify-between border-b border-border bg-surface-2 pl-2 pr-1">
+      <header className="flex h-10 shrink-0 items-center justify-between border-b border-border bg-surface-2 pl-3 pr-1">
         <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
           {title}
         </span>

@@ -247,7 +247,7 @@ export function ChangesPanel({
             placeholder="Describe this version…"
             rows={2}
             data-tour-id="commit-message"
-            className="resize-none inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+            className="resize-none inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
           />
           {commitError && <p className="text-[11px] text-danger">{commitError}</p>}
           <button

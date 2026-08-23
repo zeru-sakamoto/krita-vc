@@ -64,6 +64,42 @@ const Empty = ({ children }: { children: React.ReactNode }) => (
   <p className="px-3 py-2 text-[12px] text-text-muted">{children}</p>
 );
 
+/** One placeholder block: an inset glow that pulses in and out, in place of loaded text. */
+function GlowBlock({ className }: { className: string }) {
+  return <div className={`animate-skeleton-glow rounded bg-surface-3 ${className}`} />;
+}
+
+/** Summary card content while `repo_storage_stats` is in flight. */
+function SummarySkeleton() {
+  return (
+    <>
+      <GlowBlock className="mt-1 h-6 w-32" />
+      <GlowBlock className="mt-2 h-3 w-full max-w-64" />
+    </>
+  );
+}
+
+/** Stand-in for a `VersionCard` while `repo_storage_stats` is in flight. */
+function VersionCardSkeleton() {
+  return (
+    <div className="raised rounded-panel bg-surface-2 p-2.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <GlowBlock className="h-3.5 w-20" />
+        <GlowBlock className="h-4 w-14 rounded-badge" />
+      </div>
+      <GlowBlock className="mt-1.5 h-3 w-40" />
+      <div className="mt-2 grid grid-cols-2 gap-x-4 border-t border-border/50 pt-2">
+        <GlowBlock className="h-3 w-16" />
+        <GlowBlock className="h-3 w-16" />
+      </div>
+    </div>
+  );
+}
+
+// Fixed placeholder count for the per-version list while loading — the real count isn't known
+// until the fetch resolves.
+const VERSION_SKELETON_COUNT = 3;
+
 /** One label/value cell in a card's stat grid. */
 function Stat({ label, value }: { label: string; value?: number }) {
   return (
@@ -91,7 +127,7 @@ function VersionCard({
   const pct = savedPercent(row.storedBytes, row.originalBytes);
 
   return (
-    <div className="rounded-panel border border-border bg-surface-2 p-2.5">
+    <div className="raised rounded-panel bg-surface-2 p-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[12px] font-medium text-text">Version {row.version}</span>
         {hasData && (
@@ -137,7 +173,7 @@ export function PerformancePanel() {
   const { artistMode } = useArtistMode();
   const path = current?.path ?? "";
 
-  const stats = useStorageStats(path, refreshNonce);
+  const { stats, loading } = useStorageStats(path, refreshNonce);
   const samples = useMemo(() => readTimings(path), [path, refreshNonce]);
   const summary = useMemo(() => summarizeTimings(samples), [samples]);
   const byCommit = useMemo(() => timingByCommit(samples), [samples]);
@@ -157,13 +193,15 @@ export function PerformancePanel() {
     <div className="flex h-full min-h-0 flex-col">
       {/* Summary card (fixed) */}
       <div
-        className="m-3 mb-2 shrink-0 rounded-panel border border-border bg-surface-2 p-3"
+        className="raised m-3 mb-2 shrink-0 rounded-panel bg-surface-2 p-3"
         data-tour-id="performance-stats"
       >
         <div className="text-[11px] uppercase tracking-wide text-text-muted">
           {artistMode ? "Storage saved" : "Storage saved vs full copies"}
         </div>
-        {!stats ? (
+        {loading ? (
+          <SummarySkeleton />
+        ) : !stats ? (
           <div className="mt-1 text-[12px] text-text-muted">
             {path ? "No versions yet." : "Storage report unavailable in browser preview."}
           </div>
@@ -214,7 +252,13 @@ export function PerformancePanel() {
         Per version
       </h3>
       <div className="min-h-0 flex-1 overflow-auto px-3 pb-2">
-        {versions.length > 0 ? (
+        {loading ? (
+          <div className="flex flex-col gap-2">
+            {Array.from({ length: VERSION_SKELETON_COUNT }, (_, i) => (
+              <VersionCardSkeleton key={i} />
+            ))}
+          </div>
+        ) : versions.length > 0 ? (
           <div className="flex flex-col gap-2">
             {versions.map((r) => (
               <VersionCard

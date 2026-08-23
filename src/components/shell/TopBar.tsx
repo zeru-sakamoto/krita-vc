@@ -249,7 +249,7 @@ function CreateRepoModal({ onClose }: { onClose: () => void }) {
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder="my-illustration"
-        className="mb-3 w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mb-3 w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
       />
       <label className="mb-1 block text-[12px] text-text-muted">Location</label>
       <div className="flex items-center gap-2">
@@ -372,7 +372,7 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
             value={confirmPath}
             onChange={(e) => setConfirmPath(e.target.value)}
             placeholder={shortPath}
-            className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger focus:outline-none"
+            className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger !outline-none"
           />
         </div>
       )}

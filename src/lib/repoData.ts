@@ -391,31 +391,42 @@ export interface StorageStats {
 
 /**
  * Storage-savings report for `path` via `repo_storage_stats`: per-version original sizes plus
- * the delta store's real footprint. `null` while loading or in a plain browser (no backend).
- * `nonce` refetches after a mutation (e.g. a new commit grows the numbers).
+ * the delta store's real footprint. `stats` is `null` while loading, on fetch failure, or in a
+ * plain browser (no backend) — `loading` distinguishes the first case so callers can render a
+ * skeleton instead of an empty state. `nonce` refetches after a mutation (e.g. a new commit
+ * grows the numbers), and `loading` goes true again on that refetch too.
  */
-export function useStorageStats(path: string, nonce = 0): StorageStats | null {
+export function useStorageStats(
+  path: string,
+  nonce = 0
+): { stats: StorageStats | null; loading: boolean } {
   const [stats, setStats] = useState<StorageStats | null>(null);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!inTauri()) {
       setStats(null);
+      setLoading(false);
       return;
     }
     let cancelled = false;
+    setLoading(true);
     invoke<StorageStats>("repo_storage_stats", { path })
       .then((s) => {
         if (!cancelled) setStats(s);
       })
       .catch(() => {
         if (!cancelled) setStats(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
   }, [path, nonce]);
 
-  return stats;
+  return { stats, loading };
 }
 
 export function useArtLayers(

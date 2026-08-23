@@ -114,7 +114,7 @@ export function SetAsideModal({
         }}
         placeholder={artistMode ? "What's this? (optional)" : "message (optional)"}
         autoFocus
-        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
       />
       {count != null && (
         <p className="mt-2 text-[11px] text-text-muted">
