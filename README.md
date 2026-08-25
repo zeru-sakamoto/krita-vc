@@ -36,12 +36,17 @@ files, where git's text-oriented delta model performs poorly.
     files, the inspector's file list picks which one the main panel shows, and it shows the
     selected file's or layer's details (type, visibility, opacity, blend, painted bounds) or the
     composite's size, resolution, and color space.
+- **Version Map**: the default view — this branch's line of versions laid out on a pannable,
+  zoomable canvas, each node carrying its own artwork thumbnail and the layers it changed instead
+  of a hash and a commit message. Click a version to open its full visual diff in place. The
+  classic branch-aware **History graph** and **Branches** list are still there, one Settings
+  toggle away ("Legacy version history"), for anyone who prefers them.
 - **Real local version control**: stage exactly the files you want (or commit everything, with a
-  confirm prompt if some changes aren't staged), browse history as a branch-aware graph, and roll
-  back / undo commits. Rolling back to the version you're already on just discards unsaved changes
-  in place (no new history entry); rolling back to an older one records a new commit, linked back
-  to it in the graph by a dashed connector. Changed your mind mid-edit? Discard a single file's
-  unsaved changes, or every unstaged file at once, without touching what's staged.
+  confirm prompt if some changes aren't staged), and roll back / undo commits. Rolling back to the
+  version you're already on just discards unsaved changes in place (no new history entry); rolling
+  back to an older one records a new commit, linked back to it in the graph by a dashed connector.
+  Changed your mind mid-edit? Discard a single file's unsaved changes, or every unstaged file at
+  once, without touching what's staged.
 - **Set aside** (stash): park working-tree changes off to the side — staged files or everything —
   and bring them back later, without leaving a version in your history. A switch or merge blocked
   by unsaved changes offers setting them aside as a one-click way through, and a Settings-modal
@@ -58,7 +63,9 @@ files, where git's text-oriented delta model performs poorly.
   draggable title bar and window controls, on by default, switch back to your OS's native frame
   any time, no restart needed — a **theme selector** with 8 color themes including a true-black
   option, applied instantly via CSS, with the visual-diff highlight color following the chosen
-  theme's accent, and the **author name** signed on your versions), **Set-Aside** (every stash,
+  theme's accent, a **Legacy version history** toggle that brings back the old History and
+  Branches tabs alongside the Version Map, and the **author name** signed on your versions),
+  **Set-Aside** (every stash,
   with per-item remove and remove-all), and **Storage** (per-repository **preview-cache size**,
   **compact-storage**, and **low-memory diffs** options, plus "Clean up storage"). Backing up a
   repository is its own one-click **zip-icon button** in the activity bar, right above the
@@ -130,14 +137,15 @@ src/
 ├─ components/
 │  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, SettingsModal,
 │  │            Sidebar, Inspector, StatusBar, BusyOverlay, TourOverlay (first-launch tour)
-│  ├─ vcs/     — diff viewer (DiffView, ArtDiffView, ArtCanvas, CompareSlider,
-│  │            LayerStackPanel, PaletteDiffView), commit graph, branch/changes panels,
-│  │            StashDialogs (set-aside prompts)
+│  ├─ vcs/     — Version Map (VersionMapPanel, VersionNode — the default view), diff viewer
+│  │            (DiffView, ArtDiffView, ArtCanvas, CompareSlider, LayerStackPanel,
+│  │            PaletteDiffView), commit graph, branch/changes panels, StashDialogs
+│  │            (set-aside prompts)
 │  ├─ ui/      — IconButton, Button, Menu, Modal
 │  └─ MainPanel.tsx
 ├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode +
-│  │            author-name + tour (tour.tsx) contexts, shell detection (tauri.ts), SVG
-│  │            compositing, zoom/pan + resize hooks
+│  │            legacy-history-toggle + author-name + tour (tour.tsx) contexts, shell
+│  │            detection (tauri.ts), SVG compositing, zoom/pan + resize hooks
 ├─ styles/     — global.css (Tailwind v4 @theme tokens from DESIGN.md)
 └─ types.ts    — domain types (the frontend ↔ backend contract)
 

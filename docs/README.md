@@ -12,9 +12,11 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 ## Contents
 
 - [**Frontend architecture**](frontend-architecture.md) — app shell, the four zones, state
-  ownership, the component map, **Artist Mode** (the global friendly-labels toggle), the
-  **theme selector** (color themes + the theme-reactive diff highlight), and the
-  **application tour** (the first-launch spotlight walkthrough).
+  ownership, the component map, the **Version Map** (the default view — a pannable/zoomable
+  canvas of versions, replacing the History graph; branch color, the grid background, and the
+  Legacy version history toggle that brings the old History/Branches tabs back), **Artist Mode**
+  (the global friendly-labels toggle), the **theme selector** (color themes + the theme-reactive
+  diff highlight), and the **application tour** (the first-launch spotlight walkthrough).
 - [**Backend architecture**](backend-architecture.md) — the Rust crate's structural map: module
   layout, the request flow from a Tauri command or the `kvc` CLI into the engine and back, the
   concurrency model (`RepoLock` + the CPU-budgeted pool), the two binaries that share one crate,
@@ -30,10 +32,6 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   scrub), the GC safety model (quarantine-to-trash instead of outright delete), verified
   self-describing backups, stash ordering invariants, and the input-validation caps at the trust
   boundaries.
-- [**Data integrity — gaps**](data-integrity-gaps.md) — the companion list of defenses that
-  aren't in place yet: an append-only audit trail of destructive operations, the plugin verifying
-  its reopen matched disk, a pack self-check beyond its name, and a disk-space precheck before a
-  write.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,

@@ -5,8 +5,7 @@ is no remote to re-pull from if the store goes bad. So the engine's integrity po
 "never be the reason a file is lost", and it is built out of a handful of cheap, boring
 invariants rather than one big transaction system.
 
-This document lists the measures that are **in the code today**, with where they live. The
-companion list of what is *not* yet done is [`data-integrity-gaps.md`](data-integrity-gaps.md).
+This document lists the measures that are **in the code today**, with where they live.
 
 ---
 
@@ -207,7 +206,7 @@ shape the Krita plugin parses. Plus, for the measures above:
 
 ## 11. Audit trail, pack self-check, and a disk-space preflight
 
-The last of the former gap list (P2 — `data-integrity-gaps.md`'s old #11–#14).
+The last of the former gap list (P2 — the old gap list's #11–#14, since folded into this doc).
 
 | Measure | Where |
 | --- | --- |

@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { inTauri } from "./tauri";
 import { timed } from "./perf";
+import { mockBranches, mockCommits, mockDiff, mockEnabled } from "./mockRepo";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
 interface BackendCommit {
@@ -34,9 +35,10 @@ export function useCommits(path: string, nonce = 0): Commit[] {
   const [commits, setCommits] = useState<Commit[]>([]);
 
   useEffect(() => {
-    // No backend in a plain browser (`npm run dev`) — history stays empty.
+    // No backend in a plain browser (`npm run dev`) — history stays empty, unless the dev-only
+    // `?mock` fixture is on (see lib/mockRepo.ts).
     if (!inTauri()) {
-      setCommits([]);
+      setCommits(mockEnabled() ? mockCommits() : []);
       return;
     }
     let cancelled = false;
@@ -148,7 +150,7 @@ export function useBranches(path: string, nonce = 0): Branch[] {
   useEffect(() => {
     // No backend in a plain browser — a fresh repo always shows "main" via AppShell's fallback.
     if (!inTauri()) {
-      setBranches([]);
+      setBranches(mockEnabled() ? mockBranches() : []);
       return;
     }
     let cancelled = false;
@@ -225,7 +227,7 @@ export function useCommitDiff(path: string, commitId: string | null): DiffResult
       return;
     }
     if (!inTauri()) {
-      setResult({ entries: [], error: null, loading: false });
+      setResult({ entries: mockEnabled() ? mockDiff(commitId) : [], error: null, loading: false });
       return;
     }
     const key = `${path}|${commitId}`;

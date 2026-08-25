@@ -55,6 +55,9 @@ const PANEL_OPTION_TOUR_IDS = new Set([
 
 const PANEL_TITLE: Record<ActivityView, string> = {
   changes: "Changes",
+  // The map renders its own full-width panel and never mounts the Sidebar; present only to
+  // keep the record exhaustive.
+  map: "Version map",
   history: "History",
   branches: "Branches",
   performance: "Performance",

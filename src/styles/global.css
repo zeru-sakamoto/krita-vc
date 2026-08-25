@@ -43,6 +43,11 @@
   --color-info: #2d6ea8;
   --color-info-fg: #56b4e9;
 
+  /* Version Map grid background. Derived from each theme's own --color-bg rather than a
+     literal per-theme value, so it auto-adapts: dark themes land near-black (barely visible,
+     "very dark" per design), light themes override below to keep the old --color-border look. */
+  --color-grid: color-mix(in srgb, var(--color-bg) 75%, black);
+
   /* Diff colors */
   --color-diff-add: #1e3a2f;
   --color-diff-add-fg: #6fcf97;
@@ -257,6 +262,8 @@ html[data-theme="charcoal-light"] {
   --shadow-tint: rgba(90, 74, 54, 0.16);
   --scrim: rgba(0, 0, 0, 0.35);
   /* See studio-light note — diff overlays tuned for dark. */
+  /* "Very dark" grid only applies to dark themes — light keeps the old dot-grid look. */
+  --color-grid: var(--color-border);
 }
 
 html[data-theme="studio-light"] {
@@ -287,6 +294,7 @@ html[data-theme="studio-light"] {
   --scrim: rgba(0, 0, 0, 0.35);
   /* diff-viewer changed-pixel mask/hatch overlays were tuned for
      dark; functional here but not re-tuned. Refine if it reads poorly. */
+  --color-grid: var(--color-border);
 }
 
 /* ============================================================

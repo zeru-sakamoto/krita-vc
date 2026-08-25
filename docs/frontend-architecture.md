@@ -3,9 +3,15 @@
 The frontend is a Vite + React 19 + TypeScript app rendered in the Tauri webview. In the desktop
 shell it drives the real Rust backend through Tauri `invoke` (commit history, branches,
 working-tree scan, per-commit visual diffs, repository lifecycle — see
-[version-control.md](version-control.md)). There is **no mock data**: in a plain browser
-(`npm run dev`, no backend) the data hooks return empty results, repository actions are no-ops,
-and the status bar shows a "Browser preview" badge — the browser build is for UI work only.
+[version-control.md](version-control.md)). There is **no mock data by default**: in a plain
+browser (`npm run dev`, no backend) the data hooks return empty results, repository actions are
+no-ops, and the status bar shows a "Browser preview" badge — the browser build is for UI work
+only. The one exception is an explicitly opt-in dev fixture,
+[`src/lib/mockRepo.ts`](../src/lib/mockRepo.ts): loading `http://localhost:1420/?mock` makes
+`useCommits`/`useBranches`/`useCommitDiff` return a hand-written 12-version history with synthetic
+composites, so canvas/layout work on the [Version Map](#version-map) can be seen without the
+desktop shell. Gated on `import.meta.env.DEV` **and** the query flag, so it's stripped from
+production builds.
 
 ## Styling
 
@@ -20,11 +26,14 @@ and the status bar shows a "Browser preview" badge — the browser build is for 
   down `global.css` that overrides just the identity tokens (dark themes) or the identity + status/
   diff tokens and `color-scheme` (light themes). See [Theme selector](#theme-selector).
 
-## App shell — the four zones
+## App shell — the four zones (plus the map's full-width zone)
 
 [`AppShell`](../src/components/shell/AppShell.tsx) splits on the selected repository: with none
 selected (fresh install) it renders a welcome state pointing at the top-bar switcher; otherwise
-`RepoShell` owns layout and view state and wires the zones:
+`RepoShell` owns layout and view state and wires the zones. The **Version Map** (default view) is
+the odd one out — it drops Sidebar and Inspector entirely and owns the whole well itself, since
+the node carries the metadata a Sidebar/Inspector would otherwise show. Every other view uses the
+classic four-zone layout:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -32,17 +41,25 @@ selected (fresh install) it renders a welcome state pointing at the top-bar swit
 ├──────────┬──────────────────────┬──────────────────────┬───────────────┤
 │ Activity │ Sidebar              │ Main Panel           │ Inspector     │
 │  48px    │  240–320px resizable │  flex: 1             │  280px toggle │
-│  fixed   │  changes/history/    │  diff viewer         │  commit meta  │
-│          │  branches            │                      │               │
+│  fixed   │  changes/history*/   │  diff viewer         │  commit meta  │
+│          │  branches*/perf      │                      │               │
 └──────────┴──────────────────────┴──────────────────────┴───────────────┘
                         StatusBar (24px, fixed bottom)
+             (* history/branches only when Legacy version history is on)
 ```
+
+Performance is a hybrid: its Sidebar card (`PerformancePanel`) is always present, but the
+right-hand content depends on the Legacy toggle — Main Panel + Inspector when Legacy is on (the
+row above), or the Version Map, full width, when Legacy is off (no Inspector either, same as the
+pure Map tab). See [Version Map](#version-map) for why, and for how the map itself is one
+instance shared across both places.
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
 | Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `history` \| `branches` \| `performance`). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
-| Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `map` \| `history` \| `branches` \| `performance`). `history`/`branches` are filtered out unless [Legacy version history](#version-map) is on. The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **Legacy version history** toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
+| Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). Absent on the Map tab. |
+| Version Map | [`VersionMapPanel`](../src/components/vcs/VersionMapPanel.tsx) | The default view — see [Version Map](#version-map). Replaces Main Panel + Inspector on the Map tab, and Main Panel + Inspector on Performance when Legacy is off. |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders **one selected file** of the current commit/working diff (art-diff canvas height is drag-resizable), or an empty state. Which file is chosen by the Inspector's file list (`selectedFile`/`onSelectFile`, lifted to `RepoShell`); a multi-file commit no longer stacks every file's diff at once. |
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On the **History** view: the selected commit's version/hash, author, date, message, and a Restore action. On the **Changes** view it never shows a History commit — a focused changed file gets an "Unsaved changes" header, and a clean tree (nothing focused) gets a neutral "No changes to show" placeholder instead. Either mode's **changed-files list doubles as the main panel's file selector** — click a row to show that file in `DiffView`; a `.kra` row with an embedded document palette gets a palette sub-row that jumps straight to that palette's pane (`focusId`), and standalone palette files get their own row under a separate "Palettes" heading. Also gets a **Selected** section mirroring the diff navigator's pick — a layer's type/visibility/opacity/blend/change/painted bounds, or the composite's size/DPI/color space/layer count. |
 | Status bar | [`StatusBar`](../src/components/shell/StatusBar.tsx) | Active file, branch, commit/version count. |
@@ -69,8 +86,8 @@ State lives in `RepoShell` and flows down via props:
 
 | State | Drives |
 |-------|--------|
-| `activeView` | Which sidebar panel renders; the active activity-bar icon. Also gates the toolbar header, main-panel diff, and Inspector: switching to `"changes"` immediately drops any History selection from all three (derived `inChanges` flag), regardless of whether a working file happens to be focused yet. |
-| `selectedId` | Selected commit → main-panel diff + inspector, but only while `activeView !== "changes"`. |
+| `activeView` | Which sidebar panel renders; the active activity-bar icon. Also gates the toolbar header, main-panel diff, and Inspector: switching to `"changes"` immediately drops any History selection from all three (derived `inChanges` flag), regardless of whether a working file happens to be focused yet. Two derived flags built on it decide the map's visibility (see [Version Map](#version-map)): `inMap` (`activeView === "map"`, no Sidebar) and `perfShowsMap` (`activeView === "performance" && !legacy`); `showMap = inMap \|\| perfShowsMap` toggles the map wrapper's `hidden` class. |
+| `selectedId` | Selected commit → main-panel diff + inspector, but only while `activeView !== "changes"` and `!showMap`. |
 | `inspectorOpen` | Inspector visibility. |
 | `focus` | The diff navigator's layer/composite pick (`{ path, id }`), reported up by `ArtDiffView`'s `onFocus` → the Inspector's **Selected** section. |
 | `selectedFile` / `selectedFocusId` | Which file (among possibly several in the current diff) `DiffView` renders, and an optional navigator id to seed its view with (e.g. jump straight to an embedded palette). Set by the Inspector's file list; defaults to the diff's first top-level entry and resets when the diff changes and the current selection no longer applies. |
@@ -85,9 +102,12 @@ a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLaye
 working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
 `selectedCommit`, and `diff`.
 
-Five pieces of state live **outside** `AppShell`, each in a React context so any component can read
+Six pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
 ([`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx), see [Artist Mode](#artist-mode)), the
+Legacy version history flag ([`src/lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx), same
+context-plus-`localStorage` shape as Artist Mode, default **off** — see
+[Version Map](#version-map)), the
 custom title bar flag ([`src/lib/windowChrome.tsx`](../src/lib/windowChrome.tsx), see
 [Custom title bar](#custom-title-bar)), the
 selected color theme ([`src/lib/theme.tsx`](../src/lib/theme.tsx), see
@@ -103,7 +123,7 @@ paths; used by `ChangesPanel`'s per-file discard and `Sidebar`'s "Discard curren
 the shared `saving` / `busyMessage` / `scanning` busy flags — `saving` locks staging and drives the
 `StatusBar` progress bar during a commit, `busyMessage` (a human-readable label, or `null` when
 idle) drives the full-screen `BusyOverlay` during any write op, `scanning` spins the Changes
-refresh button. All five providers are mounted in [`App.tsx`](../src/App.tsx).
+refresh button. All six providers are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
 (`Sidebar`), the art-diff canvas height (`ArtDiffView`), modal open/close state (`BranchesPanel`,
@@ -116,7 +136,10 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
 
 ## Sidebar views
 
-`Sidebar` is a thin router on `view` (keeping the resizable shell + `DockerPanel` wrapper):
+`Sidebar` is a thin router on `view` (keeping the resizable shell + `DockerPanel` wrapper). It
+never mounts for `view === "map"` — the [Version Map](#version-map) owns the whole well instead.
+`history` and `branches` only appear in the router (and in `ActivityBar`) when **Legacy version
+history** is on; see [Version Map](#version-map) for what replaced them.
 
 - **`history`** — a live **branch switcher** (the `Menu` primitive: pick a branch to switch to it,
   footer row opens the create-branch modal) + [`CommitGraph`](../src/components/vcs/CommitGraph.tsx):
@@ -167,6 +190,74 @@ Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize
   scrollable per-version card list (stored vs full-copy bytes + % saved + save/compare time), and a
   pinned recent-operations log. Timing is client-side (localStorage); storage comes from the
   `repo_storage_stats` backend command. See [performance-report.md](performance-report.md).
+  Always visible (not legacy-gated), but what sits *beside* it in `AppShell` depends on the
+  Legacy toggle — the Version Map when Legacy is off, Main Panel + Inspector when it's on. See
+  [Version Map](#version-map).
+
+## Version Map
+
+The **default view** ([`VersionMapPanel`](../src/components/vcs/VersionMapPanel.tsx) +
+[`VersionNode`](../src/components/vcs/VersionNode.tsx)) and the visual replacement for the
+History graph: this branch's line of versions on a pannable, zoomable canvas, laid out
+left→right oldest first along a spine. Each node carries the version's after-composite, a
+connector dot the spine runs through, and a two-column grid of chips for the layers that changed
+(layer-type icon from `friendly.ts`'s `layerTypeIcon()` + an A/M/D glyph in `FileStatusChip`'s
+icon-and-color vocabulary). The node *is* the metadata — clicking one opens the full
+`MainPanel`/`DiffView` in place (back button; a `Menu` file-picker stands in for the Inspector's
+file list on a multi-file version). Only the current branch is drawn (`list_commits` is already
+scoped to its tip).
+
+Built on **React Flow** (`@xyflow/react`, pinned to `12.10.2` — `12.11.4` ships a broken pairing
+with `@xyflow/system`, Vite's dep optimizer dies on it). Node positions are computed from the
+commit graph (`nodesDraggable={false}`) — nothing is persisted, so a new commit can never leave
+the layout stale. Edges come from `parents`, not list adjacency, so a merge commit's second
+parent already draws its own line once branches land (`LANE_PITCH`/non-zero `y` are the reserved
+seam for that).
+
+- **Branch color.** A small local palette in `VersionMapPanel.tsx`
+  (`BRANCH_LANE_COLORS` — `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by
+  `laneColor(lane)`), deliberately separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent
+  is a fixed convention for the legacy History graph and stays untouched). Lane 0 — today's only
+  lane, the current/main branch — colors every node's connector dot and, mixed 55% toward
+  transparent via `color-mix`, the spine between them. The branch tip's thumbnail additionally
+  gets a **detached** `outline`/`outline-offset` ring in that same color, distinct from the flush
+  `ring-accent` used for whichever node is open. When divergent branches land, each new lane is
+  just `laneColor(laneIndex)`.
+- **Grid background.** React Flow's `Lines` variant, colored by a `--color-grid` token
+  (`src/styles/global.css`) derived from each theme's own `--color-bg` via
+  `color-mix(in srgb, var(--color-bg) 75%, black)` — dark themes render a near-black, barely
+  visible grid with no per-theme literals; the two light themes override it back to
+  `--color-border`.
+- **Minimap and zoom.** Wheel zooms toward the cursor, drag pans (`zoomOnScroll`,
+  `panOnScroll={false}`) — the same gesture pair as the diff viewer's `useZoomPan`. Below
+  `LOD_ZOOM` the caption and chips drop (a boolean `useStore` selector, so a node only re-renders
+  when the threshold is actually crossed). Nodes carry explicit `width`/`height` (`NODE_W`/
+  `NODE_H`) since the `MiniMap` sizes from the *user* node object, not the measured box.
+- **Opening a version** unmounts the *canvas* (not the panel — see below) and swaps in the
+  drilldown; the viewport is stashed in a ref beforehand and handed back as `defaultViewport` on
+  the way out, so returning to the map doesn't snap back to the oldest version.
+- **No backend command of its own.** A node calls the same `useCommitDiff` → `commit_diff` the
+  diff viewer does (`afterImage` = the capped, content-addressed composite as a `kvcimg://` URL,
+  plus `layers[]` with `change`/`layerType`, `with_rasters = false`), so opening a drilldown is a
+  `diffCache` hit, not a second round trip. Off-viewport nodes aren't mounted
+  (`onlyRenderVisibleElements`), so they never fetch.
+- **Mounted once, for the shell's lifetime.** `AppShell` renders exactly one `VersionMapPanel`
+  and toggles a `hidden` class on its wrapper (`showMap`, see [State ownership](#state-ownership))
+  rather than conditionally mounting it per view. Unmounting it — as two separate JSX call sites
+  (one for the Map tab, one for Performance) used to do — would remount the whole
+  `ReactFlowProvider` on every tab switch, silently resetting both the panned/zoomed viewport and
+  the open-drilldown `openId`, since neither lives in anything React Flow itself persists.
+
+**Legacy version history.** The old **History** and **Branches** Sidebar views are still there but
+hidden behind Settings → Appearance → "Legacy version history"
+([`lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx), default **off**). `ActivityBar` filters
+those two icons on it, and `RepoShell` snaps back to the map if the toggle goes off while you're
+standing on one, so you can't be stranded on a view with no icon. `CommitGraph`/`BranchesPanel`/
+`lib/graph.ts` are untouched — branch create/switch/merge/delete still live only in the Branches
+panel. The **Performance** tab rides the same toggle: with Legacy off there's no commit selection
+left to drive a diff viewer, so `AppShell`'s `perfShowsMap` flag shows the map beside the stats
+Sidebar instead of Main Panel + Inspector, reusing the same persistent `VersionMapPanel` instance
+above. Legacy on restores the old diff-viewer layout there, unchanged.
 
 ## Stashes — setting work aside
 
@@ -351,10 +442,12 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ ActivityBar ─ SettingsModal (gear) ─┬─ CleanupModal ("Clean up storage…")
 │                                       ├─ CheckModal ("Check for problems…", opt-in full scrub)
 │                                       └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
-├─ Sidebar ─ DockerPanel ─┬─ history  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
-│                         ├─ changes  → ChangesPanel ─ FileStatusChip
-│                         ├─ branches → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
+├─ Sidebar ─ DockerPanel ─┬─ history*  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
+│  (absent on "map")      ├─ changes   → ChangesPanel ─ FileStatusChip
+│                         ├─ branches* → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
 │                         └─ performance → PerformancePanel (summary + per-version cards + recent ops)
+├─ VersionMapPanel ─ ReactFlowProvider ─┬─ VersionNode (× one per commit — thumbnail, connector dot, layer chips)
+│  (mounted once — see Version Map)     └─ CommitDrilldown (open node) → MainPanel/DiffView, same as below
 ├─ MainPanel ─ DiffView ──┬─ art     → ArtDiffView ─┬─ LayerStackPanel ─ FileStatusChip
 │                         │          (+ 1st palette)  ├─ ArtCanvas        (side-by-side)
 │                         │                           └─ CompareSlider ─ ArtCanvas (swipe)
@@ -364,18 +457,28 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 ├─ Inspector ─ DockerPanel ─ FileStatusChip
 └─ StatusBar
 
+(* history/branches only when Legacy version history is on)
+
 BusyOverlay (sibling of the above, not nested — renders when `busyMessage` is set)
 
 RepoShell also renders TourOverlay as its own last child (see Application tour)
 ```
 
+On the Map tab (and Performance without Legacy), `VersionMapPanel` replaces Main Panel + Inspector
+(and, on the pure Map tab, Sidebar too) rather than nesting inside them — see
+[Version Map](#version-map) for the always-mounted/`hidden`-toggle mechanics.
+
 `StashDialogs.tsx` (`SetAsideModal`, `PickStashModal`, `StashConflictModal`) is shared between
 `Sidebar`'s panel-options menu and `BranchesPanel`/`Sidebar`'s save-first prompt; `SettingsModal`
 reuses its `stashTitle`/`stashSummary` helpers for the set-aside shelf rows.
 
-The whole tree is wrapped in `RepositoryProvider` → `ThemeProvider` → `ArtistModeProvider` →
-`AuthorNameProvider` → `WindowChromeProvider` → `TourProvider` (all mounted in
-[`App.tsx`](../src/App.tsx)).
+The whole tree is wrapped in `ToastProvider` → `RepositoryProvider` → `ThemeProvider` →
+`ArtistModeProvider` → `LegacyHistoryProvider` → `AuthorNameProvider` → `WindowChromeProvider` →
+`CpuBudgetProvider` → `TourProvider` (see [`App.tsx`](../src/App.tsx) for the exact nesting).
+`ToastProvider`/`CpuBudgetProvider` aren't part of the "six pieces of state" above — the toast
+queue (`src/lib/toast.tsx`) backs the backup-zip result notification in `ActivityBar`, and the CPU
+budget (`src/lib/cpuBudget.tsx`) is the Settings → Storage → "Background CPU use" knob, both
+app-global but orthogonal to `AppShell`'s own layout/view state.
 
 Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (tactile icon chip),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
@@ -383,17 +486,23 @@ outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStat
 [`BranchBadge`](../src/components/vcs/BranchBadge.tsx).
 
 Cross-cutting libs: [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx) (the toggle context),
+[`src/lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx) (the Legacy version history toggle
+context — see [Version Map](#version-map)),
 [`src/lib/repository.tsx`](../src/lib/repository.tsx) (selected-repository context + all
 mutating actions: commit/rollback/undo, stash create/pop/drop/drop-all, branch
 create/switch/merge/delete),
 [`src/lib/repoData.ts`](../src/lib/repoData.ts) (data hooks: commits, branches, diffs, layers,
 stashes),
 [`src/lib/useResize.ts`](../src/lib/useResize.ts) (shared drag-resize hook),
-[`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap`),
+[`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap` — the
+*legacy* History graph; the Version Map's own lane palette is a separate, smaller one local to
+`VersionMapPanel.tsx`, see [Version Map](#version-map)),
 [`src/lib/svgArt.ts`](../src/lib/svgArt.ts) (SVG layer compositing for the diff canvas),
 [`src/lib/friendly.ts`](../src/lib/friendly.ts) (label helpers — `assetName`, `paletteName`,
 `assetKind`, `statusVerb`, `layerTypeLabel`, `layerChangeLabel`,
 `versionNumbers`/`versionLabel`),
 [`src/lib/format.ts`](../src/lib/format.ts) (timestamps),
 [`src/lib/tour.tsx`](../src/lib/tour.tsx) (the first-launch tour's step list + state machine —
-see [Application tour](#application-tour)).
+see [Application tour](#application-tour)),
+[`src/lib/mockRepo.ts`](../src/lib/mockRepo.ts) (dev-only `?mock` fixture — see the top of this
+document).

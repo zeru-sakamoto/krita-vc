@@ -107,9 +107,14 @@ version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_c
 commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
 commits reachable from the current branch tip. The frontend drives it via Tauri `invoke` in the
 desktop shell (history, scan, commit, repo lifecycle, rollback/undo, branch create/switch/merge/
-delete, stash create/pop/drop, and per-commit visual diffs). **There is no mock data**: in a plain browser
+delete, stash create/pop/drop, and per-commit visual diffs). **There is no mock data by default**: in a plain browser
 (`npm run dev`, no backend) the data hooks return empty results, repository/branch actions are
 no-ops, and the status bar shows a "Browser preview" badge — browser mode is for UI work only.
+The one exception is an explicitly opt-in dev fixture (`src/lib/mockRepo.ts`): loading
+`http://localhost:1420/?mock` makes `useCommits`/`useBranches`/`useCommitDiff` return a
+hand-written 12-version history with synthetic composites, so canvas/layout work (the Version
+Map) can be seen without the desktop shell. It is gated on `import.meta.env.DEV` **and** the
+query flag, so it is stripped from production builds and never fires by accident.
 `.kra` diffs are real and load in two
 stages: `commit_diff` returns the capped composite + layer metadata fast, then `commit_layers`/
 `working_layers` **stream** per-layer rasters over a Tauri `Channel` as each finishes, with
@@ -323,6 +328,86 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   imagery is composited from **inline SVG markup strings** (`src/lib/svgArt.ts` — `layersBody`/
   `wrapSvg`/`compositeSvg`), which is how the backend's base64-PNG rasters render with no raster
   pipeline in the viewer. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md).
+- **Version Map** (`src/components/vcs/VersionMapPanel.tsx` + `VersionNode.tsx`) — the **default**
+  view, and the visual replacement for the History graph. This branch's line of versions on a
+  **pannable, zoomable canvas**, laid out **left→right oldest first** along a spine, one node per
+  commit: the version's **after-composite** on top, a connector dot the spine runs through, then
+  the caption and a two-column grid of **chips for the layers that changed** (layer-type icon from
+  the new `friendly.ts` `layerTypeIcon()` + an A/M/D glyph in `FileStatusChip`'s icon-and-color
+  vocabulary). On the Map tab it owns the whole well — **no Sidebar, no Inspector**; the node *is*
+  the metadata. (The Performance tab is the one place it shares the well with a Sidebar — see
+  below.) Clicking one opens the full `MainPanel`/`DiffView` in place (back button; a `Menu`
+  file-picker in the header stands in for the Inspector's file list on a multi-file version). Only
+  the current branch is drawn, which is free: `list_commits` is already scoped to the current
+  branch tip.
+  Built on **React Flow** (`@xyflow/react`), the one framework-scale frontend dependency in the
+  app — chosen over the in-repo `useZoomPan` because the branch phase needs edge routing, a
+  minimap and fit-view over a real graph, which is most of what React Flow is. It costs ~60 KB gz.
+  **The version is pinned exactly (`12.10.2`, no caret)**: `12.11.4` ships a broken pairing —
+  `@xyflow/react` imports `handleAttributionWarning` from `@xyflow/system@0.0.80`, which doesn't
+  export it, and Vite's dep optimizer dies on it. Re-test before widening the range.
+  Load-bearing details:
+  - Node positions are **computed** from the commit graph and `nodesDraggable={false}` — history
+    is not a mood board, so nothing is persisted and a new commit can never leave the layout stale.
+    `NODE_PITCH`/`LANE_PITCH` are the layout constants; branch lanes will be non-zero `y`.
+  - Edges are derived from `parents`, not from list adjacency, so a merge commit's second parent
+    already draws its own line the day branches land.
+  - Nodes must carry **explicit `width`/`height`** (`NODE_W`/`NODE_H`). React Flow's MiniMap sizes
+    from the *user* node object (`getNodeDimensions` reads it, not the measured box), so without
+    them it renders completely empty. Real node height varies with the chip count; `NODE_H` is
+    nominal and only feeds culling + the minimap.
+  - Wheel **zooms toward the cursor** and drag pans (`zoomOnScroll`, `panOnScroll={false}`) —
+    deliberately the same gesture pair as the diff viewer's `useZoomPan`, so the app's two
+    canvases don't disagree about what the wheel does.
+  - **Branch color** is a small local palette (`BRANCH_LANE_COLORS` in `VersionMapPanel.tsx` —
+    `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by `laneColor(lane)`), deliberately
+    separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent is a fixed convention for the
+    *legacy* History graph and stays untouched). Lane 0 — today's only lane, the current/main
+    branch — colors every node's connector dot and, mixed 55% toward transparent via
+    `color-mix`, the spine between them; the branch tip's thumbnail additionally gets a
+    **detached** `outline`/`outline-offset` ring in that same color, distinct from the flush
+    `ring-accent` used for whichever node is open. When divergent branches actually land, each
+    new lane is just `laneColor(laneIndex)` — no further color work needed.
+  - The canvas background is React Flow's `Lines` variant, colored by a `--color-grid` token
+    (`src/styles/global.css`) derived from each theme's own `--color-bg` via
+    `color-mix(in srgb, var(--color-bg) 75%, black)`, so dark themes render a near-black, barely
+    visible grid with no per-theme literals; the two light themes override it back to
+    `--color-border` (the darkening is dark-theme-only).
+  - Opening a version unmounts the *canvas* (not the panel — see "mounted once" below), which
+    would come back at the origin (i.e. scrolled to the *oldest* version). The viewport is stashed
+    in a ref on the way out and handed back as `defaultViewport` on the way in.
+  - **Zoom LOD**: below `LOD_ZOOM` the caption and chips are dropped. The `useStore` selector
+    returns a *boolean*, so a node re-renders only when the threshold is crossed, not per frame.
+  - **Mounted once, for the shell's lifetime.** `AppShell` renders exactly one
+    `VersionMapPanel` and toggles a `hidden` class on its wrapper rather than conditionally
+    mounting it per view — it used to have two separate JSX call sites (one for the Map tab, one
+    for Performance), each remounting the whole `ReactFlowProvider` on every switch away. The
+    wrapper's `showMap` flag covers both the Map tab and Performance-without-Legacy (below);
+    everywhere else the panel is present but `display: none`. Losing the mount would silently
+    reset both the panned/zoomed viewport and the open-drilldown `openId` on every tab switch,
+    since neither lives in anything React Flow itself persists — both are local `VersionMap`
+    state.
+  **It adds no backend command.** A node calls the same `useCommitDiff` → `commit_diff` the diff
+  viewer does, which already returns exactly what a node needs (`afterImage` = the capped,
+  content-addressed `mergedimage.png` as a `kvcimg://` URL, plus `layers[]` with `change`/
+  `layerType`) and *not* the expensive per-layer rasters (`with_rasters = false`). So opening a
+  node's drilldown is a `diffCache` hit, not a second round trip. `commit_diff` is `run_heavy`
+  (2 concurrent) and also builds a changed-pixel mask the node discards, so the count of heavy
+  calls is bounded by `onlyRenderVisibleElements` — an off-viewport node isn't mounted, so it
+  never fetches. If that stops being enough the upgrade is a dedicated
+  `commit_thumbnails(path, ids)`; don't reach for it before then.
+  The old **History** and **Branches** tabs are still there but hidden behind Settings →
+  Appearance → **"Legacy version history"** (`lib/legacyHistory.tsx`, same context-plus-
+  `localStorage` shape as Artist Mode, default **off**). `ActivityBar` filters those two items on
+  it and `RepoShell` snaps back to the map if the toggle goes off while you're standing on one, so
+  you can't be stranded on a view with no icon. `CommitGraph`/`BranchesPanel`/`lib/graph.ts` are
+  untouched — branch create/switch/merge/delete still live only in the Branches panel. The
+  **Performance** tab (`PerformancePanel`, always visible — not legacy-gated) rides the same
+  toggle: with Legacy off there's no commit selection left to drive a diff viewer, so `AppShell`'s
+  `perfShowsMap` flag (`activeView === "performance" && !legacy`) shows the map beside the stats
+  sidebar instead of `MainPanel`+`Inspector`, reusing the same persistent `VersionMapPanel`
+  instance (see "mounted once" above). Legacy on restores the old diff-viewer layout there,
+  unchanged.
 - **Artist Mode** — a global toggle (default on) that swaps technical strings for plain-language
   labels app-wide: friendly diffs, `Version N` instead of hashes, asset names instead of file
   paths, words+icons instead of `M/A/D`. State + persistence in `src/lib/artistMode.tsx`

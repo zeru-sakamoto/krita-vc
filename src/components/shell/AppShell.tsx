@@ -8,9 +8,11 @@ import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
 import { TourOverlay } from "./TourOverlay";
 import { MainPanel } from "../MainPanel";
+import { VersionMapPanel } from "../vcs/VersionMapPanel";
 import { IconButton } from "../ui/IconButton";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
+import { useLegacyHistory } from "../../lib/legacyHistory";
 import { useRepository } from "../../lib/repository";
 import {
   useBranches,
@@ -68,10 +70,11 @@ function WelcomeShell() {
 function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
   const { beginIfFirstTime } = useTour();
+  const { legacy } = useLegacyHistory();
   const { refreshNonce } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
   const branches = useBranches(repo.path, refreshNonce);
-  const [activeView, setActiveView] = useState<ActivityView>("history");
+  const [activeView, setActiveView] = useState<ActivityView>("map");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -86,6 +89,12 @@ function RepoShell({ repo }: { repo: Repository }) {
   useEffect(() => {
     beginIfFirstTime();
   }, []);
+
+  // Turning legacy history off while sitting on History/Branches would strand the user on a view
+  // with no icon to leave it by — fall back to the map.
+  useEffect(() => {
+    if (!legacy && (activeView === "history" || activeView === "branches")) setActiveView("map");
+  }, [legacy, activeView]);
 
   // Keep a valid selection as history loads/changes (default to the newest commit).
   useEffect(() => {
@@ -115,6 +124,13 @@ function RepoShell({ repo }: { repo: Repository }) {
   // Inspector once the user switches tabs. `showWorking` narrows further: only true once a
   // changed file is actually focused, which is when there's a real working-tree diff to fetch.
   const inChanges = activeView === "changes";
+  // The map owns the whole well: no sidebar, no inspector — the node carries the metadata.
+  const inMap = activeView === "map";
+  // Performance keeps its own sidebar, but once Legacy version history is off there's no
+  // commit selection driving a diff anymore — show the map beside the stats instead of a
+  // diff viewer with nothing meaningful selected.
+  const perfShowsMap = activeView === "performance" && !legacy;
+  const showMap = inMap || perfShowsMap;
   const showWorking = inChanges && focusedFile != null;
   const commitDiff = useCommitDiff(repo.path, selectedId);
   const workingDiff = useWorkingDiff(repo.path, showWorking ? focusedFile : null, refreshNonce);
@@ -157,97 +173,116 @@ function RepoShell({ repo }: { repo: Repository }) {
         {/* mr-2 leaves an 8px strip of frame down the right edge, so the chrome
             closes into a full ring instead of a C open to the right. */}
         <div className="mr-2 flex min-w-0 flex-1 gap-2 rounded-well bg-bg p-2">
-          <Sidebar
-            view={activeView}
-            commits={commits}
-            branches={branches}
-            currentBranch={currentBranch}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            focusedFile={focusedFile}
-            onFocusFile={setFocusedFile}
-            onShowChanges={() => setActiveView("changes")}
-          />
+          {!inMap && (
+            <Sidebar
+              view={activeView}
+              commits={commits}
+              branches={branches}
+              currentBranch={currentBranch}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              focusedFile={focusedFile}
+              onFocusFile={setFocusedFile}
+              onShowChanges={() => setActiveView("changes")}
+            />
+          )}
 
-          <div className="raised flex min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
-            {/* Card header — commit context (left) + inspector toggle (right).
-                Matches DockerPanel's header so every card reads the same. */}
-            <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-              {inChanges ? (
-                showWorking ? (
-                  <>
-                    <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
-                      Unsaved changes
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-[13px] text-text">
-                      {artistMode ? assetName(focusedFile) : focusedFile}
-                    </span>
-                  </>
-                ) : (
-                  <span className="flex-1 text-[13px] text-text-muted">No changes to show</span>
-                )
-              ) : selectedCommit ? (
-                <>
-                  <span
-                    className={[
-                      "text-[12px] text-text-muted",
-                      artistMode ? "font-medium" : "font-mono",
-                    ].join(" ")}
-                  >
-                    {artistMode ? versionLabel(selectedVersion) : selectedCommit.hash}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-[13px] text-text">
-                    {selectedCommit.message}
-                  </span>
-                </>
-              ) : (
-                <span className="flex-1 text-[13px] text-text-muted">
-                  {artistMode ? "No version selected" : "No commit selected"}
-                </span>
-              )}
-              {!inspectorOpen && (
-                <IconButton
-                  icon={SidebarSimple}
-                  label="Show inspector"
-                  size={18}
-                  onClick={() => setInspectorOpen(true)}
-                  tourId="inspector"
-                  iconClassName="-scale-x-100"
-                />
-              )}
-            </div>
-
-            <MainPanel
-              diff={diff}
-              error={diffError}
-              loading={diffLoading}
-              emptyHint={emptyHint}
+          {/* Always mounted, never conditionally rendered — pan/zoom and the open-version
+              drilldown live inside VersionMapPanel's own state, so remounting it on every tab
+              switch (map <-> changes <-> performance) would silently reset both. Only its
+              visibility toggles. */}
+          <div className={showMap ? "flex min-h-0 min-w-0 flex-1" : "hidden"}>
+            <VersionMapPanel
               repoPath={repo.path}
-              commitId={inChanges ? null : selectedId}
-              working={showWorking}
+              commits={commits}
+              currentBranch={currentBranch}
               nonce={refreshNonce}
-              onFocus={setFocus}
-              selectedFile={selectedFile}
-              focusId={selectedFocusId}
             />
           </div>
 
-          {inspectorOpen && (
-            <Inspector
-              commit={inChanges ? null : selectedCommit}
-              version={selectedVersion}
-              entries={diff}
-              focus={focus}
-              working={inChanges}
-              focusedFile={focusedFile}
-              isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
-              onHide={() => setInspectorOpen(false)}
-              selectedFile={selectedFile}
-              onSelectFile={(path, focusId) => {
-                setSelectedFile(path);
-                setSelectedFocusId(focusId);
-              }}
-            />
+          {!showMap && (
+            <>
+              <div className="raised flex min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
+                {/* Card header — commit context (left) + inspector toggle (right).
+                Matches DockerPanel's header so every card reads the same. */}
+                <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
+                  {inChanges ? (
+                    showWorking ? (
+                      <>
+                        <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+                          Unsaved changes
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] text-text">
+                          {artistMode ? assetName(focusedFile) : focusedFile}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="flex-1 text-[13px] text-text-muted">No changes to show</span>
+                    )
+                  ) : selectedCommit ? (
+                    <>
+                      <span
+                        className={[
+                          "text-[12px] text-text-muted",
+                          artistMode ? "font-medium" : "font-mono",
+                        ].join(" ")}
+                      >
+                        {artistMode ? versionLabel(selectedVersion) : selectedCommit.hash}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[13px] text-text">
+                        {selectedCommit.message}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="flex-1 text-[13px] text-text-muted">
+                      {artistMode ? "No version selected" : "No commit selected"}
+                    </span>
+                  )}
+                  {!inspectorOpen && (
+                    <IconButton
+                      icon={SidebarSimple}
+                      label="Show inspector"
+                      size={18}
+                      onClick={() => setInspectorOpen(true)}
+                      tourId="inspector"
+                      iconClassName="-scale-x-100"
+                    />
+                  )}
+                </div>
+
+                <MainPanel
+                  diff={diff}
+                  error={diffError}
+                  loading={diffLoading}
+                  emptyHint={emptyHint}
+                  repoPath={repo.path}
+                  commitId={inChanges ? null : selectedId}
+                  working={showWorking}
+                  nonce={refreshNonce}
+                  onFocus={setFocus}
+                  selectedFile={selectedFile}
+                  focusId={selectedFocusId}
+                />
+              </div>
+
+              {inspectorOpen && (
+                <Inspector
+                  commit={inChanges ? null : selectedCommit}
+                  version={selectedVersion}
+                  entries={diff}
+                  focus={focus}
+                  working={inChanges}
+                  focusedFile={focusedFile}
+                  isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
+                  onHide={() => setInspectorOpen(false)}
+                  selectedFile={selectedFile}
+                  onSelectFile={(path, focusId) => {
+                    setSelectedFile(path);
+                    setSelectedFocusId(focusId);
+                  }}
+                />
+              )}
+            </>
           )}
         </div>
       </div>

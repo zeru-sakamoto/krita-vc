@@ -2,7 +2,21 @@
 // on to turn technical strings (paths, hashes, status codes, palette diffs) into
 // plain-language labels. See src/lib/artistMode.tsx.
 
-import { FileImage, Image, Palette, GearSix, type Icon } from "@phosphor-icons/react";
+import {
+  BezierCurve,
+  CircleHalf,
+  Copy,
+  File,
+  FileImage,
+  FolderSimple,
+  Funnel,
+  GearSix,
+  Image,
+  PaintBrush,
+  Palette,
+  Stack,
+  type Icon,
+} from "@phosphor-icons/react";
 import type { ArtLayer, Commit, FileStatus } from "../types";
 
 /** Title-case a slug/word: "skin-tones" → "Skin Tones", "hero" → "Hero". */
@@ -104,6 +118,33 @@ export function layerTypeLabel(kind: string): string {
       return "Mask";
     default:
       return kind ? titleCase(kind.replace(/layer$/, "")) : "Layer";
+  }
+}
+
+/** Krita layer `nodetype` → an icon. Same cases as `layerTypeLabel`, kept beside it. */
+export function layerTypeIcon(kind: string): Icon {
+  switch (kind) {
+    case "paintlayer":
+      return PaintBrush;
+    case "grouplayer":
+      return FolderSimple;
+    case "filterlayer":
+    case "adjustmentlayer":
+      return Funnel;
+    case "clonelayer":
+      return Copy;
+    case "shapelayer":
+    case "vectorlayer":
+      return BezierCurve;
+    case "filelayer":
+      return File;
+    case "transparencymask":
+    case "transformmask":
+    case "selectionmask":
+    case "filtermask":
+      return CircleHalf;
+    default:
+      return Stack;
   }
 }
 

@@ -1,5 +1,6 @@
 import { AppShell } from "./components/shell/AppShell";
 import { ArtistModeProvider } from "./lib/artistMode";
+import { LegacyHistoryProvider } from "./lib/legacyHistory";
 import { AuthorNameProvider } from "./lib/authorName";
 import { ThemeProvider } from "./lib/theme";
 import { RepositoryProvider } from "./lib/repository";
@@ -14,15 +15,17 @@ function App() {
       <RepositoryProvider>
         <ThemeProvider>
           <ArtistModeProvider>
-            <AuthorNameProvider>
-              <WindowChromeProvider>
-                <CpuBudgetProvider>
-                  <TourProvider>
-                    <AppShell />
-                  </TourProvider>
-                </CpuBudgetProvider>
-              </WindowChromeProvider>
-            </AuthorNameProvider>
+            <LegacyHistoryProvider>
+              <AuthorNameProvider>
+                <WindowChromeProvider>
+                  <CpuBudgetProvider>
+                    <TourProvider>
+                      <AppShell />
+                    </TourProvider>
+                  </CpuBudgetProvider>
+                </WindowChromeProvider>
+              </AuthorNameProvider>
+            </LegacyHistoryProvider>
           </ArtistModeProvider>
         </ThemeProvider>
       </RepositoryProvider>

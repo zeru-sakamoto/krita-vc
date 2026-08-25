@@ -6,23 +6,27 @@ import {
   GearSix,
   Gauge,
   FileZip,
+  MapTrifold,
 } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
 import { SettingsModal } from "./SettingsModal";
 import { useRepository } from "../../lib/repository";
 import { useToast } from "../../lib/toast";
+import { useLegacyHistory } from "../../lib/legacyHistory";
 
-export type ActivityView = "changes" | "history" | "branches" | "performance";
+export type ActivityView = "changes" | "map" | "history" | "branches" | "performance";
 
 interface ActivityBarProps {
   active: ActivityView;
   onChange: (view: ActivityView) => void;
 }
 
-const ITEMS: { view: ActivityView; icon: typeof Stack; label: string }[] = [
+const ITEMS: { view: ActivityView; icon: typeof Stack; label: string; legacy?: boolean }[] = [
   { view: "changes", icon: Stack, label: "Changes" },
-  { view: "history", icon: ClockCounterClockwise, label: "History" },
-  { view: "branches", icon: GitBranch, label: "Branches" },
+  { view: "map", icon: MapTrifold, label: "Version map" },
+  // Superseded by the Version Map — shown only when "Legacy version history" is on.
+  { view: "history", icon: ClockCounterClockwise, label: "History", legacy: true },
+  { view: "branches", icon: GitBranch, label: "Branches", legacy: true },
   { view: "performance", icon: Gauge, label: "Performance" },
 ];
 
@@ -34,6 +38,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { current, backupRepository, busyMessage } = useRepository();
   const { show } = useToast();
+  const { legacy } = useLegacyHistory();
 
   const doBackup = async () => {
     if (!current) return;
@@ -50,7 +55,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
     // chip's bottom edge land exactly on the card edges across the gutter.
     <nav className="flex w-12 shrink-0 flex-col items-center bg-surface py-2">
       <div className="flex flex-col items-center gap-2">
-        {ITEMS.map(({ view, icon, label }) => (
+        {ITEMS.filter((i) => legacy || !i.legacy).map(({ view, icon, label }) => (
           <IconButton
             key={view}
             icon={icon}

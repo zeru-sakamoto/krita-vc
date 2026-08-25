@@ -24,6 +24,7 @@ import { hasBeenChecked } from "../../lib/checkedRepos";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
 import { useWindowChrome } from "../../lib/windowChrome";
+import { useLegacyHistory } from "../../lib/legacyHistory";
 import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
 import type { Repository, Stash } from "../../types";
 
@@ -99,6 +100,8 @@ function AppearanceSettings({
   toggleArtistMode,
   customTitleBar,
   toggleWindowChrome,
+  legacyHistory,
+  toggleLegacyHistory,
   authorName,
   setAuthorName,
   theme,
@@ -109,6 +112,8 @@ function AppearanceSettings({
   toggleArtistMode: () => void;
   customTitleBar: boolean;
   toggleWindowChrome: () => void;
+  legacyHistory: boolean;
+  toggleLegacyHistory: () => void;
   authorName: string;
   setAuthorName: (name: string) => void;
   theme: ThemeId;
@@ -128,6 +133,12 @@ function AppearanceSettings({
         detail="Use krita-vc's own title bar instead of your operating system's native window frame."
         active={customTitleBar}
         onToggle={toggleWindowChrome}
+      />
+      <ToggleRow
+        label="Legacy version history"
+        detail="Bring back the old History and Branches tabs alongside the version map."
+        active={legacyHistory}
+        onToggle={toggleLegacyHistory}
       />
       <label className="mt-2 block">
         <span className="mb-1 block text-[12px] text-text-muted">Your name</span>
@@ -307,6 +318,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { current, refreshNonce } = useRepository();
   const { artistMode, toggle: toggleArtistMode } = useArtistMode();
   const { customTitleBar, toggle: toggleWindowChrome } = useWindowChrome();
+  const { legacy: legacyHistory, toggle: toggleLegacyHistory } = useLegacyHistory();
   const { authorName, setAuthorName } = useAuthorName();
   const { theme, setTheme } = useTheme();
   const { restart: restartTour } = useTour();
@@ -358,6 +370,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 toggleArtistMode={toggleArtistMode}
                 customTitleBar={customTitleBar}
                 toggleWindowChrome={toggleWindowChrome}
+                legacyHistory={legacyHistory}
+                toggleLegacyHistory={toggleLegacyHistory}
                 authorName={authorName}
                 setAuthorName={setAuthorName}
                 theme={theme}
