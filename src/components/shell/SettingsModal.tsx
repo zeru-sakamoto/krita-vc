@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   Broom,
@@ -11,6 +11,8 @@ import {
 } from "@phosphor-icons/react";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
+import { Checkbox } from "../ui/Checkbox";
+import { Radio } from "../ui/Radio";
 import { IconButton } from "../ui/IconButton";
 import { Menu, Select } from "../ui/Menu";
 import { stashSummary, stashTitle } from "../vcs/StashDialogs";
@@ -18,11 +20,12 @@ import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme, type ThemeId } from "../../lib/theme";
 import { useRepository, type CheckReport, type CleanupReport } from "../../lib/repository";
+import { hasBeenChecked } from "../../lib/checkedRepos";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
-import type { Stash } from "../../types";
+import type { Repository, Stash } from "../../types";
 
 type SettingsCategory = "appearance" | "stash" | "performance" | "storage";
 
@@ -592,83 +595,220 @@ const PROBLEM_LABEL: Record<string, string> = {
   corruptContent: "Stored data doesn't match what it should be",
 };
 
+type CheckScope = "current" | "all" | "neverChecked";
+type CheckPhase = "confirm" | "running" | "done";
+interface CheckResult {
+  repo: Repository;
+  report?: CheckReport;
+  error?: string;
+}
+
 /**
- * "Check for problems": a read-only pass over stored history, run once on open. It changes
- * nothing, so there's no confirm step — it either reports all clear or lists what it found.
+ * "Check for problems": a read-only pass over stored history. Confirm a scope (this repo, every
+ * added repo, or only repos never checked before) before it runs; it changes nothing on disk
+ * either way. A multi-repo run can be canceled between repos — the repo currently in flight
+ * always finishes (nothing in this codebase can abort a check mid-flight), but every repo still
+ * queued is skipped.
  */
 function CheckModal({ onClose }: { onClose: () => void }) {
-  const { checkRepository } = useRepository();
-  const [report, setReport] = useState<CheckReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [scrubbing, setScrubbing] = useState(false);
+  const { repositories, current, checkRepository } = useRepository();
+  const [phase, setPhase] = useState<CheckPhase>("confirm");
+  const [scope, setScope] = useState<CheckScope>("current");
+  const [scrub, setScrub] = useState(false);
+  const [queue, setQueue] = useState<Repository[]>([]);
+  const [index, setIndex] = useState(0);
+  const [results, setResults] = useState<CheckResult[]>([]);
+  const [cancelling, setCancelling] = useState(false);
+  const cancelledRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    checkRepository()
-      .then((r) => {
-        if (!cancelled) setReport(r);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [checkRepository]);
+  const neverChecked = repositories.filter((r) => !hasBeenChecked(r.path));
 
-  const runFullCheck = () => {
-    setScrubbing(true);
-    setError(null);
-    checkRepository(true)
-      .then((r) => setReport(r))
-      .catch((e) => setError(String(e)))
-      .finally(() => setScrubbing(false));
+  const run = async () => {
+    const repos =
+      scope === "all"
+        ? repositories
+        : scope === "neverChecked"
+          ? neverChecked
+          : current
+            ? [current]
+            : [];
+    if (repos.length === 0) return;
+    cancelledRef.current = false;
+    setCancelling(false);
+    setQueue(repos);
+    setResults([]);
+    setPhase("running");
+    for (let i = 0; i < repos.length; i++) {
+      if (i > 0 && cancelledRef.current) break;
+      setIndex(i);
+      const repo = repos[i];
+      try {
+        const report = await checkRepository(scrub, repo.path);
+        setResults((prev) => [...prev, { repo, report: report ?? undefined }]);
+      } catch (e) {
+        setResults((prev) => [...prev, { repo, error: String(e) }]);
+      }
+    }
+    setPhase("done");
   };
+
+  const cancel = () => {
+    cancelledRef.current = true;
+    setCancelling(true);
+  };
+
+  const currentRepo = queue[index];
+  const batch = queue.length > 1;
+  const cancelledEarly = phase === "done" && cancelledRef.current && results.length < queue.length;
+  const scopeCount =
+    scope === "all"
+      ? repositories.length
+      : scope === "neverChecked"
+        ? neverChecked.length
+        : current
+          ? 1
+          : 0;
 
   return (
     <Modal
       title="Check for problems"
-      onClose={onClose}
-      footer={<Button onClick={onClose}>Done</Button>}
+      onClose={() => (phase === "running" ? undefined : onClose())}
+      footer={
+        phase === "confirm" ? (
+          <>
+            <Button onClick={onClose}>Cancel</Button>
+            <Button variant="primary" disabled={scopeCount === 0} onClick={run}>
+              Run check
+            </Button>
+          </>
+        ) : phase === "running" ? (
+          <Button disabled={cancelling} onClick={cancel}>
+            {cancelling ? "Cancelling…" : "Cancel"}
+          </Button>
+        ) : (
+          <Button variant="primary" onClick={onClose}>
+            Done
+          </Button>
+        )
+      }
     >
-      <p className="mb-2 text-[13px] text-text">
-        Looks over every version in your history and confirms the stored data behind it is still
-        there. Nothing is changed or removed.
-      </p>
-      {error && <p className="text-[12px] text-danger">{error}</p>}
-      {!error && report == null && <p className="text-[12px] text-text-muted">Checking…</p>}
-      {!error && report != null && report.problems.length === 0 && (
-        <p className="text-[13px] text-text">
-          All clear — {report.commitsChecked} version{report.commitsChecked === 1 ? "" : "s"} and{" "}
-          {report.objectsChecked} stored piece{report.objectsChecked === 1 ? "" : "s"} checked out
-          fine
-          {report.scrubPerformed
-            ? `, including a full read-back of all ${report.versionsScrubbed} of them.`
-            : "."}
-        </p>
-      )}
-      {!error && report != null && report.problems.length > 0 && (
+      {phase === "confirm" && (
         <>
-          <p className="text-[13px] text-text">
-            Found {report.problems.length} problem{report.problems.length === 1 ? "" : "s"}. Your
-            current artwork on disk is untouched — restore from a backup if any version won't open.
+          <p className="mb-2 text-[13px] text-text">
+            Looks over every version in your history and confirms the stored data behind it is still
+            there. Nothing is changed or removed.
           </p>
-          <ul className="mt-2 max-h-60 space-y-1.5 overflow-y-auto">
-            {report.problems.map((p, i) => (
-              <li key={i} className="rounded-button bg-surface-2 px-2 py-1.5">
-                <span className="block text-[12px] text-text">
-                  {PROBLEM_LABEL[p.kind] ?? p.kind}
-                </span>
-                <span className="block break-all text-[11px] text-text-muted">{p.detail}</span>
-              </li>
-            ))}
-          </ul>
+          <fieldset className="mt-2 flex flex-col gap-2">
+            <label className="flex items-start gap-2 text-[13px] text-text">
+              <Radio
+                name="check-scope"
+                checked={scope === "current"}
+                onChange={() => setScope("current")}
+                disabled={!current}
+                className="mt-0.5"
+              />
+              <span>Current repo{current ? ` (${current.name})` : ""}</span>
+            </label>
+            <label className="flex items-start gap-2 text-[13px] text-text">
+              <Radio
+                name="check-scope"
+                checked={scope === "all"}
+                onChange={() => setScope("all")}
+                disabled={repositories.length === 0}
+                className="mt-0.5"
+              />
+              <span>All repos ({repositories.length})</span>
+            </label>
+            <label className="flex items-start gap-2 text-[13px] text-text">
+              <Radio
+                name="check-scope"
+                checked={scope === "neverChecked"}
+                onChange={() => setScope("neverChecked")}
+                disabled={neverChecked.length === 0}
+                className="mt-0.5"
+              />
+              <span>Repos never checked before ({neverChecked.length})</span>
+            </label>
+          </fieldset>
+          <label className="mt-3 flex items-start gap-2 text-[13px] text-text">
+            <Checkbox
+              checked={scrub}
+              onChange={(e) => setScrub(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>
+              Also read back every version (slower)
+              <span className="block text-[11px] text-text-muted">
+                Re-hashes every version's stored content, not just its index.
+              </span>
+            </span>
+          </label>
         </>
       )}
-      {!error && report != null && !report.scrubPerformed && (
-        <Button className="mt-3" disabled={scrubbing} onClick={runFullCheck}>
-          {scrubbing ? "Reading back every version…" : "Also read back every version (slower)"}
-        </Button>
+
+      {phase === "running" && (
+        <p className="text-[12px] text-text-muted">
+          {batch
+            ? `Checking ${currentRepo?.name ?? "…"} (${index + 1} of ${queue.length})…`
+            : "Checking…"}
+        </p>
+      )}
+
+      {(phase === "running" || phase === "done") && results.length > 0 && (
+        <ul className="mt-2 max-h-72 space-y-1.5 overflow-y-auto">
+          {results.map(({ repo, report, error }, ri) => (
+            <li key={ri}>
+              {batch && (
+                <p className="mb-1 text-[12px] font-medium text-text">
+                  {error || (report && report.problems.length > 0)
+                    ? repo.name
+                    : `✓ ${repo.name} — all clear`}
+                </p>
+              )}
+              {error && <p className="text-[12px] text-danger">{error}</p>}
+              {!error && report && report.problems.length === 0 && !batch && (
+                <p className="text-[13px] text-text">
+                  All clear — {report.commitsChecked} version
+                  {report.commitsChecked === 1 ? "" : "s"} and {report.objectsChecked} stored piece
+                  {report.objectsChecked === 1 ? "" : "s"} checked out fine
+                  {report.scrubPerformed
+                    ? `, including a full read-back of all ${report.versionsScrubbed} of them.`
+                    : "."}
+                </p>
+              )}
+              {!error && report && report.problems.length > 0 && (
+                <ul className="space-y-1.5">
+                  {report.problems.map((p, i) => (
+                    <li key={i} className="rounded-button bg-surface-2 px-2 py-1.5">
+                      <span className="block text-[12px] text-text">
+                        {PROBLEM_LABEL[p.kind] ?? p.kind}
+                      </span>
+                      <span className="block break-all text-[11px] text-text-muted">
+                        {p.detail}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {phase === "done" && (
+        <>
+          {results.some((r) => (r.report?.problems.length ?? 0) > 0) && (
+            <p className="mt-2 text-[12px] text-text-muted">
+              Your current artwork on disk is untouched — restore from a backup if any version won't
+              open.
+            </p>
+          )}
+          {cancelledEarly && (
+            <p className="mt-2 text-[12px] text-text-muted">
+              Cancelled after checking {results.length} of {queue.length} repos.
+            </p>
+          )}
+        </>
       )}
     </Modal>
   );

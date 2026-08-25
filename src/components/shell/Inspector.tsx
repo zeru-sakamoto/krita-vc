@@ -1,7 +1,11 @@
 import { useMemo, useState } from "react";
-import { ArrowCounterClockwise, Palette as PaletteIcon, X } from "@phosphor-icons/react";
-import { IconButton } from "../ui/IconButton";
+import {
+  ArrowCounterClockwise,
+  Palette as PaletteIcon,
+  SidebarSimple,
+} from "@phosphor-icons/react";
 import { Button } from "../ui/Button";
+import { IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
 import { FileStatusChip } from "../vcs/FileStatusChip";
 import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
@@ -32,7 +36,7 @@ interface InspectorProps {
   focusedFile: string | null;
   /** True when `commit` is the current branch tip — restoring it discards in place. */
   isTip: boolean;
-  onClose: () => void;
+  onHide: () => void;
   /** Which changed file (among possibly several) is currently shown in the main panel. */
   selectedFile: string | null;
   /** Selects a file (and optionally a navigator id within it) to show in the main panel. */
@@ -106,7 +110,7 @@ export function Inspector({
   working,
   focusedFile,
   isTip,
-  onClose,
+  onHide,
   selectedFile,
   onSelectFile,
 }: InspectorProps) {
@@ -167,7 +171,15 @@ export function Inspector({
         <span className="flex-1 text-[11px] font-medium uppercase tracking-wide text-text-muted">
           {working ? "Changes" : artistMode ? "Version" : "Commit"}
         </span>
-        <IconButton icon={X} label="Close inspector" size={16} onClick={onClose} />
+        <IconButton
+          icon={SidebarSimple}
+          label="Hide inspector"
+          active
+          size={18}
+          onClick={onHide}
+          tourId="inspector"
+          iconClassName="-scale-x-100"
+        />
       </div>
       {/* Scrollable content */}
       <div className="min-h-0 flex-1 overflow-auto bg-surface">

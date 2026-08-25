@@ -15,6 +15,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
+import { Radio } from "../ui/Radio";
 import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
@@ -331,12 +332,11 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
     >
       <fieldset className="flex flex-col gap-2">
         <label className="flex items-start gap-2 text-[13px] text-text">
-          <input
-            type="radio"
+          <Radio
             name="remove-mode"
             checked={!deleteFolder}
             onChange={() => setDeleteFolder(false)}
-            className="mt-1 accent-accent"
+            className="mt-0.5"
           />
           <span>
             Remove from list only
@@ -346,12 +346,12 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
           </span>
         </label>
         <label className="flex items-start gap-2 text-[13px] text-text">
-          <input
-            type="radio"
+          <Radio
             name="remove-mode"
             checked={deleteFolder}
             onChange={() => setDeleteFolder(true)}
-            className="mt-1 accent-danger"
+            tone="danger"
+            className="mt-0.5"
           />
           <span>
             Delete folder

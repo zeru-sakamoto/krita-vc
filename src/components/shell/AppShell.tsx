@@ -205,14 +205,16 @@ function RepoShell({ repo }: { repo: Repository }) {
                   {artistMode ? "No version selected" : "No commit selected"}
                 </span>
               )}
-              <IconButton
-                icon={SidebarSimple}
-                label={inspectorOpen ? "Hide inspector" : "Show inspector"}
-                active={inspectorOpen}
-                size={18}
-                onClick={() => setInspectorOpen((v) => !v)}
-                tourId="inspector"
-              />
+              {!inspectorOpen && (
+                <IconButton
+                  icon={SidebarSimple}
+                  label="Show inspector"
+                  size={18}
+                  onClick={() => setInspectorOpen(true)}
+                  tourId="inspector"
+                  iconClassName="-scale-x-100"
+                />
+              )}
             </div>
 
             <MainPanel
@@ -239,7 +241,7 @@ function RepoShell({ repo }: { repo: Repository }) {
               working={inChanges}
               focusedFile={focusedFile}
               isTip={selectedCommit != null && selectedCommit.id === currentBranch.tip}
-              onClose={() => setInspectorOpen(false)}
+              onHide={() => setInspectorOpen(false)}
               selectedFile={selectedFile}
               onSelectFile={(path, focusId) => {
                 setSelectedFile(path);

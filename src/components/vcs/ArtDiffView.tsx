@@ -5,8 +5,6 @@ import {
   BoundingBox,
   CircleNotchIcon,
   Columns,
-  Eye,
-  EyeSlash,
   Sparkle,
 } from "@phosphor-icons/react";
 import type { ArtDiff, ChangeRegion, DiffState, PaletteDiff } from "../../types";
@@ -259,7 +257,7 @@ export function ArtDiffView({
                   active={viewMode === "slider"}
                   onClick={() => switchView("slider")}
                 />
-                <span className="mx-1 h-4 w-px bg-border" />
+                <span className="mx-1 h-4 w-px bg-text-muted/40" />
                 <IconButton
                   icon={ArrowsIn}
                   label="Reset zoom"
@@ -270,14 +268,31 @@ export function ArtDiffView({
                 <span className="text-[11px] tabular-nums text-text-muted w-9 text-center">
                   {Math.round(zoom.scale * 100)}%
                 </span>
-                <span className="mx-1 h-4 w-px bg-border" />
-                <IconButton
-                  icon={highlightOn ? Eye : EyeSlash}
-                  label={highlightOn ? "Hide change highlight" : "Show change highlight"}
-                  size={18}
-                  active={highlightOn}
+                <span className="mx-1 h-4 w-px bg-text-muted/40" />
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={highlightOn}
+                  title={highlightOn ? "Hide change highlight" : "Show change highlight"}
                   onClick={() => setHighlightOn((v) => !v)}
-                />
+                  className="tactile flex h-8 items-center gap-1.5 rounded-button bg-surface-2 px-2 text-[12px] text-text-muted hover:bg-surface-3 hover:text-text"
+                >
+                  Show Diff
+                  <span
+                    aria-hidden
+                    className={[
+                      "inset-well relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200",
+                      highlightOn ? "bg-accent" : "bg-surface-3",
+                    ].join(" ")}
+                  >
+                    <span
+                      className={[
+                        "raised absolute left-0.5 top-1/2 size-3 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
+                        highlightOn ? "translate-x-3" : "translate-x-0",
+                      ].join(" ")}
+                    />
+                  </span>
+                </button>
                 <IconButton
                   icon={Sparkle}
                   label="Highlight: changed pixels"

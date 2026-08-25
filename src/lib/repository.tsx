@@ -5,6 +5,7 @@ import type { Repository } from "../types";
 import { inTauri } from "./tauri";
 import { clearSessionCaches } from "./repoData";
 import { readAuthorName, resolvedAuthor } from "./authorName";
+import { markChecked } from "./checkedRepos";
 import { timed } from "./perf";
 import { useToast } from "./toast";
 
@@ -93,10 +94,12 @@ interface RepositoryValue {
   cleanupRepository: (dryRun: boolean) => Promise<CleanupReport | null>;
   /**
    * Read-only integrity check over the stored history. Writes nothing, so it never raises the
-   * busy overlay. Null in a plain browser or with no repository selected. `scrub` (default off)
-   * additionally re-hashes every live version's content — IO over the whole store.
+   * busy overlay. Null in a plain browser or with no path to check. `scrub` (default off)
+   * additionally re-hashes every live version's content — IO over the whole store. `path`
+   * defaults to the current repository, but callers can pass another repo's path (e.g. checking
+   * every repo in the local list).
    */
-  checkRepository: (scrub?: boolean) => Promise<CheckReport | null>;
+  checkRepository: (scrub?: boolean, path?: string) => Promise<CheckReport | null>;
   /** Bumped to make data hooks (scan/history) refetch — e.g. after a commit. */
   refreshNonce: number;
   refresh: () => void;
@@ -510,11 +513,13 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
 
   // No `busyMessage`: the check only reads, so there's nothing for a stray click to race.
   const checkRepository = useCallback(
-    async (scrub = false): Promise<CheckReport | null> => {
-      if (!inTauri() || !current) return null;
+    async (scrub = false, path = current?.path): Promise<CheckReport | null> => {
+      if (!inTauri() || !path) return null;
       setSaving(true);
       try {
-        return await invoke<CheckReport>("check_repository", { path: current.path, scrub });
+        const report = await invoke<CheckReport>("check_repository", { path, scrub });
+        markChecked(path);
+        return report;
       } finally {
         setSaving(false);
       }

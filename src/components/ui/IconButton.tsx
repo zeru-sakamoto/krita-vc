@@ -14,6 +14,8 @@ interface IconButtonProps {
   onClick?: () => void;
   /** Tour spotlight hook (`data-tour-id`) — see `src/lib/tour.tsx`. */
   tourId?: string;
+  /** Extra classes on the icon itself, e.g. to mirror a left-facing glyph. */
+  iconClassName?: string;
 }
 
 /**
@@ -33,6 +35,7 @@ export function IconButton({
   spinning = false,
   onClick,
   tourId,
+  iconClassName,
 }: IconButtonProps) {
   return (
     <button
@@ -52,7 +55,14 @@ export function IconButton({
         active ? "text-accent" : "text-text-muted",
       ].join(" ")}
     >
-      <IconCmp size={size} weight="regular" className={spinning ? "animate-spin" : undefined} />
+      <IconCmp
+        size={size}
+        weight="regular"
+        className={
+          [spinning ? "animate-spin" : "", iconClassName ?? ""].filter(Boolean).join(" ") ||
+          undefined
+        }
+      />
     </button>
   );
 }
