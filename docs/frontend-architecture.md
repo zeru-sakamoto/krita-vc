@@ -50,9 +50,10 @@ classic four-zone layout:
 
 Performance is a hybrid: its Sidebar card (`PerformancePanel`) is always present, but the
 right-hand content depends on the Legacy toggle — Main Panel + Inspector when Legacy is on (the
-row above), or the Version Map, full width, when Legacy is off (no Inspector either, same as the
-pure Map tab). See [Version Map](#version-map) for why, and for how the map itself is one
-instance shared across both places.
+row above), or the Version Map, full width, when Legacy is off (no Inspector on the map's own
+canvas, same as the pure Map tab — though opening a version there gets its own toggleable
+Inspector, see [Version Map](#version-map)). See [Version Map](#version-map) for why, and for
+how the map itself is one instance shared across both places.
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
@@ -202,11 +203,15 @@ History graph: this branch's line of versions on a pannable, zoomable canvas, la
 left→right oldest first along a spine. Each node carries the version's after-composite, a
 connector dot the spine runs through, and a two-column grid of chips for the layers that changed
 (layer-type icon from `friendly.ts`'s `layerTypeIcon()` + an A/M/D glyph in `FileStatusChip`'s
-icon-and-color vocabulary). The node *is* the metadata — clicking one opens the full
-`MainPanel`/`DiffView` in place (back button; a `Menu` file-picker stands in for the Inspector's
-file list on a multi-file version). By default only the current branch is drawn (`list_commits`
-is already scoped to its tip); a header toggle draws every branch on its own lane — see
-[Branch lanes](#branch-lanes) below.
+icon-and-color vocabulary). The node *is* the metadata on the map itself — no Sidebar, no
+Inspector there. Clicking one opens the full `MainPanel`/`DiffView` in place (back button; a
+`Menu` file-picker in the header for a multi-file version), alongside its own toggleable
+[`Inspector`](../src/components/shell/Inspector.tsx) — open by default, same restore action and
+"Selected" section as the legacy view, hidden/shown with the same icon-button pattern
+`AppShell` uses (`SidebarSimple`, toggled in `CommitDrilldown`'s own local state — the map's
+"no Inspector" only applies to the un-opened canvas). By default only the current branch is
+drawn (`list_commits` is already scoped to its tip); a header toggle draws every branch on its
+own lane — see [Branch lanes](#branch-lanes) below.
 
 Built on **React Flow** (`@xyflow/react`, pinned to `12.10.2` — `12.11.4` ships a broken pairing
 with `@xyflow/system`, Vite's dep optimizer dies on it). Node positions are computed from the
@@ -227,11 +232,27 @@ parent draws its own line into whichever lane it came from.
   `color-mix(in srgb, var(--color-bg) 75%, black)` — dark themes render a near-black, barely
   visible grid with no per-theme literals; the two light themes override it back to
   `--color-border`.
-- **Minimap and zoom.** Wheel zooms toward the cursor, drag pans (`zoomOnScroll`,
+- **Zoom and LOD.** Wheel zooms toward the cursor, drag pans (`zoomOnScroll`,
   `panOnScroll={false}`) — the same gesture pair as the diff viewer's `useZoomPan`. Below
   `LOD_ZOOM` the caption and chips drop (a boolean `useStore` selector, so a node only re-renders
-  when the threshold is actually crossed). Nodes carry explicit `width`/`height` (`NODE_W`/
-  `NODE_H`) since the `MiniMap` sizes from the *user* node object, not the measured box.
+  when the threshold is actually crossed).
+- **Minimap.** Nodes carry explicit `width`/`height` (`NODE_W`/`NODE_H`) since the `MiniMap`
+  sizes from the *user* node object, not the measured box. The dim-outside-the-viewport mask and
+  the frame around the viewport itself are **ours**, not React Flow's: it paints both as one
+  `fillRule="evenodd"` path, so `maskStrokeColor` strokes the mask's *outer* rectangle too — half
+  that stroke falls inside the viewBox and reads as a stray accent line down the minimap's edge —
+  and a `h`/`v`/`z` path can't take an `rx`. So the `MiniMap` is handed
+  `maskColor="transparent"` + `maskStrokeWidth={0}` and `MinimapViewport` draws the two pieces
+  separately: an evenodd path for the dim, and a stroke-only `<rect rx>` for the frame. The hole
+  in that mask is rounded to the same radius as the frame — a square hole under a rounded stroke
+  leaves undimmed slivers in the corners. Two couplings hold it together: the overlay is a
+  `Panel` rather than a plain div, so it inherits the same margin and stacking as the `MiniMap`'s
+  own panel and lands on it pixel-exactly; and since React Flow's minimap geometry isn't
+  exported, `MinimapViewport` re-derives it from `nodes` plus the store `transform`, which is why
+  `MINIMAP_W`/`MINIMAP_H`/`MINIMAP_OFFSET_SCALE` are shared constants — they must stay the exact
+  values the `MiniMap` itself is passed or the two SVGs drift apart. `offsetScale` is 1.5 rather
+  than React Flow's default 5 because this history is far wider than tall: `viewScale` is
+  width-driven, and that padding applied in both axes shows up as a gap in the short one.
 - **Opening a version** unmounts the *canvas* (not the panel — see below) and swaps in the
   drilldown; the viewport is stashed in a ref beforehand and handed back as `defaultViewport` on
   the way out, so returning to the map doesn't snap back to the oldest version.
@@ -280,13 +301,51 @@ for a linear history it is identical to `friendly.ts`'s positional `versionNumbe
 by the legacy graph and Inspector). Two lanes can therefore both show "Version 5" — the lane
 color and the branch name in the caption disambiguate.
 
-Two rendering details follow from lanes existing. A **lane-crossing edge** is colored by
-`laneColor(max(sourceLane, targetLane))` — the side lane at either end — so the fork out of the
-mainline and the merge back into it both read in the side line's color instead of changing hue
-halfway. And the half-width bars behind a node's connector dot (which bridge React Flow's
-gutter-only edges to the centered dot) are gated on `hasIncoming`/`hasOutgoing`, **not** on being
-the oldest/newest node: with forks, merges and column gaps, an ends-of-the-line test paints stubs
-into empty space at every one of them.
+### Drawing the line
+
+The spine is **one drawing system — SVG edges, dot to dot**. Both of a node's handles sit on its
+connector dot (node center, `SPINE_TOP`) rather than on the node's left/right edges, so a single
+edge path spans the source dot, the gutter and the target dot. React Flow draws
+`.react-flow__edges` beneath `.react-flow__nodes` and the dot is opaque, so the line reads as
+passing through it; the dot row sits in the 8px gap between the thumbnail card and the caption, so
+nothing else occludes it. This works because `@xyflow/system`'s `getHandlePosition` uses the
+handle's own measured x/y and does **not** snap to the node's bounding box.
+
+It replaced half-width CSS bars drawn inside each node, which bridged React Flow's gutter-only
+edges to the centered dot. Two systems could never stay aligned: a 1.5px box shifted
+`-translate-y-1/2` lands on a half pixel and rasterizes across two device rows while an SVG stroke
+centers cleanly on its path, so the in-node run and the gutter run sat ~1px apart and stepped at
+every node edge — and they could disagree on color, the stub using the node's lane and the edge
+using the crossing's. Don't reintroduce an in-node segment.
+
+Line color is **opaque** (`color-mix(…, var(--color-bg))`, never `transparent`): two translucent
+strokes over the same pixels composite into a brighter, two-tone band that reads as a doubled
+line.
+
+A lane-crossing connector carries per-edge `pathOptions`:
+
+```ts
+{ offset: NODE_PITCH / 2, stepPosition: toLane > fromLane ? 0 : 1, borderRadius: 16 }
+```
+
+`offset` of half a column puts the bend in the **middle of the gutter**, clear of the node's
+caption and chips — the default 20 would descend straight through them. `stepPosition` then picks
+which gutter: `0` bends right after the source, `1` right before the target, always next to the
+end on the shallower lane. So a branch drops out of the spine at the version it started from and
+climbs back in at the version it merges into, instead of running alongside the spine for half a
+column (the default `0.5`) and doubling it up.
+
+That connector's stroke is a **gradient** between the two lanes' colors, so a fork fades out of
+its parent branch's color and a merge fades back into the color it joins. `LaneGradients` emits
+one `<linearGradient>` per lane pair that actually has a connector, into its own zero-size `<svg>`
+(a `url(#…)` paint reference resolves document-wide, and there's no hook to inject defs into React
+Flow's `<svg>` short of a custom edge component). Each must be `gradientUnits="userSpaceOnUse"`
+running **purely vertically** between the two lanes' spine y values — user space here is React
+Flow's flow coordinates, the same space those y values are already in. That confines the whole
+transition to the descent, so the connector's horizontal run at either end is exactly that lane's
+own color; which is also what makes the short stretch it shares with the spine before the bend
+invisible. An `objectBoundingBox` gradient would smear the transition across the entire path and
+tint that shared stretch.
 
 The map **draws** branches; it does not act on them. Create/switch/merge/delete still live only
 in the legacy Branches panel, pending a floating action bar.
@@ -491,6 +550,7 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 │                         └─ performance → PerformancePanel (summary + per-version cards + recent ops)
 ├─ VersionMapPanel ─ ReactFlowProvider ─┬─ VersionNode (× one per commit — thumbnail, connector dot, layer chips)
 │  (mounted once — see Version Map)     └─ CommitDrilldown (open node) → MainPanel/DiffView, same as below
+│                                          + its own toggleable Inspector (open by default)
 ├─ MainPanel ─ DiffView ──┬─ art     → ArtDiffView ─┬─ LayerStackPanel ─ FileStatusChip
 │                         │          (+ 1st palette)  ├─ ArtCanvas        (side-by-side)
 │                         │                           └─ CompareSlider ─ ArtCanvas (swipe)
@@ -509,7 +569,8 @@ RepoShell also renders TourOverlay as its own last child (see Application tour)
 
 On the Map tab (and Performance without Legacy), `VersionMapPanel` replaces Main Panel + Inspector
 (and, on the pure Map tab, Sidebar too) rather than nesting inside them — see
-[Version Map](#version-map) for the always-mounted/`hidden`-toggle mechanics.
+[Version Map](#version-map) for the always-mounted/`hidden`-toggle mechanics. Opening a version
+brings the Inspector back, scoped to that drilldown rather than shared with the legacy layout's.
 
 `StashDialogs.tsx` (`SetAsideModal`, `PickStashModal`, `StashConflictModal`) is shared between
 `Sidebar`'s panel-options menu and `BranchesPanel`/`Sidebar`'s save-first prompt; `SettingsModal`

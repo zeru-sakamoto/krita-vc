@@ -53,10 +53,6 @@ export interface VersionNodeData {
   tipOf: string[];
   /** The side branch this commit sits on, or null on the current branch's own line. */
   branch: string | null;
-  /** Whether a drawn parent/child exists, so the spine stub is only drawn where a connector
-   *  actually arrives. Not "ends of the line": with lanes there are forks and column gaps. */
-  hasIncoming: boolean;
-  hasOutgoing: boolean;
   /** This branch's lane color (see VersionMapPanel's BRANCH_LANE_COLORS) — shared by every node
    *  on the line, so the connector dots read as one continuous branch identity. */
   laneColor: string;
@@ -65,8 +61,13 @@ export interface VersionNodeData {
   [key: string]: unknown;
 }
 
-// Handles carry the edges; they're never dragged from, so they're invisible and sit exactly on
-// the dot's row so a connector meets the dot instead of the card.
+// Handles carry the edges; they're never dragged from, so they're invisible. Both sit on the
+// **connector dot itself** — node center, dot row — not on the node's left/right edges, so one
+// SVG edge spans dot to dot and the whole spine is a single drawing system. Drawing part of the
+// line as CSS bars inside the node and part as SVG between nodes could never stay aligned: a
+// 1.5px box shifted by -50% lands on a half pixel while an SVG stroke centers on its path, so the
+// two runs stepped by ~1px at every node edge. `getHandlePosition` in @xyflow/system reads the
+// handle's own measured x/y and does *not* snap to the node box, which is what makes this work.
 function SpineHandle({ type, position }: { type: "source" | "target"; position: Position }) {
   return (
     <Handle
@@ -74,7 +75,7 @@ function SpineHandle({ type, position }: { type: "source" | "target"; position: 
       position={position}
       isConnectable={false}
       className="!h-0 !w-0 !min-h-0 !min-w-0 !border-0 !bg-transparent"
-      style={{ top: SPINE_TOP }}
+      style={{ top: SPINE_TOP, left: "50%", right: "auto" }}
     />
   );
 }
@@ -99,10 +100,7 @@ export const VersionNode = memo(function VersionNode({
   data: VersionNodeData;
   selected?: boolean;
 }) {
-  const { commit, version, isTip, tipOf, branch, hasIncoming, hasOutgoing } = data;
-  const { laneColor, repoPath, onOpen } = data;
-  // Dimmer than the dots — same hue as the lane, mixed toward transparent.
-  const dimLaneColor = `color-mix(in srgb, ${laneColor} 55%, transparent)`;
+  const { commit, version, isTip, tipOf, branch, laneColor, repoPath, onOpen } = data;
   const { artistMode } = useArtistMode();
   // A boolean selector, so a node re-renders only when the threshold is actually crossed —
   // not on every frame of a zoom gesture.
@@ -163,27 +161,13 @@ export const VersionNode = memo(function VersionNode({
         )}
       </button>
 
-      {/* Connector dot, with the spine continued across the node behind it. React Flow's edges
-          only span the gutter between node boxes, so without this rule the line reads as broken
-          at every version. Matches the edge stroke in `VersionMapPanel`. */}
-      <div className="relative my-2 flex w-full shrink-0 justify-center">
-        {hasIncoming && (
-          <span
-            aria-hidden
-            className="absolute left-0 right-1/2 top-1/2 h-[1.5px] -translate-y-1/2"
-            style={{ background: dimLaneColor }}
-          />
-        )}
-        {hasOutgoing && (
-          <span
-            aria-hidden
-            className="absolute left-1/2 right-0 top-1/2 h-[1.5px] -translate-y-1/2"
-            style={{ background: dimLaneColor }}
-          />
-        )}
+      {/* Connector dot. The line through it is the React Flow edge itself — edges render beneath
+          nodes and both handles sit at this dot's center, so the spine passes behind the opaque
+          dot as one continuous stroke. */}
+      <div className="my-2 flex w-full shrink-0 justify-center">
         <span
           aria-hidden
-          className="relative h-2.5 w-2.5 shrink-0 rounded-full"
+          className="h-2.5 w-2.5 shrink-0 rounded-full"
           style={{ background: laneColor }}
         />
       </div>

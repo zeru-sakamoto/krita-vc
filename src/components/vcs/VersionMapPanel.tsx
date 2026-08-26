@@ -3,11 +3,12 @@ import {
   Background,
   BackgroundVariant,
   MiniMap,
+  Panel,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
   useStore,
-  type Edge,
+  type BuiltInEdge,
   type Node,
   type Viewport,
 } from "@xyflow/react";
@@ -19,9 +20,12 @@ import {
   CaretLineRight,
   GitBranch,
   MapTrifold,
+  SidebarSimple,
 } from "@phosphor-icons/react";
 import { MainPanel } from "../MainPanel";
+import { Inspector } from "../shell/Inspector";
 import { IconButton } from "../ui/IconButton";
+import { Switch } from "../ui/Switch";
 import { Menu } from "../ui/Menu";
 import { NODE_H, NODE_W, SPINE_TOP, VersionNode, type VersionNodeData } from "./VersionNode";
 import { useCommitDiff, useCommits } from "../../lib/repoData";
@@ -35,6 +39,13 @@ const NODE_PITCH = NODE_W + 72;
 /** Vertical pitch between branch lanes — a node's nominal height plus a gutter. */
 const LANE_PITCH = NODE_H + 60;
 const FIT_PADDING = 0.15;
+/** Minimap box, and how far React Flow pads its viewBox past the content (`offsetScale * viewScale`
+ *  on every side). Our history is much wider than tall, so viewScale is width-driven and the
+ *  default 5 becomes a visible gap in the short axis. MinimapViewport re-derives the same
+ *  geometry, so these have to be the values the MiniMap itself is given. */
+const MINIMAP_W = 180;
+const MINIMAP_H = 96;
+const MINIMAP_OFFSET_SCALE = 1.5;
 /** Whether the map draws every branch or just the one you're on. Map-local, so it's a plain
  *  localStorage read rather than another app-wide context (cf. artistMode/legacyHistory). */
 const SHOW_ALL_KEY = "krita-vc:map-show-all";
@@ -51,6 +62,20 @@ const BRANCH_LANE_COLORS = [
 ];
 function laneColor(lane: number): string {
   return BRANCH_LANE_COLORS[lane % BRANCH_LANE_COLORS.length];
+}
+/** A lane's color at line weight: dimmer than its dots, but **opaque**. Mixing toward
+ *  `transparent` instead let two crossing lines composite into a brighter, two-tone band that
+ *  read as a misaligned double line — mixing toward the background looks the same and can't. */
+function dimLane(color: string): string {
+  return `color-mix(in srgb, ${color} 55%, var(--color-bg))`;
+}
+/** The y a lane's spine runs at, in flow coordinates — shared by the gradient defs below. */
+function laneY(lane: number): number {
+  return lane * LANE_PITCH + SPINE_TOP;
+}
+/** Gradient id for a connector between two lanes. */
+function laneGradientId(from: number, to: number): string {
+  return `kvc-lane-${from}-${to}`;
 }
 
 // Registered once at module scope — a fresh object here would remount every node each render.
@@ -155,8 +180,6 @@ function VersionMap({
             isTip: layout.tips.has(commit.id),
             tipOf: layout.tips.get(commit.id) ?? [],
             branch: at?.branch ?? null,
-            hasIncoming: at?.hasIncoming ?? false,
-            hasOutgoing: at?.hasOutgoing ?? false,
             repoPath,
             onOpen,
             laneColor: laneColor(lane),
@@ -167,31 +190,48 @@ function VersionMap({
   );
 
   // Edges come from `parents`, not from adjacency — so a merge commit's second parent draws its
-  // own line into whichever lane it came from.
-  const edges = useMemo<Edge[]>(() => {
-    const out: Edge[] = [];
+  // own line into whichever lane it came from. Since both handles sit on the connector dot, one
+  // edge is the *entire* line between two versions: through the source node, the gutter, and the
+  // target node, with nothing else drawing any part of it.
+  const { edges, laneLinks } = useMemo(() => {
+    const out: BuiltInEdge[] = [];
+    const links = new Set<string>(); // "from-to" lane pairs needing a gradient
     for (const c of drawn) {
       const at = layout.placed.get(c.id);
       for (const p of c.parents) {
         const from = layout.placed.get(p);
         if (!from) continue;
-        // A lane-crossing edge belongs to the *side* lane at either end, so the fork out of the
-        // mainline and the merge back into it both read in the side line's color rather than
-        // changing hue halfway. Dimmer than the nodes, so the dark well shows through.
-        const color = laneColor(Math.max(from.lane, at?.lane ?? 0));
+        const toLane = at?.lane ?? 0;
+        const crosses = from.lane !== toLane;
+        if (crosses) links.add(`${from.lane}-${toLane}`);
         out.push({
           id: `${p}->${c.id}`,
           source: p,
           target: c.id,
           type: "smoothstep",
+          // Where the step bends. `offset` is how far the path runs straight off a handle before
+          // it may turn; half a column puts that turn in the middle of the gutter, clear of the
+          // node's caption and chips (the default 20 would descend straight through them).
+          // `stepPosition` then picks *which* gutter: 0 bends right after the source, 1 right
+          // before the target — either way, next to the end that's on the shallower lane. So a
+          // branch drops out of the spine at the version it started from and climbs back in at
+          // the version it merges into, instead of running alongside the spine for half a column
+          // (the default 0.5) and doubling it up.
+          pathOptions: {
+            offset: NODE_PITCH / 2,
+            stepPosition: toLane > from.lane ? 0 : 1,
+            borderRadius: 16,
+          },
           style: {
-            stroke: `color-mix(in srgb, ${color} 55%, transparent)`,
+            stroke: crosses
+              ? `url(#${laneGradientId(from.lane, toLane)})`
+              : dimLane(laneColor(toLane)),
             strokeWidth: 1.5,
           },
         });
       }
     }
-    return out;
+    return { edges: out, laneLinks: [...links] };
   }, [drawn, layout]);
 
   // The current branch's tip, which with lanes on is no longer just the rightmost node.
@@ -215,130 +255,263 @@ function VersionMap({
 
   const openCommit = openId ? (drawn.find((c) => c.id === openId) ?? null) : null;
 
+  if (openCommit) {
+    return (
+      <CommitDrilldown
+        repoPath={repoPath}
+        commit={openCommit}
+        version={layout.placed.get(openCommit.id)?.version ?? 0}
+        nonce={nonce}
+        isTip={openCommit.id === currentBranch.tip}
+        onBack={() => setOpenId(null)}
+      />
+    );
+  }
+
   return (
     <section className="raised flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
-      {openCommit ? (
-        <CommitDrilldown
-          repoPath={repoPath}
-          commit={openCommit}
-          version={layout.placed.get(openCommit.id)?.version ?? 0}
-          nonce={nonce}
-          onBack={() => setOpenId(null)}
-        />
-      ) : (
-        <>
-          <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-            <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
-              {artistMode ? "Version map" : `Version map · ${currentBranch.name}`}
-            </span>
-            <span className="flex-1 text-[11px] text-text-muted">
-              {drawn.length} {artistMode ? "versions" : "commits"}
-              {showAll && layout.laneCount > 1 && (
-                <>
-                  {" · "}
-                  {layout.laneCount} {artistMode ? "lines" : "branches"}
-                </>
-              )}
-            </span>
-            {drawn.length > 0 && (
+      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+          {artistMode ? "Version map" : `Version map · ${currentBranch.name}`}
+        </span>
+        <span className="flex-1 text-[11px] text-text-muted">
+          {drawn.length} {artistMode ? "versions" : "commits"}
+          {showAll && layout.laneCount > 1 && (
+            <>
+              {" · "}
+              {layout.laneCount} {artistMode ? "lines" : "branches"}
+            </>
+          )}
+        </span>
+        {drawn.length > 0 && (
+          <>
+            {otherBranches > 0 && (
               <>
-                <ZoomReadout />
-                {otherBranches > 0 && (
-                  <IconButton
-                    icon={GitBranch}
-                    active={showAll}
-                    label={
-                      artistMode
-                        ? showAll
-                          ? "Show only the line you're on"
-                          : `Show all version lines (${otherBranches} other)`
-                        : showAll
-                          ? "Show only the current branch"
-                          : `Show all branches (${otherBranches} other)`
-                    }
-                    size={16}
-                    onClick={toggleShowAll}
-                  />
-                )}
-                <IconButton
-                  icon={ArrowsOut}
-                  label="Fit all versions"
-                  size={16}
-                  onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
+                <Switch
+                  active={showAll}
+                  icon={GitBranch}
+                  text={artistMode ? "All lines" : "All branches"}
+                  label={
+                    artistMode
+                      ? showAll
+                        ? "Show only the line you're on"
+                        : `Show all version lines (${otherBranches} other)`
+                      : showAll
+                        ? "Show only the current branch"
+                        : `Show all branches (${otherBranches} other)`
+                  }
+                  onClick={toggleShowAll}
                 />
-                <IconButton
-                  icon={CaretLineRight}
-                  label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
-                  size={16}
-                  onClick={jumpToLatest}
-                />
+                <span className="mx-1 h-4 w-px bg-text-muted/40" />
               </>
             )}
-          </header>
+            <ZoomReadout />
+            <IconButton
+              icon={ArrowsOut}
+              label="Fit all versions"
+              size={16}
+              onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
+            />
+            <IconButton
+              icon={CaretLineRight}
+              label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
+              size={16}
+              onClick={jumpToLatest}
+            />
+          </>
+        )}
+      </header>
 
-          {drawn.length === 0 ? (
-            <div className="grid flex-1 place-items-center">
-              <div className="flex max-w-xs flex-col items-center gap-2 px-4 text-center text-text-muted">
-                <MapTrifold size={32} />
-                <p className="text-[13px]">
-                  {artistMode
-                    ? "No versions yet — save your first version from the Changes tab."
-                    : "No commits yet — make one from the Changes tab."}
-                </p>
-              </div>
-            </div>
-          ) : (
-            <div className="min-h-0 flex-1 bg-bg">
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={NODE_TYPES}
-                // Positions are computed; the canvas pans, the nodes never move.
-                nodesDraggable={false}
-                nodesConnectable={false}
-                edgesFocusable={false}
-                elementsSelectable={false}
-                // Wheel zooms toward the cursor and drag pans — deliberately the same gesture
-                // pair as the diff viewer's `useZoomPan`, so the two canvases in this app don't
-                // disagree about what the wheel does.
-                panOnDrag
-                panOnScroll={false}
-                zoomOnScroll
-                zoomOnDoubleClick={false}
-                minZoom={0.2}
-                maxZoom={2.5}
-                defaultViewport={savedViewport.current ?? undefined}
-                // Off-viewport nodes aren't mounted, which is also what stops them fetching
-                // their composite (see VersionNode's ponytail note).
-                onlyRenderVisibleElements
-                proOptions={{ hideAttribution: true }}
-                className="[&_.react-flow\\_\\_pane]:cursor-grab [&_.react-flow\\_\\_pane.dragging]:cursor-grabbing"
-              >
-                <Background
-                  variant={BackgroundVariant.Lines}
-                  gap={24}
-                  size={1}
-                  color="var(--color-grid)"
-                />
-                <MiniMap
-                  pannable
-                  zoomable
-                  ariaLabel="Version map overview"
-                  bgColor="var(--color-surface-2)"
-                  maskColor="color-mix(in srgb, var(--color-bg) 72%, transparent)"
-                  maskStrokeColor="var(--color-accent)"
-                  maskStrokeWidth={3}
-                  nodeColor={(n) => (n.data as VersionNodeData).laneColor}
-                  nodeStrokeWidth={0}
-                  style={{ width: 180, height: 96 }}
-                  className="!raised !rounded-panel !border !border-border !bottom-3 !right-3"
-                />
-              </ReactFlow>
-            </div>
-          )}
-        </>
+      {drawn.length === 0 ? (
+        <div className="grid flex-1 place-items-center">
+          <div className="flex max-w-xs flex-col items-center gap-2 px-4 text-center text-text-muted">
+            <MapTrifold size={32} />
+            <p className="text-[13px]">
+              {artistMode
+                ? "No versions yet — save your first version from the Changes tab."
+                : "No commits yet — make one from the Changes tab."}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="relative min-h-0 flex-1 bg-bg">
+          <LaneGradients links={laneLinks} />
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={NODE_TYPES}
+            // Positions are computed; the canvas pans, the nodes never move.
+            nodesDraggable={false}
+            nodesConnectable={false}
+            edgesFocusable={false}
+            elementsSelectable={false}
+            // Wheel zooms toward the cursor and drag pans — deliberately the same gesture
+            // pair as the diff viewer's `useZoomPan`, so the two canvases in this app don't
+            // disagree about what the wheel does.
+            panOnDrag
+            panOnScroll={false}
+            zoomOnScroll
+            zoomOnDoubleClick={false}
+            minZoom={0.2}
+            maxZoom={2.5}
+            defaultViewport={savedViewport.current ?? undefined}
+            // Off-viewport nodes aren't mounted, which is also what stops them fetching
+            // their composite (see VersionNode's ponytail note).
+            onlyRenderVisibleElements
+            proOptions={{ hideAttribution: true }}
+            className="[&_.react-flow\\_\\_pane]:cursor-grab [&_.react-flow\\_\\_pane.dragging]:cursor-grabbing"
+          >
+            <Background
+              variant={BackgroundVariant.Lines}
+              gap={24}
+              size={1}
+              color="var(--color-grid)"
+            />
+            <MiniMap
+              pannable
+              zoomable
+              ariaLabel="Version map overview"
+              bgColor="var(--color-surface-2)"
+              // The mask + viewport frame are drawn by MinimapViewport below instead: React
+              // Flow paints both as ONE evenodd path, so `maskStrokeColor` also strokes the
+              // outer rectangle — half of that stroke lands inside the viewBox and reads as a
+              // stray accent line down the minimap's edge — and a path can't round the hole's
+              // corners the way an `rx` rect can.
+              maskColor="transparent"
+              maskStrokeWidth={0}
+              nodeColor={(n) => (n.data as VersionNodeData).laneColor}
+              nodeStrokeWidth={0}
+              offsetScale={MINIMAP_OFFSET_SCALE}
+              style={{ width: MINIMAP_W, height: MINIMAP_H }}
+              // `overflow-hidden` is load-bearing: React Flow's own MiniMap container is
+              // `rounded-panel` but `overflow: visible`, so the plain rectangular <svg>
+              // inside it (sharp corners, sized in HTML attrs rather than clipped to the
+              // parent) shows through past the rounded border — a straight edge doubling
+              // the CSS border on the sides and squaring off the viewport-mask box's
+              // corners instead of following the panel's rounding.
+              className="!raised !overflow-hidden !rounded-panel !border !border-border !bottom-3 !right-3"
+            />
+            <MinimapViewport nodes={nodes} />
+          </ReactFlow>
+        </div>
       )}
     </section>
+  );
+}
+
+/**
+ * The minimap's dim-outside-the-viewport mask and the rounded frame around the viewport itself,
+ * drawn as a separate overlay because React Flow paints them as one un-roundable, fully-stroked
+ * path (see the MiniMap props). Geometry is React Flow's, verbatim, so the two SVGs line up.
+ */
+function MinimapViewport({ nodes }: { nodes: Node[] }) {
+  const transform = useStore((s) => s.transform);
+  const flowWidth = useStore((s) => s.width);
+  const flowHeight = useStore((s) => s.height);
+
+  const view = {
+    x: -transform[0] / transform[2],
+    y: -transform[1] / transform[2],
+    width: flowWidth / transform[2],
+    height: flowHeight / transform[2],
+  };
+  let x1 = view.x;
+  let y1 = view.y;
+  let x2 = view.x + view.width;
+  let y2 = view.y + view.height;
+  for (const n of nodes) {
+    x1 = Math.min(x1, n.position.x);
+    y1 = Math.min(y1, n.position.y);
+    x2 = Math.max(x2, n.position.x + (n.width ?? 0));
+    y2 = Math.max(y2, n.position.y + (n.height ?? 0));
+  }
+  const viewScale = Math.max((x2 - x1) / MINIMAP_W, (y2 - y1) / MINIMAP_H);
+  const offset = MINIMAP_OFFSET_SCALE * viewScale;
+  const boxW = viewScale * MINIMAP_W + offset * 2;
+  const boxH = viewScale * MINIMAP_H + offset * 2;
+  const boxX = x1 - (viewScale * MINIMAP_W - (x2 - x1)) / 2 - offset;
+  const boxY = y1 - (viewScale * MINIMAP_H - (y2 - y1)) / 2 - offset;
+  // The hole is rounded to match the frame, else the mask's square corners leave undimmed
+  // slivers just inside the stroke's curve.
+  const r = Math.min(6 * viewScale, view.width / 2, view.height / 2);
+  const hole =
+    `M${view.x + r},${view.y}h${view.width - 2 * r}a${r},${r} 0 0 1 ${r},${r}` +
+    `v${view.height - 2 * r}a${r},${r} 0 0 1 ${-r},${r}` +
+    `h${-(view.width - 2 * r)}a${r},${r} 0 0 1 ${-r},${-r}` +
+    `v${-(view.height - 2 * r)}a${r},${r} 0 0 1 ${r},${-r}z`;
+
+  return (
+    // A Panel, not a plain div, so it inherits the same margin/stacking as the MiniMap's own
+    // panel and lands exactly on top of it; the transparent border stands in for the MiniMap's.
+    <Panel
+      position="bottom-right"
+      className="pointer-events-none !overflow-hidden !rounded-panel !border !border-transparent !bottom-3 !right-3"
+      style={{ width: MINIMAP_W, height: MINIMAP_H }}
+    >
+      <svg
+        width={MINIMAP_W}
+        height={MINIMAP_H}
+        viewBox={`${boxX} ${boxY} ${boxW} ${boxH}`}
+        aria-hidden
+      >
+        <path
+          d={`M${boxX},${boxY}h${boxW}v${boxH}h${-boxW}z ${hole}`}
+          fillRule="evenodd"
+          fill="color-mix(in srgb, var(--color-bg) 72%, transparent)"
+        />
+        <rect
+          x={view.x}
+          y={view.y}
+          width={view.width}
+          height={view.height}
+          rx={r}
+          fill="none"
+          stroke="var(--color-accent)"
+          strokeWidth={3 * viewScale}
+        />
+      </svg>
+    </Panel>
+  );
+}
+
+/**
+ * `<defs>` for the branch connectors: one gradient per lane pair that actually has a connector,
+ * fading a fork out of its parent branch's color and a merge back into the color it joins.
+ *
+ * Two load-bearing details. It lives in its own zero-size `<svg>` rather than React Flow's —
+ * a `url(#…)` paint reference resolves document-wide, and there's no hook to inject defs into
+ * React Flow's `<svg>` without a custom edge component. And the gradient is
+ * `userSpaceOnUse` running **purely vertically** between the two lanes' spine y values (user
+ * space here is React Flow's flow coordinates, since that's the referencing element's space).
+ * That confines the whole colour transition to the descent, so the connector's horizontal run at
+ * either end is exactly that lane's own colour — which is also what makes the short stretch it
+ * shares with the spine before the bend invisible. An `objectBoundingBox` gradient would smear
+ * the transition across the entire path and tint that shared stretch.
+ */
+function LaneGradients({ links }: { links: string[] }) {
+  if (links.length === 0) return null;
+  return (
+    <svg aria-hidden className="pointer-events-none absolute h-0 w-0">
+      <defs>
+        {links.map((key) => {
+          const [from, to] = key.split("-").map(Number);
+          return (
+            <linearGradient
+              key={key}
+              id={laneGradientId(from, to)}
+              gradientUnits="userSpaceOnUse"
+              x1="0"
+              y1={laneY(from)}
+              x2="0"
+              y2={laneY(to)}
+            >
+              <stop offset="0" style={{ stopColor: dimLane(laneColor(from)) }} />
+              <stop offset="1" style={{ stopColor: dimLane(laneColor(to)) }} />
+            </linearGradient>
+          );
+        })}
+      </defs>
+    </svg>
   );
 }
 
@@ -358,25 +531,33 @@ function ZoomReadout() {
   );
 }
 
-/** The full diff viewer for one version, in place of the map. No inspector — the file picker in
- *  the header is what replaces its file list for a multi-file version. */
+/** The full diff viewer for one version, in place of the map. The file picker in the header
+ *  replaces the Inspector's file list for a multi-file version; the Inspector itself is
+ *  optional here (default open, same as the legacy view) for its per-layer "Selected" details
+ *  and the restore action — toggled with the same icon-button pattern `AppShell` uses. */
 function CommitDrilldown({
   repoPath,
   commit,
   version,
   nonce,
+  isTip,
   onBack,
 }: {
   repoPath: string;
   commit: Commit;
   version: number;
   nonce: number;
+  isTip: boolean;
   onBack: () => void;
 }) {
   const { artistMode } = useArtistMode();
   // Same call the node already made, so this is a `diffCache` hit and opens instantly.
   const { entries, error, loading } = useCommitDiff(repoPath, commit.id);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [selectedFocusId, setSelectedFocusId] = useState<string | undefined>(undefined);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  // Which layer/composite the diff navigator has selected — mirrored into the Inspector.
+  const [focus, setFocus] = useState<{ path: string; id: string } | null>(null);
 
   // Top-level files only — embedded palettes (`<kra>::<palette>`) are reached inside their .kra.
   const files = useMemo(
@@ -387,53 +568,84 @@ function CommitDrilldown({
   const active = selectedFile && files.includes(selectedFile) ? selectedFile : (files[0] ?? null);
 
   return (
-    <>
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-1 pr-3">
-        <IconButton icon={ArrowLeft} label="Back to the version map" size={16} onClick={onBack} />
-        <span
-          className={[
-            "shrink-0 text-[12px] text-text-muted",
-            artistMode ? "font-medium" : "font-mono",
-          ].join(" ")}
-        >
-          {artistMode ? versionLabel(version) : commit.hash}
-        </span>
-        <span className="min-w-0 flex-1 truncate text-[13px] text-text">{commit.message}</span>
-        {files.length > 1 && (
-          <Menu
-            align="right"
-            trigger={(open) => (
-              <span
-                className={[
-                  "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted",
-                  "hover:bg-state-hover hover:text-text",
-                  open ? "bg-state-active text-text" : "",
-                ].join(" ")}
-                title="Choose which file to view"
-              >
-                {active ? (artistMode ? assetName(active) : active) : "Files"}
-                <CaretDown size={12} />
-              </span>
-            )}
-            items={files.map((f) => ({
-              id: f,
-              label: artistMode ? assetName(f) : f,
-              selected: f === active,
-              onSelect: () => setSelectedFile(f),
-            }))}
-          />
-        )}
-      </header>
-      <MainPanel
-        diff={entries}
-        error={error}
-        loading={loading}
-        repoPath={repoPath}
-        commitId={commit.id}
-        working={false}
-        nonce={nonce}
-        selectedFile={active}
-      />
-    </>
+    <div className="flex min-h-0 min-w-0 flex-1 gap-2">
+      <section className="raised flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
+        <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-1 pr-1">
+          <IconButton icon={ArrowLeft} label="Back to the version map" size={16} onClick={onBack} />
+          <span
+            className={[
+              "shrink-0 text-[12px] text-text-muted",
+              artistMode ? "font-medium" : "font-mono",
+            ].join(" ")}
+          >
+            {artistMode ? versionLabel(version) : commit.hash}
+          </span>
+          <span className="min-w-0 flex-1 truncate text-[13px] text-text">{commit.message}</span>
+          {files.length > 1 && (
+            <Menu
+              align="right"
+              trigger={(open) => (
+                <span
+                  className={[
+                    "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted",
+                    "hover:bg-state-hover hover:text-text",
+                    open ? "bg-state-active text-text" : "",
+                  ].join(" ")}
+                  title="Choose which file to view"
+                >
+                  {active ? (artistMode ? assetName(active) : active) : "Files"}
+                  <CaretDown size={12} />
+                </span>
+              )}
+              items={files.map((f) => ({
+                id: f,
+                label: artistMode ? assetName(f) : f,
+                selected: f === active,
+                onSelect: () => setSelectedFile(f),
+              }))}
+            />
+          )}
+          {!inspectorOpen && (
+            <IconButton
+              icon={SidebarSimple}
+              label="Show inspector"
+              size={18}
+              onClick={() => setInspectorOpen(true)}
+              iconClassName="-scale-x-100"
+            />
+          )}
+        </header>
+        <MainPanel
+          diff={entries}
+          error={error}
+          loading={loading}
+          repoPath={repoPath}
+          commitId={commit.id}
+          working={false}
+          nonce={nonce}
+          onFocus={setFocus}
+          selectedFile={active}
+          focusId={selectedFocusId}
+        />
+      </section>
+
+      {inspectorOpen && (
+        <Inspector
+          commit={commit}
+          version={version}
+          entries={entries}
+          focus={focus}
+          working={false}
+          focusedFile={null}
+          isTip={isTip}
+          onHide={() => setInspectorOpen(false)}
+          selectedFile={active}
+          onSelectFile={(path, focusId) => {
+            setSelectedFile(path);
+            setSelectedFocusId(focusId);
+          }}
+        />
+      )}
+    </div>
   );
 }

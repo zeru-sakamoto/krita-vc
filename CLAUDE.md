@@ -343,7 +343,11 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   vocabulary). On the Map tab it owns the whole well — **no Sidebar, no Inspector**; the node *is*
   the metadata. (The Performance tab is the one place it shares the well with a Sidebar — see
   below.) Clicking one opens the full `MainPanel`/`DiffView` in place (back button; a `Menu`
-  file-picker in the header stands in for the Inspector's file list on a multi-file version).
+  file-picker in the header for a multi-file version), alongside its own toggleable **Inspector**
+  (open by default, same restore action and "Selected" section as the legacy view — hidden/shown
+  with the same `SidebarSimple` icon-button pattern `AppShell` uses, but tracked in
+  `CommitDrilldown`'s own local state rather than shared with the legacy layout's). The map's
+  "no Inspector" only describes the un-opened canvas.
   By default only the current branch is drawn, which is free: `list_commits` is already scoped to
   the current branch tip. A header toggle (`GitBranch` icon, shown only when another branch
   exists) switches to **all branches on their own lanes**; it defaults **off**, persists to
@@ -380,17 +384,46 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
     use). Two lanes can therefore both show "Version 5"; the lane color and the branch name in the
     caption disambiguate.
   - Edges are derived from `parents`, not from list adjacency, so a merge commit's second parent
-    draws its own line. A lane-crossing edge is colored by `laneColor(max(sourceLane, targetLane))`
-    — the *side* lane at either end — so the fork out of the mainline and the merge back into it
-    both read in the side line's color instead of changing hue halfway.
-  - The half-width bars behind a node's connector dot (which bridge React Flow's gutter-only edges
-    to the centered dot) are gated on `hasIncoming`/`hasOutgoing` — "is there a drawn parent /
-    child" — **not** on being the oldest/newest node. With lanes there are forks, merges and
-    column gaps, and an ends-of-the-line test paints stubs into empty space at every one of them.
+    draws its own line.
+  - **The spine is one drawing system: SVG edges, dot to dot.** Both of a node's handles sit on
+    its **connector dot** (node center, `SPINE_TOP`) rather than on its left/right edges, so a
+    single edge path spans the source dot, the gutter and the target dot; React Flow draws edges
+    beneath nodes and the dot is opaque, so the line reads as passing through it. This works
+    because `@xyflow/system`'s `getHandlePosition` uses the handle's own measured x/y and does
+    **not** snap to the node box. It replaced half-width CSS bars drawn inside each node: a
+    1.5px box shifted `-translate-y-1/2` lands on a half pixel while an SVG stroke centers on its
+    path, so the in-node and gutter runs stepped ~1px at every node edge and could disagree on
+    color. Don't reintroduce an in-node segment.
+  - Line color is **opaque** — `color-mix(…, var(--color-bg))`, not `transparent`. Mixing toward
+    transparent let two crossing lines composite into a brighter, two-tone band that read as a
+    doubled line.
+  - A lane-crossing connector carries per-edge `pathOptions: { offset: NODE_PITCH / 2,
+    stepPosition: fork ? 0 : 1, borderRadius: 16 }`. `offset` half a column puts the bend in the
+    **middle of the gutter**, clear of the node's caption and chips (the default 20 descends
+    straight through them); `stepPosition` 0 bends right after the source, 1 right before the
+    target — always next to the end on the shallower lane, so a branch drops out of the spine at
+    the version it started from and climbs back in at the version it merges into. The default 0.5
+    ran it alongside the spine for half a column, which is what doubled the line.
+  - That connector's stroke is a **gradient** between the two lanes' colors, defined by
+    `LaneGradients` in its own zero-size `<svg>` (a `url(#…)` paint reference resolves
+    document-wide). It must be `gradientUnits="userSpaceOnUse"` running **purely vertically**
+    between the two lanes' spine y values — user space here is React Flow's flow coordinates. That
+    confines the transition to the descent, so each horizontal run is exactly its own lane's
+    color, which is also what hides the short stretch the connector shares with the spine before
+    the bend. An `objectBoundingBox` gradient smears the transition across the whole path and
+    tints that shared stretch.
   - Nodes must carry **explicit `width`/`height`** (`NODE_W`/`NODE_H`). React Flow's MiniMap sizes
     from the *user* node object (`getNodeDimensions` reads it, not the measured box), so without
     them it renders completely empty. Real node height varies with the chip count; `NODE_H` is
     nominal and only feeds culling + the minimap.
+  - The minimap's **mask and viewport frame are drawn by `MinimapViewport`**, not React Flow,
+    which paints both as one evenodd path — so `maskStrokeColor` also strokes the mask's outer
+    rectangle (half of it inside the viewBox: a stray accent line down the edge) and the hole's
+    corners can't be rounded. The `MiniMap` gets `maskColor="transparent"`/`maskStrokeWidth={0}`
+    and the overlay draws an evenodd dim path plus a stroke-only `<rect rx>`. It re-derives React
+    Flow's (unexported) minimap geometry, so `MINIMAP_W`/`MINIMAP_H`/`MINIMAP_OFFSET_SCALE` must
+    stay exactly what the `MiniMap` is passed, and it's a `Panel` so it lands on the minimap
+    pixel-exactly.
   - Wheel **zooms toward the cursor** and drag pans (`zoomOnScroll`, `panOnScroll={false}`) —
     deliberately the same gesture pair as the diff viewer's `useZoomPan`, so the app's two
     canvases don't disagree about what the wheel does.

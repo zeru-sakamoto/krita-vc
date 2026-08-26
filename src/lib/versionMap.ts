@@ -19,9 +19,6 @@ export interface PlacedCommit {
   version: number;
   /** The branch this commit was made on; null on lane 0 and for pre-branching commits. */
   branch: string | null;
-  /** Some drawn commit is this one's parent / child — drives the node's spine stubs. */
-  hasIncoming: boolean;
-  hasOutgoing: boolean;
 }
 
 export interface MapLayout {
@@ -75,14 +72,12 @@ export function buildVersionMap(
   const laneOf = new Map<string, number>();
   const lanes = new Map<string, number>(); // branch name → lane
   const depth = new Map<string, number>();
-  const hasChild = new Set<string>();
 
   for (const c of ordered) {
     let d = 1;
     for (const p of c.parents) {
       const pd = depth.get(p);
       if (pd === undefined) continue; // parent outside the drawn set (shouldn't happen)
-      hasChild.add(p);
       if (pd + 1 > d) d = pd + 1;
     }
     depth.set(c.id, d);
@@ -118,8 +113,6 @@ export function buildVersionMap(
       col,
       version: depth.get(c.id) ?? 1,
       branch: lane === 0 ? null : (c.branch ?? null),
-      hasIncoming: c.parents.some((p) => byId.has(p)),
-      hasOutgoing: hasChild.has(c.id),
     });
   }
 
