@@ -364,6 +364,12 @@ deduplicates across branches for free.
   refuses on a dirty tree and materializes that branch's tree first (same rewrite-only-differing-
   files path as `switch_branch`), then records the new branch at `base`'s tip — this needs the
   full repo (`Repo::open`, not `open_light`) since it walks `tree_at_commit`.
+- **Create at a commit** (`create_branch_at`) — the same thing from an *arbitrary* commit rather
+  than another branch's tip: "go back to version 5 and try a different direction". Identical
+  rules (clean tree, materialize, `Repo::open`) reusing `tree_at_commit` + `materialize_tree`;
+  the commits between it and the old tip stay reachable from the branch they were made on.
+  Reached through `create_branch`'s `commit:` argument, mutually exclusive with `base:`.
+  Deliberately **not** in the `kvc` CLI — the Krita plugin has no version picker to call it from.
 - **Switch** (`switch_branch`) — refused on a dirty tree (`DirtyTree`; a clean scan also proves
   no untracked files can be clobbered). Computes both branch trees and calls `materialize_tree`,
   which rewrites **only files whose committed content hash differs** — unchanged files are never
@@ -529,9 +535,9 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `scan_repository(path)` | Working-tree changes as `WorkingChange[]` (`staged: false`). |
 | `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths (the frontend's "staged" set), omitted/`null` commits everything. Returns the `Commit`. |
 | `discard_changes(path, paths)` | Discard uncommitted changes, restoring them to the branch tip's committed content — no new commit. Empty `paths` discards everything dirty; otherwise only those relative paths. |
-| `list_commits(path)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. |
+| `list_commits(path, allBranches?)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. `allBranches: true` (default false, so every existing caller is unchanged) unions the reachable set over *every* branch tip instead — the Version Map's "show all lines" mode. |
 | `list_branches(path)` | All local branches as `{ name, tip, current }`. |
-| `create_branch(path, name, base?)` | Create + switch to a branch. No `base` (or `base` = current): instant, at the current tip. Different `base`: materializes that branch's tree first (refused on unsaved changes). Returns the branch list. |
+| `create_branch(path, name, base?, commit?)` | Create + switch to a branch. No `base`/`commit` (or `base` = current): instant, at the current tip. Different `base`: materializes that branch's tree first (refused on unsaved changes). `commit`: same, but starting at an arbitrary commit id rather than a branch tip (`create_branch_at`); mutually exclusive with `base` and wins if both are passed. Returns the branch list. |
 | `switch_branch(path, name)` | Switch the working tree to a branch (rewrites only differing files). Returns the branch list. |
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one, and never `main`). Returns the branch list. |

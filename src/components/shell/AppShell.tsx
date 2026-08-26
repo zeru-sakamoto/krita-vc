@@ -195,6 +195,7 @@ function RepoShell({ repo }: { repo: Repository }) {
             <VersionMapPanel
               repoPath={repo.path}
               commits={commits}
+              branches={branches}
               currentBranch={currentBranch}
               nonce={refreshNonce}
             />

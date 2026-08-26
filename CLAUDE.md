@@ -102,10 +102,16 @@ single-slot, auto-dismissing, bottom-right, reusing the `--z-toast` token) for t
 error result, since the busy overlay covers only the in-flight zip itself. **Branching is real**:
 `.kvc/branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
-branch's tree first), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
+branch's tree first, and `branch::create_branch_at` starts one at an **arbitrary commit** —
+"go back to version 5 and try a different direction" — via the same `tree_at_commit` +
+`materialize_tree` path, exposed as `create_branch`'s `commit:` arg, mutually exclusive with
+`base:`; deliberately **not** in the `kvc` CLI, since the Krita plugin has no version picker to
+call it from), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
 commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
-commits reachable from the current branch tip. The frontend drives it via Tauri `invoke` in the
+commits reachable from the current branch tip unless its `allBranches` flag is set (default
+false, so every existing caller is unchanged), which unions the reachable set over *every*
+branch tip — the Version Map's "show all lines" mode. The frontend drives it via Tauri `invoke` in the
 desktop shell (history, scan, commit, repo lifecycle, rollback/undo, branch create/switch/merge/
 delete, stash create/pop/drop, and per-commit visual diffs). **There is no mock data by default**: in a plain browser
 (`npm run dev`, no backend) the data hooks return empty results, repository/branch actions are
@@ -337,9 +343,17 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   vocabulary). On the Map tab it owns the whole well — **no Sidebar, no Inspector**; the node *is*
   the metadata. (The Performance tab is the one place it shares the well with a Sidebar — see
   below.) Clicking one opens the full `MainPanel`/`DiffView` in place (back button; a `Menu`
-  file-picker in the header stands in for the Inspector's file list on a multi-file version). Only
-  the current branch is drawn, which is free: `list_commits` is already scoped to the current
-  branch tip.
+  file-picker in the header stands in for the Inspector's file list on a multi-file version).
+  By default only the current branch is drawn, which is free: `list_commits` is already scoped to
+  the current branch tip. A header toggle (`GitBranch` icon, shown only when another branch
+  exists) switches to **all branches on their own lanes**; it defaults **off**, persists to
+  `localStorage` (`krita-vc:map-show-all`), and is deliberately plain component state rather than
+  another app-wide context — it is map-local, not a global preference. On, the panel makes its
+  *own* `useCommits(repoPath, nonce, true)` call for the wider `allBranches` scope; off, the path
+  it passes is `""`, which `useCommits` short-circuits, so the off state costs nothing and draws
+  exactly the commits the shell already loaded. **The map draws branches; it does not act on
+  them** — create/switch/merge/delete still live only in the legacy Branches panel, pending a
+  floating action bar.
   Built on **React Flow** (`@xyflow/react`), the one framework-scale frontend dependency in the
   app — chosen over the in-repo `useZoomPan` because the branch phase needs edge routing, a
   minimap and fit-view over a real graph, which is most of what React Flow is. It costs ~60 KB gz.
@@ -349,9 +363,30 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   Load-bearing details:
   - Node positions are **computed** from the commit graph and `nodesDraggable={false}` — history
     is not a mood board, so nothing is persisted and a new commit can never leave the layout stale.
-    `NODE_PITCH`/`LANE_PITCH` are the layout constants; branch lanes will be non-zero `y`.
+    `NODE_PITCH`/`LANE_PITCH` are the layout constants. The lane/column assignment itself is a
+    pure function in **`src/lib/versionMap.ts`** (`buildVersionMap`), deliberately *not* in
+    `lib/graph.ts` — `buildGraph` lays a DAG out vertically for the legacy rail, where a lane is
+    an x column and lane 0 means "the mainline"; here a lane is a y offset and lane 0 means "the
+    branch you're standing on". Three rules carry it: **lane 0 is the current branch's
+    first-parent spine** walked back from its tip (*not* the commits stamped with its name — after
+    a merge the folded-in commits still carry *their* branch and belong on a side lane, and
+    standing on a side branch its shared ancestors are stamped `main` and would jog your own line
+    down a lane); everything else groups by `commit.branch` into lanes 1.. in order of first
+    appearance; and **column = generation depth** (`1 + max(depth(parents))`), so parallel work on
+    two branches lines up in the same column instead of leaving chronological gaps and a merge
+    lands one column past the deeper parent. That same depth is the node's **"Version N"** — so
+    shared ancestors read the same on every lane, and for a linear history it is identical to
+    `friendly.ts`'s positional `versionNumbers()` (which the legacy graph and Inspector still
+    use). Two lanes can therefore both show "Version 5"; the lane color and the branch name in the
+    caption disambiguate.
   - Edges are derived from `parents`, not from list adjacency, so a merge commit's second parent
-    already draws its own line the day branches land.
+    draws its own line. A lane-crossing edge is colored by `laneColor(max(sourceLane, targetLane))`
+    — the *side* lane at either end — so the fork out of the mainline and the merge back into it
+    both read in the side line's color instead of changing hue halfway.
+  - The half-width bars behind a node's connector dot (which bridge React Flow's gutter-only edges
+    to the centered dot) are gated on `hasIncoming`/`hasOutgoing` — "is there a drawn parent /
+    child" — **not** on being the oldest/newest node. With lanes there are forks, merges and
+    column gaps, and an ends-of-the-line test paints stubs into empty space at every one of them.
   - Nodes must carry **explicit `width`/`height`** (`NODE_W`/`NODE_H`). React Flow's MiniMap sizes
     from the *user* node object (`getNodeDimensions` reads it, not the measured box), so without
     them it renders completely empty. Real node height varies with the chip count; `NODE_H` is
@@ -362,12 +397,12 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   - **Branch color** is a small local palette (`BRANCH_LANE_COLORS` in `VersionMapPanel.tsx` —
     `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by `laneColor(lane)`), deliberately
     separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent is a fixed convention for the
-    *legacy* History graph and stays untouched). Lane 0 — today's only lane, the current/main
-    branch — colors every node's connector dot and, mixed 55% toward transparent via
-    `color-mix`, the spine between them; the branch tip's thumbnail additionally gets a
-    **detached** `outline`/`outline-offset` ring in that same color, distinct from the flush
-    `ring-accent` used for whichever node is open. When divergent branches actually land, each
-    new lane is just `laneColor(laneIndex)` — no further color work needed.
+    *legacy* History graph and stays untouched). A lane's color paints every node's connector dot
+    on it and, mixed 55% toward transparent via `color-mix`, the spine between them; **every**
+    branch tip's thumbnail additionally gets a **detached** `outline`/`outline-offset` ring in its
+    lane color, distinct from the flush `ring-accent` used for whichever node is open, plus a
+    branch-name chip under its caption. A branch created but not yet committed on shares its
+    parent branch's tip node, so it shows up as a second chip there for free.
   - The canvas background is React Flow's `Lines` variant, colored by a `--color-grid` token
     (`src/styles/global.css`) derived from each theme's own `--color-bg` via
     `color-mix(in srgb, var(--color-bg) 75%, black)`, so dark themes render a near-black, barely

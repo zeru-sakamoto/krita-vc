@@ -24,6 +24,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 - [**File tracking & version control**](version-control.md) — the Rust backend's *feature*
   behavior: the `.kvc/` store, the scanner, commits, branches (create/switch/merge), stashes
   (setting work aside), delta-chain storage, the `.kra` tile engine, and the Tauri commands.
+- [**Per-document tracking**](per-document-tracking.md) — *design note, not implemented.* Moving
+  from one history per folder to one history per `.kra` document: the `Project`/`Document` split,
+  a shared object store with per-document history, migration, and the blast radius.
 - [**Data integrity**](data-integrity.md) — the measures the engine already applies to avoid
   losing an artist's work: the cross-process repo lock, a `branches.json` generation counter that
   lets user-facing reads detect a stale snapshot, atomic + fsynced writes and save ordering (plus

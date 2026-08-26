@@ -514,14 +514,28 @@ pub async fn commit_snapshot(
 /// Commits reachable from the current branch tip, in stored (topological) order — commits
 /// on merged branches appear, commits unique to other branches don't.
 #[tauri::command]
-pub async fn list_commits(path: String) -> std::result::Result<Vec<Commit>, String> {
+pub async fn list_commits(
+    path: String,
+    all_branches: Option<bool>,
+) -> std::result::Result<Vec<Commit>, String> {
     run(move || {
         let root = Path::new(&path);
         read_consistent(root, || {
             let repo = Repo::open_light(root)?;
-            let reach = match repo.branches.tip() {
-                Some(tip) => commit::ancestors(&repo.commits, tip),
-                None => return Ok(Vec::new()),
+            // Default scope is the current branch only — every existing caller (legacy history
+            // graph, inspector, performance) depends on that. The Version Map opts in.
+            let reach = if all_branches.unwrap_or(false) {
+                repo.branches
+                    .branches
+                    .values()
+                    .filter(|t| !t.is_empty())
+                    .flat_map(|t| commit::ancestors(&repo.commits, t))
+                    .collect()
+            } else {
+                match repo.branches.tip() {
+                    Some(tip) => commit::ancestors(&repo.commits, tip),
+                    None => return Ok(Vec::new()),
+                }
             };
             Ok(repo
                 .commits
@@ -568,24 +582,29 @@ pub async fn list_branches(path: String) -> std::result::Result<Vec<BranchDto>, 
     .await
 }
 
-/// Create a branch and switch to it. Without `base` it starts at the current tip (instant —
-/// the tree is identical); with a different `base` branch it materializes that branch's tree,
-/// which needs the full repo (chains) and a clean working tree.
+/// Create a branch and switch to it. Without `base`/`commit` it starts at the current tip
+/// (instant — the tree is identical); with a different `base` branch, or with an arbitrary
+/// `commit` id, it materializes that tree, which needs the full repo (chains) and a clean
+/// working tree. `commit` wins if both are somehow passed.
 #[tauri::command]
 pub async fn create_branch(
     path: String,
     name: String,
     base: Option<String>,
+    commit: Option<String>,
 ) -> std::result::Result<Vec<BranchDto>, String> {
     run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "creating a branch")?;
-        let mut repo = if base.is_some() {
+        let mut repo = if base.is_some() || commit.is_some() {
             Repo::open(root)?
         } else {
             Repo::open_light(root)?
         };
-        crate::branch::create_branch(&mut repo, &name, base.as_deref())?;
+        match commit.as_deref() {
+            Some(id) => crate::branch::create_branch_at(&mut repo, &name, id)?,
+            None => crate::branch::create_branch(&mut repo, &name, base.as_deref())?,
+        }
         Ok(branch_dtos(&repo))
     })
     .await

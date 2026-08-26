@@ -204,25 +204,24 @@ connector dot the spine runs through, and a two-column grid of chips for the lay
 (layer-type icon from `friendly.ts`'s `layerTypeIcon()` + an A/M/D glyph in `FileStatusChip`'s
 icon-and-color vocabulary). The node *is* the metadata — clicking one opens the full
 `MainPanel`/`DiffView` in place (back button; a `Menu` file-picker stands in for the Inspector's
-file list on a multi-file version). Only the current branch is drawn (`list_commits` is already
-scoped to its tip).
+file list on a multi-file version). By default only the current branch is drawn (`list_commits`
+is already scoped to its tip); a header toggle draws every branch on its own lane — see
+[Branch lanes](#branch-lanes) below.
 
 Built on **React Flow** (`@xyflow/react`, pinned to `12.10.2` — `12.11.4` ships a broken pairing
 with `@xyflow/system`, Vite's dep optimizer dies on it). Node positions are computed from the
 commit graph (`nodesDraggable={false}`) — nothing is persisted, so a new commit can never leave
 the layout stale. Edges come from `parents`, not list adjacency, so a merge commit's second
-parent already draws its own line once branches land (`LANE_PITCH`/non-zero `y` are the reserved
-seam for that).
+parent draws its own line into whichever lane it came from.
 
 - **Branch color.** A small local palette in `VersionMapPanel.tsx`
   (`BRANCH_LANE_COLORS` — `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by
   `laneColor(lane)`), deliberately separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent
-  is a fixed convention for the legacy History graph and stays untouched). Lane 0 — today's only
-  lane, the current/main branch — colors every node's connector dot and, mixed 55% toward
-  transparent via `color-mix`, the spine between them. The branch tip's thumbnail additionally
-  gets a **detached** `outline`/`outline-offset` ring in that same color, distinct from the flush
-  `ring-accent` used for whichever node is open. When divergent branches land, each new lane is
-  just `laneColor(laneIndex)`.
+  is a fixed convention for the legacy History graph and stays untouched). A lane's color paints
+  every node's connector dot on it and, mixed 55% toward transparent via `color-mix`, the spine
+  between them. Every branch tip's thumbnail additionally gets a **detached**
+  `outline`/`outline-offset` ring in its lane color, distinct from the flush `ring-accent` used
+  for whichever node is open, plus a branch-name chip under its caption.
 - **Grid background.** React Flow's `Lines` variant, colored by a `--color-grid` token
   (`src/styles/global.css`) derived from each theme's own `--color-bg` via
   `color-mix(in srgb, var(--color-bg) 75%, black)` — dark themes render a near-black, barely
@@ -247,6 +246,50 @@ seam for that).
   (one for the Map tab, one for Performance) used to do — would remount the whole
   `ReactFlowProvider` on every tab switch, silently resetting both the panned/zoomed viewport and
   the open-drilldown `openId`, since neither lives in anything React Flow itself persists.
+
+### Branch lanes
+
+A header toggle (`GitBranch` icon, shown only once another branch exists) switches the map from
+the current branch to **all branches, each on its own lane**. It defaults **off**, persists to
+`localStorage` (`krita-vc:map-show-all`), and is plain component state rather than another
+app-wide context — it is map-local, not a global preference. On, the panel makes its own
+`useCommits(repoPath, nonce, true)` call for the backend's wider `allBranches` scope (a union of
+the reachable set over every branch tip); off, the path it passes is `""`, which `useCommits`
+short-circuits, so the off state costs nothing and draws exactly the commits the shell already
+loaded.
+
+The lane/column assignment is a pure function in
+[`lib/versionMap.ts`](../src/lib/versionMap.ts) (`buildVersionMap`), deliberately **not** in
+`lib/graph.ts`: `buildGraph` lays a DAG out vertically for the legacy rail, where a lane is an x
+column and lane 0 means "the mainline"; here a lane is a y offset and lane 0 means "the branch
+you're standing on". Three rules carry it:
+
+- **Lane 0 is the current branch's first-parent spine**, walked back from its tip — *not* the
+  commits stamped with its name. After a merge the folded-in commits still carry *their* branch
+  and belong on a side lane; and standing on a side branch, its shared ancestors are stamped
+  `main` and would otherwise jog the line you're on down a lane.
+- **Everything else groups by `commit.branch`** into lanes 1.. in order of first appearance
+  (oldest first), so a lane's color doesn't shuffle between refetches.
+- **Column = generation depth** (`1 + max(depth(parents))`), so parallel work on two branches
+  lines up in the same column instead of leaving chronological gaps, and a merge lands one column
+  past the deeper of its parents. A `(lane, col)` collision guard bumps the column — it shouldn't
+  fire, but an invisibly stacked node is a nasty failure.
+
+That same depth is the node's **"Version N"**, so shared ancestors read the same on every lane;
+for a linear history it is identical to `friendly.ts`'s positional `versionNumbers()` (still used
+by the legacy graph and Inspector). Two lanes can therefore both show "Version 5" — the lane
+color and the branch name in the caption disambiguate.
+
+Two rendering details follow from lanes existing. A **lane-crossing edge** is colored by
+`laneColor(max(sourceLane, targetLane))` — the side lane at either end — so the fork out of the
+mainline and the merge back into it both read in the side line's color instead of changing hue
+halfway. And the half-width bars behind a node's connector dot (which bridge React Flow's
+gutter-only edges to the centered dot) are gated on `hasIncoming`/`hasOutgoing`, **not** on being
+the oldest/newest node: with forks, merges and column gaps, an ends-of-the-line test paints stubs
+into empty space at every one of them.
+
+The map **draws** branches; it does not act on them. Create/switch/merge/delete still live only
+in the legacy Branches panel, pending a floating action bar.
 
 **Legacy version history.** The old **History** and **Branches** Sidebar views are still there but
 hidden behind Settings → Appearance → "Legacy version history"

@@ -1452,6 +1452,49 @@ fn switch_refuses_dirty_tree() {
 }
 
 #[test]
+fn create_branch_at_an_older_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut r = seeded_repo(&dir);
+    let c1 = r.commits[0].id.clone();
+
+    std::fs::write(root.join("a.gpl"), b"second-a").unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    std::fs::write(root.join("a.gpl"), b"third-a").unwrap();
+    let c3 = commit::commit_snapshot(&mut r, "c3", "t").unwrap();
+
+    // Branch off the *first* version, two commits back from the tip.
+    branch::create_branch_at(&mut r, "retry", &c1).unwrap();
+    assert_eq!(r.branches.current, "retry");
+    assert_eq!(r.branches.tip(), Some(c1.as_str()));
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert!(scan::scan(&r).unwrap().is_empty(), "tree left dirty");
+
+    // The skipped commits stay reachable from the branch they were made on.
+    branch::switch_branch(&mut r, "main").unwrap();
+    assert_eq!(r.branches.tip(), Some(c3.id.as_str()));
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"third-a");
+    assert!(commit::ancestors(&r.commits, &c3.id).contains(&c2.id));
+
+    // Unknown id, duplicate name, and a dirty tree are all refused.
+    assert!(matches!(
+        branch::create_branch_at(&mut r, "nope", "deadbeef"),
+        Err(KvcError::NoCommit(_))
+    ));
+    assert!(matches!(
+        branch::create_branch_at(&mut r, "retry", &c1),
+        Err(KvcError::BranchExists(_))
+    ));
+    std::fs::write(root.join("a.gpl"), b"unsaved edit").unwrap();
+    assert!(matches!(
+        branch::create_branch_at(&mut r, "other", &c1),
+        Err(KvcError::DirtyTree)
+    ));
+    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved edit");
+    assert_eq!(r.branches.current, "main");
+}
+
+#[test]
 fn merge_fast_forward() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

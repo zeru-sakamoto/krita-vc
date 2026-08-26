@@ -46,11 +46,17 @@ export interface VersionNodeData {
   commit: Commit;
   /** Version number (newest = highest), from `versionNumbers`. */
   version: number;
-  /** This commit is the current branch's tip. */
+  /** This commit is some branch's tip (any branch, not just the current one). */
   isTip: boolean;
-  /** Ends of the line: the spine is drawn half-width on these so it stops at the end dots. */
-  isOldest: boolean;
-  isNewest: boolean;
+  /** Branch names whose tip is this commit — chips under the caption. A branch created but not
+   *  yet committed on shares its parent branch's tip node, so it shows up here for free. */
+  tipOf: string[];
+  /** The side branch this commit sits on, or null on the current branch's own line. */
+  branch: string | null;
+  /** Whether a drawn parent/child exists, so the spine stub is only drawn where a connector
+   *  actually arrives. Not "ends of the line": with lanes there are forks and column gaps. */
+  hasIncoming: boolean;
+  hasOutgoing: boolean;
   /** This branch's lane color (see VersionMapPanel's BRANCH_LANE_COLORS) — shared by every node
    *  on the line, so the connector dots read as one continuous branch identity. */
   laneColor: string;
@@ -93,7 +99,8 @@ export const VersionNode = memo(function VersionNode({
   data: VersionNodeData;
   selected?: boolean;
 }) {
-  const { commit, version, isTip, isOldest, isNewest, laneColor, repoPath, onOpen } = data;
+  const { commit, version, isTip, tipOf, branch, hasIncoming, hasOutgoing } = data;
+  const { laneColor, repoPath, onOpen } = data;
   // Dimmer than the dots — same hue as the lane, mixed toward transparent.
   const dimLaneColor = `color-mix(in srgb, ${laneColor} 55%, transparent)`;
   const { artistMode } = useArtistMode();
@@ -125,7 +132,13 @@ export const VersionNode = memo(function VersionNode({
         aria-pressed={selected}
         title={commit.message}
         className={[
-          "raised block w-full overflow-hidden rounded-panel bg-surface-2",
+          // React Flow sets the node wrapper's `pointer-events` to `none` unless the node is
+          // selectable/draggable or an `onNode*` handler is passed to <ReactFlow> — none of which
+          // apply here, since this map handles opening a version via its own button `onClick`
+          // instead. `pointer-events: none` is inherited, so descendants need to opt back in
+          // (`pointer-events-auto`) or every click falls through to the pane and pans instead.
+          // `nopan` then stops that pane pan-drag from starting on this button in the first place.
+          "nopan pointer-events-auto raised block w-full overflow-hidden rounded-panel bg-surface-2",
           "transition-[box-shadow,transform] duration-100 ease-out",
           "hover:-translate-y-0.5 active:translate-y-0",
           selected ? "ring-1 ring-accent" : "",
@@ -154,14 +167,14 @@ export const VersionNode = memo(function VersionNode({
           only span the gutter between node boxes, so without this rule the line reads as broken
           at every version. Matches the edge stroke in `VersionMapPanel`. */}
       <div className="relative my-2 flex w-full shrink-0 justify-center">
-        {!isOldest && (
+        {hasIncoming && (
           <span
             aria-hidden
             className="absolute left-0 right-1/2 top-1/2 h-[1.5px] -translate-y-1/2"
             style={{ background: dimLaneColor }}
           />
         )}
-        {!isNewest && (
+        {hasOutgoing && (
           <span
             aria-hidden
             className="absolute left-1/2 right-0 top-1/2 h-[1.5px] -translate-y-1/2"
@@ -193,6 +206,28 @@ export const VersionNode = memo(function VersionNode({
             <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-text">
               {commit.message}
             </p>
+            {/* Two lanes can both read "Version 5" — versions are counted along each line's own
+                ancestry. The lane color says which line; this says which by name. */}
+            {(branch || tipOf.length > 0) && (
+              <div className="mt-1 flex flex-wrap justify-center gap-1">
+                {branch && tipOf.length === 0 && (
+                  <span className="text-[10px] text-text-muted">{branch}</span>
+                )}
+                {tipOf.map((name) => (
+                  <span
+                    key={name}
+                    title={artistMode ? `Newest version on "${name}"` : `Branch tip: ${name}`}
+                    className="rounded-badge border px-1.5 py-px text-[10px] leading-tight"
+                    style={{
+                      color: laneColor,
+                      borderColor: `color-mix(in srgb, ${laneColor} 45%, transparent)`,
+                    }}
+                  >
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           {(shown.length > 0 || extraFiles > 0) && (

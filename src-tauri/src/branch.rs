@@ -41,6 +41,27 @@ pub fn create_branch(repo: &mut Repo, name: &str, base: Option<&str>) -> Result<
     }
 }
 
+/// Create `name` starting at an arbitrary *commit* and switch to it — "go back to version 5 and
+/// try a different direction". Same rules as [`switch_branch`]: refuses on a dirty tree, rewrites
+/// only the files that differ. `commit_id` needn't be any branch's tip; the commits between it
+/// and the old tip stay reachable from the branch they were made on.
+pub fn create_branch_at(repo: &mut Repo, name: &str, commit_id: &str) -> Result<()> {
+    let name = validate_name(name)?;
+    if repo.branches.branches.contains_key(&name) {
+        return Err(KvcError::BranchExists(name));
+    }
+    let target = tree_at_commit(&repo.commits, commit_id)
+        .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
+    ensure_clean(repo)?;
+    let current = current_tree(repo);
+    materialize_tree(repo, &current, &target)?;
+    repo.branches
+        .branches
+        .insert(name.clone(), commit_id.to_string());
+    repo.branches.current = name;
+    repo.save()
+}
+
 /// Switch the working tree to `name`. Refuses on a dirty tree (a clean scan also proves
 /// there are no untracked files, so materialization cannot clobber unsaved work). Only
 /// files whose committed content differs between the two branch trees are rewritten.

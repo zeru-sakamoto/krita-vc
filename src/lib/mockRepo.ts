@@ -6,7 +6,7 @@
 // ponytail: hand-written fixture, not a generator. It exists to look at layout, so it only needs
 // to be plausible; if a case needs real data, run the desktop shell.
 
-import type { ArtDiff, ArtLayer, Branch, Commit, FileStatus } from "../types";
+import type { ArtDiff, ArtLayer, Branch, Commit, FileChange, FileStatus } from "../types";
 
 export function mockEnabled(): boolean {
   if (!import.meta.env.DEV || typeof location === "undefined") return false;
@@ -67,8 +67,29 @@ const MESSAGES = [
 
 export const MOCK_PATH = "characters/hero.kra";
 
-export function mockCommits(): Commit[] {
+/** Where the side line forks off `main`, and where it merges back — indices into MESSAGES. */
+const FORK_AT = 4;
+const MERGE_AT = 9;
+const SIDE = ["Rough in the alt hair", "Recolour the alt hair"];
+const SIDE_BRANCH = "hair-experiment";
+const MAIN_TIP = `mock-${MESSAGES.length - 1}`;
+const SIDE_TIP = `side-${SIDE.length - 1}`;
+
+function mockChanges(i: number): FileChange[] {
+  return [
+    { path: MOCK_PATH, status: (i === 0 ? "A" : "M") as FileStatus },
+    ...(i % 4 === 3 ? [{ path: "palettes/skin-tones.gpl", status: "M" as FileStatus }] : []),
+  ];
+}
+
+/**
+ * A 12-version main line plus a two-version side branch that forks at `FORK_AT` and merges back
+ * at `MERGE_AT` — the fixture the Version Map's lane layout is developed against, since the
+ * frontend has no test runner. Load `http://localhost:1420/?mock` and turn "show all lines" on.
+ */
+export function mockCommits(allBranches = false): Commit[] {
   const now = Date.now();
+  const at = (i: number) => new Date(now - (MESSAGES.length - i) * 5 * HOUR).toISOString();
   // Oldest first while building (so parents are easy), reversed to newest-first at the end —
   // the shape `useCommits` returns.
   const out: Commit[] = MESSAGES.map((message, i) => ({
@@ -76,24 +97,46 @@ export function mockCommits(): Commit[] {
     hash: `c0ffee${i.toString(16).padStart(2, "0")}`,
     message,
     author: AUTHOR,
-    timestamp: new Date(now - (MESSAGES.length - i) * 5 * HOUR).toISOString(),
-    parents: i === 0 ? [] : [`mock-${i - 1}`],
+    timestamp: at(i),
+    parents:
+      i === 0
+        ? []
+        : // The merge commit's second parent is the side line's tip.
+          i === MERGE_AT && allBranches
+          ? [`mock-${i - 1}`, SIDE_TIP]
+          : [`mock-${i - 1}`],
     branch: "main",
-    changes: [
-      { path: MOCK_PATH, status: (i === 0 ? "A" : "M") as FileStatus },
-      ...(i % 4 === 3 ? [{ path: "palettes/skin-tones.gpl", status: "M" as FileStatus }] : []),
-    ],
+    changes: mockChanges(i),
   }));
+  if (!allBranches) return out.reverse();
+
+  const side: Commit[] = SIDE.map((message, k) => ({
+    id: `side-${k}`,
+    hash: `5-de-0${k}`,
+    message,
+    author: AUTHOR,
+    timestamp: at(FORK_AT + k + 1),
+    parents: [k === 0 ? `mock-${FORK_AT}` : `side-${k - 1}`],
+    branch: SIDE_BRANCH,
+    changes: mockChanges(FORK_AT + k),
+  }));
+  // Insert in log order (oldest first) so the reverse below still yields newest-first.
+  out.splice(FORK_AT + 1, 0, ...side);
   return out.reverse();
 }
 
 export function mockBranches(): Branch[] {
-  return [{ name: "main", kind: "current", tip: "mock-" + (MESSAGES.length - 1) }];
+  return [
+    { name: "main", kind: "current", tip: MAIN_TIP },
+    { name: SIDE_BRANCH, kind: "local", tip: SIDE_TIP },
+  ];
 }
 
 /** The `commit_diff` payload for one mock commit: one art entry, composite + changed layers. */
 export function mockDiff(commitId: string): ArtDiff[] {
-  const i = Number(commitId.replace("mock-", "")) || 0;
+  // Side-branch ids (`side-N`) are offset so their art doesn't clone the main line's.
+  const n = Number(commitId.replace(/^(mock|side)-/, "")) || 0;
+  const i = commitId.startsWith("side-") ? n + MESSAGES.length : n;
   const [bg, ink] = PALETTES[i % PALETTES.length];
   const count = 2 + (i % 4);
   const layers: ArtLayer[] = Array.from({ length: count }, (_, k) => {

@@ -30,19 +30,29 @@ interface BackendCommit {
  * Real commit history for `path` via `list_commits`, newest-first and mapped to the
  * frontend `Commit` shape (the graph + inspector consume it). Empty in a plain browser
  * (no backend). `nonce` lets callers force a refetch (e.g. after committing).
+ *
+ * `allBranches` widens the scope from the current branch's tip to every branch's — the Version
+ * Map's "show all lines" mode. Off by default, so the legacy history graph, the inspector and the
+ * performance tab keep seeing exactly the current branch. An empty `path` skips the fetch
+ * entirely, which is how the map turns its extra all-branches call off without breaking the
+ * rules of hooks.
  */
-export function useCommits(path: string, nonce = 0): Commit[] {
+export function useCommits(path: string, nonce = 0, allBranches = false): Commit[] {
   const [commits, setCommits] = useState<Commit[]>([]);
 
   useEffect(() => {
     // No backend in a plain browser (`npm run dev`) — history stays empty, unless the dev-only
     // `?mock` fixture is on (see lib/mockRepo.ts).
     if (!inTauri()) {
-      setCommits(mockEnabled() ? mockCommits() : []);
+      setCommits(path && mockEnabled() ? mockCommits(allBranches) : []);
+      return;
+    }
+    if (!path) {
+      setCommits([]);
       return;
     }
     let cancelled = false;
-    invoke<BackendCommit[]>("list_commits", { path })
+    invoke<BackendCommit[]>("list_commits", { path, allBranches })
       .then((cs) => {
         if (cancelled) return;
         // Backend stores oldest-first; the graph expects newest-first.
@@ -70,7 +80,7 @@ export function useCommits(path: string, nonce = 0): Commit[] {
     return () => {
       cancelled = true;
     };
-  }, [path, nonce]);
+  }, [path, nonce, allBranches]);
 
   return commits;
 }
