@@ -14,6 +14,7 @@ import traceback
 
 from krita import DockWidget, Krita
 from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QPalette
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -114,6 +115,13 @@ class VcDocker(DockWidget):
         self.stack.addWidget(self._build_empty_page())
         self.stack.addWidget(self._build_main_page())
 
+        # Construction-time, so not covered by @guard (which only wraps post-construction Qt
+        # slots) — a QSS typo must degrade to an unstyled panel, never a docker that fails to load.
+        try:
+            self.setStyleSheet(self._build_stylesheet())
+        except Exception:
+            pass
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
@@ -138,6 +146,7 @@ class VcDocker(DockWidget):
     def _build_not_configured_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.addStretch()
         label = QLabel(
             "The kvc command-line tool wasn't found.\n"
@@ -155,6 +164,7 @@ class VcDocker(DockWidget):
     def _build_empty_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.addStretch()
         self.empty_label = QLabel("")
         self.empty_label.setWordWrap(True)
@@ -166,42 +176,66 @@ class VcDocker(DockWidget):
     def _build_main_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         # Branch row: current branch (menu: switch / new branch…) + repo name + options menu.
         top = QHBoxLayout()
+        top.setSpacing(4)
         self.branch_button = QToolButton()
+        self.branch_button.setObjectName("glyphButton")
         self.branch_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.branch_button.setPopupMode(QToolButton.InstantPopup)
+        self.branch_button.setAutoRaise(True)
         self.repo_label = QLabel("")
-        self.repo_label.setAlignment(Qt.AlignRight)
+        # AlignRight alone has no vertical component, which Qt then defaults to top rather than
+        # centered — invisible while the label's height matched its text, but not once the row
+        # gets a fixed shared height below.
+        self.repo_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.refresh_button = QToolButton()
-        self.refresh_button.setText("⟳")
+        self._set_refresh_icon()
         self.refresh_button.setToolTip("Save open documents and rescan")
-        self.refresh_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.refresh_button.setAutoRaise(True)
         self.refresh_button.clicked.connect(self._on_refresh_clicked)
         self.options_button = QToolButton()
-        self.options_button.setText("⋯")
+        self.options_button.setObjectName("glyphButton")
+        # Vertical dots read as a recognizable "kebab menu" at small sizes; the horizontal
+        # ellipsis "⋯" just looked like a smudge next to the other glyphs.
+        self.options_button.setText("⋮")
         self.options_button.setToolTip("Panel options")
         self.options_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.options_button.setPopupMode(QToolButton.InstantPopup)
+        self.options_button.setAutoRaise(True)
         top.addWidget(self.branch_button)
         top.addStretch()
         top.addWidget(self.repo_label)
         top.addWidget(self.refresh_button)
         top.addWidget(self.options_button)
+        # Mixed fonts/icon-vs-text content give these four different natural heights, and
+        # relying on the layout to vertically-center each against the row's tallest item drifts
+        # depending on font metrics — pin them to one shared height instead so they share a
+        # baseline exactly, regardless of glyph/icon/font-size changes above.
+        for w in (self.branch_button, self.repo_label, self.refresh_button, self.options_button):
+            w.setFixedHeight(22)
+            top.setAlignment(w, Qt.AlignVCenter)
         layout.addLayout(top)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        layout.addWidget(QLabel("Changes"))
+        changes_label = QLabel("Changes")
+        changes_label.setObjectName("sectionLabel")
+        layout.addWidget(changes_label)
         self.changes_list = QListWidget()
         self.changes_list.itemChanged.connect(self._on_item_checked)
         layout.addWidget(self.changes_list, stretch=1)
 
         author_row = QHBoxLayout()
-        author_row.addWidget(QLabel("Author"))
+        author_row.setSpacing(6)
+        author_label = QLabel("Author")
+        author_label.setObjectName("sectionLabel")
+        author_row.addWidget(author_label)
         self.author_edit = QLineEdit(
             Krita.instance().readSetting(kvc.SETTINGS_GROUP, "authorName", "") or "You"
         )
@@ -216,11 +250,28 @@ class VcDocker(DockWidget):
 
         buttons = QHBoxLayout()
         self.commit_button = QPushButton("Commit")
+        self.commit_button.setObjectName("commitButton")
         self.commit_button.clicked.connect(self._on_commit)
         buttons.addWidget(self.commit_button)
         layout.addLayout(buttons)
 
         return page
+
+    def _set_refresh_icon(self):
+        """Native icon if Krita's active theme has it, else the Unicode fallback it always had.
+        Guarded end to end: a missing/renamed API or a null icon must never be worse than the
+        glyph it's replacing."""
+        icon = None
+        try:
+            icon = Krita.instance().icon("view-refresh")
+        except Exception:
+            pass
+        if icon and not icon.isNull():
+            self.refresh_button.setIcon(icon)
+            self.refresh_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        else:
+            self.refresh_button.setText("⟳")
+            self.refresh_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
 
     @guard
     def _browse_for_binary(self):
@@ -239,6 +290,45 @@ class VcDocker(DockWidget):
         self.refresh()
 
     # --- state refresh ---------------------------------------------------------------
+
+    def _build_stylesheet(self):
+        """Colors derived from the active palette, not hardcoded — Krita is multi-theme, and a
+        plugin docker should track whatever theme the artist picked rather than fight it.
+        `setAutoRaise` (set on each toolbutton) handles their flat/hover look natively; this
+        covers what that doesn't reach: labels, list, inputs, the commit button."""
+        pal = self.palette()
+        muted = pal.color(QPalette.Disabled, QPalette.WindowText).name()
+        border = pal.color(QPalette.Mid).name()
+        hover = pal.color(QPalette.Midlight).name()
+        pressed = pal.color(QPalette.Dark).name()
+        base = pal.color(QPalette.Base).name()
+        highlight = pal.color(QPalette.Highlight).name()
+        return f"""
+            QToolButton {{ padding: 3px; border-radius: 3px; }}
+            QToolButton::menu-indicator {{ image: none; width: 0px; }}
+            /* branch_button's "⌥"/"▾" and options_button's "⋯" are plain Unicode glyphs at
+               default font size, which reads as barely-there next to real icons/text. */
+            QToolButton#glyphButton {{ font-size: 14px; font-weight: 600; }}
+
+            QLabel#sectionLabel {{ font-weight: 600; color: {muted}; padding-top: 2px; }}
+
+            QListWidget {{ border: 1px solid {border}; border-radius: 3px; background: {base}; }}
+            QListWidget::item {{ padding: 2px 4px; }}
+            QListWidget::item:hover {{ background: {hover}; }}
+            QListWidget::item:selected {{ background: {highlight}; }}
+
+            QLineEdit, QPlainTextEdit {{
+                border: 1px solid {border}; border-radius: 3px; padding: 2px 4px; background: {base};
+            }}
+            QLineEdit:focus, QPlainTextEdit:focus {{ border: 1px solid {highlight}; }}
+
+            QPushButton#commitButton {{
+                border: 1px solid {border}; border-radius: 3px; padding: 4px 12px; font-weight: 600;
+            }}
+            QPushButton#commitButton:hover:!disabled {{ background: {hover}; }}
+            QPushButton#commitButton:pressed {{ background: {pressed}; }}
+            QPushButton#commitButton:disabled {{ color: {muted}; border-color: {muted}; }}
+        """
 
     def _show_error(self, message):
         self.status_label.setText(f"⚠ {message}")
