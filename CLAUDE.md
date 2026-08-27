@@ -139,8 +139,8 @@ commit id (+ the current branch); create is O(1) (an optional base branch materi
 branch's tree first, and `branch::create_branch_at` starts one at an **arbitrary commit** —
 "go back to version 5 and try a different direction" — via the same `tree_at_commit` +
 `materialize_tree` path, exposed as `create_branch`'s `commit:` arg, mutually exclusive with
-`base:`; deliberately **not** in the `kvc` CLI, since the Krita plugin has no version picker to
-call it from), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
+`base:`; reached from the Version Map's **pick-a-version** mode, and deliberately **not** in the
+`kvc` CLI, since the Krita plugin has no version picker to call it from), switch rewrites only files that differ between branch trees, merge fast-forwards or builds a two-parent merge commit (conflicts take the source
 version, flagged `"C"`). Trees fold along the **first-parent chain** (`tree_at_commit`) — every
 commit's `files` is by invariant the diff vs its first parent. `list_commits` is scoped to
 commits reachable from the current branch tip unless its `allBranches` flag is set (default
@@ -405,9 +405,23 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   another app-wide context — it is map-local, not a global preference. On, the panel makes its
   *own* `useCommits(repoPath, nonce, true)` call for the wider `allBranches` scope; off, the path
   it passes is `""`, which `useCommits` short-circuits, so the off state costs nothing and draws
-  exactly the commits the shell already loaded. **The map draws branches; it does not act on
-  them** — create/switch/merge/delete still live only in the legacy Branches panel, pending a
-  floating action bar.
+  exactly the commits the shell already loaded. **The map also acts on branches**, via a floating
+  `MapActionBar` (a React Flow `<Panel position="top-left">`, clear of the bottom-right minimap;
+  `nopan`, same reason `VersionNode`'s thumbnail carries it). It's one `Menu`, whose `selected` /
+  `detail` / hover-revealed `action` / `footer` slots are already the legacy Branches panel's row
+  model, so switch/merge/delete/create need no new primitive. Alongside it sits the one action
+  only the map can offer: **"Start a line here"** enters a **pick mode** where the next node click
+  forks a branch at that version (`create_branch_at`, which had been written, tested and
+  unreachable — nothing else in the app is a version picker). Pick mode is one boolean and
+  **`VersionNode` knows nothing about it**: the node calls whatever it was handed as `data.onOpen`,
+  so the panel just swaps the callback (`picking ? onPick : onOpen`). Escape and Cancel both leave
+  it. All three branch call sites — this bar, the legacy `BranchesPanel`, and the History sidebar's
+  branch switcher — share **`useBranchActions`** (`src/components/vcs/useBranchActions.tsx`), a hook
+  returning `{ run, error, switchTo, askMerge, askDelete, askCreate, dialogs }`: the dirty-tree
+  error router (`"unsaved changes"` → `SaveFirstModal` → set-aside-and-**retry the blocked action**)
+  plus every confirm dialog as one node. It's in its own file, not `BranchDialogs.tsx`, because it
+  needs `SetAsideModal` and `StashDialogs` already imports `errorText` from `BranchDialogs` — that
+  would close an import cycle.
   Built on **React Flow** (`@xyflow/react`), the one framework-scale frontend dependency in the
   app — chosen over the in-repo `useZoomPan` because the branch phase needs edge routing, a
   minimap and fit-view over a real graph, which is most of what React Flow is. It costs ~60 KB gz.
@@ -420,13 +434,18 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
     `NODE_PITCH`/`LANE_PITCH` are the layout constants. The lane/column assignment itself is a
     pure function in **`src/lib/versionMap.ts`** (`buildVersionMap`), deliberately *not* in
     `lib/graph.ts` — `buildGraph` lays a DAG out vertically for the legacy rail, where a lane is
-    an x column and lane 0 means "the mainline"; here a lane is a y offset and lane 0 means "the
-    branch you're standing on". Three rules carry it: **lane 0 is the current branch's
-    first-parent spine** walked back from its tip (*not* the commits stamped with its name — after
-    a merge the folded-in commits still carry *their* branch and belong on a side lane, and
-    standing on a side branch its shared ancestors are stamped `main` and would jog your own line
-    down a lane); everything else groups by `commit.branch` into lanes 1.. in order of first
-    appearance; and **column = generation depth** (`1 + max(depth(parents))`), so parallel work on
+    an x column; here a lane is a y offset. Both agree lane 0 is the mainline. Three rules carry
+    it: **lane 0 is the trunk's first-parent spine** walked back from `main`'s tip (*not* the
+    commits stamped with its name — after a merge the folded-in commits still carry *their* branch
+    and belong on a side lane). Anchoring on `main` rather than on the branch you're standing on
+    is load-bearing and was a real bug: lane 0 used to follow *your* branch, so a fork off main
+    drew as one straight line, and main's next commit — same generation depth, so the same column
+    — got shunted onto a side lane by the collision guard. **The trunk must not move when you
+    switch branches.** `main`'s tip isn't always in the drawn set (with "show all lines" off,
+    `list_commits` is scoped to *your* tip), so the anchor falls back to the newest drawn commit
+    stamped `main`, then to the current tip. Everything else groups by `commit.branch` into lanes
+    1.. in order of first appearance; and **column = generation depth**
+    (`1 + max(depth(parents))`), so parallel work on
     two branches lines up in the same column instead of leaving chronological gaps and a merge
     lands one column past the deeper parent. That same depth is the node's **"Version N"** — so
     shared ancestors read the same on every lane, and for a linear history it is identical to
@@ -447,13 +466,18 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   - Line color is **opaque** — `color-mix(…, var(--color-bg))`, not `transparent`. Mixing toward
     transparent let two crossing lines composite into a brighter, two-tone band that read as a
     doubled line.
-  - A lane-crossing connector carries per-edge `pathOptions: { offset: NODE_PITCH / 2,
-    stepPosition: fork ? 0 : 1, borderRadius: 16 }`. `offset` half a column puts the bend in the
-    **middle of the gutter**, clear of the node's caption and chips (the default 20 descends
-    straight through them); `stepPosition` 0 bends right after the source, 1 right before the
-    target — always next to the end on the shallower lane, so a branch drops out of the spine at
-    the version it started from and climbs back in at the version it merges into. The default 0.5
-    ran it alongside the spine for half a column, which is what doubled the line.
+  - A lane-crossing connector's bend goes in the **middle of the gutter next to the end on the
+    shallower lane** — so a branch drops out of the spine at the version it started from and
+    climbs back in at the version it merges into, never running alongside the spine (the default
+    `stepPosition` 0.5 over the whole span does, which is what doubled the line) and never
+    descending through the node's caption and chips. That x is picked by solving `stepPosition`
+    for it (`versionMap.ts`'s `bendFraction`, checked by `scripts/checkVersionMap.mjs`), with
+    `offset` left **small** (`STEP_GAP`). Aiming a gap point *at* the bend instead
+    (`offset: NODE_PITCH / 2`, `stepPosition: fork ? 0 : 1`) looked equivalent and wasn't:
+    `getSmoothStepPath` drops a gap point only when it lands exactly on the bend, and the measured
+    handle x's carry float error, so on the far end it sometimes didn't — the stray point a hair
+    from the corner collapsed that corner's radius to ~0 and the connector had one round bend and
+    one square one.
   - That connector's stroke is a **gradient** between the two lanes' colors, defined by
     `LaneGradients` in its own zero-size `<svg>` (a `url(#…)` paint reference resolves
     document-wide). It must be `gradientUnits="userSpaceOnUse"` running **purely vertically**
@@ -477,13 +501,19 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   - Wheel **zooms toward the cursor** and drag pans (`zoomOnScroll`, `panOnScroll={false}`) —
     deliberately the same gesture pair as the diff viewer's `useZoomPan`, so the app's two
     canvases don't disagree about what the wheel does.
-  - **Branch color** is a small local palette (`BRANCH_LANE_COLORS` in `VersionMapPanel.tsx` —
-    `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by `laneColor(lane)`), deliberately
-    separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent is a fixed convention for the
-    *legacy* History graph and stays untouched). A lane's color paints every node's connector dot
+  - **Branch color**: since lane 0 is the trunk, lane index no longer says where you're standing,
+    so the **accent is spent saying it** — `laneColor(lane, currentLane)` returns accent for
+    whichever lane the current branch is on (`MapLayout.currentLane`, read off the current tip's
+    *placement* rather than a branch-name map, so a branch with no commits of its own still
+    resolves to the node it shares), and every other lane cycles a small local palette
+    (`BRANCH_LANE_COLORS` in `VersionMapPanel.tsx` — `info-fg`, `success-fg`, `warning-fg`). Same
+    idea as `graph.ts`'s `branchColorMap`, but its `LANE_COLORS` stays untouched: positional
+    lane-0-is-accent is a fixed convention for the *legacy* History graph. A lane's color paints every node's connector dot
     on it and, mixed 55% toward transparent via `color-mix`, the spine between them; **every**
     branch tip's thumbnail additionally gets a **detached** `outline`/`outline-offset` ring in its
-    lane color, distinct from the flush `ring-accent` used for whichever node is open, plus a
+    lane color, distinct from the flush `ring-accent` used for whichever node is open — on *your*
+    lane those are now the same colour and only the geometry tells them apart, so don't collapse
+    it — plus a
     branch-name chip under its caption. A branch created but not yet committed on shares its
     parent branch's tip node, so it shows up as a second chip there for free.
   - The canvas background is React Flow's `Lines` variant, colored by a `--color-grid` token
@@ -496,6 +526,24 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
     in a ref on the way out and handed back as `defaultViewport` on the way in.
   - **Zoom LOD**: below `LOD_ZOOM` the caption and chips are dropped. The `useStore` selector
     returns a *boolean*, so a node re-renders only when the threshold is crossed, not per frame.
+  - **The pending-version preview.** When the working tree is dirty the map draws one extra,
+    non-commit node (`PreviewNode` in `VersionNode.tsx`, node type `preview`) one column past the
+    end of the current lane: a dashed empty frame where the composite would go, a **hollow**
+    connector dot, `Version N+1 · not saved yet`, the branch chip, and a single dashed
+    "Unsaved changes" chip — reached by a dashed edge off the tip. Clicking it jumps to Changes.
+    There is exactly **one** of these and it only ever sits on the current lane: there is one
+    working tree, so a per-branch preview would be a fiction the backend can't back. It shows no
+    composite and no per-layer chips deliberately — both need `working_diff`, which is `run_heavy`,
+    uncached, and (because the map is mounted for the shell's lifetime, below) would refire on
+    every `refreshNonce` bump in every view; the dirty flag instead comes from the shell's single
+    `scan_repository`, which is one `stat`. That scan is **hoisted into `RepoShell`** and passed to
+    both `Sidebar` and the map — `Sidebar` isn't mounted in map view, and a second
+    `useWorkingChanges` in the always-mounted map would rescan everywhere and race the one
+    `setScanning` boolean. It counts as a map citizen for fit-view, the minimap (so its `data`
+    must carry a `laneColor` like any node) and "jump to latest", but **not** for pick mode: its
+    callback is always `onShowChanges`, never the panel's `onNodeClick`, so it can't be forked
+    from — the `picking` flag only dims it. Its column is the lane's **last** column + 1, not the
+    tip's, since `buildVersionMap`'s collision guard can shift a node right of its depth.
   - **Mounted once, for the shell's lifetime.** `AppShell` renders exactly one
     `VersionMapPanel` and toggles a `hidden` class on its wrapper rather than conditionally
     mounting it per view — it used to have two separate JSX call sites (one for the Map tab, one

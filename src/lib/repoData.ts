@@ -272,6 +272,16 @@ export function useCommitDiff(path: string, commitId: string | null): DiffResult
 }
 
 /**
+ * Last-known `working_diff` result per `path|file`, so re-focusing a file (e.g. tabbing away to
+ * the Version Map and back) can paint instantly instead of blanking to a spinner. Deliberately
+ * *not* keyed on `nonce`: the working tree can have changed since, which is exactly why the
+ * effect below still refetches behind the stale paint and replaces it once the real answer
+ * lands — this is a "show something now" cache, not a correctness one.
+ */
+const workingDiffCache = new Map<string, DiffEntry[]>();
+const WORKING_DIFF_CACHE_MAX = 20;
+
+/**
  * The visual diff for a single working-tree file (working copy vs its last committed version)
  * via `working_diff`. Empty when `file` is null or in a plain browser (no backend).
  * `nonce` forces a refetch after a rescan/commit.
@@ -285,13 +295,19 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
       return;
     }
     let cancelled = false;
-    setResult({ entries: [], error: null, loading: true });
+    const key = `${path}|${file}`;
+    const stale = workingDiffCache.get(key);
+    setResult({ entries: stale ?? [], error: null, loading: true });
     timed(path, "diff", invoke<DiffEntry[]>("working_diff", { path, file }))
       .then((entries) => {
+        workingDiffCache.set(key, entries);
+        while (workingDiffCache.size > WORKING_DIFF_CACHE_MAX) {
+          workingDiffCache.delete(workingDiffCache.keys().next().value!);
+        }
         if (!cancelled) setResult({ entries, error: null, loading: false });
       })
       .catch((e) => {
-        if (!cancelled) setResult({ entries: [], error: String(e), loading: false });
+        if (!cancelled) setResult({ entries: stale ?? [], error: String(e), loading: false });
       });
     return () => {
       cancelled = true;
@@ -326,6 +342,7 @@ const LAYER_CACHE_MAX = 20;
 export function clearSessionCaches(): void {
   diffCache.clear();
   layerCache.clear();
+  workingDiffCache.clear();
 }
 
 /** The settings knobs this repo's `.kvc/config.json` exposes (see `get_repo_config`). */

@@ -7,7 +7,7 @@
     "dev": "vite",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"index.html\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"index.html\"",
-    "build": "npm run format && cargo fmt --manifest-path src-tauri/Cargo.toml && tsc && vite build",
+    "build": "npm run format && cargo fmt --manifest-path src-tauri/Cargo.toml && tsc && node scripts/checkVersionMap.mjs && vite build",
     "preview": "vite preview",
     "screenshots": "node scripts/screenshots.mjs",
     "tauri": "tauri"

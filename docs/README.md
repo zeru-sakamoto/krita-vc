@@ -13,10 +13,12 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 
 - [**Frontend architecture**](frontend-architecture.md) — app shell, the four zones, state
   ownership, the component map, the **Version Map** (the default view — a pannable/zoomable
-  canvas of versions, replacing the History graph; branch color, the grid background, and the
-  Legacy version history toggle that brings the old History/Branches tabs back), **Artist Mode**
-  (the global friendly-labels toggle), the **theme selector** (color themes + the theme-reactive
-  diff highlight), and the **application tour** (the first-launch spotlight walkthrough).
+  canvas of versions, replacing the History graph; branch lanes, branch color, the floating
+  branch action bar and pick-a-version branching, the pending-version preview node, the grid
+  background, and the Legacy version history toggle that brings the old History/Branches tabs
+  back), **Artist Mode** (the global friendly-labels toggle), the **theme selector** (color themes
+  + the theme-reactive diff highlight), and the **application tour** (the first-launch spotlight
+  walkthrough).
 - [**Backend architecture**](backend-architecture.md) — the Rust crate's structural map: module
   layout, the request flow from a Tauri command or the `kvc` CLI into the engine and back, the
   concurrency model (`RepoLock` + the CPU-budgeted pool), the two binaries that share one crate,

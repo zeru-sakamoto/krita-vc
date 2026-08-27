@@ -250,3 +250,111 @@ export const VersionNode = memo(function VersionNode({
     </div>
   );
 });
+
+/** What the panel packs into the pending-changes preview node. */
+export interface PreviewNodeData {
+  /** The version this would become — the current tip's version + 1. */
+  version: number;
+  /** The branch it would land on (always the current one — there's only one working tree). */
+  branch: string;
+  /** The current lane's color, i.e. the accent. The MiniMap reads `laneColor` off every node's
+   *  data object, so this key is required even though only one node type is "real". */
+  laneColor: string;
+  /** Pick-a-version mode is active — grey the button out. It can never actually be picked (its
+   *  callback is always `onShowChanges`, never the panel's `onNodeClick`); this is purely so it
+   *  doesn't look selectable mid-pick. */
+  picking: boolean;
+  /** Jump to the Changes tab. */
+  onOpen: () => void;
+  [key: string]: unknown;
+}
+
+/**
+ * The ghost node at the end of the current branch: where the working tree's changes would land if
+ * they were saved as a version. Everything about it is dashed and hollow — a slot reserved, not a
+ * version. Only drawn when the tree is actually dirty, so a clean map looks exactly as it did
+ * before this existed.
+ *
+ * ponytail: deliberately shows *no* composite and *no* per-layer chips, just "Unsaved changes".
+ * Both would need `working_diff`, which is `run_heavy`, uncached, and — since the map is mounted
+ * for the shell's whole lifetime — would refire on every `refreshNonce` bump in every view. The
+ * upgrade, if the summary chip proves too thin, is to cache `working_diff` first.
+ */
+export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNodeData }) {
+  const { version, branch, laneColor, picking, onOpen } = data;
+  const { artistMode } = useArtistMode();
+  const detailed = useStore((s) => s.transform[2] >= LOD_ZOOM);
+  const dashed = `color-mix(in srgb, ${laneColor} 55%, transparent)`;
+
+  return (
+    <div
+      className={`flex flex-col items-center ${picking ? "opacity-50" : ""}`}
+      style={{ width: NODE_W }}
+    >
+      <SpineHandle type="target" position={Position.Left} />
+      <SpineHandle type="source" position={Position.Right} />
+
+      <button
+        type="button"
+        onClick={onOpen}
+        disabled={picking}
+        title={artistMode ? "Unsaved changes — open the Changes tab" : "Working tree (uncommitted)"}
+        // No `raised`: a shadow would make an empty frame read as a real, present thing.
+        className={[
+          "nopan pointer-events-auto block w-full overflow-hidden rounded-panel border-2 border-dashed bg-bg",
+          "transition-transform duration-100 ease-out",
+          picking ? "" : "hover:-translate-y-0.5 active:translate-y-0",
+        ].join(" ")}
+        style={{ height: THUMB_H, borderColor: dashed }}
+      >
+        <div className="grid h-full w-full place-items-center">
+          <Plus size={28} className="text-text-muted" />
+        </div>
+      </button>
+
+      {/* Hollow connector dot. A 10px circle can't render a legible dash, so the ring is what
+          says "not real yet" while still sitting on the spine like every other dot. */}
+      <div className="my-2 flex w-full shrink-0 justify-center">
+        <span
+          aria-hidden
+          className="h-2.5 w-2.5 shrink-0 rounded-full border-2 bg-bg"
+          style={{ borderColor: laneColor }}
+        />
+      </div>
+
+      {detailed && (
+        <>
+          <div className="w-full text-center">
+            <p
+              className={[
+                "text-[11px] text-text-muted",
+                artistMode ? "font-medium" : "font-mono",
+              ].join(" ")}
+            >
+              {artistMode ? versionLabel(version) : "working tree"}
+              <span className="mx-1" aria-hidden>
+                ·
+              </span>
+              {artistMode ? "not saved yet" : "uncommitted"}
+            </p>
+            <div className="mt-1 flex flex-wrap justify-center gap-1">
+              <span
+                title={artistMode ? `Would be saved on "${branch}"` : `Branch: ${branch}`}
+                className="rounded-badge border border-dashed px-1.5 py-px text-[10px] leading-tight"
+                style={{ color: laneColor, borderColor: dashed }}
+              >
+                {branch}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-2 flex w-full justify-center">
+            <span className="rounded-badge border border-dashed border-border px-2 py-1 text-[11px] leading-none text-text-muted">
+              Unsaved changes
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+});

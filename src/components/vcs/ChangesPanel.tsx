@@ -122,7 +122,8 @@ export function ChangesPanel({
   items: WorkingChange[];
   error: string | null;
 }) {
-  const { current, saving, setSaving, setBusyMessage, refresh, discardChanges } = useRepository();
+  const { current, saving, scanning, setSaving, setBusyMessage, refresh, discardChanges } =
+    useRepository();
   const { authorName } = useAuthorName();
   const [message, setMessage] = useState("");
   const [commitError, setCommitError] = useState<string | null>(null);
@@ -147,6 +148,8 @@ export function ChangesPanel({
 
   const { entries, loading } = useWorkingDiff(path ?? "", docPath);
   const rows = useMemo(() => layerRows(entries), [entries]);
+  // Either kind of "checking" leaves the diff this button reverts in flux.
+  const checking = scanning || loading;
 
   const doCommit = async () => {
     if (!message.trim() || saving || !path) return;
@@ -211,8 +214,8 @@ export function ChangesPanel({
             <button
               type="button"
               onClick={() => setConfirmDiscard(true)}
-              disabled={saving}
-              title="Undo everything since the last version"
+              disabled={saving || checking}
+              title={checking ? "Checking for changes…" : "Undo everything since the last version"}
               className="flex items-center gap-1 rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
             >
               <ArrowCounterClockwise size={11} />

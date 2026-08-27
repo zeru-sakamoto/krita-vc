@@ -5,6 +5,7 @@ import { Select } from "../ui/Menu";
 import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
 import { useBranches } from "../../lib/repoData";
+import { versionLabel } from "../../lib/friendly";
 
 /**
  * Shared branch dialogs, used by both the History branch switcher (Sidebar) and the
@@ -24,8 +25,21 @@ export function errorText(e: unknown): string {
 /**
  * Name-a-branch dialog; creates and switches to it. Starting from the current branch is
  * instant; picking another base switches the working files to that branch first.
+ *
+ * With `commit` set the branch forks from that version instead (`create_branch_at`) — the base
+ * picker is hidden, since the backend takes one or the other, not both.
  */
-export function CreateBranchModal({ onClose }: { onClose: () => void }) {
+export function CreateBranchModal({
+  onClose,
+  commit,
+  version,
+}: {
+  onClose: () => void;
+  /** Fork from this commit rather than a branch tip — the Version Map's pick-a-version mode. */
+  commit?: string;
+  /** That commit's version number, for the copy. */
+  version?: number;
+}) {
   const { createBranch, saving, current, refreshNonce } = useRepository();
   const { artistMode } = useArtistMode();
   const branches = useBranches(current?.path ?? "", refreshNonce);
@@ -38,7 +52,7 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
     setError(null);
     try {
       // Only send a base when it differs from the current branch (the instant path).
-      await createBranch(name, base && base !== currentName ? base : undefined);
+      await createBranch(name, base && base !== currentName ? base : undefined, commit);
       onClose();
     } catch (e) {
       setError(
@@ -53,7 +67,15 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
 
   return (
     <Modal
-      title={artistMode ? "Start a new version line" : "Create a branch"}
+      title={
+        commit
+          ? artistMode
+            ? `Start a new line from ${version ? versionLabel(version) : "this version"}`
+            : "Create a branch here"
+          : artistMode
+            ? "Start a new version line"
+            : "Create a branch"
+      }
       onClose={() => (saving ? undefined : onClose())}
       footer={
         <>
@@ -67,9 +89,13 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
       }
     >
       <p className="text-[13px] leading-relaxed text-text-muted">
-        {artistMode
-          ? "Try an idea without touching your current work. New versions you save will live on this line until you bring them back together."
-          : "The new branch starts at the chosen base branch's latest commit; new commits land on it until you switch back."}
+        {commit
+          ? artistMode
+            ? `Your artwork goes back to ${version ? versionLabel(version) : "that version"} and the new line starts there. Everything after it stays safe on the line you're on now.`
+            : `The new branch starts at ${version ? `version ${version}` : "the selected commit"}; the working tree is rewritten to that commit's files.`
+          : artistMode
+            ? "Try an idea without touching your current work. New versions you save will live on this line until you bring them back together."
+            : "The new branch starts at the chosen base branch's latest commit; new commits land on it until you switch back."}
       </p>
       <input
         type="text"
@@ -82,7 +108,8 @@ export function CreateBranchModal({ onClose }: { onClose: () => void }) {
         autoFocus
         className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
       />
-      {branches.length > 1 && (
+      {/* A base branch and a starting commit are mutually exclusive backend-side. */}
+      {!commit && branches.length > 1 && (
         <div className="mt-3">
           <span className="mb-1 block text-[12px] text-text-muted">
             {artistMode ? "Start from" : "Base branch"}

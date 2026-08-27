@@ -18,6 +18,7 @@ import {
   useBranches,
   useCommits,
   useCommitDiff,
+  useWorkingChanges,
   useWorkingDiff,
   type DiffResult,
 } from "../../lib/repoData";
@@ -71,9 +72,18 @@ function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
   const { beginIfFirstTime } = useTour();
   const { legacy } = useLegacyHistory();
-  const { refreshNonce } = useRepository();
+  const { refreshNonce, setScanning } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
   const branches = useBranches(repo.path, refreshNonce);
+  // One scan of the tracked artwork for the whole shell. Lifted out of `Sidebar` because the
+  // Version Map needs the same dirty flag and the Sidebar isn't mounted in map view — and a
+  // second `useWorkingChanges` in the (always-mounted) map would both rescan in every view and
+  // race the one `setScanning` boolean.
+  const { items: workingItems, error: workingError } = useWorkingChanges(
+    repo.path,
+    refreshNonce,
+    setScanning
+  );
   const [activeView, setActiveView] = useState<ActivityView>("map");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
@@ -183,6 +193,12 @@ function RepoShell({ repo }: { repo: Repository }) {
               onSelect={setSelectedId}
               focusedFile={focusedFile}
               onFocusFile={setFocusedFile}
+              workingItems={workingItems}
+              workingError={workingError}
+              // Whatever diff the well is currently showing — the working diff in Changes, the
+              // selected commit's in History. Undo/discard/set-aside all act on state this diff
+              // reads, so they're blocked while it's still being computed too, not just mid-scan.
+              diffLoading={diffLoading}
               onShowChanges={() => setActiveView("changes")}
             />
           )}
@@ -198,6 +214,7 @@ function RepoShell({ repo }: { repo: Repository }) {
               branches={branches}
               currentBranch={currentBranch}
               nonce={refreshNonce}
+              dirty={workingItems.length > 0}
               onShowChanges={() => setActiveView("changes")}
             />
           </div>

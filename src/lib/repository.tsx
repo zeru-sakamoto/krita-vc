@@ -81,9 +81,11 @@ interface RepositoryValue {
   /**
    * Create a branch and switch to it. Starts at the current tip (instant, no file I/O)
    * unless `base` names another branch, which switches the working tree to that branch's
-   * files first (refused while there are unsaved changes).
+   * files first (refused while there are unsaved changes), or `commit` names an arbitrary
+   * version to fork from ("go back to version 5 and try a different direction" — the Version
+   * Map's pick-a-version mode). `base` and `commit` are mutually exclusive; `commit` wins.
    */
-  createBranch: (name: string, base?: string) => Promise<void>;
+  createBranch: (name: string, base?: string, commit?: string) => Promise<void>;
   /** Switch the working tree to a branch (rewrites only files that differ). */
   switchBranch: (name: string) => Promise<void>;
   /** Merge a branch into the current one (fast-forward or merge commit). */
@@ -469,10 +471,12 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   const createBranch = useCallback(
-    (name: string, base?: string) =>
+    (name: string, base?: string, commit?: string) =>
       branchMutation(
         "create_branch",
-        base ? { name, base } : { name },
+        // The backend takes both and lets `commit` win; pick here instead so what was asked
+        // for is what's sent.
+        commit ? { name, commit } : base ? { name, base } : { name },
         "Creating branch — please wait…"
       ),
     [branchMutation]

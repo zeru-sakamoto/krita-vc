@@ -19,12 +19,8 @@ import { CommitGraph } from "../vcs/CommitGraph";
 import { ChangesPanel } from "../vcs/ChangesPanel";
 import { BranchesPanel } from "../vcs/BranchesPanel";
 import { PerformancePanel } from "../vcs/PerformancePanel";
-import {
-  CreateBranchModal,
-  SaveFirstModal,
-  errorText,
-  isUnsavedChangesError,
-} from "../vcs/BranchDialogs";
+import { errorText } from "../vcs/BranchDialogs";
+import { useBranchActions } from "../vcs/useBranchActions";
 import {
   PickStashModal,
   SetAsideModal,
@@ -36,10 +32,10 @@ import {
 } from "../vcs/StashDialogs";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
-import { useStashes, useWorkingChanges } from "../../lib/repoData";
+import { useStashes } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
-import type { Branch, Commit } from "../../types";
+import type { Branch, Commit, WorkingChange } from "../../types";
 
 // Tour steps that spotlight one row inside the (normally click-to-open) panel-options
 // menu — the tour forces the menu open for the duration of these steps since the
@@ -72,6 +68,12 @@ interface SidebarProps {
   /** Working-tree file whose diff is shown in the main panel (Changes view). */
   focusedFile: string | null;
   onFocusFile: (path: string | null) => void;
+  /** The shell's one scan of the tracked artwork — the Version Map needs the same result, so it
+   *  lives in `AppShell` rather than here. */
+  workingItems: WorkingChange[];
+  workingError: string | null;
+  /** Whether the diff currently in the well (working or commit) is still being computed. */
+  diffLoading: boolean;
   /** Jump to the Changes view (used by the save-first prompt). */
   onShowChanges: () => void;
 }
@@ -90,6 +92,9 @@ export function Sidebar({
   onSelect,
   focusedFile,
   onFocusFile,
+  workingItems,
+  workingError,
+  diffLoading,
   onShowChanges,
 }: SidebarProps) {
   const {
@@ -97,10 +102,8 @@ export function Sidebar({
     refreshNonce,
     refresh,
     scanning,
-    setScanning,
     undoLastCommit,
     discardChanges,
-    switchBranch,
     popStash,
     saving,
   } = useRepository();
@@ -109,9 +112,6 @@ export function Sidebar({
   const forcePanelOptionsOpen = tourActive && PANEL_OPTION_TOUR_IDS.has(tourStep.tourId);
   const [confirmUndo, setConfirmUndo] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [saveFirst, setSaveFirst] = useState(false);
-  const [switchError, setSwitchError] = useState<string | null>(null);
   const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
   const [discardAllError, setDiscardAllError] = useState<string | null>(null);
   const [setAside, setSetAside] = useState<{ scope: StashScope; paths: string[] | null } | null>(
@@ -119,42 +119,28 @@ export function Sidebar({
   );
   const [pickStash, setPickStash] = useState(false);
   const [stashConflict, setStashConflict] = useState<string | null>(null);
-  // The branch the pending switch was aiming at, held across the save-first prompt so setting
-  // work aside can complete the switch the user actually asked for.
-  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  // Branch switch/create plus the save-first prompt and its set-aside-and-retry escape hatch —
+  // shared with the Version Map's action bar and the Branches panel.
+  const branchActions = useBranchActions({
+    currentBranch: currentBranch.name,
+    onShowChanges,
+  });
 
-  // Lifted here (not local to ChangesPanel) so the panel-options actions and the panel itself
-  // share one scan of the tracked artwork.
-  const { items: workingItems, error: workingError } = useWorkingChanges(
-    current?.path ?? null,
-    refreshNonce,
-    setScanning
-  );
+  // Either kind of "checking" — the working-tree rescan or the diff being computed — leaves
+  // state these actions read in flux, so both block undo/discard/set-aside the same way.
+  const checking = scanning || diffLoading;
   const changedPaths = workingItems.map((c) => c.change.path);
   const stashes = useStashes(current?.path ?? null, refreshNonce);
 
-  const onSwitch = async (name: string) => {
-    if (name === currentBranch.name || saving) return;
-    setSwitchError(null);
-    try {
-      await switchBranch(name);
-    } catch (e) {
-      if (isUnsavedChangesError(e)) {
-        setPendingSwitch(name);
-        setSaveFirst(true);
-      } else setSwitchError(errorText(e));
-    }
-  };
-
   const onPop = async (id: string) => {
-    setSwitchError(null);
+    branchActions.setError(null);
     try {
       await popStash(id);
       setPickStash(false);
     } catch (e) {
       setPickStash(false);
       if (isStashConflictError(e)) setStashConflict(errorText(e));
-      else setSwitchError(errorText(e));
+      else branchActions.setError(errorText(e));
     }
   };
 
@@ -195,7 +181,7 @@ export function Sidebar({
   // aside and bringing it back both act on the working tree, so those rows (and the `footer`
   // group's divider) are changes-only; History's menu is just undo.
   const openSetAside = (scope: StashScope, paths: string[] | null) => {
-    setSwitchError(null);
+    branchActions.setError(null);
     setSetAside({ scope, paths });
   };
   const setAsideItems = (
@@ -248,14 +234,19 @@ export function Sidebar({
       minWidth={200}
       footer={view === "changes" ? stashFooter : undefined}
       forceOpen={forcePanelOptionsOpen}
+      // Blocked mid-check: the working-tree state these actions read (undo/discard/set-aside)
+      // could change out from under a click while a rescan or diff is in flight.
+      disabled={checking}
       trigger={(open) => (
         <span
-          title="Panel options"
+          title={checking ? "Checking for changes…" : "Panel options"}
           aria-label="Panel options"
           data-tour-id="panel-options"
           className={[
             "grid h-8 w-8 place-items-center rounded-button text-text-muted",
-            "transition-colors hover:bg-state-hover hover:text-text",
+            checking
+              ? "cursor-not-allowed opacity-40"
+              : "transition-colors hover:bg-state-hover hover:text-text",
             open ? "bg-white/5 text-text" : "",
           ].join(" ")}
         >
@@ -339,14 +330,14 @@ export function Sidebar({
                   id: b.name,
                   label: b.name,
                   selected: b.kind === "current",
-                  onSelect: () => void onSwitch(b.name),
+                  onSelect: () => branchActions.switchTo(b.name),
                 }))}
                 footer={[
                   {
                     id: "new-branch",
                     label: artistMode ? "New version line…" : "New branch…",
                     icon: <Plus size={13} />,
-                    onSelect: () => setCreateOpen(true),
+                    onSelect: () => branchActions.askCreate(),
                   },
                 ]}
               />
@@ -355,7 +346,9 @@ export function Sidebar({
               </span>
             </div>
 
-            {switchError && <p className="px-3 pt-2 text-[12px] text-danger">{switchError}</p>}
+            {branchActions.error && (
+              <p className="px-3 pt-2 text-[12px] text-danger">{branchActions.error}</p>
+            )}
 
             <div data-tour-id="history-versions">
               <CommitGraph
@@ -397,32 +390,15 @@ export function Sidebar({
         <div className="h-10 w-0.5 rounded-full bg-transparent transition-colors group-hover:bg-accent" />
       </div>
 
-      {createOpen && <CreateBranchModal onClose={() => setCreateOpen(false)} />}
-      {saveFirst && (
-        <SaveFirstModal
-          onClose={() => {
-            setSaveFirst(false);
-            setPendingSwitch(null);
-          }}
-          onShowChanges={onShowChanges}
-          onSetAside={() => {
-            setSaveFirst(false);
-            openSetAside("all", null);
-          }}
-        />
-      )}
+      {branchActions.dialogs}
 
+      {/* The panel-options set-aside (the shelf actions). The save-first prompt has its own,
+          inside `branchActions` — that one exists to unblock a switch, this one is the action. */}
       {setAside && (
         <SetAsideModal
           scope={setAside.scope}
           paths={setAside.paths}
           onClose={() => setSetAside(null)}
-          // The tree is clean now, so a switch that was blocked can finally go through.
-          onDone={() => {
-            const target = pendingSwitch;
-            setPendingSwitch(null);
-            if (target) void onSwitch(target);
-          }}
         />
       )}
 

@@ -34,7 +34,7 @@ export function DockerPanel({
         <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
           {title}
         </span>
-        {actions && <div className="flex items-center">{actions}</div>}
+        {actions && <div className="flex items-center gap-1">{actions}</div>}
       </header>
       <div className={["min-h-0 flex-1", scroll ? "overflow-auto" : ""].join(" ")}>{children}</div>
     </section>

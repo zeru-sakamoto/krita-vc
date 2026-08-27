@@ -19,8 +19,11 @@ import {
   CaretDown,
   CaretLineRight,
   GitBranch,
+  GitMerge,
   MapTrifold,
+  Plus,
   SidebarSimple,
+  Trash,
 } from "@phosphor-icons/react";
 import { MainPanel } from "../MainPanel";
 import { Inspector } from "../shell/Inspector";
@@ -28,17 +31,33 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Switch } from "../ui/Switch";
 import { Menu } from "../ui/Menu";
-import { NODE_H, NODE_W, SPINE_TOP, VersionNode, type VersionNodeData } from "./VersionNode";
+import { useBranchActions, type BranchActions } from "./useBranchActions";
+import {
+  NODE_H,
+  NODE_W,
+  PreviewNode,
+  SPINE_TOP,
+  VersionNode,
+  type PreviewNodeData,
+  type VersionNodeData,
+} from "./VersionNode";
 import { useCommitDiff, useCommits } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import { assetName, versionLabel } from "../../lib/friendly";
-import { buildVersionMap } from "../../lib/versionMap";
+import { bendFraction, buildVersionMap } from "../../lib/versionMap";
 import type { Branch, Commit } from "../../types";
 
 /** Horizontal pitch between node columns (node width + gutter). */
 const NODE_PITCH = NODE_W + 72;
 /** Vertical pitch between branch lanes — a node's nominal height plus a gutter. */
 const LANE_PITCH = NODE_H + 60;
+/** How far a connector runs straight off its handle before it may bend. Deliberately small (and
+ *  *not* the gutter half-width): `getSmoothStepPath` drops a gap point only when it lands exactly
+ *  on the bend x, and float error in the measured handle positions meant it sometimes didn't —
+ *  leaving a stray point a hair from the corner, which collapses that corner's radius to ~0. One
+ *  bend rounded and the other square. Keeping the gap points well clear of the bend makes both
+ *  corners get the full radius; `stepPosition` below still puts the bend in the gutter. */
+const STEP_GAP = 20;
 const FIT_PADDING = 0.15;
 /** Minimap box, and how far React Flow pads its viewBox past the content (`offsetScale * viewScale`
  *  on every side). Our history is much wider than tall, so viewScale is width-driven and the
@@ -51,18 +70,21 @@ const MINIMAP_OFFSET_SCALE = 1.5;
  *  localStorage read rather than another app-wide context (cf. artistMode/legacyHistory). */
 const SHOW_ALL_KEY = "krita-vc:map-show-all";
 
-// Version Map's own lane palette — separate from graph.ts's LANE_COLORS (mainline=accent there
-// is deliberate, for the legacy History graph). Reuses theme-tuned status tokens, so no new CSS
-// tokens are needed. Index 0 is always the branch you're standing on; divergent branches take
-// 1.. in order of first appearance (see lib/versionMap.ts).
+// Version Map's own lane palette — separate from graph.ts's LANE_COLORS (whose positional
+// lane-0-is-accent is a fixed convention for the legacy History graph). Reuses theme-tuned status
+// tokens, so no new CSS tokens are needed. Lane 0 is the trunk and divergent branches take 1.. in
+// order of first appearance (see lib/versionMap.ts) — so lane index no longer says where you're
+// standing, and the accent is spent saying it instead: whichever lane you're on gets it, the rest
+// cycle this palette. Same idea as graph.ts's `branchColorMap`.
 const BRANCH_LANE_COLORS = [
   "var(--color-info-fg)",
   "var(--color-success-fg)",
   "var(--color-warning-fg)",
-  "var(--color-accent)",
 ];
-function laneColor(lane: number): string {
-  return BRANCH_LANE_COLORS[lane % BRANCH_LANE_COLORS.length];
+function laneColor(lane: number, currentLane: number): string {
+  return lane === currentLane
+    ? "var(--color-accent)"
+    : BRANCH_LANE_COLORS[lane % BRANCH_LANE_COLORS.length];
 }
 /** A lane's color at line weight: dimmer than its dots, but **opaque**. Mixing toward
  *  `transparent` instead let two crossing lines composite into a brighter, two-tone band that
@@ -80,7 +102,10 @@ function laneGradientId(from: number, to: number): string {
 }
 
 // Registered once at module scope — a fresh object here would remount every node each render.
-const NODE_TYPES = { version: VersionNode };
+const NODE_TYPES = { version: VersionNode, preview: PreviewNode };
+
+/** Node id of the pending-changes preview. Can never collide with a commit id. */
+const PREVIEW_ID = "__preview__";
 
 interface VersionMapPanelProps {
   repoPath: string;
@@ -90,7 +115,11 @@ interface VersionMapPanelProps {
   currentBranch: Branch;
   /** Bumped by any mutating repo op — forwarded to the drilldown diff. */
   nonce?: number;
-  /** Switches the shell to the Changes tab — wired to the empty-state's call to action. */
+  /** The working tree has uncommitted changes — draws the pending-version preview node at the
+   *  end of the current branch. From the shell's one `scan_repository`. */
+  dirty?: boolean;
+  /** Switches the shell to the Changes tab — wired to the empty-state's call to action and to
+   *  the preview node. */
   onShowChanges: () => void;
 }
 
@@ -125,12 +154,17 @@ function VersionMap({
   branches,
   currentBranch,
   nonce = 0,
+  dirty = false,
   onShowChanges,
 }: VersionMapPanelProps) {
   const { artistMode } = useArtistMode();
   const [openId, setOpenId] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(() => localStorage.getItem(SHOW_ALL_KEY) === "1");
+  // Pick-a-version mode: the action bar asked for a starting point, so the next node click
+  // forks a branch there instead of opening the diff viewer.
+  const [picking, setPicking] = useState(false);
   const { fitView, setCenter, getViewport } = useReactFlow();
+  const actions = useBranchActions({ currentBranch: currentBranch.name, onShowChanges });
 
   // Only fetched while the toggle is on: an empty path makes `useCommits` a no-op, so the off
   // state costs nothing and stays byte-identical to the commits the shell already loaded.
@@ -165,7 +199,43 @@ function VersionMap({
     [getViewport]
   );
 
-  const nodes = useMemo<Node<VersionNodeData>[]>(
+  const onPick = useCallback(
+    (id: string) => {
+      setPicking(false);
+      actions.askCreate(id, layout.placed.get(id)?.version);
+    },
+    [actions, layout]
+  );
+  // The node calls whatever it was handed as `onOpen` — swapping the callback is the entire
+  // pick mode, so VersionNode needs no notion of it.
+  const onNodeClick = picking ? onPick : onOpen;
+
+  useEffect(() => {
+    if (!picking) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPicking(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [picking]);
+
+  // Where an unsaved version would land: one column past the end of the current lane, on that
+  // lane. ponytail: takes the lane's *last* column rather than the tip's, because
+  // `buildVersionMap`'s collision guard can shift a node right of its generation depth — so the
+  // tip isn't reliably the rightmost thing on its own lane. Off by a column at worst, never
+  // overlapping. Null when clean, when there's nothing to hang it off, or before history loads.
+  const preview = useMemo(() => {
+    if (!dirty || drawn.length === 0 || !currentBranch.tip) return null;
+    const tip = layout.placed.get(currentBranch.tip);
+    if (!tip) return null;
+    let col = 0;
+    for (const p of layout.placed.values()) {
+      if (p.lane === layout.currentLane) col = Math.max(col, p.col);
+    }
+    return { col: col + 1, version: tip.version + 1 };
+  }, [dirty, drawn.length, currentBranch.tip, layout]);
+
+  const nodes = useMemo<Node<VersionNodeData | PreviewNodeData>[]>(
     () =>
       drawn.map((commit) => {
         const at = layout.placed.get(commit.id);
@@ -185,13 +255,34 @@ function VersionMap({
             tipOf: layout.tips.get(commit.id) ?? [],
             branch: at?.branch ?? null,
             repoPath,
-            onOpen,
-            laneColor: laneColor(lane),
+            onOpen: onNodeClick,
+            laneColor: laneColor(lane, layout.currentLane),
           },
         };
       }),
-    [drawn, layout, repoPath, openId, onOpen]
+    [drawn, layout, repoPath, openId, onNodeClick]
   );
+
+  const allNodes = useMemo<Node<VersionNodeData | PreviewNodeData>[]>(() => {
+    if (!preview) return nodes;
+    return [
+      ...nodes,
+      {
+        id: PREVIEW_ID,
+        type: "preview",
+        position: { x: preview.col * NODE_PITCH, y: layout.currentLane * LANE_PITCH },
+        width: NODE_W,
+        height: NODE_H,
+        data: {
+          version: preview.version,
+          branch: currentBranch.name,
+          laneColor: laneColor(layout.currentLane, layout.currentLane),
+          picking,
+          onOpen: onShowChanges,
+        },
+      },
+    ];
+  }, [nodes, preview, layout.currentLane, currentBranch.name, picking, onShowChanges]);
 
   // Edges come from `parents`, not from adjacency — so a merge commit's second parent draws its
   // own line into whichever lane it came from. Since both handles sit on the connector dot, one
@@ -213,49 +304,70 @@ function VersionMap({
           source: p,
           target: c.id,
           type: "smoothstep",
-          // Where the step bends. `offset` is how far the path runs straight off a handle before
-          // it may turn; half a column puts that turn in the middle of the gutter, clear of the
-          // node's caption and chips (the default 20 would descend straight through them).
-          // `stepPosition` then picks *which* gutter: 0 bends right after the source, 1 right
-          // before the target — either way, next to the end that's on the shallower lane. So a
-          // branch drops out of the spine at the version it started from and climbs back in at
-          // the version it merges into, instead of running alongside the spine for half a column
-          // (the default 0.5) and doubling it up.
+          // Where the step bends. `stepPosition` is a fraction of the run between the two gap
+          // points, so solve it for the descent x we actually want: the middle of the gutter
+          // *next to the end on the shallower lane* — a branch drops out of the spine at the
+          // version it started from and climbs back in at the version it merges into, clear of
+          // the node's caption and chips, and never runs alongside the spine (which doubles it).
           pathOptions: {
-            offset: NODE_PITCH / 2,
-            stepPosition: toLane > from.lane ? 0 : 1,
+            offset: STEP_GAP,
+            stepPosition: bendFraction(
+              ((at?.col ?? 0) - from.col) * NODE_PITCH,
+              toLane > from.lane,
+              NODE_PITCH,
+              STEP_GAP
+            ),
             borderRadius: 16,
           },
           style: {
             stroke: crosses
               ? `url(#${laneGradientId(from.lane, toLane)})`
-              : dimLane(laneColor(toLane)),
+              : dimLane(laneColor(toLane, layout.currentLane)),
             strokeWidth: 1.5,
           },
         });
       }
     }
+    // The dashed run out to the pending-changes preview. Same lane as its parent, so it needs no
+    // bend and no lane gradient — just the spine's color, dashed.
+    if (preview && currentBranch.tip && layout.placed.has(currentBranch.tip)) {
+      out.push({
+        id: `${currentBranch.tip}->${PREVIEW_ID}`,
+        source: currentBranch.tip,
+        target: PREVIEW_ID,
+        type: "smoothstep",
+        style: {
+          stroke: dimLane(laneColor(layout.currentLane, layout.currentLane)),
+          strokeWidth: 1.5,
+          strokeDasharray: "5 4",
+        },
+      });
+    }
     return { edges: out, laneLinks: [...links] };
-  }, [drawn, layout]);
+  }, [drawn, layout, preview, currentBranch.tip]);
 
   // The current branch's tip, which with lanes on is no longer just the rightmost node.
   const tipAt = currentBranch.tip ? (layout.placed.get(currentBranch.tip) ?? null) : null;
   const tipCol = tipAt?.col ?? null;
   const tipLane = tipAt?.lane ?? 0;
+  // With unsaved changes the preview node *is* the newest thing on the line, so that's what
+  // "latest" means.
+  const latestCol = preview?.col ?? tipCol;
+  const latestLane = preview ? layout.currentLane : tipLane;
   const jumpToLatest = useCallback(() => {
-    if (tipCol == null) return;
-    setCenter(tipCol * NODE_PITCH + NODE_W / 2, tipLane * LANE_PITCH + SPINE_TOP, {
+    if (latestCol == null) return;
+    setCenter(latestCol * NODE_PITCH + NODE_W / 2, latestLane * LANE_PITCH + SPINE_TOP, {
       zoom: 1,
       duration: 350,
     });
-  }, [tipCol, tipLane, setCenter]);
+  }, [latestCol, latestLane, setCenter]);
 
   // Land on the newest version, and follow it when a new one is committed.
   useEffect(() => {
-    if (tipCol == null) return;
+    if (latestCol == null) return;
     const t = setTimeout(jumpToLatest, 0); // after React Flow has measured the nodes
     return () => clearTimeout(t);
-  }, [tipCol, jumpToLatest]);
+  }, [latestCol, jumpToLatest]);
 
   const openCommit = openId ? (drawn.find((c) => c.id === openId) ?? null) : null;
 
@@ -342,9 +454,9 @@ function VersionMap({
         </div>
       ) : (
         <div className="relative min-h-0 flex-1 bg-bg">
-          <LaneGradients links={laneLinks} />
+          <LaneGradients links={laneLinks} currentLane={layout.currentLane} />
           <ReactFlow
-            nodes={nodes}
+            nodes={allNodes}
             edges={edges}
             nodeTypes={NODE_TYPES}
             // Positions are computed; the canvas pans, the nodes never move.
@@ -398,11 +510,149 @@ function VersionMap({
               // corners instead of following the panel's rounding.
               className="!raised !overflow-hidden !rounded-panel !border !border-border !bottom-3 !right-3"
             />
-            <MinimapViewport nodes={nodes} />
+            <MinimapViewport nodes={allNodes} />
+            <MapActionBar
+              branches={branches}
+              currentBranch={currentBranch}
+              actions={actions}
+              picking={picking}
+              onStartPicking={() => setPicking(true)}
+              onCancelPicking={() => setPicking(false)}
+            />
           </ReactFlow>
         </div>
       )}
+
+      {/* Sibling of the canvas, not a child — `Modal` has no portal (cf. CleanupModal). */}
+      {actions.dialogs}
     </section>
+  );
+}
+
+/**
+ * The map's branch controls, floating over the top-left of the canvas (clear of the minimap,
+ * which sits bottom-right). Switch, merge, delete and create all live in one `Menu` — its `selected`,
+ * `detail`, hover-revealed `action` and `footer` slots are exactly the legacy Branches panel's
+ * row model, so this needs no new primitive.
+ *
+ * "Start a line here" is the one action the map alone can offer: `create_branch_at` has been in
+ * the engine, tested and unreachable, because nothing else in the app is a version picker.
+ */
+function MapActionBar({
+  branches,
+  currentBranch,
+  actions,
+  picking,
+  onStartPicking,
+  onCancelPicking,
+}: {
+  branches: Branch[];
+  currentBranch: Branch;
+  actions: BranchActions;
+  picking: boolean;
+  onStartPicking: () => void;
+  onCancelPicking: () => void;
+}) {
+  const { artistMode } = useArtistMode();
+  const { saving } = actions;
+
+  return (
+    // `nopan` for the same reason VersionNode's thumbnail has it — without it a drag started on
+    // the bar pans the canvas underneath. Panel itself already re-enables pointer events, which
+    // is why MinimapViewport has to opt back *out*.
+    <Panel position="top-left" className="nopan !top-3 !left-3">
+      <div className="raised flex items-center gap-1 rounded-panel border border-border bg-surface-2 p-1">
+        {picking ? (
+          <>
+            <span className="px-2 text-[12px] text-text">
+              {artistMode
+                ? "Click the version to start the new line from"
+                : "Click the commit to branch from"}
+            </span>
+            <Button onClick={onCancelPicking}>Cancel</Button>
+          </>
+        ) : (
+          <>
+            <Menu
+              minWidth={220}
+              trigger={(open) => (
+                <span
+                  className={[
+                    "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text",
+                    "hover:bg-state-hover",
+                    open ? "bg-state-active" : "",
+                  ].join(" ")}
+                  title={artistMode ? "Choose which version line you're on" : "Switch branch"}
+                >
+                  <GitBranch size={13} className="text-text-muted" />
+                  <span className="max-w-40 truncate">{currentBranch.name}</span>
+                  <CaretDown size={12} className="text-text-muted" />
+                </span>
+              )}
+              items={branches.map((b) => ({
+                id: b.name,
+                label: b.name,
+                selected: b.kind === "current",
+                detail: b.tip ? b.tip.slice(0, 7) : undefined,
+                disabled: saving,
+                onSelect: () => actions.switchTo(b.name),
+                action:
+                  b.kind === "current" ? undefined : (
+                    <span className="flex items-center gap-0.5">
+                      <IconButton
+                        icon={GitMerge}
+                        label={
+                          artistMode
+                            ? `Bring ${b.name} into ${currentBranch.name}`
+                            : `Merge into ${currentBranch.name}`
+                        }
+                        size={14}
+                        disabled={saving || !b.tip}
+                        onClick={() => actions.askMerge(b.name)}
+                      />
+                      {/* The backend refuses to delete main too (DeleteMain). */}
+                      {b.name !== "main" && (
+                        <IconButton
+                          icon={Trash}
+                          label={artistMode ? "Remove this version line" : "Delete branch"}
+                          size={14}
+                          disabled={saving}
+                          onClick={() => actions.askDelete(b.name)}
+                        />
+                      )}
+                    </span>
+                  ),
+              }))}
+              footer={[
+                {
+                  id: "new-branch",
+                  label: artistMode ? "New version line…" : "New branch…",
+                  icon: <Plus size={13} />,
+                  disabled: saving,
+                  onSelect: () => actions.askCreate(),
+                },
+              ]}
+            />
+            <span className="mx-0.5 h-4 w-px bg-text-muted/40" />
+            <button
+              type="button"
+              onClick={onStartPicking}
+              disabled={saving}
+              title={
+                artistMode
+                  ? "Go back to an earlier version and take a different direction from there"
+                  : "Create a branch starting at any commit"
+              }
+              className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:opacity-40"
+            >
+              <GitBranch size={13} />
+              {artistMode ? "Start a line here…" : "Branch from a commit…"}
+            </button>
+          </>
+        )}
+      </div>
+      {actions.error && <p className="mt-1 max-w-xs text-[12px] text-danger">{actions.error}</p>}
+    </Panel>
   );
 }
 
@@ -495,7 +745,7 @@ function MinimapViewport({ nodes }: { nodes: Node[] }) {
  * shares with the spine before the bend invisible. An `objectBoundingBox` gradient would smear
  * the transition across the entire path and tint that shared stretch.
  */
-function LaneGradients({ links }: { links: string[] }) {
+function LaneGradients({ links, currentLane }: { links: string[]; currentLane: number }) {
   if (links.length === 0) return null;
   return (
     <svg aria-hidden className="pointer-events-none absolute h-0 w-0">
@@ -512,8 +762,8 @@ function LaneGradients({ links }: { links: string[] }) {
               x2="0"
               y2={laneY(to)}
             >
-              <stop offset="0" style={{ stopColor: dimLane(laneColor(from)) }} />
-              <stop offset="1" style={{ stopColor: dimLane(laneColor(to)) }} />
+              <stop offset="0" style={{ stopColor: dimLane(laneColor(from, currentLane)) }} />
+              <stop offset="1" style={{ stopColor: dimLane(laneColor(to, currentLane)) }} />
             </linearGradient>
           );
         })}

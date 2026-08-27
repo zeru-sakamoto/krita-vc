@@ -79,7 +79,9 @@ element (`fixed inset-0`, so it still visually covers all four zones); it render
 tour isn't active. See [Application tour](#application-tour).
 
 [`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable panel container (24px title
-bar + scroll area) used by the Sidebar and Inspector.
+bar + scroll area) used by the Sidebar and Inspector. Its header's `actions` slot lays out icons
+with a small `gap-1` so adjacent buttons (e.g. Changes' rescan + panel-options) don't sit flush
+against each other — every panel gets this for free rather than each header spacing its own icons.
 
 ## State ownership
 
@@ -100,8 +102,11 @@ Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) —
 selected repository path and the shared `refreshNonce`. `useCommitDiff` (committed visual
 diffs) keys only on path + commit id: a commit's diff is immutable once made, so it never needs
 a nonce-driven refetch — only `useWorkingDiff`/the working side of `useArtLayers` do, since the
-working copy genuinely changes. Derived per render: `currentBranch` (from `useBranches`),
-`selectedCommit`, and `diff`.
+working copy genuinely changes. `useWorkingDiff` still keeps a small stale-while-revalidate cache
+(`workingDiffCache`, keyed on path + file, *not* nonce) so re-focusing a file — e.g. tabbing over
+to the Version Map and back — repaints the last-known diff immediately instead of blanking to a
+spinner, while the real `working_diff` call runs behind it and replaces the paint once it lands.
+Derived per render: `currentBranch` (from `useBranches`), `selectedCommit`, and `diff`.
 
 Six pieces of state live **outside** `AppShell`, each in a React context so any component can read
 them without prop-drilling: the global Artist Mode flag
@@ -169,7 +174,11 @@ history** is on; see [Version Map](#version-map) for what replaced them.
   The rows are **read-only**: choosing which layers go into a version needs a write path that
   synthesizes a `.kra` holding only the ticked ones, and checkboxes that don't bind would be
   worse than none. "Undo all" in the section header, and "Discard current changes" in the
-  sidebar's `…` menu, both revert the artwork via the repository context's `discardChanges`. A failed commit's error message is local `commitError` state, reset
+  sidebar's `…` menu, both revert the artwork via the repository context's `discardChanges`. Both
+  that button and the whole `…` menu are disabled — dimmed, tooltip swapped to "Checking for
+  changes…" — while `scanning` or the diff itself is still `loading`: undo/discard/set-aside all
+  read state those two computations are still in the middle of producing, so a click mid-check
+  could act on a picture that's about to change. A failed commit's error message is local `commitError` state, reset
   on repo or branch change (an effect keyed on `path`/`currentBranch.name`) — otherwise it outlives
   the commit it belongs to and, since `ChangesPanel` stays mounted across repo/branch switches,
   misleadingly reads as live on an unrelated one. While a commit or discard is in flight the staging controls lock,
@@ -182,11 +191,18 @@ history** is on; see [Version Map](#version-map) for what replaced them.
   opens the create modal. The create modal's base-branch picker (a plain `<select>`, only shown
   when more than one branch exists) defaults to the current branch — picking another one is passed
   through as `createBranch(name, base)`, which materializes that branch's tree before recording the
-  new branch (refused, with a friendly prompt, on unsaved changes). Shared dialogs live in
-  [`BranchDialogs.tsx`](../src/components/vcs/BranchDialogs.tsx); the backend's dirty-tree error
-  (stable `"unsaved changes"` prefix) becomes a friendly `SaveFirstModal` offering three ways out:
-  save first (jump to Changes), **set it aside** (stash everything, then retry the blocked
-  switch/merge automatically), or cancel. This is a local-only VCS — there are no remotes.
+  new branch (refused, with a friendly prompt, on unsaved changes). The actions and every dialog
+  they raise now live in one hook,
+  [`useBranchActions`](../src/components/vcs/useBranchActions.tsx) — `BranchesPanel` used to carry
+  its own copy of this state machine, and now just renders `actions.dialogs`. It's shared with the
+  Version Map's own action bar (see [Branch actions & pick-a-version](#branch-actions--pick-a-version-mode))
+  and the History sidebar's branch switcher, so the dirty-tree routing and confirm copy can't drift
+  between the three. It lives in its own file rather than `BranchDialogs.tsx` because it needs
+  `SetAsideModal`, and `StashDialogs.tsx` already imports `errorText` from `BranchDialogs.tsx` —
+  putting it there would close an import cycle. The backend's dirty-tree error (stable
+  `"unsaved changes"` prefix) becomes a friendly `SaveFirstModal` offering three ways out: save
+  first (jump to Changes), **set it aside** (stash everything, then retry the blocked switch/merge
+  automatically), or cancel. This is a local-only VCS — there are no remotes.
 - **`performance`** — [`PerformancePanel`](../src/components/vcs/PerformancePanel.tsx): the
   Performance report — a summary card (average operation times + total storage saved), a
   scrollable per-version card list (stored vs full-copy bytes + % saved + save/compare time), and a
@@ -220,14 +236,20 @@ commit graph (`nodesDraggable={false}`) — nothing is persisted, so a new commi
 the layout stale. Edges come from `parents`, not list adjacency, so a merge commit's second
 parent draws its own line into whichever lane it came from.
 
-- **Branch color.** A small local palette in `VersionMapPanel.tsx`
-  (`BRANCH_LANE_COLORS` — `info-fg`, `success-fg`, `warning-fg`, `accent`, cycled by
-  `laneColor(lane)`), deliberately separate from `graph.ts`'s `LANE_COLORS` (whose lane-0-is-accent
-  is a fixed convention for the legacy History graph and stays untouched). A lane's color paints
-  every node's connector dot on it and, mixed 55% toward transparent via `color-mix`, the spine
-  between them. Every branch tip's thumbnail additionally gets a **detached**
-  `outline`/`outline-offset` ring in its lane color, distinct from the flush `ring-accent` used
-  for whichever node is open, plus a branch-name chip under its caption.
+- **Branch color.** Since lane 0 is now the trunk (see [Branch lanes](#branch-lanes) below), lane
+  index alone no longer says where you're standing, so the accent is spent saying it instead:
+  `laneColor(lane, currentLane)` returns `var(--color-accent)` for whichever lane the current
+  branch is actually on (`MapLayout.currentLane`, read off the current tip's *placement* rather
+  than a branch-name map, so a branch with no commits of its own still resolves correctly), and
+  every other lane cycles a small local palette (`BRANCH_LANE_COLORS` in `VersionMapPanel.tsx` —
+  `info-fg`, `success-fg`, `warning-fg`), deliberately separate from `graph.ts`'s `LANE_COLORS`
+  (whose positional lane-0-is-accent is a fixed convention for the legacy History graph and stays
+  untouched). A lane's color paints every node's connector dot on it and, mixed 55% toward
+  transparent via `color-mix`, the spine between them. Every branch tip's thumbnail additionally
+  gets a **detached** `outline`/`outline-offset` ring in its lane color, distinct from the flush
+  `ring-accent` used for whichever node is open — on *your* lane those two are now the same color
+  and only the geometry (detached vs. flush) tells them apart — plus a branch-name chip under its
+  caption.
 - **Grid background.** React Flow's `Lines` variant, colored by a `--color-grid` token
   (`src/styles/global.css`) derived from each theme's own `--color-bg` via
   `color-mix(in srgb, var(--color-bg) 75%, black)` — dark themes render a near-black, barely
@@ -283,13 +305,17 @@ loaded.
 The lane/column assignment is a pure function in
 [`lib/versionMap.ts`](../src/lib/versionMap.ts) (`buildVersionMap`), deliberately **not** in
 `lib/graph.ts`: `buildGraph` lays a DAG out vertically for the legacy rail, where a lane is an x
-column and lane 0 means "the mainline"; here a lane is a y offset and lane 0 means "the branch
-you're standing on". Three rules carry it:
+column; here a lane is a y offset. Both agree lane 0 is the mainline. Three rules carry it:
 
-- **Lane 0 is the current branch's first-parent spine**, walked back from its tip — *not* the
-  commits stamped with its name. After a merge the folded-in commits still carry *their* branch
-  and belong on a side lane; and standing on a side branch, its shared ancestors are stamped
-  `main` and would otherwise jog the line you're on down a lane.
+- **Lane 0 is the trunk's first-parent spine**, walked back from `main`'s tip — *not* the commits
+  stamped with its name, since after a merge the folded-in commits still carry *their* branch and
+  belong on a side lane. Anchoring on `main` rather than on the branch you're standing on is
+  load-bearing and was a real bug: lane 0 used to follow *your* branch, so a fork off main drew as
+  one straight line, and main's next commit — same generation depth, so the same column — got
+  shunted onto a side lane by the collision guard below. **The trunk must not move when you switch
+  branches.** `main`'s tip isn't always in the drawn set (with "show all lines" off, `list_commits`
+  is scoped to *your* tip), so the anchor falls back to the newest drawn commit stamped `main`,
+  then to the current tip.
 - **Everything else groups by `commit.branch`** into lanes 1.. in order of first appearance
   (oldest first), so a lane's color doesn't shuffle between refetches.
 - **Column = generation depth** (`1 + max(depth(parents))`), so parallel work on two branches
@@ -301,6 +327,18 @@ That same depth is the node's **"Version N"**, so shared ancestors read the same
 for a linear history it is identical to `friendly.ts`'s positional `versionNumbers()` (still used
 by the legacy graph and Inspector). Two lanes can therefore both show "Version 5" — the lane
 color and the branch name in the caption disambiguate.
+
+`buildVersionMap` also returns `currentLane` — the lane the current branch sits on, read off the
+current tip's *placement* rather than a branch-name map (a branch created but not yet committed on
+has no commits of its own and shares its parent's tip node, whose lane is the right answer) — used
+by [Branch color](#version-map) above and by the [pending-version preview](#pending-version-preview)
+below. [`scripts/checkVersionMap.mjs`](../scripts/checkVersionMap.mjs) pins all of this (trunk stays
+on lane 0 standing on either branch, main's next commit lands in the same column as the fork beside
+it, the trunk-tip-outside-the-drawn-set fallback, and the gutter-bend corner-radius case below) —
+`buildVersionMap` is pure and its only import is `import type` (erased), so Node's native TS
+stripping runs the `.ts` file directly with no test runner or config. Wired into `npm run build`
+(`node scripts/checkVersionMap.mjs` runs after `tsc`, before `vite build`), so a layout regression
+fails the build instead of shipping silently.
 
 ### Drawing the line
 
@@ -326,15 +364,27 @@ line.
 A lane-crossing connector carries per-edge `pathOptions`:
 
 ```ts
-{ offset: NODE_PITCH / 2, stepPosition: toLane > fromLane ? 0 : 1, borderRadius: 16 }
+{ offset: STEP_GAP, stepPosition: bendFraction(dx, fork, NODE_PITCH, STEP_GAP), borderRadius: 16 }
 ```
 
-`offset` of half a column puts the bend in the **middle of the gutter**, clear of the node's
-caption and chips — the default 20 would descend straight through them. `stepPosition` then picks
-which gutter: `0` bends right after the source, `1` right before the target, always next to the
-end on the shallower lane. So a branch drops out of the spine at the version it started from and
-climbs back in at the version it merges into, instead of running alongside the spine for half a
-column (the default `0.5`) and doubling it up.
+The bend needs to land in the **middle of the gutter next to the end on the shallower lane** — so
+a branch drops out of the spine at the version it started from and climbs back in at the version
+it merges into, clear of the node's caption and chips, and never runs alongside the spine (which
+doubles the line). `stepPosition` is a *fraction* of the run between the two gap points, not an
+absolute x, so [`bendFraction`](../src/lib/versionMap.ts) (in `versionMap.ts` rather than the
+panel, so the layout check can call it) solves for the fraction that puts the descent at that
+gutter midpoint given `dx` (the horizontal span between the two connector dots), `NODE_PITCH` and
+the gap `STEP_GAP` each end runs straight off its handle before it may bend.
+
+`STEP_GAP` (20px) is deliberately small, and deliberately *not* half the gutter width. An earlier
+version aimed the gap point itself at the bend (`offset: NODE_PITCH / 2`, `stepPosition: fork ? 0
+: 1`) — visually identical, but not equivalent: `getSmoothStepPath` only drops a gap point when it
+lands *exactly* on the bend x, and the measured handle positions carry float error, so on the far
+end it sometimes didn't. The stray point a hair from the corner collapsed that corner's radius to
+~0 — one bend rounded, the other square. Keeping the gap points well clear of the bend (small
+`STEP_GAP`) means both corners always get the full radius regardless of that float error;
+`scripts/checkVersionMap.mjs` pins the corner radius on both ends for a fork, a one-column merge,
+and a three-column merge.
 
 That connector's stroke is a **gradient** between the two lanes' colors, so a fork fades out of
 its parent branch's color and a merge fades back into the color it joins. `LaneGradients` emits
@@ -348,16 +398,59 @@ own color; which is also what makes the short stretch it shares with the spine b
 invisible. An `objectBoundingBox` gradient would smear the transition across the entire path and
 tint that shared stretch.
 
-The map **draws** branches; it does not act on them. Create/switch/merge/delete still live only
-in the legacy Branches panel, pending a floating action bar.
+### Branch actions & pick-a-version mode
+
+The map used to only *draw* branches — create/switch/merge/delete lived solely in the legacy
+Branches panel. `MapActionBar` (a React Flow `<Panel position="top-left">`, clear of the
+bottom-right minimap; `nopan`, same reason `VersionNode`'s thumbnail carries it) now puts those
+same actions on the canvas: one `Menu` whose `selected`/`detail`/hover-revealed `action`/`footer`
+slots are exactly the legacy Branches panel's row model (switch by selecting, merge/delete via the
+row's hover actions, "New branch…" in the footer), so it needed no new primitive — just
+[`useBranchActions`](../src/components/vcs/useBranchActions.tsx) (see the [`branches`
+view](#sidebar-views) above) wired to a second call site.
+
+Alongside it sits the one action only the map can offer: **"Start a line here…"** enters a
+**pick-a-version mode** where the next node click forks a branch at that version, via
+`create_branch_at` — written, tested and unreachable in the backend until now, since nothing else
+in the app is a version picker. Pick mode is one boolean (`picking`) and `VersionNode` needs no
+notion of it: the node always calls whatever it was handed as `data.onOpen`, so entering pick mode
+just swaps that callback (`picking ? onPick : onOpen`) rather than teaching the node a new state.
+Escape and the bar's own "Cancel" both leave it. `onPick` calls
+`actions.askCreate(id, layout.placed.get(id)?.version)` — `useBranchActions`'s `askCreate` takes an
+optional `commit`/`version` pair, which `CreateBranchModal` uses to fork from that commit instead
+of a base branch (the base-branch picker is hidden when `commit` is set — the backend takes one or
+the other, not both) and to word its copy around "version N" rather than "the current branch's
+latest".
+
+### Pending-version preview
+
+When the working tree is dirty, the map draws one extra, non-commit node — `PreviewNode` in
+[`VersionNode.tsx`](../src/components/vcs/VersionNode.tsx), node type `"preview"` — one column past
+the end of the current lane: a dashed empty frame where the composite would go, a **hollow**
+connector dot, "Version N+1 · not saved yet", the branch chip, and a single dashed "Unsaved
+changes" chip, reached by a dashed edge off the tip. Clicking it jumps to the Changes tab. There is
+exactly **one** of these and it only ever sits on the current lane — there is one working tree, so
+a per-branch preview would be a fiction the backend can't back.
+
+It shows no composite and no per-layer chips deliberately: both would need `working_diff`, which
+is `run_heavy`, uncached, and — since the map is [mounted for the shell's whole
+lifetime](#version-map) — would refire on every `refreshNonce` bump in *every* view. The dirty flag
+instead comes from the shell's single `scan_repository` (`dirty` prop, `workingItems.length > 0`),
+which is one `stat`. It counts as a map citizen for fit-view, the minimap (its node `data` carries
+a `laneColor` like any real node) and "jump to latest", but **not** for pick mode — its callback is
+always `onShowChanges`, never the panel's `onNodeClick`, so it can't be forked from; `picking` only
+dims it. Its column is the lane's **last** column + 1, not the tip's, since `buildVersionMap`'s
+collision guard can shift a node right of its own generation depth, so the tip isn't reliably the
+rightmost thing on its own lane — off by a column at worst, never overlapping.
 
 **Legacy version history.** The old **History** and **Branches** Sidebar views are still there but
 hidden behind Settings → Appearance → "Legacy version history"
 ([`lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx), default **off**). `ActivityBar` filters
 those two icons on it, and `RepoShell` snaps back to the map if the toggle goes off while you're
-standing on one, so you can't be stranded on a view with no icon. `CommitGraph`/`BranchesPanel`/
-`lib/graph.ts` are untouched — branch create/switch/merge/delete still live only in the Branches
-panel. The **Performance** tab rides the same toggle: with Legacy off there's no commit selection
+standing on one, so you can't be stranded on a view with no icon. `CommitGraph`/`lib/graph.ts` are
+untouched; `BranchesPanel` itself now shares its actions with the map's `MapActionBar` via
+`useBranchActions` (see [Branch actions & pick-a-version mode](#branch-actions--pick-a-version-mode)
+above) rather than owning them outright. The **Performance** tab rides the same toggle: with Legacy off there's no commit selection
 left to drive a diff viewer, so `AppShell`'s `perfShowsMap` flag shows the map beside the stats
 Sidebar instead of Main Panel + Inspector, reusing the same persistent `VersionMapPanel` instance
 above. Legacy on restores the old diff-viewer layout there, unchanged.
@@ -548,10 +641,12 @@ AppShell (→ WelcomeShell with no repository, else RepoShell)
 │                                       └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
 ├─ Sidebar ─ DockerPanel ─┬─ history*  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │  (absent on "map")      ├─ changes   → ChangesPanel ─ FileStatusChip
-│                         ├─ branches* → BranchesPanel ─ BranchBadge + BranchDialogs (create/save-first modals)
+│                         ├─ branches* → BranchesPanel ─ BranchBadge + useBranchActions (dialogs)
 │                         └─ performance → PerformancePanel (summary + per-version cards + recent ops)
 ├─ VersionMapPanel ─ ReactFlowProvider ─┬─ VersionNode (× one per commit — thumbnail, connector dot, layer chips)
-│  (mounted once — see Version Map)     └─ CommitDrilldown (open node) → MainPanel/DiffView, same as below
+│  (mounted once — see Version Map)     ├─ PreviewNode (pending-changes preview, only while dirty)
+│                                       ├─ MapActionBar (switch/merge/delete/create + pick-a-version, via useBranchActions)
+│                                       └─ CommitDrilldown (open node) → MainPanel/DiffView, same as below
 │                                          + its own toggleable Inspector (open by default)
 ├─ MainPanel ─ DiffView ──┬─ art     → ArtDiffView ─┬─ LayerStackPanel ─ FileStatusChip
 │                         │          (+ 1st palette)  ├─ ArtCanvas        (side-by-side)
@@ -575,7 +670,8 @@ On the Map tab (and Performance without Legacy), `VersionMapPanel` replaces Main
 brings the Inspector back, scoped to that drilldown rather than shared with the legacy layout's.
 
 `StashDialogs.tsx` (`SetAsideModal`, `PickStashModal`, `StashConflictModal`) is shared between
-`Sidebar`'s panel-options menu and `BranchesPanel`/`Sidebar`'s save-first prompt; `SettingsModal`
+`Sidebar`'s panel-options menu and `useBranchActions`'s save-first prompt (in turn shared by
+`BranchesPanel`, `Sidebar`'s History branch switcher, and the map's `MapActionBar`); `SettingsModal`
 reuses its `stashTitle`/`stashSummary` helpers for the set-aside shelf rows.
 
 The whole tree is wrapped in `ToastProvider` → `RepositoryProvider` → `ThemeProvider` →
