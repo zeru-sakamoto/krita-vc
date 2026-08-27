@@ -3,9 +3,13 @@
 //! to commit/scan/branch without going through the desktop app's IPC.
 //!
 //! Usage: kvc <status|commit|branches|switch|create-branch|discard|stash|stash-pop|stash-list|check>
-//!            --repo <path> [flags...]
+//!            --repo <path to a .kra> [flags...]
 //! Every subcommand prints one JSON object to stdout on success, or
 //! `{"error": "..."}` to stderr with a non-zero exit code on failure.
+//!
+//! `--repo` takes the path to a **`.kra` document**, not a folder — one document is one history.
+//! The flag name is unchanged because the Krita plugin passes whatever it has; the engine
+//! resolves the document's store (normally `<folder>/.kvc/<slug>/`) from the path itself.
 
 use krita_vc_lib::branch;
 use krita_vc_lib::commands::stash_dtos;
@@ -141,6 +145,7 @@ fn run_status(flags: &HashMap<String, String>) -> Result<String, String> {
     // process: `open_light` already read the shelf and branches.json, so both are free here,
     // whereas a second `kvc branches` spawn would re-parse the whole commit log to get them.
     Ok(json!({
+        "document": repo.doc.relpath,
         "branch": repo.branches.current,
         "branches": branch_list(&repo),
         "changes": changes,

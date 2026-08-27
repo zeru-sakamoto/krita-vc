@@ -6,21 +6,22 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KvcError {
-    #[error("not a .kvc repository: {0}")]
+    #[error("not tracked yet: {0}")]
     NotARepo(PathBuf),
 
-    #[error("a .kvc repository already exists at {0}")]
+    #[error("already tracked: {0}")]
     AlreadyRepo(PathBuf),
 
-    #[error(
-        "cannot create a repository here — {0} is already a .kvc repository above this folder"
-    )]
-    NestedRepo(PathBuf),
+    #[error("only Krita documents (.kra) can be tracked: {0}")]
+    Unsupported(PathBuf),
 
-    #[error(
-        "cannot create a repository here — {0} inside this folder is already a .kvc repository"
-    )]
-    ContainsRepo(PathBuf),
+    // Distinct from `NotARepo` on purpose, and the distinction is load-bearing: `NotARepo` means
+    // "never versioned", which the UI answers by offering to start tracking. Answering it that
+    // way for a document whose history is merely on a drive that isn't plugged in would create an
+    // empty store and orphan every version the artist saved. The "history isn't reachable" prefix
+    // is matched by the frontend — keep it stable.
+    #[error("history isn't reachable: the version history is kept in {0}, which isn't available right now")]
+    StoreUnreachable(PathBuf),
 
     #[error("corrupted or unreadable .kra archive: {0}")]
     CorruptZip(String),

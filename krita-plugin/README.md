@@ -40,14 +40,15 @@ stays in the desktop app.
 
 ## Using it
 
-Open a `.kra` file that lives inside a folder already tracked by the desktop app (i.e.
-some ancestor folder has a `.kvc/` directory). The docker shows the current branch, the
-working-tree changelist, and a message box with **Commit** and **⚡ Checkpoint** (a
-one-tap commit with an auto-generated "Checkpoint HH:MM" message).
+Open a `.kra` file the desktop app is already tracking. Each artwork has its own history,
+kept in the hidden `.kvc/` folder beside it — so the docker follows the document you're
+working on, not a folder. It shows the current branch, what's changed, and a message box with
+**Commit** and **⚡ Checkpoint** (a one-tap commit with an auto-generated "Checkpoint HH:MM"
+message).
 
 **You don't need to press Ctrl+S first.** Versions are built from what's on disk, so the
-docker saves for you: clicking into the panel saves every open document in the repository
-that has unsaved changes, and Commit and Checkpoint save before they capture anything. The
+docker saves for you: clicking into the panel saves the tracked document if it has unsaved
+changes, and Commit and Checkpoint save before they capture anything. The
 **⟳** button does the same on demand, then rescans. So the changelist describes your canvas,
 not your last manual save, and a commit can't quietly miss the last ten minutes of painting.
 
@@ -94,7 +95,7 @@ failed.
   the one built in step 1 (not the main `krita-vc`/`krita-vc.exe` app binary, which is a
   different target).
 - **"Krita VC tracks .kra documents"** — the active document is a `.png`/`.jpg`/etc. Only
-  `.kra` files are versioned; save it as `.kra` inside the tracked folder first.
+  `.kra` files are versioned; save it as `.kra` and start tracking it in the desktop app.
 - **"repository is busy (locked by another process): \<repo\> — \<operation\> for \<age\>"** —
   the desktop app or another `kvc` invocation is genuinely mid-write right now; the message
   names which repo, what it's doing, and how long. Just retry once it finishes. Nothing to
@@ -117,12 +118,12 @@ and `pykrita/kritavc/` from the resource folder.
 
 - Commit and Checkpoint are disabled only when nothing is ticked. The docker saves your
   documents for you (see "Using it"), so an unsaved `.kra` is no longer a reason to refuse.
-- Saving only touches `.kra` documents inside the repository that Krita reports as modified.
+- Saving only touches the tracked `.kra` document, and only when Krita reports it modified.
   A clean document is never rewritten, so focusing the panel with nothing to save costs
-  nothing, and a `.png` you happen to have open in the same folder is left alone.
+  nothing, and anything else you have open — another artwork, a `.png` — is left alone.
 - Author name is a plugin-local setting (Krita has no shared login with the desktop
   app); it defaults to `"You"`, matching the desktop app's own fallback.
-- The changelist can include palette files (`.gpl`/`.kpl`/`.aco`/`.ase`) sitting next to
-  your art, not just `.kra` documents — those are tracked too, even though the docker only
-  appears when a `.kra` is active. Untick them if you don't want them in a version.
+- Standalone palette files (`.gpl`/`.kpl`/`.aco`/`.ase`) are not tracked. A `.kra`'s own
+  embedded document palettes still show up in the desktop app's diffs, which is where they
+  mattered.
 - `python krita-plugin/test_kvc_client.py` runs the client's self-check (no Krita needed).

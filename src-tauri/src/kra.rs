@@ -1209,7 +1209,7 @@ pub fn layer_raster(
         refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
     let key = raster_cache_key(&entry_path, &mut key_tiles, width, height, default_pixel);
     if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+        let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &png);
         return Ok(Some(LayerRaster { url, png, key }));
     }
     // Reconstruct + LZF-decode tiles in parallel (nested rayon inside the per-layer par_iter is
@@ -1245,7 +1245,7 @@ pub fn layer_raster(
     let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
     let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
     crate::raster::cache_write(&cache_dir, &key, &png);
-    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &png);
     Ok(Some(LayerRaster { url, png, key }))
 }
 
@@ -1669,13 +1669,11 @@ impl WorkingKra {
         }) else {
             return Ok(None);
         };
-        // The repo root is two levels up from `.kvc/cache` — derived here so the
-        // test-facing signature (cache_dir only) stays unchanged.
-        let root = cache_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(cache_dir)
-            .to_path_buf();
+        // The store dir (holding `cache/`) is one level up from `cache_dir` — derived here so
+        // the test-facing signature (cache_dir only) stays unchanged. Must match what
+        // `register_served_repo` registers (`repo.store`), or `raster_url`'s hex-encoded path
+        // won't resolve and the raster silently 404s as a broken image.
+        let store = cache_dir.parent().unwrap_or(cache_dir).to_path_buf();
         // See `default_pixel_rgba`'s doc comment: the sibling `.defaultpixel` entry fills
         // whatever the tile records don't cover.
         let default_pixel = self
@@ -1702,7 +1700,7 @@ impl WorkingKra {
                     width,
                     height,
                     cache_dir,
-                    &root,
+                    &store,
                     default_pixel,
                 )
             }
@@ -1721,7 +1719,7 @@ impl WorkingKra {
                     width,
                     height,
                     cache_dir,
-                    &root,
+                    &store,
                     default_pixel,
                 )
             }
@@ -1742,7 +1740,7 @@ fn rasterize_working_tiles(
     width: i64,
     height: i64,
     cache_dir: &std::path::Path,
-    root: &std::path::Path,
+    store: &std::path::Path,
     default_pixel: Option<[u8; 4]>,
 ) -> Result<Option<LayerRaster>> {
     let (tw, th, ps) = tile_dims(header);
@@ -1756,7 +1754,7 @@ fn rasterize_working_tiles(
         .collect();
     let key = raster_cache_key(entry_path, &mut key_tiles, width, height, default_pixel);
     if let Some(png) = crate::raster::cache_read(cache_dir, &key) {
-        let url = crate::raster::raster_url(root, cache_dir, &key, &png);
+        let url = crate::raster::raster_url(store, cache_dir, &key, &png);
         return Ok(Some(LayerRaster { url, png, key }));
     }
     // LZF-decode tiles in parallel, blit serially (same pattern as the committed path).
@@ -1779,7 +1777,7 @@ fn rasterize_working_tiles(
     let (capped, cw, ch) = crate::raster::cap_rgba(&canvas, width as u32, height as u32);
     let png = crate::raster::rgba_to_png(&capped, cw, ch)?;
     crate::raster::cache_write(cache_dir, &key, &png);
-    let url = crate::raster::raster_url(root, cache_dir, &key, &png);
+    let url = crate::raster::raster_url(store, cache_dir, &key, &png);
     Ok(Some(LayerRaster { url, png, key }))
 }
 

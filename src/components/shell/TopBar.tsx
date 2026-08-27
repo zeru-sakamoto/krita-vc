@@ -2,15 +2,13 @@ import { useState } from "react";
 import {
   Archive,
   CaretDown,
-  FolderOpen,
-  FolderPlus,
   Minus,
+  PaintBrush,
   Plus,
   Square,
   Trash,
   X,
 } from "@phosphor-icons/react";
-import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
@@ -19,12 +17,11 @@ import { Radio } from "../ui/Radio";
 import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
-import { errorText } from "../vcs/BranchDialogs";
 import type { Repository } from "../../types";
 
 /**
- * Slim top bar spanning the window. Hosts the repository switcher (a folder the
- * user has designated). Local-only VCS — no remote/fetch/push affordances.
+ * Slim top bar spanning the window. Hosts the artwork switcher — one `.kra` the user has
+ * chosen to track. Local-only VCS — no remote/fetch/push affordances.
  * (DESIGN.md → Layout & App Shell → Top bar)
  */
 export function TopBar() {
@@ -32,7 +29,6 @@ export function TopBar() {
     useRepository();
   const { customTitleBar } = useWindowChrome();
   const [modal, setModal] = useState<
-    | { kind: "create" }
     | { kind: "remove"; repo: Repository }
     | { kind: "backup-all-result"; total: number; failed: string[] }
     | null
@@ -50,13 +46,13 @@ export function TopBar() {
     label: repo.name,
     detail: repo.path,
     selected: repo.id === currentId,
-    icon: <FolderOpen size={15} weight="regular" />,
+    icon: <PaintBrush size={15} weight="regular" />,
     onSelect: () => setCurrent(repo.id),
     action: (
       <button
         type="button"
-        title="Remove repository"
-        aria-label={`Remove ${repo.name}`}
+        title="Stop tracking this artwork"
+        aria-label={`Stop tracking ${repo.name}`}
         onClick={(e) => {
           e.stopPropagation();
           setModal({ kind: "remove", repo });
@@ -70,20 +66,14 @@ export function TopBar() {
 
   const footer: MenuItem[] = [
     {
-      id: "create-repository",
-      label: "Create repository",
-      icon: <FolderPlus size={15} weight="regular" />,
-      onSelect: () => setModal({ kind: "create" }),
-    },
-    {
       id: "browse-repository",
-      label: "Browse existing repository…",
+      label: "Track an artwork…",
       icon: <Plus size={15} weight="regular" />,
       onSelect: browseRepository,
     },
     {
       id: "backup-all-repositories",
-      label: "Back up all repositories…",
+      label: "Back up all artworks…",
       icon: <Archive size={15} weight="regular" />,
       separator: true,
       onSelect: backupAll,
@@ -98,7 +88,7 @@ export function TopBar() {
       <img src="/logo.svg" alt="" className="h-5 w-5 shrink-0" />
       <div data-tour-id="repo-switcher" className="flex items-center">
         <Menu
-          trigger={() => <RepoTrigger name={current?.name ?? "Open a repository…"} />}
+          trigger={() => <RepoTrigger name={current?.name ?? "Track an artwork…"} />}
           items={items}
           footer={footer}
           minWidth={240}
@@ -107,7 +97,6 @@ export function TopBar() {
 
       {showWindowControls && <WindowControls />}
 
-      {modal?.kind === "create" && <CreateRepoModal onClose={() => setModal(null)} />}
       {modal?.kind === "remove" && (
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
@@ -139,7 +128,7 @@ function BackupAllResultModal({
       footer={<Button onClick={onClose}>Close</Button>}
     >
       <p className="text-[13px] text-text">
-        {succeeded} of {total} repositor{total === 1 ? "y" : "ies"} backed up.
+        {succeeded} of {total} artwork{total === 1 ? "" : "s"} backed up.
       </p>
       {failed.length > 0 && (
         <ul className="mt-2 flex flex-col gap-1 font-mono text-[12px] text-danger">
@@ -193,101 +182,37 @@ function WindowControls() {
 function RepoTrigger({ name }: { name: string }) {
   return (
     <span
-      title="Switch repository"
+      title="Switch artwork"
       className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[13px] text-text transition-colors hover:bg-state-hover"
     >
-      <FolderOpen size={15} weight="regular" className="text-text-muted" />
+      <PaintBrush size={15} weight="regular" className="text-text-muted" />
       <span className="max-w-55 truncate font-medium">{name}</span>
       <CaretDown size={12} className="text-text-muted" />
     </span>
   );
 }
 
-function CreateRepoModal({ onClose }: { onClose: () => void }) {
-  const { createRepository } = useRepository();
-  const [name, setName] = useState("");
-  const [parent, setParent] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const pickParent = async () => {
-    // No native picker outside the desktop shell.
-    if (!inTauri()) return;
-    const picked = await open({ directory: true, title: "Choose where to create the repository" });
-    if (typeof picked === "string") setParent(picked);
-  };
-
-  const create = async () => {
-    if (!name.trim() || !parent || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await createRepository(parent, name);
-      onClose();
-    } catch (e) {
-      setError(errorText(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal
-      title="Create repository"
-      onClose={onClose}
-      footer={
-        <>
-          <Button onClick={onClose}>Cancel</Button>
-          <Button variant="primary" disabled={!name.trim() || !parent || busy} onClick={create}>
-            {busy ? "Creating…" : "Create"}
-          </Button>
-        </>
-      }
-    >
-      <label className="mb-1 block text-[12px] text-text-muted">Repository name</label>
-      <input
-        autoFocus
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="my-illustration"
-        className="mb-3 w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
-      />
-      <label className="mb-1 block text-[12px] text-text-muted">Location</label>
-      <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 truncate inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text">
-          {parent ? `${parent}` : <span className="text-text-muted">No folder chosen</span>}
-        </span>
-        <Button onClick={pickParent}>Choose…</Button>
-      </div>
-      {parent && name.trim() && (
-        <p className="mt-2 truncate font-mono text-[11px] text-text-muted">
-          Creates: {parent}/{name.trim()}
-        </p>
-      )}
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
-    </Modal>
-  );
-}
-
 function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => void }) {
   const { removeRepository } = useRepository();
-  const [deleteFolder, setDeleteFolder] = useState(false);
-  const [confirmPath, setConfirmPath] = useState("");
+  const [deleteHistory, setDeleteHistory] = useState(false);
+  const [confirmName, setConfirmName] = useState("");
   const [busy, setBusy] = useState(false);
-  // Set only if a folder delete fell back to a permanent one (Recycle Bin unavailable) —
-  // then the modal stays open to surface that instead of closing silently.
+  // Set only if the delete fell back to a permanent one (Recycle Bin unavailable) — then the
+  // modal stays open to surface that instead of closing silently.
   const [fallbackWarning, setFallbackWarning] = useState(false);
 
-  // Last two path segments (parent\repo) — enough to confirm intent without typing the full path
-  const shortPath = repo.path.split(/[\\/]/).filter(Boolean).slice(-2).join("\\");
-  const canConfirm = !busy && (!deleteFolder || confirmPath.replace(/\//g, "\\") === shortPath);
+  // Typing the artwork's name is the confirmation. Deleting history is unrecoverable and the
+  // artwork keeps looking perfectly fine afterwards, so there's nothing to notice if it was a
+  // misclick — unlike the folder delete this replaced, which took the art with it and so at
+  // least announced itself.
+  const canConfirm = !busy && (!deleteHistory || confirmName.trim() === repo.name);
 
   const remove = async () => {
     if (!canConfirm) return;
     setBusy(true);
     try {
-      const usedTrash = await removeRepository(repo.id, deleteFolder);
-      if (deleteFolder && !usedTrash) {
+      const usedTrash = await removeRepository(repo.id, deleteHistory);
+      if (deleteHistory && !usedTrash) {
         setFallbackWarning(true);
       } else {
         onClose();
@@ -305,8 +230,8 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
         footer={<Button onClick={onClose}>Close</Button>}
       >
         <p className="text-[13px] text-text">
-          The Recycle Bin wasn’t available, so the folder was deleted permanently instead of moved
-          there. It can’t be recovered from Explorer.
+          The Recycle Bin wasn’t available, so the version history was deleted permanently instead
+          of moved there. It can’t be recovered from Explorer. Your artwork file is untouched.
         </p>
       </Modal>
     );
@@ -314,18 +239,18 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
 
   return (
     <Modal
-      title={`Remove “${repo.name}”?`}
+      title={`Stop tracking “${repo.name}”?`}
       onClose={onClose}
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
           <Button
-            variant={deleteFolder ? "destructive" : "default"}
+            variant={deleteHistory ? "destructive" : "default"}
             disabled={!canConfirm}
             onClick={remove}
           >
-            {deleteFolder ? <Trash size={14} /> : null}
-            {deleteFolder ? "Delete folder" : "Remove from list"}
+            {deleteHistory ? <Trash size={14} /> : null}
+            {deleteHistory ? "Delete history" : "Remove from list"}
           </Button>
         </>
       }
@@ -334,44 +259,46 @@ function RemoveRepoModal({ repo, onClose }: { repo: Repository; onClose: () => v
         <label className="flex items-start gap-2 text-[13px] text-text">
           <Radio
             name="remove-mode"
-            checked={!deleteFolder}
-            onChange={() => setDeleteFolder(false)}
+            checked={!deleteHistory}
+            onChange={() => setDeleteHistory(false)}
             className="mt-0.5"
           />
           <span>
             Remove from list only
             <span className="block text-[11px] text-text-muted">
-              Forgets this repository here. Files and version history stay on disk.
+              Forgets this artwork here. The file and its version history stay on disk, and you can
+              add it back at any time.
             </span>
           </span>
         </label>
         <label className="flex items-start gap-2 text-[13px] text-text">
           <Radio
             name="remove-mode"
-            checked={deleteFolder}
-            onChange={() => setDeleteFolder(true)}
+            checked={deleteHistory}
+            onChange={() => setDeleteHistory(true)}
             tone="danger"
             className="mt-0.5"
           />
           <span>
-            Delete folder
+            Delete version history
             <span className="block text-[11px] text-text-muted">
-              Moves the entire folder and all its contents to the Recycle Bin.
+              Moves every saved version of this artwork to the Recycle Bin. The artwork file itself
+              is never touched — only its history.
             </span>
           </span>
         </label>
       </fieldset>
 
-      {deleteFolder && (
+      {deleteHistory && (
         <div className="mt-3">
           <label className="mb-1 block text-[12px] text-text-muted">
-            Type <span className="font-mono text-text">{shortPath}</span> to confirm:
+            Type <span className="font-mono text-text">{repo.name}</span> to confirm:
           </label>
           <input
             autoFocus
-            value={confirmPath}
-            onChange={(e) => setConfirmPath(e.target.value)}
-            placeholder={shortPath}
+            value={confirmName}
+            onChange={(e) => setConfirmName(e.target.value)}
+            placeholder={repo.name}
             className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text placeholder:text-text-muted focus:border-danger !outline-none"
           />
         </div>

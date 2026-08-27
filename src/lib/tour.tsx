@@ -32,7 +32,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     tourId: "refresh",
     title: "Rescan for changes",
-    body: "If a change you made doesn't show up, click here to check the folder again.",
+    body: "If a change you made doesn't show up, click here to check the artwork again.",
     view: "changes",
   },
   {
@@ -42,15 +42,9 @@ export const TOUR_STEPS: TourStep[] = [
     view: "changes",
   },
   {
-    tourId: "changes-staged",
-    title: "Staged files",
-    body: "Files you move here are what get included when you commit a new version.",
-    view: "changes",
-  },
-  {
     tourId: "changes-unstaged",
-    title: "Changes",
-    body: "Everything you've edited but haven't staged yet — hover a file to stage it or discard just that one.",
+    title: "What changed",
+    body: "The layers you've painted, added or removed since your last saved version.",
     view: "changes",
   },
   {
@@ -61,8 +55,8 @@ export const TOUR_STEPS: TourStep[] = [
   },
   {
     tourId: "commit-button",
-    title: "Commit version",
-    body: "Saves a new version from your staged files — or everything, if nothing's staged.",
+    title: "Save this version",
+    body: "Records the artwork as it is right now, so you can always come back to it.",
     view: "changes",
   },
   {
@@ -80,19 +74,13 @@ export const TOUR_STEPS: TourStep[] = [
   {
     tourId: "panel-option-discard-all",
     title: "Discard current changes",
-    body: "Reverts every changed file to its last saved version. Staged files aren't touched.",
-    view: "changes",
-  },
-  {
-    tourId: "panel-option-stash-staged",
-    title: "Set aside staged files",
-    body: "Parks just your staged files off to the side without committing them.",
+    body: "Reverts this artwork to its latest saved version. Anything painted since is lost.",
     view: "changes",
   },
   {
     tourId: "panel-option-stash-all",
-    title: "Set aside everything",
-    body: "Parks all your current changes off to the side, clearing your working files for now.",
+    title: "Set this aside",
+    body: "Parks your current changes off to the side without saving a version, so you can come back to them later.",
     view: "changes",
   },
   {

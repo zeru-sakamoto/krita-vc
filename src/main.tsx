@@ -8,6 +8,9 @@ import "./styles/global.css";
 // the default Charcoal palette for a frame.
 applyTheme(readTheme());
 
+// Suppress the webview's native right-click menu app-wide.
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <App />

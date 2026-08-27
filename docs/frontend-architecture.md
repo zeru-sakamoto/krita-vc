@@ -57,7 +57,7 @@ how the map itself is one instance shared across both places.
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
-| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Repository switcher (folder the user designated); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
+| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Artwork switcher (one `.kra` the user chose to track — see [per-document-tracking.md](per-document-tracking.md)); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
 | Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `map` \| `history` \| `branches` \| `performance`). `history`/`branches` are filtered out unless [Legacy version history](#version-map) is on. The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **Legacy version history** toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). Absent on the Map tab. |
 | Version Map | [`VersionMapPanel`](../src/components/vcs/VersionMapPanel.tsx) | The default view — see [Version Map](#version-map). Replaces Main Panel + Inspector on the Map tab, and Main Panel + Inspector on Performance when Legacy is off. |
@@ -95,7 +95,7 @@ State lives in `RepoShell` and flows down via props:
 
 Data comes from the hooks in [`src/lib/repoData.ts`](../src/lib/repoData.ts) — `useCommits`
 (branch-scoped history), `useBranches` (local branches + current + tips), `useWorkingChanges`
-(the real `scan_repository` result + a UI-only `staged` flag per file), `useWorkingDiff`
+(the real `scan_repository` result — at most one entry, the tracked artwork), `useWorkingDiff`
 (working-tree visual diffs), `useArtLayers` (streamed per-layer rasters) — all keyed by the
 selected repository path and the shared `refreshNonce`. `useCommitDiff` (committed visual
 diffs) keys only on path + commit id: a commit's diff is immutable once made, so it never needs
@@ -129,9 +129,8 @@ refresh button. All six providers are mounted in [`App.tsx`](../src/App.tsx).
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
 (`Sidebar`), the art-diff canvas height (`ArtDiffView`), modal open/close state (`BranchesPanel`,
 `Sidebar`), and the diff view/compare/highlight controls (`ArtDiffView`). The working-tree items
-+ per-file staged flag are the one exception: `useWorkingChanges` (below) is called in `Sidebar`,
-not `ChangesPanel`, and passed down as props, since `Sidebar`'s "Discard current changes" action
-needs the same staged/unstaged split without a second scan.
+are the one exception: `useWorkingChanges` (below) is called in `Sidebar`, not `ChangesPanel`, and
+passed down as props, so the panel and the panel-options actions act on one scan.
 Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize.ts) hook
 (pointer-capture drag, clamped, persisted under a `krita-vc:` key).
 
@@ -159,16 +158,18 @@ history** is on; see [Version Map](#version-map) for what replaced them.
   `ResizeObserver` to draw this one overlay across non-adjacent rows. Selection drives the main
   panel.
 - **`changes`** — [`ChangesPanel`](../src/components/vcs/ChangesPanel.tsx): a "Saving to
-  `<BranchBadge>`" header (the current branch — a commit always lands on it), then working-tree
-  changes grouped Staged / Unstaged, with per-file and **Stage all / Unstage all** toggles.
-  Staging is **real**: `commit_snapshot`'s optional `paths` (`commit::commit_selected` in Rust)
-  restricts the commit to the staged relative paths, leaving the rest dirty. Hitting "Commit
-  version" with nothing staged, or with only some files staged, shows a confirm `Modal` first
-  (commit everything anyway / commit only the staged files) before calling through; all-staged
-  commits right away. Each row also has a **discard** button (reverts just that file to its last
-  saved version, behind a confirm modal); the sidebar's `…` menu adds "Discard current changes"
-  (all *unstaged* files at once — staged files are left alone), both backed by the repository
-  context's `discardChanges`. A failed commit's error message is local `commitError` state, reset
+  `<BranchBadge>`" header (the current branch — a commit always lands on it), then **the layers
+  that changed** since the last version. A store tracks one `.kra`, so the file list this panel
+  used to show would always be one row, and staging a subset of a one-file working tree means
+  nothing; what the artist wants to know is what moved in the painting. The rows come from
+  `useWorkingDiff`'s existing per-layer `change` — **no new backend command** — rolled up so a
+  changed group reads as one row with an "+N inside" count rather than spilling its children
+  (the backend enumerates layers with `.descendants()`, so children arrive as siblings of their
+  group with no parent link; the rollup is honest about being approximate for that reason).
+  The rows are **read-only**: choosing which layers go into a version needs a write path that
+  synthesizes a `.kra` holding only the ticked ones, and checkboxes that don't bind would be
+  worse than none. "Undo all" in the section header, and "Discard current changes" in the
+  sidebar's `…` menu, both revert the artwork via the repository context's `discardChanges`. A failed commit's error message is local `commitError` state, reset
   on repo or branch change (an effect keyed on `path`/`currentBranch.name`) — otherwise it outlives
   the commit it belongs to and, since `ChangesPanel` stays mounted across repo/branch switches,
   misleadingly reads as live on an unrelated one. While a commit or discard is in flight the staging controls lock,
@@ -371,9 +372,10 @@ two places:
 - **`Sidebar`'s panel-options `Menu`** (history + changes) is grouped into three
   divider-separated sections: undo/discard, then set-aside, then bring-back (`Menu` gained a
   `MenuItem.separator` flag — a rule above that row — since one `footer` group can only draw one
-  divider and this needs two). The two set-aside rows ("Set aside staged files" / "Set aside
-  everything") are **changes-view only**, since they act on the working tree, and are gated on
-  `commits.length` — same guard as undo, since there's no committed state to revert to otherwise.
+  divider and this needs two). The set-aside row ("Set this aside") is **changes-view only**,
+  since it acts on the working tree, and is gated on `commits.length` — same guard as undo, since
+  there's no committed state to revert to otherwise. (There were two rows here, staged and
+  everything; with one tracked artwork they became the same action.)
   The two bring-back rows ("Bring back latest" / "Bring back…") are `footer` items shown in
   **both** views, since you might be looking at History when you want a stash back.
 - **`SettingsModal`**'s "Set-aside shelf" section lists every stash (label/asset summary +
@@ -514,7 +516,7 @@ automatically.
 - [`TourOverlay`](../src/components/shell/TourOverlay.tsx) renders `null` when inactive. Spotlight
   targets are plain `data-tour-id` attributes: `IconButton` and `Menu`'s `MenuItem` both take an
   optional `tourId` prop that sets it, and a handful of other targets (the repo switcher, the
-  branch badge row, staged/unstaged sections, the commit-graph, the commit message/button) carry
+  branch badge row, the changed-layer list, the commit-graph, the commit message/button) carry
   `data-tour-id` directly on a wrapper — so no ref plumbing is needed to locate a step's target.
   The dim-with-a-hole effect is **four plain opaque `fixed` bands** tiling the viewport around the
   target rect (top/bottom/left/right) plus a fifth, transparent, non-interactive div over the hole

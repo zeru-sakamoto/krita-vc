@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
 import {
   ArrowCounterClockwise,
+  FolderOpen,
   Palette as PaletteIcon,
   SidebarSimple,
 } from "@phosphor-icons/react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
@@ -21,6 +23,7 @@ import {
 } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
+import { inTauri } from "../../lib/tauri";
 
 interface InspectorProps {
   commit: Commit | null;
@@ -115,7 +118,7 @@ export function Inspector({
   onSelectFile,
 }: InspectorProps) {
   const { artistMode } = useArtistMode();
-  const { rollbackToCommit, saving } = useRepository();
+  const { current, rollbackToCommit, saving } = useRepository();
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -193,8 +196,27 @@ export function Inspector({
                   </span>
                 </MetaRow>
                 <MetaRow label="File">
-                  <span className={["selectable", artistMode ? "" : "font-mono"].join(" ")}>
-                    {artistMode ? assetName(focusedFile) : focusedFile}
+                  <span className="flex min-w-0 items-center gap-1">
+                    <span
+                      className={[
+                        "selectable min-w-0 truncate",
+                        artistMode ? "" : "font-mono",
+                      ].join(" ")}
+                    >
+                      {artistMode ? assetName(focusedFile) : focusedFile}
+                    </span>
+                    {current && (
+                      <button
+                        type="button"
+                        title="Go to file"
+                        aria-label="Go to file"
+                        disabled={!inTauri()}
+                        onClick={() => void revealItemInDir(current.path)}
+                        className="shrink-0 rounded-button p-0.5 text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                      >
+                        <FolderOpen size={13} />
+                      </button>
+                    )}
                   </span>
                 </MetaRow>
               </div>
@@ -357,7 +379,7 @@ export function Inspector({
           <p className="text-[13px] leading-relaxed text-text-muted">
             {isTip
               ? "This discards any unsaved changes and restores your last saved version. No new version is recorded."
-              : "This copies that version's files into your working folder and saves the result as a new version. Nothing in your history is lost — you can always come back."}
+              : "This puts that version back on disk and saves the result as a new version. Nothing in your history is lost — you can always come back."}
           </p>
           {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
         </Modal>

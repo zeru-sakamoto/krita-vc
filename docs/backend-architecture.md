@@ -26,7 +26,8 @@ since there are two `[[bin]]` targets.
 
 ```text
 src/
-  repo.rs      .kvc/ on-disk layout, Repo struct (load/mutate/save), RepoLock, safe_join,
+  repo.rs      store layout, Repo struct (load/mutate/save; `root` = the folder holding the
+               tracked .kra, `store` = its history dir), store_dir_for, RepoLock, safe_join,
                decompression-bomb-capped archive reads
   scan.rs      working-tree walk (walkdir) vs index.json → U/M/D classification, is_supported
                tracking guardrail
@@ -69,7 +70,7 @@ commands.rs #[tauri::command]      bin/kvc.rs main()
       │  + cpu::install)                 │
       └──────────────┬───────────────────┘
                       ▼
-        RepoLock::acquire(op)   (mutating calls only; both callers share .kvc/kvc.lock)
+        RepoLock::acquire(op)   (mutating calls only; both callers share <store>/kvc.lock)
                       ▼
         Repo::open / open_light  →  engine fn (commit.rs / branch.rs / stash.rs / …)
                       ▼
@@ -101,7 +102,7 @@ would break that contract.
 Two independent mechanisms, solving different problems:
 
 - **`RepoLock`** ([`repo.rs`](../src-tauri/src/repo.rs)) — a real OS-level advisory lock
-  (`File::try_lock`, `LockFileEx`/`flock`) over `.kvc/kvc.lock`, taken by every **mutating** entry
+  (`File::try_lock`, `LockFileEx`/`flock`) over `<store>/kvc.lock`, taken by every **mutating** entry
   point in both the desktop app and the `kvc` CLI, so a plugin commit can't interleave with a
   desktop commit/switch/GC into a torn write. The engine itself has no internal locking — this is
   the only serialization point. Released automatically when the holding process's file handle
@@ -147,7 +148,7 @@ no GPL/copyleft dependency in the tree.
 | [tauri](https://github.com/tauri-apps/tauri) | 2.11.3 | MIT OR Apache-2.0 | App shell, IPC (`invoke`), window management |
 | [tauri-build](https://github.com/tauri-apps/tauri) | 2.6.3 | MIT OR Apache-2.0 | Build-time codegen for the Tauri app (build-dependency) |
 | [tauri-plugin-opener](https://github.com/tauri-apps/plugins-workspace) | 2.5.4 | MIT OR Apache-2.0 | Opening files/URLs with the OS default handler |
-| [tauri-plugin-dialog](https://github.com/tauri-apps/plugins-workspace) | 2.7.1 | MIT OR Apache-2.0 | Native folder/save pickers (repo Browse, backup export) |
+| [tauri-plugin-dialog](https://github.com/tauri-apps/plugins-workspace) | 2.7.1 | MIT OR Apache-2.0 | Native file/folder/save pickers (choosing a `.kra` to track, the store root, backup export) |
 | [serde](https://github.com/serde-rs/serde) | 1.0.228 | MIT OR Apache-2.0 | Serialization framework for every on-disk/DTO type |
 | [serde_json](https://github.com/serde-rs/json) | 1.0.150 | MIT OR Apache-2.0 | JSON state files (`index.json`, `branches.json`, …) and command DTOs |
 | [zip](https://github.com/zip-rs/zip2) | 2.4.2 | MIT | Reading/writing `.kra`/`.kpl` archives |
@@ -176,6 +177,6 @@ The npm side of the IPC boundary ([`package.json`](../package.json)) — see
 | Package | License | Used for |
 |---|---|---|
 | [@tauri-apps/api](https://github.com/tauri-apps/tauri) | MIT OR Apache-2.0 | `invoke`, window controls (custom title bar) |
-| [@tauri-apps/plugin-dialog](https://github.com/tauri-apps/plugins-workspace) | MIT OR Apache-2.0 | JS bindings for the native folder/save picker |
+| [@tauri-apps/plugin-dialog](https://github.com/tauri-apps/plugins-workspace) | MIT OR Apache-2.0 | JS bindings for the native file/folder/save picker |
 | [@tauri-apps/plugin-opener](https://github.com/tauri-apps/plugins-workspace) | MIT OR Apache-2.0 | JS bindings for opening files/URLs |
 | [@tauri-apps/cli](https://github.com/tauri-apps/tauri) | MIT OR Apache-2.0 | `npm run tauri` dev/build tooling (dev-dependency) |

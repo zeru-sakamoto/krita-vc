@@ -1,8 +1,26 @@
-//! `.kvc/` repository: on-disk layout, JSON state schema, and lifecycle (init / open).
+//! `.kvc/` document store: on-disk layout, JSON state schema, and lifecycle (init / open).
+//!
+//! **One `.kra` document = one history.** A document's store is entirely self-contained and
+//! lives beside its `.kra` in a shared, hidden container folder — so an art folder holding
+//! seven tracked paintings grows one `.kvc/` with seven independent stores inside it, not seven
+//! folders. Nothing is shared between them (deliberately: sharing `objects/` is what would
+//! force a project/document split and a repo-wide GC that can delete another document's blobs;
+//! cross-document tile dedup is worth roughly nothing, since dedup pays off *within* one
+//! painting's history).
 //!
 //! Layout:
 //! ```text
-//! .kvc/
+//! artfolder/
+//!   painting.kra
+//!   .kvc/                    hidden; holds README.txt and one store per tracked document
+//!     README.txt
+//!     painting-a3f9c1/       <- the store; `Repo::store` points here
+//! ```
+//!
+//! Inside one store:
+//! ```text
+//! <store>/
+//!   doc.json       which document this store belongs to (relpath, display name, created)
 //!   config.json    engine config (delta-chain threshold, tile size, cache budget)
 //!   index.json     committed head per tracked file (drives the scanner)
 //!   chains/        delta-stream versions, one shard per tracked file (drives storage/restore);
@@ -90,8 +108,9 @@ impl RepoLock {
     /// because Windows enforces a locked byte range against ordinary reads too (unlike POSIX
     /// `flock`, which is purely advisory) — a blocked caller reading `kvc.lock` directly would
     /// hit `ERROR_LOCK_VIOLATION`. The sidecar is never locked, so it's always readable.
-    pub fn acquire(root: &Path, op: &str) -> Result<Self> {
-        let path = kvc_dir(root).join("kvc.lock");
+    pub fn acquire(kra_path: &Path, op: &str) -> Result<Self> {
+        let store = store_dir_for(kra_path);
+        let path = store.join("kvc.lock");
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -100,11 +119,13 @@ impl RepoLock {
             .map_err(|e| io_at(&path, e))?;
         match file.try_lock() {
             Ok(()) => {
-                let _ = write_lock_info(root, op); // best-effort; never blocks the acquire
+                let _ = write_lock_info(&store, op); // best-effort; never blocks the acquire
                 Ok(RepoLock(file))
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(KvcError::Locked(
-                lock_holder_description(root, &lock_info_path(root)),
+                // Name the *artwork*, not the store — "painting.kra — committing for 3s" is
+                // what the artist can act on.
+                lock_holder_description(kra_path, &lock_info_path(&store)),
             )),
             Err(std::fs::TryLockError::Error(e)) => Err(io_at(&path, e)),
         }
@@ -113,13 +134,13 @@ impl RepoLock {
 // No `impl Drop`: dropping `File` closes the handle, and the OS releases the lock along with
 // it — including when the process is killed, which is exactly the case a marker file can't.
 
-fn lock_info_path(root: &Path) -> PathBuf {
-    kvc_dir(root).join("kvc.lock.info")
+fn lock_info_path(store: &Path) -> PathBuf {
+    store.join("kvc.lock.info")
 }
 
 /// Best-effort rewrite of the `kvc.lock.info` sidecar right after acquiring the real lock.
-fn write_lock_info(root: &Path, op: &str) -> std::io::Result<()> {
-    std::fs::write(lock_info_path(root), op)
+fn write_lock_info(store: &Path, op: &str) -> std::io::Result<()> {
+    std::fs::write(lock_info_path(store), op)
 }
 
 /// Best-effort "<repo> — <op> for <age>" detail for a `Locked` error: which repo, what the
@@ -194,20 +215,198 @@ fn verify_zip(dest: &Path, expected_entries: usize, expect_manifest: bool) -> Re
     Ok(())
 }
 
-pub fn kvc_dir(root: &Path) -> PathBuf {
-    root.join(KVC_DIR)
-}
-pub fn objects_dir(root: &Path) -> PathBuf {
-    kvc_dir(root).join("objects")
+pub fn objects_dir(store: &Path) -> PathBuf {
+    store.join("objects")
 }
 /// Content-addressed capped-raster cache (see `raster::cache_read`/`cache_write`). Created by
-/// `init`; writes `create_dir_all` lazily so repos from before the cache existed keep working.
-pub fn cache_dir(root: &Path) -> PathBuf {
-    kvc_dir(root).join("cache")
+/// `init`; writes `create_dir_all` lazily.
+pub fn cache_dir(store: &Path) -> PathBuf {
+    store.join("cache")
 }
 /// Per-file chain shards (see [`ChainStore`]).
-pub fn chains_dir(root: &Path) -> PathBuf {
-    kvc_dir(root).join("chains")
+pub fn chains_dir(store: &Path) -> PathBuf {
+    store.join("chains")
+}
+
+/// Which document a store belongs to. The durable record: `relpath` is the document's name
+/// within its folder, so a store is still identifiable after the app forgets about it, and a
+/// later rename can re-point by content hash without guessing from the directory name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocMeta {
+    /// The document's path relative to [`Repo::root`] — always a bare filename, since a store
+    /// always lives in the `.kvc/` beside its own document.
+    pub relpath: String,
+    pub display_name: String,
+    pub created_at: String,
+}
+
+/// Directory name for one document's store. The sanitised file stem keeps it recognisable in
+/// Explorer; the short hash keeps two documents whose names sanitise identically ("a b.kra" and
+/// "a-b.kra") from colliding.
+pub fn store_slug(kra_path: &Path, salt: &str) -> String {
+    let stem = kra_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut safe: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    safe.truncate(40);
+    let safe = safe.trim_matches('-').to_string();
+    let name = kra_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let digest = hash_bytes(format!("{salt}{name}").as_bytes());
+    if safe.is_empty() {
+        format!("doc-{}", &digest[..12])
+    } else {
+        format!("{safe}-{}", &digest[..6])
+    }
+}
+
+/// App-global override for where stores are kept, or `None` for the default (beside the
+/// document). Read from a plain JSON file rather than passed in per call, so the Tauri app and
+/// the `kvc` CLI — which never sees the app's settings — resolve the same store for the same
+/// document.
+pub fn custom_store_root() -> Option<PathBuf> {
+    if let Some(cached) = CUSTOM_ROOT.read().ok().and_then(|c| c.clone()) {
+        return cached;
+    }
+    let fresh = read_custom_store_root();
+    if let Ok(mut c) = CUSTOM_ROOT.write() {
+        *c = Some(fresh.clone());
+    }
+    fresh
+}
+
+/// `None` = not yet read; `Some(None)` = read, and there is no override.
+static CUSTOM_ROOT: RwLock<Option<Option<PathBuf>>> = RwLock::new(None);
+
+fn read_custom_store_root() -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(store_root_config_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let s = v.get("root")?.as_str()?.trim().to_string();
+    (!s.is_empty()).then(|| PathBuf::from(s))
+}
+
+/// Set (or clear, with `None`) the app-global store root. Existing stores are **not** moved —
+/// the setting only decides where the *next* document's store is created, and where documents
+/// created under it are looked up.
+pub fn set_custom_store_root(root: Option<&Path>) -> Result<()> {
+    let path = store_root_config_path()
+        .ok_or_else(|| KvcError::BadIndex("no application data directory".into()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+    }
+    let body = match root {
+        Some(r) => json_object_root(&r.to_string_lossy()),
+        None => "{}".to_string(),
+    };
+    std::fs::write(&path, body).map_err(|e| io_at(&path, e))?;
+    if let Ok(mut c) = CUSTOM_ROOT.write() {
+        *c = None; // re-read on next use
+    }
+    Ok(())
+}
+
+fn json_object_root(value: &str) -> String {
+    serde_json::json!({ "root": value }).to_string()
+}
+
+fn store_root_config_path() -> Option<PathBuf> {
+    Some(app_data_dir()?.join("storeRoot.json"))
+}
+
+/// Per-user application data directory, resolved without Tauri so the CLI shares it.
+fn app_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    Some(base?.join("com.zeru-sakamoto.krita-vc"))
+}
+
+/// Where this document's store lives. Default is the `.kvc/` container beside the document, so
+/// history travels with the art and lands on the same drive. A custom root moves every *new*
+/// store under one folder instead; the slug is then salted with the document's full path, since
+/// two folders can hold same-named paintings.
+pub fn store_dir_for(kra_path: &Path) -> PathBuf {
+    match custom_store_root() {
+        Some(root) => {
+            let salt = kra_path
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            root.join(store_slug(kra_path, &salt))
+        }
+        None => doc_root(kra_path)
+            .join(KVC_DIR)
+            .join(store_slug(kra_path, "")),
+    }
+}
+
+/// The working tree for a document: the folder holding it.
+pub fn doc_root(kra_path: &Path) -> PathBuf {
+    kra_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The document's name within [`doc_root`]. Always a bare filename.
+pub fn doc_relpath(kra_path: &Path) -> Result<String> {
+    kra_path
+        .file_name()
+        .map(|n| n.to_string_lossy().replace('\\', "/"))
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| KvcError::BadPath(kra_path.to_string_lossy().into_owned()))
+}
+
+const CONTAINER_README: &str = "\
+This folder holds the version history for the artwork in this folder.
+
+Each subfolder is one artwork's saved versions. Deleting this folder deletes every version
+of every artwork here — the artwork files themselves are not stored in here, but their
+history is, and it cannot be recovered afterwards.
+
+Krita VC creates and manages this folder. You do not need to open it.
+";
+
+/// Make the container folder unobtrusive: hidden in Explorer's default view, and carrying a
+/// note explaining what it is for anyone who turns hidden files on. Both best-effort — neither
+/// failing is a reason to refuse to create a store.
+fn dress_container(container: &Path) {
+    let readme = container.join("README.txt");
+    if !readme.exists() {
+        let _ = std::fs::write(&readme, CONTAINER_README);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        let wide: Vec<u16> = container
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                wide.as_ptr(),
+                FILE_ATTRIBUTE_HIDDEN,
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,7 +877,18 @@ impl Branches {
 
 /// Loaded repository state. Mutated in-memory then flushed with [`Repo::save`].
 pub struct Repo {
+    /// The **working tree**: the folder holding the tracked document. Everything the engine
+    /// writes back to disk is `safe_join`ed onto this.
     pub root: PathBuf,
+    /// The **store**: where this document's history lives — normally `<root>/.kvc/<slug>/`,
+    /// but anywhere at all if the user set a custom store root. Split from `root` because the
+    /// two stopped being the same folder when one art folder started holding several
+    /// independent histories.
+    pub store: PathBuf,
+    /// Which document this store tracks. Held separately from `index`, which only knows about
+    /// files that have been *committed* — a freshly-initialised store has an empty index but a
+    /// perfectly well-defined document.
+    pub doc: DocMeta,
     pub config: Config,
     pub index: Index,
     /// Delta chains, sharded per tracked file and loaded lazily — see [`ChainStore`].
@@ -720,86 +930,109 @@ struct BackupManifest {
 }
 
 impl Repo {
-    pub fn is_repo(root: &Path) -> bool {
-        kvc_dir(root).join("config.json").is_file()
+    /// Is this `.kra` already tracked? Addressed by the **document**, not its folder — an art
+    /// folder holding a tracked painting says nothing about its neighbours.
+    pub fn is_repo(kra_path: &Path) -> bool {
+        store_dir_for(kra_path).join("config.json").is_file()
     }
 
-    /// Create a fresh `.kvc/` in `root`.
-    pub fn init(root: &Path) -> Result<()> {
-        let kvc = kvc_dir(root);
-        if kvc.join("config.json").exists() {
-            return Err(KvcError::AlreadyRepo(root.to_path_buf()));
+    /// Start tracking one `.kra`, creating its store beside it.
+    pub fn init(kra_path: &Path) -> Result<()> {
+        if !crate::scan::is_supported(&kra_path.to_string_lossy()) {
+            return Err(KvcError::Unsupported(kra_path.to_path_buf()));
         }
-
-        // Ancestor guard: refuse to nest inside an existing repo. Just path-component
-        // walking + a config.json stat per ancestor, no directory traversal.
-        for ancestor in root.ancestors().skip(1) {
-            if Self::is_repo(ancestor) {
-                return Err(KvcError::NestedRepo(ancestor.to_path_buf()));
+        if !kra_path.is_file() {
+            return Err(KvcError::NotARepo(kra_path.to_path_buf()));
+        }
+        let store = store_dir_for(kra_path);
+        if store.join("config.json").exists() {
+            return Err(KvcError::AlreadyRepo(kra_path.to_path_buf()));
+        }
+        // The only "nesting" guard left: stores are siblings by design, so the folder-level
+        // ancestor/descendant walks the folder model needed are gone. A store either already
+        // exists for this exact document (above) or it doesn't.
+        if let Some(parent) = store.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+            // Only the default in-folder container gets hidden + a README; a user-chosen store
+            // root is a folder they picked themselves and expect to see.
+            if custom_store_root().is_none() {
+                dress_container(parent);
             }
         }
 
-        // Descendant guard: refuse to swallow an existing repo somewhere below root.
-        // root may not exist yet (created below via create_dir_all), so skip the walk
-        // entirely rather than let WalkDir error on a missing path.
-        if root.is_dir() {
-            let walker = walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_entry(|e| e.file_name() != KVC_DIR);
-            for entry in walker {
-                let entry = entry.map_err(walk_err)?;
-                if entry.depth() > 0 && entry.file_type().is_dir() && Self::is_repo(entry.path()) {
-                    return Err(KvcError::ContainsRepo(entry.path().to_path_buf()));
-                }
-            }
-        }
-
-        std::fs::create_dir_all(objects_dir(root)).map_err(|e| io_at(&kvc, e))?;
-        std::fs::create_dir_all(cache_dir(root)).map_err(|e| io_at(&kvc, e))?;
-        std::fs::create_dir_all(chains_dir(root)).map_err(|e| io_at(&kvc, e))?;
-        write_json(&kvc.join("config.json"), &Config::default())?;
-        write_json(&kvc.join("index.json"), &Index::default())?;
-        write_atomic(&kvc.join("commits.log"), b"")?;
-        write_json(&kvc.join("branches.json"), &Branches::default())?;
+        std::fs::create_dir_all(objects_dir(&store)).map_err(|e| io_at(&store, e))?;
+        std::fs::create_dir_all(cache_dir(&store)).map_err(|e| io_at(&store, e))?;
+        std::fs::create_dir_all(chains_dir(&store)).map_err(|e| io_at(&store, e))?;
+        let relpath = doc_relpath(kra_path)?;
+        write_json(
+            &store.join("doc.json"),
+            &DocMeta {
+                display_name: relpath.clone(),
+                relpath,
+                created_at: now_iso(),
+            },
+        )?;
+        write_json(&store.join("config.json"), &Config::default())?;
+        write_json(&store.join("index.json"), &Index::default())?;
+        write_atomic(&store.join("commits.log"), b"")?;
+        write_json(&store.join("branches.json"), &Branches::default())?;
         Ok(())
     }
 
-    /// Delete a repository folder (its whole tree, art files included), preferring the OS
-    /// Recycle Bin so an accidental delete stays recoverable from Explorer/Finder. Falls back to
-    /// a permanent `remove_dir_all` if the trash move fails (e.g. no trash provider on that
-    /// filesystem) so the action never gets stuck — the returned bool tells the caller which
-    /// happened. Guarded by [`is_repo`] so a stray path can't be wiped.
-    pub fn delete(root: &Path) -> Result<bool> {
-        if !Self::is_repo(root) {
-            return Err(KvcError::NotARepo(root.to_path_buf()));
+    /// Stop tracking a document: delete its **store**, preferring the OS Recycle Bin so an
+    /// accidental delete stays recoverable from Explorer/Finder. Falls back to a permanent
+    /// `remove_dir_all` if the trash move fails (e.g. no trash provider on that filesystem) so
+    /// the action never gets stuck — the returned bool tells the caller which happened.
+    ///
+    /// **Never touches the artwork.** Under the folder model this deleted the project tree, art
+    /// files included; a document's store holds only history, and destroying someone's painting
+    /// because they stopped versioning it would be indefensible.
+    pub fn delete(kra_path: &Path) -> Result<bool> {
+        if !Self::is_repo(kra_path) {
+            return Err(KvcError::NotARepo(kra_path.to_path_buf()));
         }
-        if trash::delete(root).is_ok() {
-            return Ok(true);
+        let store = store_dir_for(kra_path);
+        let trashed = if trash::delete(&store).is_ok() {
+            true
+        } else {
+            std::fs::remove_dir_all(&store).map_err(|e| io_at(&store, e))?;
+            false
+        };
+        // Take the container with it once the last store in it is gone, so an art folder that
+        // stops being versioned doesn't keep a hidden folder holding nothing but a README.
+        if let Some(container) = store.parent() {
+            if container.file_name().map(|n| n == KVC_DIR).unwrap_or(false) {
+                let empty = std::fs::read_dir(container).map(|mut d| {
+                    d.all(|e| e.map(|e| e.file_name() == "README.txt").unwrap_or(false))
+                });
+                if empty.unwrap_or(false) {
+                    let _ = std::fs::remove_dir_all(container);
+                }
+            }
         }
-        std::fs::remove_dir_all(root).map_err(|e| io_at(root, e))?;
-        Ok(false)
+        Ok(trashed)
     }
 
-    /// Zip a repository's whole folder (art files + `.kvc/`) to `dest` — a manual, on-demand
-    /// backup for the user to move to their own cloud storage or an external drive. It's the
-    /// only thing that helps against loss the app can't intervene in (the project folder deleted
-    /// outside the app, disk failure, external corruption): extracting the zip anywhere and
-    /// Browsing to it "just works" since [`is_repo`] only checks for `.kvc/config.json`. Carries
-    /// a `MANIFEST.json` entry (repo name, branch, tip commit, timestamp, app version) so a
-    /// recovered zip is self-describing, and the finished archive is reopened and checked (entry
-    /// count + manifest readability) before reporting success — an unverified backup is not
-    /// actually a backup.
-    pub fn export_zip(root: &Path, dest: &Path) -> Result<()> {
-        if !Self::is_repo(root) {
-            return Err(KvcError::NotARepo(root.to_path_buf()));
+    /// Zip one document (the `.kra` **plus** its store) to `dest` — a manual, on-demand backup
+    /// for the user to move to their own cloud storage or an external drive. It's the only thing
+    /// that helps against loss the app can't intervene in (the folder deleted outside the app,
+    /// disk failure, external corruption). Carries a `MANIFEST.json` entry (document name,
+    /// branch, tip commit, timestamp, app version) so a recovered zip is self-describing, and
+    /// the finished archive is reopened and checked (entry count + manifest readability) before
+    /// reporting success — an unverified backup is not actually a backup.
+    ///
+    /// The archive holds `<name>.kra` at the top level and the store under `.kvc/<slug>/`, i.e.
+    /// exactly the on-disk shape — extract it into any folder and the document is tracked there.
+    pub fn export_zip(kra_path: &Path, dest: &Path) -> Result<()> {
+        if !Self::is_repo(kra_path) {
+            return Err(KvcError::NotARepo(kra_path.to_path_buf()));
         }
-        // Best-effort: a repo whose branch state can't be loaded still gets backed up, just
+        let store = store_dir_for(kra_path);
+        let relpath = doc_relpath(kra_path)?;
+        // Best-effort: a document whose branch state can't be loaded still gets backed up, just
         // without the manifest — the zip itself is the thing that must never silently fail.
-        let manifest = Self::open_light(root).ok().map(|r| BackupManifest {
-            repo_name: root
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+        let manifest = Self::open_light(kra_path).ok().map(|r| BackupManifest {
+            repo_name: relpath.clone(),
             branch: r.branches.current.clone(),
             tip_commit: r.branches.tip().unwrap_or("").to_string(),
             timestamp: now_iso(),
@@ -810,7 +1043,19 @@ impl Repo {
         let mut zw = ZipWriter::new(file);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         let mut entry_count = 0usize;
-        for entry in walkdir::WalkDir::new(root) {
+
+        // The document itself, at the archive root.
+        zw.start_file(relpath.clone(), opts).map_err(zip_err)?;
+        zw.write_all(&std::fs::read(kra_path).map_err(|e| io_at(kra_path, e))?)?;
+        entry_count += 1;
+
+        // Its store, rebased under `.kvc/<slug>/` so the layout survives extraction even when
+        // the store currently lives under a custom root somewhere else entirely.
+        let slug = store
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "store".into());
+        for entry in walkdir::WalkDir::new(&store) {
             let entry = entry.map_err(walk_err)?;
             if !entry.file_type().is_file() {
                 continue;
@@ -818,11 +1063,12 @@ impl Repo {
             // Zip entry names are `/`-separated regardless of platform.
             let rel = entry
                 .path()
-                .strip_prefix(root)
+                .strip_prefix(&store)
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('\\', "/");
-            zw.start_file(rel, opts).map_err(zip_err)?;
+            zw.start_file(format!("{KVC_DIR}/{slug}/{rel}"), opts)
+                .map_err(zip_err)?;
             let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
             zw.write_all(&bytes)?;
             entry_count += 1;
@@ -838,24 +1084,38 @@ impl Repo {
         verify_zip(dest, entry_count, manifest.is_some())
     }
 
-    /// Validate `.kvc/` and load its state. Chains load lazily per shard; only a repo still
+    /// Resolve a document to `(working-tree root, store dir)`, or say precisely why not.
+    ///
+    /// The distinction between the two failures is load-bearing: `NotARepo` means "never
+    /// versioned", and the UI answers it by offering to start tracking — which, for a document
+    /// whose history is merely sitting on a drive that isn't plugged in right now, would create
+    /// an empty store and orphan every version the artist ever saved. So an unreachable store
+    /// root is its own error and must never degrade to `NotARepo`.
+    fn locate(kra_path: &Path) -> Result<(PathBuf, PathBuf)> {
+        let store = store_dir_for(kra_path);
+        if store.join("config.json").is_file() {
+            return Ok((doc_root(kra_path), store));
+        }
+        Err(locate_failure(kra_path, custom_store_root().as_deref()))
+    }
+
+    /// Validate the store and load its state. Chains load lazily per shard; only a store still
     /// carrying the pre-sharding monolithic chains file pays a one-time full parse here (the
     /// split persists on the next save).
-    pub fn open(root: &Path) -> Result<Repo> {
-        if !Self::is_repo(root) {
-            return Err(KvcError::NotARepo(root.to_path_buf()));
-        }
-        let kvc = kvc_dir(root);
+    pub fn open(kra_path: &Path) -> Result<Repo> {
+        let (root, kvc) = Self::locate(kra_path)?;
         let (commits, persisted, migrate) = read_commits(&kvc)?;
         let branches = read_branches(&kvc, &commits)?;
         let chains = if kvc.join("chains.bin").is_file() || kvc.join("chains.json").is_file() {
-            ChainStore::from_legacy(chains_dir(root), read_chains(&kvc)?)
+            ChainStore::from_legacy(chains_dir(&kvc), read_chains(&kvc)?)
         } else {
-            ChainStore::empty(chains_dir(root))
+            ChainStore::empty(chains_dir(&kvc))
         };
         let (config, config_dirty) = read_config(&kvc)?;
         Ok(Repo {
-            root: root.to_path_buf(),
+            root,
+            doc: read_doc_meta(&kvc)?,
+            store: kvc.clone(),
             config,
             index: read_json_with_backup(&kvc.join("index.json"))?,
             chains,
@@ -874,19 +1134,18 @@ impl Repo {
     /// skipped. For read paths that never reconstruct or store (scan, log).
     /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo
     /// (on a legacy repo the store would come up empty).
-    pub fn open_light(root: &Path) -> Result<Repo> {
-        if !Self::is_repo(root) {
-            return Err(KvcError::NotARepo(root.to_path_buf()));
-        }
-        let kvc = kvc_dir(root);
+    pub fn open_light(kra_path: &Path) -> Result<Repo> {
+        let (root, kvc) = Self::locate(kra_path)?;
         let (commits, persisted, migrate) = read_commits(&kvc)?;
         let branches = read_branches(&kvc, &commits)?;
         let (config, config_dirty) = read_config(&kvc)?;
         Ok(Repo {
-            root: root.to_path_buf(),
+            root,
+            doc: read_doc_meta(&kvc)?,
+            store: kvc.clone(),
             config,
             index: read_json_with_backup(&kvc.join("index.json"))?,
-            chains: ChainStore::empty(chains_dir(root)),
+            chains: ChainStore::empty(chains_dir(&kvc)),
             packs: crate::delta::Packs::default(),
             commits,
             branches,
@@ -899,11 +1158,18 @@ impl Repo {
     }
 
     pub fn objects_dir(&self) -> PathBuf {
-        objects_dir(&self.root)
+        objects_dir(&self.store)
     }
 
     pub fn cache_dir(&self) -> PathBuf {
-        cache_dir(&self.root)
+        cache_dir(&self.store)
+    }
+
+    /// Every path this store versions. Exactly one — the tracked document — but returned as a
+    /// slice so the commit/scan/diff paths that already loop over "the files in this repo" keep
+    /// their shape rather than being rewritten around a singular.
+    pub fn tracked_paths(&self) -> Vec<String> {
+        vec![self.doc.relpath.clone()]
     }
 
     /// Mark the in-memory commit list as truncated (undo popped a commit, GC dropped
@@ -920,7 +1186,7 @@ impl Repo {
     /// unreachable orphan record, never a dangling branch tip. `stashes.json` follows for the
     /// same reason — a stash record must never outlive the chain content it points at.
     pub fn save(&mut self) -> Result<()> {
-        let kvc = kvc_dir(&self.root);
+        let kvc = self.store.clone();
         if self.config_dirty {
             write_json(&kvc.join("config.json"), &self.config)?;
             self.config_dirty = false;
@@ -939,7 +1205,7 @@ impl Repo {
     /// Persist `config` alone — for settings edits, which never touch index/chains/commits/
     /// branches and shouldn't pay for `save()`'s full flush.
     pub fn save_config(&mut self) -> Result<()> {
-        write_json(&kvc_dir(&self.root).join("config.json"), &self.config)?;
+        write_json(&self.store.join("config.json"), &self.config)?;
         self.config_dirty = false;
         Ok(())
     }
@@ -977,14 +1243,14 @@ impl Repo {
     /// [`Repo::save`] rewrites index/commits from possibly-partial state.
     pub fn save_branches(&mut self) -> Result<()> {
         self.branches.generation = self.branches.generation.wrapping_add(1);
-        write_json_with_backup(&kvc_dir(&self.root).join("branches.json"), &self.branches)
+        write_json_with_backup(&self.store.join("branches.json"), &self.branches)
     }
 
     /// Flush only `stashes.json` — same reasoning as [`Repo::save_branches`]: dropping a stash
     /// runs on an `open_light` repo, where a full [`Repo::save`] would rewrite index/commits from
     /// possibly-partial state.
     pub fn save_stashes(&self) -> Result<()> {
-        write_json_with_backup(&kvc_dir(&self.root).join("stashes.json"), &self.stashes)
+        write_json_with_backup(&self.store.join("stashes.json"), &self.stashes)
     }
 }
 
@@ -1200,12 +1466,29 @@ fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
     }
 }
 
+/// Why a document with no store at its expected path failed to open. Split out from
+/// [`Repo::locate`] so the rule can be tested without mutating the process-global store root.
+pub fn locate_failure(kra_path: &Path, custom_root: Option<&Path>) -> KvcError {
+    match custom_root {
+        // The store root is configured but not currently mounted — say so. Reporting `NotARepo`
+        // here would invite the UI to offer "start tracking", minting an empty store and
+        // orphaning every version the artist saved.
+        Some(root) if !root.is_dir() => KvcError::StoreUnreachable(root.to_path_buf()),
+        _ => KvcError::NotARepo(kra_path.to_path_buf()),
+    }
+}
+
+/// A store always carries `doc.json`; a missing one means the store is damaged, not empty.
+fn read_doc_meta(store: &Path) -> Result<DocMeta> {
+    read_json(&store.join("doc.json"))
+}
+
 /// Read just `branches.json`'s generation counter — for a cheap before/after staleness check
 /// around a read command, without paying for a full [`Repo::open_light`] (which also re-reads
 /// `commits.log`, the part that actually scales with history). A missing `branches.json` (a
 /// pre-branching repo) reads as generation 0, same as a fresh one.
-pub fn read_branches_generation(root: &Path) -> Result<u64> {
-    let path = kvc_dir(root).join("branches.json");
+pub fn read_branches_generation(store: &Path) -> Result<u64> {
+    let path = store.join("branches.json");
     if !path.is_file() {
         return Ok(0);
     }

@@ -30,13 +30,11 @@ function titleCase(input: string): string {
     .join(" ");
 }
 
-/** Basename without extension — the file's real name, case preserved exactly (only
- *  path/extension stripped and separators de-slugged to spaces for readability). */
+/** The file's actual name as the artist typed/saved it — just the path stripped down to its
+ *  basename, extension and all. No de-slugging or extension-stripping: that guessed at a
+ *  "nicer" name and drifted from what's actually on disk. */
 export function assetName(path: string): string {
-  const base = path.split(/[\\/]/).pop() ?? path;
-  const stem = base.replace(/\.[^.]+$/, "");
-  const deslugged = stem.replace(/[-_]+/g, " ").trim();
-  return deslugged || base;
+  return path.split(/[\\/]/).pop() ?? path;
 }
 
 /**

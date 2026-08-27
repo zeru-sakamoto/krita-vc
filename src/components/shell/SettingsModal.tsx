@@ -4,11 +4,14 @@ import {
   Broom,
   CaretDown,
   Cpu,
+  FolderOpen,
   Gauge,
   HardDrive,
   ShieldCheck,
   Trash,
 } from "@phosphor-icons/react";
+import { open as pickFolder } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Checkbox } from "../ui/Checkbox";
@@ -23,6 +26,7 @@ import { useRepository, type CheckReport, type CleanupReport } from "../../lib/r
 import { hasBeenChecked } from "../../lib/checkedRepos";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
+import { inTauri } from "../../lib/tauri";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { useLegacyHistory } from "../../lib/legacyHistory";
 import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
@@ -92,7 +96,74 @@ function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
 }
 
 function NoRepoFallback() {
-  return <p className="text-[12px] text-text-muted">Open a repository to see these settings.</p>;
+  return <p className="text-[12px] text-text-muted">Open an artwork to see these settings.</p>;
+}
+
+/**
+ * Where new artworks keep their version history. App-global (the `kvc` CLI reads the same
+ * setting, so it can't live in a per-artwork config), which is why it renders outside the
+ * artwork gate — you must be able to change it before opening anything.
+ *
+ * Deliberately does **not** move existing histories: this decides where the *next* artwork's
+ * store is created, and where artworks created under it are looked up. Saying so plainly beats
+ * implying a migration that didn't happen.
+ */
+function StoreRootRow() {
+  const [root, setRoot] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    invoke<string | null>("get_store_root")
+      .then(setRoot)
+      .catch(() => setRoot(null));
+  }, []);
+
+  const apply = async (next: string | null) => {
+    setBusy(true);
+    try {
+      await invoke("set_store_root", { path: next });
+      setRoot(next);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const choose = async () => {
+    if (!inTauri()) return;
+    const picked = await pickFolder({
+      directory: true,
+      title: "Choose where to keep version history",
+    });
+    if (typeof picked === "string") await apply(picked);
+  };
+
+  return (
+    <div className="mb-3">
+      <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
+        <FolderOpen size={13} />
+        Where version history is kept
+      </span>
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text">
+          {root ?? <span className="font-sans text-text-muted">Beside each artwork</span>}
+        </span>
+        <Button onClick={choose} disabled={busy || !inTauri()}>
+          Choose…
+        </Button>
+        {root && (
+          <Button onClick={() => apply(null)} disabled={busy}>
+            Reset
+          </Button>
+        )}
+      </div>
+      <span className="mt-1 block text-[11px] text-text-muted">
+        By default each artwork's history lives in a hidden folder beside it, so it travels with
+        your files and stays on the same drive. Changing this only affects artworks you start
+        tracking from now on — existing history isn't moved.
+      </span>
+    </div>
+  );
 }
 
 function AppearanceSettings({
@@ -402,17 +473,21 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 )}
               </>
             )}
-            {category === "storage" &&
-              (current ? (
-                <StorageSettings
-                  config={config}
-                  updateConfig={updateConfig}
-                  onShowCleanup={() => setShowCleanup(true)}
-                  onShowCheck={() => setShowCheck(true)}
-                />
-              ) : (
-                <NoRepoFallback />
-              ))}
+            {category === "storage" && (
+              <>
+                <StoreRootRow />
+                {current ? (
+                  <StorageSettings
+                    config={config}
+                    updateConfig={updateConfig}
+                    onShowCleanup={() => setShowCleanup(true)}
+                    onShowCheck={() => setShowCheck(true)}
+                  />
+                ) : (
+                  <NoRepoFallback />
+                )}
+              </>
+            )}
           </div>
         </div>
       </Modal>

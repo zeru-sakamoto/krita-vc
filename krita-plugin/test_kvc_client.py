@@ -112,10 +112,12 @@ def test_verify_accepts_real_binary():
     kvc.verify_binary(__file__)
 
 
-def test_find_repo_survives_bad_paths():
-    assert kvc.find_repo(None) is None
-    assert kvc.find_repo("") is None
-    assert kvc.find_repo("\0bad") is None
+def test_find_doc_survives_bad_paths():
+    assert kvc.find_doc(None) is None
+    assert kvc.find_doc("") is None
+    assert kvc.find_doc("\0bad") is None
+    # Only .kra documents are trackable at all.
+    assert kvc.find_doc("swatches.gpl") is None
 
 
 def capture_args():
@@ -165,15 +167,17 @@ def test_write_wrappers_build_expected_argv():
     assert seen[3] == ["stash-list", "--repo", "R"], seen[3]
 
 
-def test_in_repo_rejects_sibling_with_shared_prefix():
-    root = os.path.join("art", "repo")
-    assert kvc.in_repo(root, os.path.join(root, "hero.kra"))
-    assert kvc.in_repo(root, os.path.join(root, "chars", "hero.kra"))
-    # The bug a bare startswith() would have: a sibling folder whose name extends the root's.
-    assert not kvc.in_repo(root, os.path.join("art", "repo2", "hero.kra"))
-    assert not kvc.in_repo(root, root)  # the folder itself isn't a document in it
-    assert not kvc.in_repo(root, None)
-    assert not kvc.in_repo(None, "x.kra")
+def test_is_tracked_document_is_exact_identity():
+    tracked = os.path.join("art", "repo", "hero.kra")
+    assert kvc.is_tracked_document(tracked, tracked)
+    # Normalized on both sides, so the same file spelled differently still matches.
+    assert kvc.is_tracked_document(tracked, os.path.join("art", "repo", ".", "hero.kra"))
+    # A neighbour in the same folder is a *different* history, not part of this one — the
+    # folder-prefix test this replaced would have said yes to it.
+    assert not kvc.is_tracked_document(tracked, os.path.join("art", "repo", "villain.kra"))
+    assert not kvc.is_tracked_document(tracked, os.path.dirname(tracked))
+    assert not kvc.is_tracked_document(tracked, None)
+    assert not kvc.is_tracked_document(None, "x.kra")
 
 
 def test_stat_key_of_missing_file_is_none():

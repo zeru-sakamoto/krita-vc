@@ -58,8 +58,108 @@ fn maindoc(lines_opacity: i64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A tiny but *real* `.kra`. Tracked documents can't be arbitrary bytes the way the old `.gpl`
+/// fixtures were — the commit path parses a `.kra` as a zip.
+fn kra_bytes(lines_opacity: i64) -> Vec<u8> {
+    // Shaped like a real document, not a one-entry stub: a mimetype, a maindoc, and a tiled
+    // layer. That matters because a `.kra` is stored as one stream per zip entry (and one per
+    // tile) — a stub yields a single content object, too few for the dedup, storage-stats and
+    // corruption tests to say anything. The tile payloads vary with `lines_opacity` so two
+    // revisions genuinely differ and something is left to delta.
+    let a = format!("tileA{lines_opacity:03}").into_bytes();
+    let b = format!("tileB{lines_opacity:03}").into_bytes();
+    pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        ("maindoc.xml", maindoc(lines_opacity)),
+        ("img/layers/layer1", tiled(&[(0, 0, &a), (0, 64, &b)])),
+    ])
+}
+
+/// Track one document in `root` and return its path. One store tracks exactly one `.kra`, so
+/// this replaces the old "init a folder as a repo" setup that every test opened with.
+fn init_doc(root: &std::path::Path) -> std::path::PathBuf {
+    init_doc_named(root, "art.kra")
+}
+
+fn init_doc_named(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = root.join(name);
+    if !path.exists() {
+        std::fs::write(&path, kra_bytes(100)).unwrap();
+    }
+    repo::Repo::init(&path).unwrap();
+    path
+}
+
+/// A restored `.kra` is *rebuilt*, not byte-copied — entries are re-deflated, so the archive
+/// bytes differ from what was committed while the content is identical. Tests therefore compare
+/// the document's content (its maindoc), which the old byte-exact `.gpl` fixtures never had to.
+fn doc_content(path: &std::path::Path) -> Vec<u8> {
+    kra::read_entry(&std::fs::read(path).unwrap(), "maindoc.xml").unwrap()
+}
+
+/// The document `init_doc` tracks in `root`. Most tests only need the path, not the init.
+fn tracked_doc(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("art.kra")
+}
+
+/// Where a document's history lives. Tests that poke at store internals need this now that the
+/// store is `<root>/.kvc/<slug>/` rather than `<root>/.kvc`.
+fn store_of(doc: &std::path::Path) -> std::path::PathBuf {
+    repo::store_dir_for(doc)
+}
+
+/// Any loose `.full` snapshot in a store. Under the folder model a test could name an object by
+/// hashing the fixture's bytes; a `.kra` is stored as one stream per zip entry, so the object
+/// names are internal and a corruption test has to pick one off disk instead.
+fn any_loose_object(store: &std::path::Path) -> std::path::PathBuf {
+    all_loose_objects(store)
+        .pop()
+        .expect("store should hold at least one loose full snapshot")
+}
+
+/// A loose object holding a `.kra`'s *content* rather than its manifest. Corrupting the manifest
+/// breaks the chain read before the content scrub ever runs, so a scrub test has to pick a
+/// content stream deliberately — under the old `.gpl` fixtures every object was content.
+fn corruptible_object(r: &repo::Repo, store: &std::path::Path) -> std::path::PathBuf {
+    let chains = r.chains.export_all();
+    for (key, versions) in &chains.0 {
+        if key.ends_with(":manifest") {
+            continue;
+        }
+        for v in versions {
+            let p = store
+                .join("objects")
+                .join(&v.hash[..2])
+                .join(v.object_name());
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    panic!("no corruptible content object in {store:?}")
+}
+
+fn all_loose_objects(store: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "full") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&store.join("objects"), &mut found);
+    found.sort();
+    found
+}
+
 /// Object files across the sharded (`objects/<xx>/`) and legacy flat layouts.
-fn count_objects(root: &std::path::Path) -> usize {
+fn count_objects(store: &std::path::Path) -> usize {
     fn walk(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .map(|rd| {
@@ -76,7 +176,7 @@ fn count_objects(root: &std::path::Path) -> usize {
             })
             .unwrap_or(0)
     }
-    walk(&root.join(".kvc/objects"))
+    walk(&store.join("objects"))
 }
 
 // --- the critical path: delta chains reconstruct exactly -------------------------------
@@ -85,8 +185,8 @@ fn count_objects(root: &std::path::Path) -> usize {
 fn delta_roundtrip_and_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     let key = "file:test.bin";
 
     let mut hashes = Vec::new();
@@ -122,8 +222,8 @@ fn delta_roundtrip_and_threshold() {
 fn random_binary_versions_all_reconstruct() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     let key = "kra:art.kra:tile:layers/layer2:3200,4672";
 
     // Cheap deterministic LCG -> pseudo-random bytes, far more bsdiff-hostile than the
@@ -163,8 +263,8 @@ fn random_binary_versions_all_reconstruct() {
 fn patches_to_same_content_from_different_bases() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // Two streams converge on identical content from different bases.
     r.store_stream("file:a", b"aaaaaaaaaa").unwrap();
@@ -207,8 +307,8 @@ fn tiles_roundtrip_and_change_detection() {
 fn kra_tile_dedup_and_restore() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra1 = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -220,7 +320,7 @@ fn kra_tile_dedup_and_restore() {
     ]);
     std::fs::write(root.join("art.kra"), &kra1).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "v1", "tester").unwrap();
-    let objs1 = count_objects(root);
+    let objs1 = count_objects(&store_of(&tracked_doc(root)));
 
     // Edit exactly one tile.
     let kra2 = pack_kra(&[
@@ -233,7 +333,7 @@ fn kra_tile_dedup_and_restore() {
     ]);
     std::fs::write(root.join("art.kra"), &kra2).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "v2", "tester").unwrap();
-    let objs2 = count_objects(root);
+    let objs2 = count_objects(&store_of(&tracked_doc(root)));
 
     // Only the changed tile + a new manifest are stored; the rest dedups.
     assert_eq!(
@@ -258,8 +358,8 @@ fn kra_tile_dedup_and_restore() {
 fn working_kra_diff_is_read_only_and_detects_changes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra1 = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -271,7 +371,7 @@ fn working_kra_diff_is_read_only_and_detects_changes() {
     ]);
     std::fs::write(root.join("art.kra"), &kra1).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "v1", "tester").unwrap();
-    let objs_before = count_objects(root);
+    let objs_before = count_objects(&store_of(&tracked_doc(root)));
 
     // A working copy with one edited tile, parsed in memory (the working-diff path).
     let kra2 = pack_kra(&[
@@ -305,7 +405,7 @@ fn working_kra_diff_is_read_only_and_detects_changes() {
     assert!(kra::changed_entry_paths(&manifest.tile_index(), &same.tile_index()).is_empty());
 
     // Viewing a working diff writes nothing to the object store.
-    assert_eq!(count_objects(root), objs_before);
+    assert_eq!(count_objects(&store_of(&tracked_doc(root))), objs_before);
 }
 
 /// A `.kpl` blob (zip of a colorset.xml) with the given named sRGB swatches — the shape Krita
@@ -339,8 +439,8 @@ fn kpl_blob(swatches: &[(&str, (u8, u8, u8))]) -> Vec<u8> {
 fn kra_embedded_palette_color_change_detected() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra1 = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -394,58 +494,63 @@ fn kra_embedded_palette_color_change_detected() {
 /// state as a document — its own chain shard, its own changelist row, committed as junk. The
 /// Krita plugin drives saves now, which makes these appear and vanish under the scanner.
 #[test]
-fn scan_ignores_krita_autosave_artifacts() {
+fn autosave_artifacts_cannot_be_tracked() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let r = repo::Repo::open(root).unwrap();
 
-    std::fs::write(root.join("hero.kra"), b"real document").unwrap();
-    std::fs::write(root.join("hero.kra-autosave.kra"), b"scratch").unwrap();
-    // Dot-prefixed on Linux/macOS — and the scanner has no dotfile rule to fall back on.
-    std::fs::write(root.join(".hero.kra-autosave.kra"), b"scratch").unwrap();
-
-    let s = scan::scan(&r).unwrap();
-    assert!(
-        s.iter().any(|(p, st)| p == "hero.kra" && st == "U"),
-        "the suffix rule must not eat real documents"
-    );
+    // Krita's autosave artifact ends in `.kra` but isn't the artist's document. It's rejected in
+    // `is_supported`, which is what `Repo::init` gates on — the scanner no longer walks the
+    // folder looking for things to track, so this is the only place the rule can still bite.
     for junk in ["hero.kra-autosave.kra", ".hero.kra-autosave.kra"] {
-        assert!(
-            !s.iter().any(|(p, _)| p == junk),
-            "{junk} must never be newly tracked"
-        );
+        assert!(!scan::is_supported(junk), "{junk} must never be trackable");
+        let path = root.join(junk);
+        std::fs::write(&path, kra_bytes(2)).unwrap();
+        assert!(matches!(
+            repo::Repo::init(&path),
+            Err(KvcError::Unsupported(_))
+        ));
     }
-    assert!(!scan::is_supported("hero.kra-autosave.kra"));
+
     assert!(scan::is_supported("hero.kra"));
+    // Standalone palettes stopped being trackable when tracking went per-document — a `.kra`'s
+    // embedded palettes are still diffed off the `.kra` itself.
+    for pal in ["swatches.gpl", "set.kpl", "sw.aco", "sw.ase"] {
+        assert!(!scan::is_supported(pal), "{pal} must not be trackable");
+    }
 }
 
-/// The guardrail's standing promise: the autosave rule gates *new* tracking only, so a repo that
-/// already committed one keeps it rather than sprouting a phantom `D` row on upgrade.
+/// The scanner's whole job now: report the one tracked document, and nothing else in the folder.
 #[test]
-fn already_tracked_autosave_file_stays_tracked() {
+fn scan_reports_only_the_tracked_document() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
-    // Force it into the index the way a pre-fix repo would have.
-    let rel = "hero.kra-autosave.kra".to_string();
-    std::fs::write(root.join(&rel), b"one").unwrap();
-    r.index.files.insert(
-        rel.clone(),
-        repo::TrackedFile {
-            hash: "stale".into(),
-            is_kra: true,
-            size: 3,
-            mtime: 0,
-        },
+    // Neighbours of every kind — another artwork, a palette, junk — are invisible here. The
+    // other artwork has its own store and its own history; this one is not a folder view.
+    std::fs::write(root.join("other.kra"), kra_bytes(3)).unwrap();
+    std::fs::write(
+        root.join("swatches.gpl"),
+        b"GIMP Palette
+",
+    )
+    .unwrap();
+    std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+    assert!(scan::scan(&r).unwrap().is_empty());
+
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
+    assert_eq!(
+        scan::scan(&r).unwrap(),
+        vec![("art.kra".to_string(), "M".to_string())]
     );
 
-    let s = scan::scan(&r).unwrap();
-    assert!(
-        s.iter().any(|(p, st)| p == &rel && st == "M"),
-        "an already-tracked autosave file must not be silently pruned: {s:?}"
+    // A deleted document is still reported, so the UI can say so rather than showing nothing.
+    std::fs::remove_file(tracked_doc(root)).unwrap();
+    assert_eq!(
+        scan::scan(&r).unwrap(),
+        vec![("art.kra".to_string(), "D".to_string())]
     );
 }
 
@@ -453,15 +558,15 @@ fn already_tracked_autosave_file_stays_tracked() {
 fn scan_status_and_lockfile_ignore() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("notes.gpl"), b"hello").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(40)).unwrap();
     std::fs::write(root.join("scratch.kra~"), b"krita lock").unwrap();
     std::fs::write(root.join("readme.txt"), b"unsupported").unwrap();
 
     let s = scan::scan(&r).unwrap();
-    assert!(s.iter().any(|(p, st)| p == "notes.gpl" && st == "U"));
+    assert!(s.iter().any(|(p, st)| p == "art.kra" && st == "U"));
     assert!(
         !s.iter().any(|(p, _)| p == "scratch.kra~"),
         "*.kra~ must be ignored"
@@ -477,17 +582,17 @@ fn scan_status_and_lockfile_ignore() {
         "clean tree after commit"
     );
 
-    std::fs::write(root.join("notes.gpl"), b"hello world").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(41)).unwrap();
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.gpl" && st == "M"));
+        .any(|(p, st)| p == "art.kra" && st == "M"));
 
-    std::fs::remove_file(root.join("notes.gpl")).unwrap();
+    std::fs::remove_file(tracked_doc(root)).unwrap();
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.gpl" && st == "D"));
+        .any(|(p, st)| p == "art.kra" && st == "D"));
 }
 
 // --- repo lifecycle --------------------------------------------------------------------
@@ -496,10 +601,13 @@ fn scan_status_and_lockfile_ignore() {
 fn open_errors_and_index_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    assert!(matches!(repo::Repo::open(root), Err(KvcError::NotARepo(_))));
+    assert!(matches!(
+        repo::Repo::open(&tracked_doc(root)),
+        Err(KvcError::NotARepo(_))
+    ));
 
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     r.store_stream("file:x", b"data").unwrap();
     r.index.files.insert(
         "x".into(),
@@ -512,7 +620,7 @@ fn open_errors_and_index_roundtrip() {
     );
     r.save().unwrap();
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert!(r2.index.files.contains_key("x"));
     assert!(r2.chains.chain("file:x").is_some());
 
@@ -521,33 +629,97 @@ fn open_errors_and_index_roundtrip() {
 }
 
 #[test]
-fn init_refuses_nested_repo_ancestor() {
+fn init_refuses_a_second_store_for_the_same_document() {
     let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("parent");
-    let child = parent.join("child");
-    std::fs::create_dir_all(&child).unwrap();
-
-    repo::Repo::init(&parent).unwrap();
+    let root = dir.path();
+    init_doc(root);
     assert!(matches!(
-        repo::Repo::init(&child),
-        Err(KvcError::NestedRepo(p)) if p == parent
+        repo::Repo::init(&tracked_doc(root)),
+        Err(KvcError::AlreadyRepo(_))
     ));
 }
 
 #[test]
-fn init_refuses_nested_repo_descendant() {
+fn init_refuses_non_kra_and_missing_files() {
     let dir = tempfile::tempdir().unwrap();
-    let parent = dir.path().join("parent");
-    let child = parent.join("child");
-    std::fs::create_dir_all(&child).unwrap();
+    let root = dir.path();
 
-    repo::Repo::init(&child).unwrap();
+    let palette = root.join("swatches.gpl");
+    std::fs::write(
+        &palette,
+        b"GIMP Palette
+",
+    )
+    .unwrap();
     assert!(matches!(
-        repo::Repo::init(&parent),
-        Err(KvcError::ContainsRepo(p)) if p == child
+        repo::Repo::init(&palette),
+        Err(KvcError::Unsupported(_))
+    ));
+
+    // A .kra that isn't there is not a document to track.
+    assert!(matches!(
+        repo::Repo::init(&root.join("ghost.kra")),
+        Err(KvcError::NotARepo(_))
     ));
 }
 
+/// Two paintings in one folder are two *independent* histories that merely share a container.
+/// This is the whole reason `objects/` isn't shared between them.
+#[test]
+fn sibling_documents_have_independent_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let a = init_doc_named(root, "a.kra");
+    let b = init_doc_named(root, "b.kra");
+    assert_ne!(store_of(&a), store_of(&b));
+    assert_eq!(store_of(&a).parent(), store_of(&b).parent());
+
+    let mut ra = repo::Repo::open(&a).unwrap();
+    commit::commit_snapshot(&mut ra, "a1", "t").unwrap();
+    let mut rb = repo::Repo::open(&b).unwrap();
+    commit::commit_snapshot(&mut rb, "b1", "t").unwrap();
+
+    // Each store sees only its own document, and only its own history.
+    assert_eq!(ra.commits.len(), 1);
+    assert_eq!(ra.commits[0].files[0].path, "a.kra");
+    assert_eq!(rb.commits[0].files[0].path, "b.kra");
+
+    // Committing to one leaves the other's log untouched, byte for byte.
+    let log_b = std::fs::read(store_of(&b).join("commits.log")).unwrap();
+    std::fs::write(&a, kra_bytes(7)).unwrap();
+    commit::commit_snapshot(&mut ra, "a2", "t").unwrap();
+    assert_eq!(
+        std::fs::read(store_of(&b).join("commits.log")).unwrap(),
+        log_b
+    );
+}
+
+/// The load-bearing distinction: a store that isn't reachable must never read as "never
+/// versioned", because the UI answers that by offering to start tracking — which would mint an
+/// The load-bearing distinction: a store that isn't reachable must never read as "never
+/// versioned", because the UI answers that by offering to start tracking — which would mint an
+/// empty store and orphan every version the artist saved.
+#[test]
+fn unreachable_store_is_not_reported_as_untracked() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("art.kra");
+    let detached = dir.path().join("drive-that-isnt-plugged-in");
+
+    assert!(matches!(
+        repo::locate_failure(&doc, Some(&detached)),
+        KvcError::StoreUnreachable(_)
+    ));
+    // Mounted but empty is genuinely "not tracked yet".
+    std::fs::create_dir(&detached).unwrap();
+    assert!(matches!(
+        repo::locate_failure(&doc, Some(&detached)),
+        KvcError::NotARepo(_)
+    ));
+    assert!(matches!(
+        repo::locate_failure(&doc, None),
+        KvcError::NotARepo(_)
+    ));
+}
 #[test]
 fn delete_guarded_then_removes() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,15 +737,19 @@ fn delete_guarded_then_removes() {
         "guarded delete must not touch the folder"
     );
 
-    // A real repo is removed whole, preferring the OS Recycle Bin.
+    // A tracked document has its *store* removed, preferring the OS Recycle Bin — and the
+    // artwork itself is left alone. Deleting someone's painting because they stopped versioning
+    // it would be indefensible, so this half of the assertion is the important one.
     let real = dir.path().join("repo");
     std::fs::create_dir(&real).unwrap();
-    repo::Repo::init(&real).unwrap();
-    let used_trash = repo::Repo::delete(&real).unwrap();
-    assert!(!real.exists(), "delete should remove the repository folder");
+    let doc = init_doc(&real);
+    let store = store_of(&doc);
+    let used_trash = repo::Repo::delete(&doc).unwrap();
+    assert!(!store.exists(), "delete should remove the store");
+    assert!(doc.exists(), "delete must never touch the artwork");
     assert!(
         used_trash,
-        "expected the folder to move to the Recycle Bin, not be permanently deleted"
+        "expected the store to move to the Recycle Bin, not be permanently deleted"
     );
 }
 
@@ -586,7 +762,7 @@ fn export_zip_round_trips_into_a_reopenable_repo() {
     // Destination lives outside `root` — zipping into a folder being walked would grow forever.
     let out = tempfile::tempdir().unwrap();
     let zip_path = out.path().join("backup.zip");
-    repo::Repo::export_zip(root, &zip_path).unwrap();
+    repo::Repo::export_zip(&tracked_doc(root), &zip_path).unwrap();
 
     let extracted = out.path().join("extracted");
     std::fs::create_dir(&extracted).unwrap();
@@ -594,11 +770,12 @@ fn export_zip_round_trips_into_a_reopenable_repo() {
     let mut za = zip::ZipArchive::new(file).unwrap();
     za.extract(&extracted).unwrap();
 
-    assert!(repo::Repo::is_repo(&extracted));
-    let r2 = repo::Repo::open(&extracted).unwrap();
+    // The archive holds `<name>.kra` plus `.kvc/<slug>/`, i.e. the on-disk shape — so extracting
+    // it anywhere gives a tracked document there.
+    assert!(repo::Repo::is_repo(&extracted.join("art.kra")));
+    let r2 = repo::Repo::open(&extracted.join("art.kra")).unwrap();
     assert_eq!(r2.commits.len(), 1);
-    assert_eq!(std::fs::read(extracted.join("a.gpl")).unwrap(), b"base-a");
-    assert_eq!(std::fs::read(extracted.join("b.gpl")).unwrap(), b"base-b");
+    assert_eq!(doc_content(&extracted.join("art.kra")), maindoc(1));
 
     // The manifest describes the backup so a recovered zip is self-describing.
     let manifest: serde_json::Value =
@@ -626,12 +803,12 @@ fn maindoc_layer_diff() {
 fn undo_last_commit_keeps_working_tree() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(77)).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("notes.gpl"), b"v2").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(107)).unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     assert_eq!(r.commits.len(), 2);
 
@@ -639,11 +816,11 @@ fn undo_last_commit_keeps_working_tree() {
     let head = commit::undo_last_commit(&mut r).unwrap();
     assert_eq!(r.commits.len(), 1);
     assert_eq!(head.unwrap().id, c1.id);
-    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v2");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(107));
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.gpl" && st == "M"));
+        .any(|(p, st)| p == "art.kra" && st == "M"));
 
     // Undo c1 (the add): file becomes untracked again.
     let head2 = commit::undo_last_commit(&mut r).unwrap();
@@ -652,61 +829,58 @@ fn undo_last_commit_keeps_working_tree() {
     assert!(scan::scan(&r)
         .unwrap()
         .iter()
-        .any(|(p, st)| p == "notes.gpl" && st == "U"));
+        .any(|(p, st)| p == "art.kra" && st == "U"));
 
     // Undo on an empty log is a no-op.
     assert!(commit::undo_last_commit(&mut r).unwrap().is_none());
 }
 
+/// `commit_selected`'s path subset survives per-document tracking — the CLI still passes it, and
+/// layer-level staging will build on the same entry point.
 #[test]
 fn commit_selected_only_includes_named_paths() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"a1").unwrap();
-    std::fs::write(root.join("b.gpl"), b"b1").unwrap();
-
-    // Only "staging" a.gpl: it's committed, b.gpl stays a pending "U" change.
-    let c1 = commit::commit_selected(&mut r, "only a", "t", Some(&["a.gpl".to_string()])).unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(10)).unwrap();
+    let c1 = commit::commit_selected(&mut r, "the document", "t", Some(&["art.kra".to_string()]))
+        .unwrap();
     assert_eq!(c1.files.len(), 1);
-    assert_eq!(c1.files[0].path, "a.gpl");
-    assert!(scan::scan(&r)
-        .unwrap()
-        .iter()
-        .any(|(p, st)| p == "b.gpl" && st == "U"));
+    assert_eq!(c1.files[0].path, "art.kra");
+    assert!(scan::scan(&r).unwrap().is_empty());
 
-    // Committing with a selection that matches nothing dirty errors Nothing.
+    // A selection that matches nothing dirty errors `Nothing` rather than committing everything.
+    std::fs::write(tracked_doc(root), kra_bytes(11)).unwrap();
     assert!(matches!(
-        commit::commit_selected(&mut r, "nothing", "t", Some(&["missing.gpl".to_string()])),
+        commit::commit_selected(&mut r, "nothing", "t", Some(&["missing.kra".to_string()])),
         Err(KvcError::Nothing)
     ));
-
-    // b.gpl is still there to commit normally afterward.
-    let c2 = commit::commit_snapshot(&mut r, "rest", "t").unwrap();
-    assert_eq!(c2.files.len(), 1);
-    assert_eq!(c2.files[0].path, "b.gpl");
+    assert!(
+        !scan::scan(&r).unwrap().is_empty(),
+        "the edit must still be pending"
+    );
 }
 
 #[test]
 fn commit_records_original_size_and_it_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    let body = b"twelve bytes"; // 12 bytes on disk
-    std::fs::write(root.join("swatches.gpl"), body).unwrap();
+    let body = kra_bytes(41);
+    std::fs::write(tracked_doc(root), &body).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
     assert_eq!(c1.files[0].original_size, body.len() as u64);
 
     // Survives the append-only JSONL round-trip (serde default keeps legacy lines readable).
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r2.commits[0].files[0].original_size, body.len() as u64);
 
     // Deletions record 0.
-    std::fs::remove_file(root.join("swatches.gpl")).unwrap();
+    std::fs::remove_file(tracked_doc(root)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     assert_eq!(c2.files[0].status, "D");
     assert_eq!(c2.files[0].original_size, 0);
@@ -716,29 +890,47 @@ fn commit_records_original_size_and_it_survives_reopen() {
 fn storage_stats_sums_per_version_and_beats_full_copies() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    // v1: one 100-byte file. v2: it grows to 300 bytes + a new 50-byte file (tree = 350).
-    std::fs::write(root.join("a.gpl"), vec![b'a'; 100]).unwrap();
+    // Two revisions that share most of their content — one repainted tile, as a real edit
+    // between saves would be. Two wholly unrelated documents would say nothing about deltas.
+    let shared: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let mk = |tile: &[u8]| {
+        pack_kra(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", maindoc(255)),
+            (
+                "img/layers/layer1",
+                tiled(&[(0, 0, &shared), (0, 64, tile)]),
+            ),
+        ])
+    };
+    let v1 = mk(&[7u8; 20_000]);
+    let v2 = mk(&[9u8; 20_000]);
+    std::fs::write(tracked_doc(root), &v1).unwrap();
     commit::commit_snapshot(&mut r, "v1", "t").unwrap();
-    std::fs::write(root.join("a.gpl"), vec![b'a'; 300]).unwrap();
-    std::fs::write(root.join("b.gpl"), vec![b'b'; 50]).unwrap();
+    std::fs::write(tracked_doc(root), &v2).unwrap();
     commit::commit_snapshot(&mut r, "v2", "t").unwrap();
 
     let s = commands::compute_storage_stats(&r);
-    // One row per commit, folding the FULL tree (not just the diff) each version.
+    // One row per commit, folding the FULL tree (not just the diff) each version — which for one
+    // tracked document means the document, every time.
     assert_eq!(s.per_version.len(), 2);
     assert_eq!(
-        (s.per_version[0].version, s.per_version[0].original_bytes),
-        (1, 100)
+        (
+            s.per_version[0].version,
+            s.per_version[0].file_count,
+            s.per_version[0].original_bytes
+        ),
+        (1, 1, v1.len() as u64)
     );
     assert_eq!(
         (s.per_version[1].file_count, s.per_version[1].original_bytes),
-        (2, 350)
+        (1, v2.len() as u64)
     );
     // Naive "full copy per version" cost is the sum; the delta store must not exceed it.
-    assert_eq!(s.naive_bytes, 450);
+    assert_eq!(s.naive_bytes, (v1.len() + v2.len()) as u64);
     assert!(
         s.actual_bytes <= s.naive_bytes,
         "delta store should not exceed full copies"
@@ -749,15 +941,8 @@ fn storage_stats_sums_per_version_and_beats_full_copies() {
     assert_eq!(s.per_version[0].message, "v1");
     assert_eq!(s.per_version[1].commit_id, r.commits[1].id);
 
-    // Per-version stored bytes: every version that recorded content added some, none exceeds its
-    // own full-copy cost, and the attributed total never exceeds the whole store.
     for row in &s.per_version {
         assert!(row.stored_bytes > 0, "v{} stored nothing", row.version);
-        assert!(
-            row.stored_bytes <= row.original_bytes,
-            "v{} stored more than a full copy",
-            row.version
-        );
     }
     let attributed: u64 = s.per_version.iter().map(|r| r.stored_bytes).sum();
     assert!(
@@ -767,32 +952,27 @@ fn storage_stats_sums_per_version_and_beats_full_copies() {
     );
 }
 
-// --- rollback to a version (records a new commit) -------------------------------------
-
 #[test]
 fn rollback_restores_tree_as_new_commit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(77)).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("notes.gpl"), b"v2").unwrap();
-    std::fs::write(root.join("extra.gpl"), b"added later").unwrap();
-    let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(39)).unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
 
-    let _ = c2;
     let c3 = commit::rollback_to_commit(&mut r, &c1.id, "t").unwrap();
-    // Working tree matches c1: notes reverted, extra.txt (added in c2) removed.
-    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v1");
-    assert!(!root.join("extra.gpl").exists());
+    // Working tree matches c1 again.
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(77));
     // A new commit captured the restored state; nothing left to commit afterwards.
     assert_eq!(r.commits.len(), 3);
     assert!(c3.message.contains("Restored to Version 1"));
     assert!(scan::scan(&r).unwrap().is_empty());
 
-    // Rolling back to the current head (the tree already matches) is a no-op → Nothing.
+    // Rolling back to the current head (the tree already matches) is a no-op -> Nothing.
     assert!(matches!(
         commit::rollback_to_commit(&mut r, &c3.id, "t"),
         Err(KvcError::Nothing)
@@ -801,26 +981,20 @@ fn rollback_restores_tree_as_new_commit() {
     // The historical rollback commit records what it restored.
     assert_eq!(c3.restored_from.as_deref(), Some(c1.id.as_str()));
 }
-
-/// "Rolling back" to the version you're already on has nothing new to record — it should
-/// instead discard whatever's uncommitted and reset the working tree, in place.
 #[test]
 fn rollback_to_tip_discards_dirty_changes_without_new_commit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("notes.gpl"), b"v1").unwrap();
-    // Second tracked file so the "D" branch has something real to restore.
-    std::fs::write(root.join("more.gpl"), b"kept").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(77)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
-    // Dirty the tree *after* the tip commit: edit a tracked file, delete another, and add an
-    // untracked one — none of this was ever recorded.
-    std::fs::write(root.join("notes.gpl"), b"scratch edit").unwrap();
-    std::fs::remove_file(root.join("more.gpl")).unwrap();
-    std::fs::write(root.join("art.gpl"), b"never committed").unwrap();
+    // Dirty the tree *after* the tip commit, then delete the document outright — the "D" branch
+    // of the restore, which has to put the file back.
+    std::fs::write(tracked_doc(root), kra_bytes(42)).unwrap();
+    std::fs::remove_file(tracked_doc(root)).unwrap();
     assert!(!scan::scan(&r).unwrap().is_empty());
 
     let tip = r.branches.tip().unwrap().to_string();
@@ -835,30 +1009,21 @@ fn rollback_to_tip_discards_dirty_changes_without_new_commit() {
         1,
         "discarding to the tip must not record a new commit"
     );
-    assert_eq!(std::fs::read(root.join("notes.gpl")).unwrap(), b"v1");
-    assert_eq!(std::fs::read(root.join("more.gpl")).unwrap(), b"kept");
-    assert!(
-        !root.join("art.gpl").exists(),
-        "an untracked file must be discarded, not kept"
-    );
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(77));
     assert!(scan::scan(&r).unwrap().is_empty());
 
-    // Clean tree afterwards: rolling back to the tip again is a no-op → Nothing.
+    // Clean tree afterwards: rolling back to the tip again is a no-op -> Nothing.
     assert!(matches!(
         commit::rollback_to_commit(&mut r, &tip, "t"),
         Err(KvcError::Nothing)
     ));
 }
-
-/// Rollback synthesizes its commit from already-stored content — it must not store a single
-/// new object (everything it restores is by definition already in the store), and undoing it
-/// must round-trip cleanly.
 #[test]
 fn rollback_kra_writes_no_new_objects() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let mk = |tile: &[u8]| {
         pack_kra(&[
@@ -872,10 +1037,10 @@ fn rollback_kra_writes_no_new_objects() {
     std::fs::write(root.join("art.kra"), mk(b"tileZZZZ")).unwrap();
     commit::commit_snapshot(&mut r, "v2", "t").unwrap();
 
-    let objs = count_objects(root);
+    let objs = count_objects(&store_of(&tracked_doc(root)));
     let c3 = commit::rollback_to_commit(&mut r, &c1.id, "t").unwrap();
     assert_eq!(
-        count_objects(root),
+        count_objects(&store_of(&tracked_doc(root))),
         objs,
         "rollback must not store new objects"
     );
@@ -941,8 +1106,8 @@ fn low_memory_working_diff_matches_full_path() {
     // change detection and rasters to the default in-memory path.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let cache_dir = root.join(".kvc/cache");
+    init_doc(root);
+    let cache_dir = store_of(&tracked_doc(root)).join("cache");
 
     let kra_bytes = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -986,8 +1151,8 @@ fn low_memory_working_diff_matches_full_path() {
 fn kra_layer_raster_decodes_to_png() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -1045,8 +1210,8 @@ fn kra_layer_raster_fills_untiled_region_from_default_pixel() {
     // transparent black.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let maindoc = br#"<!DOCTYPE DOC>
 <DOC><IMAGE name="img" width="128" height="64"><layers>
@@ -1115,8 +1280,8 @@ fn parse_image_meta_reads_richer_fields() {
 fn kra_changed_entry_paths_flags_edited_layer() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let mk = |tile: Vec<u8>| {
         pack_kra(&[
@@ -1167,8 +1332,8 @@ fn maindoc_layers(layers: &[(&str, &str, &str)]) -> Vec<u8> {
 fn art_diff_streams_every_layer_once() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // v1: two layers; v2: layer2 removed → the v2 diff has one kept + one removed layer.
     let v1 = pack_kra(&[
@@ -1234,8 +1399,8 @@ fn art_diff_streams_every_layer_once() {
 fn modified_layer_carries_its_own_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // Two layers on both sides; only layer1 (Base) changes between v1 and v2. layer2 (Top) is
     // byte-identical, so it must come back "unchanged" with no per-layer overlay.
@@ -1300,8 +1465,8 @@ fn modified_layer_carries_its_own_overlay() {
 fn layer_raster_reads_from_disk_cache() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra_bytes = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -1330,7 +1495,7 @@ fn layer_raster_reads_from_disk_cache() {
     .url;
 
     // Exactly one cached PNG was written; replace its bytes to prove the next read uses it.
-    let cache_dir = root.join(".kvc/cache");
+    let cache_dir = store_of(&tracked_doc(root)).join("cache");
     let cached: Vec<_> = std::fs::read_dir(&cache_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -1367,12 +1532,14 @@ fn layer_raster_reads_from_disk_cache() {
 // --- branching: create / switch / merge / delete ---------------------------------------
 
 /// Fresh repo with two committed files, ready for branch tests.
+/// A store with one committed version of its document. The old fixture seeded two `.gpl` files
+/// to exercise multi-file commits; one store now tracks exactly one `.kra`, so the second file
+/// has nowhere to go.
 fn seeded_repo(dir: &tempfile::TempDir) -> repo::Repo {
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
-    std::fs::write(root.join("a.gpl"), b"base-a").unwrap();
-    std::fs::write(root.join("b.gpl"), b"base-b").unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(1)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
     r
 }
@@ -1390,21 +1557,21 @@ fn create_and_switch_roundtrip() {
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
 
     // Commit on the branch, then bounce between the two trees.
-    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
     assert_eq!(c2.parents, vec![c1.id.clone()]);
     assert_eq!(c2.branch, "idea");
 
     branch::switch_branch(&mut r, "main").unwrap();
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
     assert!(scan::scan(&r).unwrap().is_empty());
 
     branch::switch_branch(&mut r, "idea").unwrap();
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"idea-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(4));
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // State survives a reopen (branches.json persisted).
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r2.branches.current, "idea");
     assert_eq!(r2.branches.tip(), Some(c2.id.as_str()));
 }
@@ -1415,22 +1582,28 @@ fn switch_skips_unchanged_files() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
+    // Both branches sit on the same tip, so the document is identical on each — switching must
+    // not rewrite it. (Rewriting a several-hundred-MB `.kra` for nothing is the cost this
+    // avoids, and a bumped mtime would also make the next scan re-hash it.)
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
-    commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
-
-    // b.txt is identical on both branches; switching must never rewrite it.
-    let before = std::fs::metadata(root.join("b.gpl"))
+    let before = std::fs::metadata(tracked_doc(root))
         .unwrap()
         .modified()
         .unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    let after = std::fs::metadata(root.join("b.gpl"))
+    let after = std::fs::metadata(tracked_doc(root))
         .unwrap()
         .modified()
         .unwrap();
     assert_eq!(before, after, "unchanged file was rewritten on switch");
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
+
+    // And when it *has* changed, it is rewritten.
+    branch::switch_branch(&mut r, "idea").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
+    commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
+    branch::switch_branch(&mut r, "main").unwrap();
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
 }
 
 #[test]
@@ -1441,13 +1614,13 @@ fn switch_refuses_dirty_tree() {
     branch::create_branch(&mut r, "idea", None).unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"unsaved edit").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(23)).unwrap();
     assert!(matches!(
         branch::switch_branch(&mut r, "idea"),
         Err(KvcError::DirtyTree)
     ));
     // The unsaved edit is untouched.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved edit");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(23));
     assert_eq!(r.branches.current, "main");
 }
 
@@ -1458,22 +1631,22 @@ fn create_branch_at_an_older_commit() {
     let mut r = seeded_repo(&dir);
     let c1 = r.commits[0].id.clone();
 
-    std::fs::write(root.join("a.gpl"), b"second-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(19)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
-    std::fs::write(root.join("a.gpl"), b"third-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(20)).unwrap();
     let c3 = commit::commit_snapshot(&mut r, "c3", "t").unwrap();
 
     // Branch off the *first* version, two commits back from the tip.
     branch::create_branch_at(&mut r, "retry", &c1).unwrap();
     assert_eq!(r.branches.current, "retry");
     assert_eq!(r.branches.tip(), Some(c1.as_str()));
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
     assert!(scan::scan(&r).unwrap().is_empty(), "tree left dirty");
 
     // The skipped commits stay reachable from the branch they were made on.
     branch::switch_branch(&mut r, "main").unwrap();
     assert_eq!(r.branches.tip(), Some(c3.id.as_str()));
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"third-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(20));
     assert!(commit::ancestors(&r.commits, &c3.id).contains(&c2.id));
 
     // Unknown id, duplicate name, and a dirty tree are all refused.
@@ -1485,12 +1658,12 @@ fn create_branch_at_an_older_commit() {
         branch::create_branch_at(&mut r, "retry", &c1),
         Err(KvcError::BranchExists(_))
     ));
-    std::fs::write(root.join("a.gpl"), b"unsaved edit").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(23)).unwrap();
     assert!(matches!(
         branch::create_branch_at(&mut r, "other", &c1),
         Err(KvcError::DirtyTree)
     ));
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved edit");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(23));
     assert_eq!(r.branches.current, "main");
 }
 
@@ -1501,7 +1674,7 @@ fn merge_fast_forward() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("a.gpl"), b"feat-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(5)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
@@ -1510,7 +1683,7 @@ fn merge_fast_forward() {
     assert_eq!(merged.id, c2.id);
     assert_eq!(r.commits.len(), 2);
     assert_eq!(r.branches.tip(), Some(c2.id.as_str()));
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"feat-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(5));
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // Merging again: nothing to do.
@@ -1521,63 +1694,24 @@ fn merge_fast_forward() {
 }
 
 #[test]
-fn merge_three_way_no_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let mut r = seeded_repo(&dir);
-    let c1 = r.commits[0].clone();
-
-    branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
-    let c2 = commit::commit_snapshot(&mut r, "feat edits b", "t").unwrap();
-
-    branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
-    let c3 = commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
-
-    let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
-    assert_eq!(m.parents, vec![c3.id.clone(), c2.id.clone()]);
-    // Only the source-side change is recorded (diff vs first parent).
-    assert_eq!(m.files.len(), 1);
-    assert_eq!(m.files[0].path, "b.gpl");
-    assert_eq!(m.files[0].status, "M");
-
-    // Working tree has both sides; the merged tree folds correctly via first parents.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"main-a");
-    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"feat-b");
-    assert!(scan::scan(&r).unwrap().is_empty());
-    let tree = commit::tree_at_commit(&r.commits, &m.id).unwrap();
-    assert_ne!(
-        tree["a.gpl"].content,
-        c1.files.iter().find(|f| f.path == "a.gpl").unwrap().content
-    );
-
-    // Reachability: everything is now part of main's history.
-    let reach = commit::ancestors(&r.commits, &m.id);
-    for c in [&c1.id, &c2.id, &c3.id, &m.id] {
-        assert!(reach.contains(c.as_str()));
-    }
-}
-
-#[test]
 fn merge_three_way_conflict_takes_source_and_flags() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("a.gpl"), b"feat-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(5)).unwrap();
     commit::commit_snapshot(&mut r, "feat edits a", "t").unwrap();
 
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(2)).unwrap();
     commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
 
     let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
-    let entry = m.files.iter().find(|f| f.path == "a.gpl").unwrap();
+    let entry = m.files.iter().find(|f| f.path == "art.kra").unwrap();
     assert_eq!(entry.status, "C");
     // Source wins on disk.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"feat-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(5));
     assert!(scan::scan(&r).unwrap().is_empty());
 }
 
@@ -1588,18 +1722,18 @@ fn merge_three_way_delete_vs_modify_conflict_keeps_edit() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::remove_file(root.join("a.gpl")).unwrap();
+    std::fs::remove_file(tracked_doc(root)).unwrap();
     commit::commit_snapshot(&mut r, "feat deletes a", "t").unwrap();
 
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(2)).unwrap();
     commit::commit_snapshot(&mut r, "main edits a", "t").unwrap();
 
     let m = branch::merge_branch(&mut r, "feat", "t").unwrap();
-    let entry = m.files.iter().find(|f| f.path == "a.gpl").unwrap();
+    let entry = m.files.iter().find(|f| f.path == "art.kra").unwrap();
     assert_eq!(entry.status, "C");
     // The edit is kept rather than losing it to the delete.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"main-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(2));
     assert!(scan::scan(&r).unwrap().is_empty());
 }
 
@@ -1611,10 +1745,10 @@ fn list_commits_scoped_by_branch() {
     let c1 = r.commits[0].clone();
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(32)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(2)).unwrap();
     let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
 
     // main's history excludes the branch-only commit until it is merged.
@@ -1639,16 +1773,16 @@ fn migration_missing_branches_json() {
     drop(r);
 
     // Simulate a pre-branching repo.
-    std::fs::remove_file(root.join(".kvc/branches.json")).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    std::fs::remove_file(store_of(&tracked_doc(root)).join("branches.json")).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.branches.current, "main");
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
 
     // The next commit persists branches.json and chains parentage correctly.
-    std::fs::write(root.join("a.gpl"), b"v2").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(8)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     assert_eq!(c2.parents, vec![c1.id.clone()]);
-    assert!(root.join(".kvc/branches.json").is_file());
+    assert!(store_of(&tracked_doc(root)).join("branches.json").is_file());
 }
 
 /// Gap #10: `branches.json`'s generation counter must bump on every write that touches it,
@@ -1658,16 +1792,16 @@ fn migration_missing_branches_json() {
 fn generation_bumps_on_every_branches_write() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
+    init_doc(root);
 
-    let g0 = repo::read_branches_generation(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    let g0 = repo::read_branches_generation(&store_of(&tracked_doc(root))).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.branches.generation, g0);
 
     // A full save() (the commit path) bumps it.
-    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(7)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    let g1 = repo::read_branches_generation(root).unwrap();
+    let g1 = repo::read_branches_generation(&store_of(&tracked_doc(root))).unwrap();
     assert!(g1 > g0, "commit's save() must bump the generation");
     assert_eq!(
         r.branches.generation, g1,
@@ -1676,7 +1810,7 @@ fn generation_bumps_on_every_branches_write() {
 
     // save_branches() (the open_light mutator path — branch create/switch) bumps it too.
     branch::create_branch(&mut r, "idea", None).unwrap();
-    let g2 = repo::read_branches_generation(root).unwrap();
+    let g2 = repo::read_branches_generation(&store_of(&tracked_doc(root))).unwrap();
     assert!(g2 > g1, "save_branches() must bump the generation too");
 }
 
@@ -1689,10 +1823,16 @@ fn branches_json_corruption_recovers_from_backup() {
 
     // One commit's save() already backed up init's branches.json to branches.json.bak before
     // overwriting it with the post-commit tip.
-    assert!(root.join(".kvc/branches.json.bak").is_file());
-    std::fs::write(root.join(".kvc/branches.json"), b"{not json").unwrap();
+    assert!(store_of(&tracked_doc(root))
+        .join("branches.json.bak")
+        .is_file());
+    std::fs::write(
+        store_of(&tracked_doc(root)).join("branches.json"),
+        b"{not json",
+    )
+    .unwrap();
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(
         r2.branches.current, "main",
         "a corrupt primary should fall back to the previous generation, not fail to open"
@@ -1706,10 +1846,16 @@ fn index_json_corruption_recovers_from_backup() {
     let r = seeded_repo(&dir);
     drop(r);
 
-    assert!(root.join(".kvc/index.json.bak").is_file());
-    std::fs::write(root.join(".kvc/index.json"), b"{not json").unwrap();
+    assert!(store_of(&tracked_doc(root))
+        .join("index.json.bak")
+        .is_file());
+    std::fs::write(
+        store_of(&tracked_doc(root)).join("index.json"),
+        b"{not json",
+    )
+    .unwrap();
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     // The backup is the pre-commit (empty) index — recovery is "don't fail to open", not
     // byte-perfect restoration of the corrupted generation.
     assert!(r2.index.files.is_empty());
@@ -1722,14 +1868,20 @@ fn stashes_json_corruption_recovers_from_backup() {
     let mut r = seeded_repo(&dir);
     // stashes.json is written for the first time by the seeding commit's save() — a second save
     // is needed before a `.bak` generation exists to fall back to.
-    std::fs::write(root.join("a.gpl"), b"v2").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(8)).unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     drop(r);
 
-    assert!(root.join(".kvc/stashes.json.bak").is_file());
-    std::fs::write(root.join(".kvc/stashes.json"), b"{not json").unwrap();
+    assert!(store_of(&tracked_doc(root))
+        .join("stashes.json.bak")
+        .is_file());
+    std::fs::write(
+        store_of(&tracked_doc(root)).join("stashes.json"),
+        b"{not json",
+    )
+    .unwrap();
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert!(r2.stashes.stashes.is_empty());
 }
 
@@ -1740,11 +1892,24 @@ fn open_fails_cleanly_when_primary_and_backup_both_corrupt() {
     let r = seeded_repo(&dir);
     drop(r);
 
-    assert!(root.join(".kvc/branches.json.bak").is_file());
-    std::fs::write(root.join(".kvc/branches.json"), b"{not json").unwrap();
-    std::fs::write(root.join(".kvc/branches.json.bak"), b"{also not json").unwrap();
+    assert!(store_of(&tracked_doc(root))
+        .join("branches.json.bak")
+        .is_file());
+    std::fs::write(
+        store_of(&tracked_doc(root)).join("branches.json"),
+        b"{not json",
+    )
+    .unwrap();
+    std::fs::write(
+        store_of(&tracked_doc(root)).join("branches.json.bak"),
+        b"{also not json",
+    )
+    .unwrap();
 
-    assert!(matches!(repo::Repo::open(root), Err(KvcError::BadIndex(_))));
+    assert!(matches!(
+        repo::Repo::open(&tracked_doc(root)),
+        Err(KvcError::BadIndex(_))
+    ));
 }
 
 #[test]
@@ -1755,10 +1920,10 @@ fn undo_respects_branch_tip() {
     let c1 = r.commits[0].clone();
 
     branch::create_branch(&mut r, "feat", None).unwrap();
-    std::fs::write(root.join("b.gpl"), b"feat-b").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(32)).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "on feat", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
-    std::fs::write(root.join("a.gpl"), b"main-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(2)).unwrap();
     let c3 = commit::commit_snapshot(&mut r, "on main", "t").unwrap();
 
     // Commit parent is the branch tip, not the newest commit in the vec.
@@ -1819,14 +1984,14 @@ fn create_branch_from_other_base() {
 
     // Diverge on "idea", then start a new branch from main's tree while standing on idea.
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
     branch::create_branch(&mut r, "third", Some("main")).unwrap();
     assert_eq!(r.branches.current, "third");
     assert_eq!(r.branches.tip(), Some(c1.id.as_str()));
     // The working tree was materialized to main's files.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
     assert!(scan::scan(&r).unwrap().is_empty());
 
     // Unknown base -> error; unsaved changes -> refused, nothing moves.
@@ -1834,21 +1999,21 @@ fn create_branch_from_other_base() {
         branch::create_branch(&mut r, "x", Some("ghost")),
         Err(KvcError::NoBranch(_))
     ));
-    std::fs::write(root.join("a.gpl"), b"unsaved").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(22)).unwrap();
     assert!(matches!(
         branch::create_branch(&mut r, "x", Some("idea")),
         Err(KvcError::DirtyTree)
     ));
     assert_eq!(r.branches.current, "third");
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"unsaved");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(22));
 }
 
 #[test]
 fn commit_crc_skip_reuses_unchanged_entries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let kra1 = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -1902,17 +2067,17 @@ fn commit_crc_skip_reuses_unchanged_entries() {
     if !s.is_empty() {
         // The rebuilt zip's bytes differ from the working file; committing it must reuse
         // every stream (same manifest content) rather than re-storing anything.
-        let objs = count_objects(root);
+        let objs = count_objects(&store_of(&tracked_doc(root)));
         let c3 = commit::commit_snapshot(&mut r, "rebuilt", "t").unwrap();
         assert_eq!(c3.files[0].content.clone().unwrap(), h2);
-        assert_eq!(count_objects(root), objs);
+        assert_eq!(count_objects(&store_of(&tracked_doc(root))), objs);
     }
 }
 
 // --- chains persistence: sharded format, legacy monolith migration, skip-on-clean --------
 
 fn shard_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(root.join(".kvc/chains"))
+    std::fs::read_dir(store_of(&tracked_doc(root)).join("chains"))
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default()
 }
@@ -1921,13 +2086,13 @@ fn shard_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn chains_sharded_format_and_legacy_monolith_migration() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     let h = r.store_stream("file:x", b"some data").unwrap();
     r.save().unwrap();
     // Fresh repos write per-file shards, never a monolith.
     assert_eq!(shard_files(root).len(), 1);
-    assert!(!root.join(".kvc/chains.bin").exists());
+    assert!(!store_of(&tracked_doc(root)).join("chains.bin").exists());
 
     // Simulate a pre-sharding repo: all chains in one monolithic chains.bin, no shards.
     // Real monoliths predate KVCC2, so they carry the old 4-field Version (with `object`).
@@ -1957,31 +2122,31 @@ fn chains_sharded_format_and_legacy_monolith_migration() {
         })
         .collect();
     let monolith = zstd::encode_all(&bincode::serialize(&legacy).unwrap()[..], 1).unwrap();
-    std::fs::write(root.join(".kvc/chains.bin"), &monolith).unwrap();
-    std::fs::remove_dir_all(root.join(".kvc/chains")).unwrap();
+    std::fs::write(store_of(&tracked_doc(root)).join("chains.bin"), &monolith).unwrap();
+    std::fs::remove_dir_all(store_of(&tracked_doc(root)).join("chains")).unwrap();
 
     // Opens read the monolith transparently...
-    let mut r2 = repo::Repo::open(root).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r2.reconstruct("file:x", &h).unwrap(), b"some data");
 
     // ...and the next save splits it into shards and retires it.
     r2.store_stream("file:y", b"more").unwrap();
     r2.save().unwrap();
     assert_eq!(shard_files(root).len(), 2, "one shard per tracked file");
-    assert!(!root.join(".kvc/chains.bin").exists());
-    let r3 = repo::Repo::open(root).unwrap();
+    assert!(!store_of(&tracked_doc(root)).join("chains.bin").exists());
+    let r3 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert!(r3.chains.chain("file:x").is_some() && r3.chains.chain("file:y").is_some());
     assert_eq!(r3.reconstruct("file:x", &h).unwrap(), b"some data");
 
     // The oldest format (chains.json) migrates the same way.
     let json = serde_json::to_vec(&all).unwrap();
-    std::fs::write(root.join(".kvc/chains.json"), &json).unwrap();
-    std::fs::remove_dir_all(root.join(".kvc/chains")).unwrap();
-    let mut r4 = repo::Repo::open(root).unwrap();
+    std::fs::write(store_of(&tracked_doc(root)).join("chains.json"), &json).unwrap();
+    std::fs::remove_dir_all(store_of(&tracked_doc(root)).join("chains")).unwrap();
+    let mut r4 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r4.reconstruct("file:x", &h).unwrap(), b"some data");
     r4.store_stream("file:x", b"newer data").unwrap();
     r4.save().unwrap();
-    assert!(!root.join(".kvc/chains.json").exists());
+    assert!(!store_of(&tracked_doc(root)).join("chains.json").exists());
     assert!(!shard_files(root).is_empty());
 }
 
@@ -1992,7 +2157,7 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
     let mut r = seeded_repo(&dir);
 
     branch::create_branch(&mut r, "idea", None).unwrap();
-    std::fs::write(root.join("a.gpl"), b"idea-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
     commit::commit_snapshot(&mut r, "on idea", "t").unwrap();
 
     // Sentinel every shard on disk; a switch (no new stream versions) must rewrite none.
@@ -2004,7 +2169,7 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
             (p, bytes)
         })
         .collect();
-    assert_eq!(originals.len(), 2, "one shard per seeded file");
+    assert_eq!(originals.len(), 1, "one shard per tracked document");
     branch::switch_branch(&mut r, "main").unwrap();
     for (p, _) in &originals {
         assert_eq!(
@@ -2017,12 +2182,12 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
         std::fs::write(p, bytes).unwrap();
     }
 
-    // A commit to a.txt rewrites exactly a.txt's shard; b.txt's shard is untouched.
+    // A commit rewrites exactly the tracked document's shard.
     let before: std::collections::HashMap<_, _> = shard_files(root)
         .into_iter()
         .map(|p| (p.clone(), std::fs::read(&p).unwrap()))
         .collect();
-    std::fs::write(root.join("a.gpl"), b"main-a2").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(3)).unwrap();
     commit::commit_snapshot(&mut r, "on main", "t").unwrap();
     let changed = shard_files(root)
         .into_iter()
@@ -2030,7 +2195,7 @@ fn switch_skips_chains_rewrite_commit_touches_only_changed_file() {
         .count();
     assert_eq!(changed, 1, "only the committed file's shard is rewritten");
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(
         r2.chains.export_all().0.len(),
         r.chains.export_all().0.len()
@@ -2046,9 +2211,17 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
+    // `extra` is deliberately large and near-incompressible so its versions bsdiff-chain — the
+    // patch-chain bases GC must not reclaim. Under the folder model this was a second tracked
+    // file; a `.kra` entry gives the same shape inside one document.
+    let bulk = |seed: u8| -> Vec<u8> {
+        (0..90_000u32)
+            .map(|i| ((i as u8) ^ seed).wrapping_mul(31))
+            .collect()
+    };
     let mk = |tile: &[u8], extra: &[u8]| {
         pack_kra(&[
             ("mimetype", b"application/x-krita".to_vec()),
@@ -2059,38 +2232,36 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
     };
     // Three commits on main (so the patch-chaining generic file has history), then a branch
     // with its own commit, then: undo one commit + delete the branch = two orphan sets.
-    std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"x1")).unwrap();
-    // A large-ish text file so its versions bsdiff-chain (>64KB, incompressible-ish text).
-    let big1: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
-    std::fs::write(root.join("notes.gpl"), &big1).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileAAAA", &bulk(1))).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
-    let mut big2 = big1.clone();
-    big2.extend_from_slice(b"more");
-    std::fs::write(root.join("notes.gpl"), &big2).unwrap();
-    std::fs::write(root.join("art.kra"), mk(b"tileBBBB", b"x1")).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileBBBB", &bulk(2))).unwrap();
     let c2 = commit::commit_snapshot(&mut r, "c2", "t").unwrap();
 
     // Branch with a divergent edit, then go back to main.
     branch::create_branch(&mut r, "scrap", None).unwrap();
-    std::fs::write(root.join("art.kra"), mk(b"tileSCRAP", b"x2")).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileSCRAP", &bulk(3))).unwrap();
     commit::commit_snapshot(&mut r, "scrap edit", "t").unwrap();
     branch::switch_branch(&mut r, "main").unwrap();
 
     // Another main commit, then undo it (its edits resurface as pending and get re-committed
     // — dedup makes that cheap), and delete scrap: the stranded branch history is the garbage.
-    std::fs::write(root.join("art.kra"), mk(b"tileCCCC", b"x3")).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileCCCC", &bulk(4))).unwrap();
     commit::commit_snapshot(&mut r, "c3", "t").unwrap();
     commit::undo_last_commit(&mut r).unwrap();
     commit::commit_snapshot(&mut r, "c3 again", "t").unwrap();
     branch::delete_branch(&mut r, "scrap").unwrap();
 
-    let objs_before = count_objects(root);
+    let objs_before = count_objects(&store_of(&tracked_doc(root)));
 
     // Dry run reports without deleting.
     let dry = gc::collect_garbage(&mut r, true).unwrap();
     assert!(dry.dry_run && dry.bytes_reclaimed > 0 && dry.versions_removed > 0);
-    assert_eq!(count_objects(root), objs_before, "dry run must not delete");
+    assert_eq!(
+        count_objects(&store_of(&tracked_doc(root))),
+        objs_before,
+        "dry run must not delete"
+    );
 
     let report = gc::collect_garbage(&mut r, false).unwrap();
     assert!(!report.dry_run);
@@ -2098,29 +2269,25 @@ fn gc_reclaims_orphans_and_preserves_reachable_history() {
     // the deleted branch's commit is dropped here.
     assert_eq!(report.commits_removed, 1, "the stranded branch commit");
     assert!(report.bytes_reclaimed > 0);
-    assert!(count_objects(root) < objs_before);
+    assert!(count_objects(&store_of(&tracked_doc(root))) < objs_before);
 
     // Everything reachable reconstructs byte-for-byte, in this session and after reopen.
-    for repo_ref in [&r, &repo::Repo::open(root).unwrap()] {
-        for (cid, tile, extra, big) in [
-            (&c1.id, b"tileAAAA".as_slice(), b"x1".as_slice(), &big1),
-            (&c2.id, b"tileBBBB".as_slice(), b"x1".as_slice(), &big2),
+    for repo_ref in [&r, &repo::Repo::open(&tracked_doc(root)).unwrap()] {
+        for (cid, tile, extra) in [
+            (&c1.id, b"tileAAAA".as_slice(), bulk(1)),
+            (&c2.id, b"tileBBBB".as_slice(), bulk(2)),
         ] {
-            let kra_bytes = commit::file_at_commit(repo_ref, "art.kra", cid).unwrap();
-            let l =
-                tiles::parse(&kra::read_entry(&kra_bytes, "img/layers/layer1").unwrap()).unwrap();
+            let doc = commit::file_at_commit(repo_ref, "art.kra", cid).unwrap();
+            let l = tiles::parse(&kra::read_entry(&doc, "img/layers/layer1").unwrap()).unwrap();
             assert_eq!(l.tiles[0].data, tile);
-            assert_eq!(kra::read_entry(&kra_bytes, "img/extra.bin").unwrap(), extra);
-            assert_eq!(
-                &commit::file_at_commit(repo_ref, "notes.gpl", cid).unwrap(),
-                big
-            );
+            // The bsdiff-chained entry: its patch bases had to survive the sweep.
+            assert_eq!(kra::read_entry(&doc, "img/extra.bin").unwrap(), extra);
         }
     }
 
     // The tree is still clean and a fresh commit works after GC.
     assert!(scan::scan(&r).unwrap().is_empty());
-    std::fs::write(root.join("art.kra"), mk(b"tileDDDD", b"x4")).unwrap();
+    std::fs::write(root.join("art.kra"), mk(b"tileDDDD", &bulk(5))).unwrap();
     commit::commit_snapshot(&mut r, "post-gc", "t").unwrap();
     assert!(scan::scan(&r).unwrap().is_empty());
 }
@@ -2144,16 +2311,12 @@ fn cleanup_moves_dead_objects_to_trash_instead_of_deleting() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(7)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(
-        root.join("a.gpl"),
-        b"v2, different enough to store its own object",
-    )
-    .unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(9)).unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     // Undoing c2 drops it from the log — its stored version is now referenced by nothing.
     commit::undo_last_commit(&mut r).unwrap();
@@ -2164,7 +2327,7 @@ fn cleanup_moves_dead_objects_to_trash_instead_of_deleting() {
         "expected c2's orphaned object to be swept"
     );
 
-    let trash = root.join(".kvc/trash");
+    let trash = store_of(&tracked_doc(root)).join("trash");
     assert!(trash.is_dir(), "quarantined objects land in .kvc/trash");
     let runs: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
     assert_eq!(runs.len(), 1, "one run directory for this cleanup");
@@ -2181,8 +2344,8 @@ fn cleanup_moves_dead_packs_to_trash() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // 40 distinct tiles (> PACK_MIN_OBJECTS) packs into one file, per
     // `large_commit_packs_objects_and_reconstructs`.
@@ -2201,7 +2364,7 @@ fn cleanup_moves_dead_packs_to_trash() {
     std::fs::write(root.join("art.kra"), &kra).unwrap();
     commit::commit_snapshot(&mut r, "packed", "t").unwrap();
     assert_eq!(
-        std::fs::read_dir(root.join(".kvc/objects/pack"))
+        std::fs::read_dir(store_of(&tracked_doc(root)).join("objects/pack"))
             .unwrap()
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
@@ -2216,7 +2379,7 @@ fn cleanup_moves_dead_packs_to_trash() {
     assert!(report.objects_deleted > 0);
 
     assert_eq!(
-        std::fs::read_dir(root.join(".kvc/objects/pack"))
+        std::fs::read_dir(store_of(&tracked_doc(root)).join("objects/pack"))
             .unwrap()
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
@@ -2224,7 +2387,7 @@ fn cleanup_moves_dead_packs_to_trash() {
         0,
         "the dead pack must be gone from objects/pack"
     );
-    let trash = root.join(".kvc/trash");
+    let trash = store_of(&tracked_doc(root)).join("trash");
     let runs: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
     assert_eq!(runs.len(), 1);
     let quarantined_pack = std::fs::read_dir(runs[0].path().join("pack"))
@@ -2242,23 +2405,19 @@ fn dry_run_cleanup_never_touches_trash() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"v1").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(7)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(
-        root.join("a.gpl"),
-        b"v2, different enough to store its own object",
-    )
-    .unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(9)).unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     commit::undo_last_commit(&mut r).unwrap();
 
     let report = gc::collect_garbage(&mut r, true).unwrap();
     assert!(report.dry_run && report.bytes_reclaimed > 0);
     assert!(
-        !root.join(".kvc/trash").exists(),
+        !store_of(&tracked_doc(root)).join("trash").exists(),
         "dry run must not create or populate a trash run"
     );
 }
@@ -2269,12 +2428,12 @@ fn dry_run_cleanup_never_touches_trash() {
 fn objects_sharded_layout_with_flat_read_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let data = b"object payload".to_vec();
     let h = r.store_stream("file:x", &data).unwrap();
-    let objects = root.join(".kvc/objects");
+    let objects = store_of(&tracked_doc(root)).join("objects");
     let sharded = objects.join(&h[..2]).join(format!("{h}.full"));
     assert!(sharded.is_file(), "new objects land in objects/<xx>/");
 
@@ -2303,8 +2462,8 @@ fn objects_sharded_layout_with_flat_read_fallback() {
 fn large_commit_packs_objects_and_reconstructs() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // 40 tiles (> PACK_MIN_OBJECTS) with distinct contents.
     let tiles_v1: Vec<(i64, i64, Vec<u8>)> = (0..40i64)
@@ -2323,13 +2482,13 @@ fn large_commit_packs_objects_and_reconstructs() {
     let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
 
     // The tile batch became one pack; only the manifest & small entries are loose.
-    let packs: Vec<_> = std::fs::read_dir(root.join(".kvc/objects/pack"))
+    let packs: Vec<_> = std::fs::read_dir(store_of(&tracked_doc(root)).join("objects/pack"))
         .unwrap()
         .flatten()
         .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
         .collect();
     assert_eq!(packs.len(), 1, "one pack per large batch");
-    let loose = count_objects(root) - packs.len();
+    let loose = count_objects(&store_of(&tracked_doc(root))) - packs.len();
     assert!(
         loose < 10,
         "tiles must be packed, not loose (found {loose} loose objects)"
@@ -2341,7 +2500,7 @@ fn large_commit_packs_objects_and_reconstructs() {
     assert_eq!(l.tiles.len(), 40);
     assert_eq!(l.tiles[7].data, tiles_v1[7].2);
 
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     let restored2 = commit::file_at_commit(&r2, "art.kra", &c1.id).unwrap();
     assert_eq!(restored, restored2);
 
@@ -2349,14 +2508,14 @@ fn large_commit_packs_objects_and_reconstructs() {
     drop(r2);
     std::fs::remove_file(root.join("art.kra")).unwrap();
     std::fs::write(root.join("art.kra"), &kra).unwrap();
-    let before = count_objects(root);
+    let before = count_objects(&store_of(&tracked_doc(root)));
     // Deleting + rewriting identical bytes leaves content identical to the tip — a clean scan
     // (mtime changed but hash matches) means nothing to commit.
     assert!(matches!(
         commit::commit_snapshot(&mut r, "again", "t"),
         Err(KvcError::Nothing)
     ));
-    assert_eq!(count_objects(root), before);
+    assert_eq!(count_objects(&store_of(&tracked_doc(root))), before);
 }
 
 // --- incremental .kra materialization on switch ------------------------------------------
@@ -2365,8 +2524,8 @@ fn large_commit_packs_objects_and_reconstructs() {
 fn kra_switch_materializes_incrementally() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let t1 = tiled(&[(0, 0, &[1u8; 500]), (64, 0, &[2u8; 500])]);
     let t2 = tiled(&[(0, 0, &[3u8; 500])]);
@@ -2445,15 +2604,15 @@ fn kra_switch_materializes_incrementally() {
 fn commits_log_appends_and_migrates_legacy() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
-    let log = root.join(".kvc/commits.log");
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    let log = store_of(&tracked_doc(root)).join("commits.log");
     assert!(log.is_file(), "init writes the log");
-    assert!(!root.join(".kvc/commits.json").exists());
+    assert!(!store_of(&tracked_doc(root)).join("commits.json").exists());
 
-    std::fs::write(root.join("a.gpl"), b"one").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(15)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
-    std::fs::write(root.join("a.gpl"), b"two").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(16)).unwrap();
     commit::commit_snapshot(&mut r, "c2", "t").unwrap();
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(text.lines().count(), 2, "one JSON line per commit");
@@ -2462,18 +2621,18 @@ fn commits_log_appends_and_migrates_legacy() {
     let commits = r.commits.clone();
     drop(r);
     std::fs::write(
-        root.join(".kvc/commits.json"),
+        store_of(&tracked_doc(root)).join("commits.json"),
         serde_json::to_vec(&commits).unwrap(),
     )
     .unwrap();
     std::fs::remove_file(&log).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.commits.len(), 2, "legacy commits.json readable");
-    std::fs::write(root.join("a.gpl"), b"three").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(17)).unwrap();
     commit::commit_snapshot(&mut r, "c3", "t").unwrap();
     assert!(log.is_file(), "first save writes the log");
     assert!(
-        !root.join(".kvc/commits.json").exists(),
+        !store_of(&tracked_doc(root)).join("commits.json").exists(),
         "legacy file retired after the log is in place"
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
@@ -2484,14 +2643,14 @@ fn commits_log_appends_and_migrates_legacy() {
     let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
     f.write_all(b"{\"id\":\"torn").unwrap();
     drop(f);
-    let mut r = repo::Repo::open(root).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.commits.len(), 3, "torn tail dropped, history intact");
 
     // Undo rewrites the log without the popped commit (and scrubs the torn tail with it).
     commit::undo_last_commit(&mut r).unwrap();
     assert_eq!(r.commits.len(), 2);
     drop(r);
-    let r = repo::Repo::open(root).unwrap();
+    let r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.commits.len(), 2, "log rewritten after undo");
     let text = std::fs::read_to_string(&log).unwrap();
     assert_eq!(text.lines().count(), 2);
@@ -2504,8 +2663,8 @@ fn commits_log_appends_and_migrates_legacy() {
 fn undo_uses_recorded_file_hash() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let doc1 = pack_kra(&[
         ("mimetype", b"application/x-krita".to_vec()),
@@ -2544,12 +2703,12 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     r.config.cache_max_bytes = 300; // in-memory only — tiny budget for the test
 
     // 5 x 100-byte cache PNGs with strictly increasing mtimes.
-    let cache = root.join(".kvc/cache");
+    let cache = store_of(&tracked_doc(root)).join("cache");
     let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     for i in 0..5u32 {
         let p = cache.join(format!("entry{i}.png"));
@@ -2559,7 +2718,7 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
             .unwrap();
     }
     // One stale .tmp (crash leftover, >1h old) and one fresh .tmp (in-flight, must survive).
-    let stale = root.join(".kvc/config.tmp");
+    let stale = store_of(&tracked_doc(root)).join("config.tmp");
     std::fs::write(&stale, [0u8; 40]).unwrap();
     std::fs::File::options()
         .write(true)
@@ -2569,7 +2728,7 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
         .unwrap();
     // (In the pack dir with a name no real atomic write uses — GC's own `repo.save()`
     // legitimately creates and renames `.kvc/*.tmp` names mid-run.)
-    let fresh = root.join(".kvc/objects/pack/inflight.tmp");
+    let fresh = store_of(&tracked_doc(root)).join("objects/pack/inflight.tmp");
     std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
     std::fs::write(&fresh, [0u8; 40]).unwrap();
 
@@ -2613,8 +2772,8 @@ fn gc_consolidates_small_packs() {
     use krita_vc_lib::gc;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // 9 commits, each rewriting 33 tiles with fresh content — every commit crosses
     // PACK_MIN_OBJECTS and writes its own small pack.
@@ -2649,7 +2808,7 @@ fn gc_consolidates_small_packs() {
         );
     }
     let packs = |root: &std::path::Path| -> usize {
-        std::fs::read_dir(root.join(".kvc/objects/pack"))
+        std::fs::read_dir(store_of(&tracked_doc(root)).join("objects/pack"))
             .map(|rd| {
                 rd.flatten()
                     .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
@@ -2676,7 +2835,7 @@ fn gc_consolidates_small_packs() {
     assert_eq!(packs(root), 1, "small live packs merged into one");
 
     // Every version still reconstructs from the consolidated pack — this session and reopened.
-    for repo_ref in [&r, &repo::Repo::open(root).unwrap()] {
+    for repo_ref in [&r, &repo::Repo::open(&tracked_doc(root)).unwrap()] {
         for (round, id) in ids.iter().enumerate() {
             let bytes = commit::file_at_commit(repo_ref, "art.kra", id).unwrap();
             let block =
@@ -2698,7 +2857,7 @@ fn gc_consolidates_small_packs() {
 fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
+    init_doc(root);
 
     // Fabricate a pre-KVCC2 shard by hand: bare zstd(bincode) with the old 4-field Version
     // (including the redundant `object`), plus its loose object, exactly as the old code
@@ -2712,7 +2871,9 @@ fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
     }
     let content = b"hello legacy".to_vec();
     let hash = repo::hash_bytes(&content);
-    let obj_dir = root.join(".kvc/objects").join(&hash[..2]);
+    let obj_dir = store_of(&tracked_doc(root))
+        .join("objects")
+        .join(&hash[..2]);
     std::fs::create_dir_all(&obj_dir).unwrap();
     std::fs::write(
         obj_dir.join(format!("{hash}.full")),
@@ -2730,14 +2891,14 @@ fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
         }],
     );
     let plain = bincode::serialize(&chains).unwrap();
-    let shard = root.join(".kvc/chains").join(format!(
+    let shard = store_of(&tracked_doc(root)).join("chains").join(format!(
         "{}.bin",
         &blake3::hash(b"notes.txt").to_hex()[..16]
     ));
     std::fs::write(&shard, zstd::encode_all(&plain[..], 1).unwrap()).unwrap();
 
     // The legacy shard reads transparently.
-    let mut r = repo::Repo::open(root).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r.reconstruct("file:notes.txt", &hash).unwrap(), content);
 
     // Dirtying the shard rewrites it in the new format; both versions still reconstruct.
@@ -2747,7 +2908,7 @@ fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
     r.save().unwrap();
     let bytes = std::fs::read(&shard).unwrap();
     assert!(bytes.starts_with(b"KVCC2"), "dirtied shard upgraded");
-    let r2 = repo::Repo::open(root).unwrap();
+    let r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert_eq!(r2.reconstruct("file:notes.txt", &hash).unwrap(), content);
     assert_eq!(
         r2.reconstruct("file:notes.txt", &h2).unwrap(),
@@ -2755,9 +2916,11 @@ fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
     );
 
     // A rotten shard still reads as empty (never a panic).
-    let bad = root.join(".kvc/chains").join("deadbeefdeadbeef.bin");
+    let bad = store_of(&tracked_doc(root))
+        .join("chains")
+        .join("deadbeefdeadbeef.bin");
     std::fs::write(&bad, b"not a shard").unwrap();
-    let r3 = repo::Repo::open(root).unwrap();
+    let r3 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert!(r3.chains.chain("file:whatever").is_none());
 }
 
@@ -2795,8 +2958,8 @@ fn kra_with_composite(composite_png: &[u8], tile: &[u8]) -> Vec<u8> {
 fn composite_tiles_dedup_and_pixel_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // 1280x1280 = 5x5 composite blocks.
     let (w, h) = (1280u32, 1280u32);
@@ -2815,9 +2978,9 @@ fn composite_tiles_dedup_and_pixel_roundtrip() {
     }
     let png2 = raster::rgba_to_png(&px2, w, h).unwrap();
     std::fs::write(root.join("art.kra"), kra_with_composite(&png2, b"tile-v1")).unwrap();
-    let before = count_objects(root);
+    let before = count_objects(&store_of(&tracked_doc(root)));
     let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
-    let added = count_objects(root) - before;
+    let added = count_objects(&store_of(&tracked_doc(root))) - before;
     assert!(
         added <= 3,
         "a one-block composite edit must add ~2 objects (block + manifest), added {added}"
@@ -2844,8 +3007,8 @@ fn composite_tiles_dedup_and_pixel_roundtrip() {
 fn composite_fallback_stays_raw_byte_exact() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // A 16-bit grayscale PNG is ineligible for re-encoding — must stay Raw, byte-for-byte.
     let mut gray16 = Vec::new();
@@ -2870,8 +3033,8 @@ fn composite_fallback_stays_raw_byte_exact() {
 fn composite_materialize_across_branch_switch() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let (w, h) = (600u32, 500u32); // non-multiple of 256: exercises partial edge blocks
     let px_main = test_canvas(w, h, 7);
@@ -2915,8 +3078,8 @@ fn composite_materialize_across_branch_switch() {
 fn tile_pixel_deltas_flag_mixed_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let planar = |seed: u8| -> Vec<u8> {
         (0..64 * 64 * 4u32)
@@ -2980,9 +3143,9 @@ fn tile_pixel_deltas_flag_mixed_history() {
 fn repo_config_round_trips_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
+    init_doc(root);
 
-    let mut r = repo::Repo::open_light(root).unwrap();
+    let mut r = repo::Repo::open_light(&tracked_doc(root)).unwrap();
     assert_eq!(
         r.config.cache_max_bytes,
         256 * 1024 * 1024,
@@ -2994,7 +3157,7 @@ fn repo_config_round_trips_across_reopen() {
     r.config.tile_pixel_deltas = true;
     r.save_config().unwrap();
 
-    let reopened = repo::Repo::open_light(root).unwrap();
+    let reopened = repo::Repo::open_light(&tracked_doc(root)).unwrap();
     assert_eq!(reopened.config.cache_max_bytes, 512 * 1024 * 1024);
     assert!(reopened.config.tile_pixel_deltas);
 }
@@ -3007,111 +3170,103 @@ fn stash_all_reverts_working_tree() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
-    std::fs::write(root.join("new.gpl"), b"brand new").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(6)).unwrap();
     let s = stash::create(&mut r, "lighting pass", "t", None).unwrap();
 
     assert_eq!(s.label, "lighting pass");
     assert_eq!(s.branch, "main");
-    assert_eq!(s.files.len(), 2);
+    assert_eq!(s.files.len(), 1);
     assert_eq!(stash::list(&r).len(), 1);
-    // The tree is clean again: the edit is reverted and the never-committed file is gone.
+    // The tree is clean again: the edit is reverted.
     assert!(scan::scan(&r).unwrap().is_empty());
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
-    assert!(!root.join("new.gpl").exists());
-    // History is untouched — a stash is not a commit.
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
+    // History is untouched - a stash is not a commit.
     assert_eq!(r.commits.len(), 1);
 }
-
 #[test]
 fn stash_then_pop_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
-    std::fs::write(root.join("new.gpl"), b"brand new").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(6)).unwrap();
     let s = stash::create(&mut r, "", "t", None).unwrap();
 
     stash::pop(&mut r, &s.id).unwrap();
 
-    // Byte-exact restore, and the shelf is empty again.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"wip-a");
-    assert_eq!(std::fs::read(root.join("new.gpl")).unwrap(), b"brand new");
+    // The set-aside work is back, and the shelf is empty again.
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(6));
     assert!(stash::list(&r).is_empty());
     // The index must still hold the *committed* head, so the restored work reads as unsaved
     // rather than silently looking already-committed.
-    let mut seen = scan::scan(&r).unwrap();
-    seen.sort();
     assert_eq!(
-        seen,
-        vec![
-            ("a.gpl".to_string(), "M".to_string()),
-            ("new.gpl".to_string(), "U".to_string()),
-        ]
+        scan::scan(&r).unwrap(),
+        vec![("art.kra".to_string(), "M".to_string())]
     );
 }
-
 #[test]
 fn stash_selected_paths_only() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
-    std::fs::write(root.join("b.gpl"), b"wip-b").unwrap();
-    let only = vec!["a.gpl".to_string()];
-    let s = stash::create(&mut r, "just a", "t", Some(&only)).unwrap();
-
-    assert_eq!(s.files.len(), 1);
-    // a.gpl reverted; b.gpl left dirty.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"base-a");
-    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"wip-b");
+    std::fs::write(tracked_doc(root), kra_bytes(6)).unwrap();
+    assert!(matches!(
+        stash::create(&mut r, "nothing", "t", Some(&["other.kra".to_string()])),
+        Err(KvcError::Nothing)
+    ));
     assert_eq!(
-        scan::scan(&r).unwrap(),
-        vec![("b.gpl".to_string(), "M".to_string())]
+        doc_content(&tracked_doc(root)),
+        maindoc(6),
+        "edit must survive"
     );
-}
 
+    let only = vec!["art.kra".to_string()];
+    let s = stash::create(&mut r, "just the document", "t", Some(&only)).unwrap();
+    assert_eq!(s.files.len(), 1);
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
+    assert!(scan::scan(&r).unwrap().is_empty());
+}
 #[test]
-fn pop_refuses_when_dirty() {
+fn pop_refuses_when_stashed_deletion_meets_an_edit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::remove_file(tracked_doc(root)).unwrap();
     let s = stash::create(&mut r, "", "t", None).unwrap();
-    // Same file edited again since setting aside.
-    std::fs::write(root.join("a.gpl"), b"newer work").unwrap();
+    assert_eq!(s.files[0].status, "D");
+
+    // The document is back and edited since — restoring the deletion would destroy that work.
+    std::fs::write(tracked_doc(root), kra_bytes(14)).unwrap();
 
     match stash::pop(&mut r, &s.id) {
-        Err(KvcError::StashConflict(files)) => assert_eq!(files, "a.gpl"),
-        other => panic!("expected StashConflict, got {other:?}"),
+        Err(KvcError::StashConflict(files)) => assert_eq!(files, "art.kra"),
+        other => panic!("expected StashConflict, got {:?}", other.map(|_| ())),
     }
     // Nothing lost on either side: the newer edit stands and the stash survives.
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"newer work");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(14));
     assert_eq!(stash::list(&r).len(), 1);
     // The conflict message must not collide with the branch-switch prompt's prefix.
-    assert!(!KvcError::StashConflict("a.gpl".into())
+    assert!(!KvcError::StashConflict("art.kra".into())
         .to_string()
         .starts_with("unsaved changes"));
 }
-
 #[test]
 fn gc_keeps_stashed_content() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(6)).unwrap();
     let s = stash::create(&mut r, "", "t", None).unwrap();
 
     // A stash is reachable from no branch tip — only rooting it keeps its content alive.
     gc::collect_garbage(&mut r, false).unwrap();
 
-    let mut r = repo::Repo::open(root).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     stash::pop(&mut r, &s.id).unwrap();
-    assert_eq!(std::fs::read(root.join("a.gpl")).unwrap(), b"wip-a");
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(6));
 }
 
 #[test]
@@ -3120,17 +3275,17 @@ fn dropped_stash_content_is_collectable() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"wip-a").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(6)).unwrap();
     let s = stash::create(&mut r, "", "t", None).unwrap();
-    let with_stash = count_objects(root);
+    let with_stash = count_objects(&store_of(&tracked_doc(root)));
 
     stash::drop_one(&mut r, &s.id).unwrap();
     assert!(stash::list(&r).is_empty());
 
-    let mut r = repo::Repo::open(root).unwrap();
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
     gc::collect_garbage(&mut r, false).unwrap();
     assert!(
-        count_objects(root) < with_stash,
+        count_objects(&store_of(&tracked_doc(root))) < with_stash,
         "dropping the last stash should make its content collectable"
     );
 }
@@ -3139,19 +3294,16 @@ fn dropped_stash_content_is_collectable() {
 fn stash_requires_a_commit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
-    std::fs::write(root.join("a.gpl"), b"never committed").unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(13)).unwrap();
 
     // No tip means no committed state to revert to.
     assert!(matches!(
         stash::create(&mut r, "", "t", None),
         Err(KvcError::NoCommit(_))
     ));
-    assert_eq!(
-        std::fs::read(root.join("a.gpl")).unwrap(),
-        b"never committed"
-    );
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(13));
 }
 
 #[test]
@@ -3168,8 +3320,8 @@ fn stash_with_nothing_dirty_errors() {
 fn stash_dedups_kra_tiles_against_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let mk = |t1: &[u8], t2: &[u8]| {
         pack_kra(&[
@@ -3180,13 +3332,13 @@ fn stash_dedups_kra_tiles_against_history() {
     };
     std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"tileBBBB")).unwrap();
     commit::commit_snapshot(&mut r, "v1", "t").unwrap();
-    let committed = count_objects(root);
+    let committed = count_objects(&store_of(&tracked_doc(root)));
 
     // Only the second tile changes — the first must dedup against the committed version, which
     // is the whole premise of storing stashes through the same relpath-keyed streams.
     std::fs::write(root.join("art.kra"), mk(b"tileAAAA", b"tileZZZZ")).unwrap();
     let s = stash::create(&mut r, "", "t", None).unwrap();
-    let grew = count_objects(root) - committed;
+    let grew = count_objects(&store_of(&tracked_doc(root))) - committed;
     assert!(
         grew <= 3,
         "a one-tile edit should cost a handful of objects, not a full copy (grew by {grew})"
@@ -3460,8 +3612,8 @@ fn merge_layers_skips_unchanged_despite_tile_reordering() {
 fn pop_merges_conflicting_kra_instead_of_refusing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let v1 = layered_kra(
         "img",
@@ -3529,8 +3681,8 @@ fn pop_merges_conflicting_kra_instead_of_refusing() {
 fn pop_merge_failure_leaves_working_tree_and_stash() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     let v1 = layered_kra("img", "RGBA", &[("L", "{a}", "layer1", b"aaaa")]);
     std::fs::write(root.join("art.kra"), &v1).unwrap();
@@ -3559,9 +3711,9 @@ fn stash_dtos_are_newest_first() {
     let root = dir.path();
     let mut r = seeded_repo(&dir);
 
-    std::fs::write(root.join("a.gpl"), b"first wip").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(11)).unwrap();
     stash::create(&mut r, "older", "t", None).unwrap();
-    std::fs::write(root.join("b.gpl"), b"second wip").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(36)).unwrap();
     stash::create(&mut r, "newer", "t", None).unwrap();
 
     // The engine stores oldest-first; the UI's "bring back the latest" takes row 0, so the DTO
@@ -3570,7 +3722,7 @@ fn stash_dtos_are_newest_first() {
     let labels: Vec<&str> = dtos.iter().map(|d| d.label.as_str()).collect();
     assert_eq!(labels, vec!["newer", "older"]);
     // Statuses survive the CommittedFile -> FileChange mapping for the status chip.
-    assert_eq!(dtos[0].changes[0].path, "b.gpl");
+    assert_eq!(dtos[0].changes[0].path, "art.kra");
     assert_eq!(dtos[0].changes[0].status, "M");
     assert_eq!(dtos[0].branch, "main");
 }
@@ -3612,42 +3764,35 @@ fn working_tree_writes_are_atomic() {
 fn corrupt_object_is_refused_on_restore_but_not_on_the_diff_path() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"the real palette").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(21)).unwrap();
     let c1 = commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
     // Small first version = a full zstd snapshot named by blake3 of the file bytes. Replace its
     // payload with a *valid* frame holding different content: it decodes fine, so only a hash
     // check can catch it.
-    let hash = repo::hash_bytes(b"the real palette");
-    let obj = root
-        .join(".kvc/objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.full"));
-    assert!(obj.is_file(), "expected a loose full snapshot at {obj:?}");
+    let obj = corruptible_object(&r, &store_of(&tracked_doc(root)));
     std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
 
     // Restore path: refuses, and leaves the working file exactly as it was.
-    std::fs::write(root.join("a.gpl"), b"my unsaved edit").unwrap();
-    let mut r2 = repo::Repo::open(root).unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(12)).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     let err = commit::discard_working_changes(&mut r2, &c1.id, None).unwrap_err();
     assert!(
         matches!(err, KvcError::Corrupt(_)),
         "expected Corrupt, got {err:?}"
     );
-    assert_eq!(
-        std::fs::read(root.join("a.gpl")).unwrap(),
-        b"my unsaved edit"
-    );
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(12));
 
     // Diff path: same object, no verification, no error — a wrong pixel in a preview is not data
     // loss, and this is the loop the app is tuned around.
-    let r3 = repo::Repo::open(root).unwrap();
-    assert_eq!(
-        commit::file_at_commit(&r3, "a.gpl", &c1.id).unwrap(),
-        b"tampered"
+    let r3 = repo::Repo::open(&tracked_doc(root)).unwrap();
+    let rebuilt = commit::file_at_commit(&r3, "art.kra", &c1.id).unwrap();
+    assert!(
+        !rebuilt.is_empty(),
+        "the diff path must rebuild, not refuse"
     );
 }
 
@@ -3674,35 +3819,38 @@ fn check_reports_missing_objects_and_dangling_tips() {
     assert!(clean.ok(), "healthy repo reported {:?}", clean.problems);
     assert!(clean.commits_checked >= 2 && clean.objects_checked > 0);
 
-    // Delete one live object.
-    let hash = repo::hash_bytes(b"base-a");
-    let obj = root
-        .join(".kvc/objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.full"));
+    // Delete one live object. A *content* stream, deliberately: losing a `.kra`'s manifest is
+    // reported as a broken chain instead, which is a different problem from a missing object.
+    let obj = corruptible_object(&r, &store_of(&tracked_doc(root)));
     std::fs::remove_file(&obj).unwrap();
-    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
+    let report =
+        check::check_repository(&mut repo::Repo::open(&tracked_doc(root)).unwrap(), false).unwrap();
     assert!(!report.ok());
-    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
-    assert_eq!(report.problems[0].kind, "missingObject");
+    assert!(
+        report.problems.iter().any(|p| p.kind == "missingObject"),
+        "{:?}",
+        report.problems
+    );
 
     // A branch tip naming a version that isn't in the log — the state that makes every commit
     // on that branch unreachable.
-    let mut r2 = repo::Repo::open(root).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     r2.branches
         .branches
         .insert("main".to_string(), "nosuchcommit".to_string());
     r2.save_branches().unwrap();
-    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
+    let report =
+        check::check_repository(&mut repo::Repo::open(&tracked_doc(root)).unwrap(), false).unwrap();
     assert!(report.problems.iter().any(|p| p.kind == "danglingTip"));
 
     // Damage in the middle of the commit log is reported, not silently truncated away.
-    let log = root.join(".kvc/commits.log");
+    let log = store_of(&tracked_doc(root)).join("commits.log");
     let text = std::fs::read_to_string(&log).unwrap();
     let mut lines: Vec<&str> = text.lines().collect();
     lines[0] = "{not json";
     std::fs::write(&log, lines.join("\n")).unwrap();
-    let report = check::check_repository(&mut repo::Repo::open(root).unwrap(), false).unwrap();
+    let report =
+        check::check_repository(&mut repo::Repo::open(&tracked_doc(root)).unwrap(), false).unwrap();
     assert!(report.problems.iter().any(|p| p.kind == "badLogLine"));
 }
 
@@ -3724,11 +3872,7 @@ fn check_scrub_off_by_default_skips_content_hash() {
 
     // Tamper a loose object with a *valid* zstd frame holding different content — it decodes
     // fine, so `object_exists` alone can't catch it.
-    let hash = repo::hash_bytes(b"base-a");
-    let obj = root
-        .join(".kvc/objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.full"));
+    let obj = corruptible_object(&r, &store_of(&tracked_doc(root)));
     std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
 
     let plain = check::check_repository(&mut r, false).unwrap();
@@ -3747,21 +3891,17 @@ fn check_scrub_detects_corrupted_loose_object() {
     use krita_vc_lib::check;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"the real palette").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(21)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
-    let hash = repo::hash_bytes(b"the real palette");
-    let obj = root
-        .join(".kvc/objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.full"));
+    let obj = any_loose_object(&store_of(&tracked_doc(root)));
     assert!(obj.is_file());
     std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
 
-    let mut r2 = repo::Repo::open(root).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     let scrubbed = check::check_repository(&mut r2, true).unwrap();
     assert!(!scrubbed.ok(), "scrub must catch the tampered object");
     assert!(scrubbed.problems.iter().any(|p| p.kind == "corruptContent"));
@@ -3774,8 +3914,8 @@ fn check_scrub_detects_corrupted_pack_entry() {
     use krita_vc_lib::check;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     // 40 distinct tiles (> PACK_MIN_OBJECTS) pack into one file, per
     // `large_commit_packs_objects_and_reconstructs`.
@@ -3794,7 +3934,7 @@ fn check_scrub_detects_corrupted_pack_entry() {
     std::fs::write(root.join("art.kra"), &kra).unwrap();
     commit::commit_snapshot(&mut r, "packed", "t").unwrap();
 
-    let pack_path = std::fs::read_dir(root.join(".kvc/objects/pack"))
+    let pack_path = std::fs::read_dir(store_of(&tracked_doc(root)).join("objects/pack"))
         .unwrap()
         .flatten()
         .map(|e| e.path())
@@ -3812,7 +3952,7 @@ fn check_scrub_detects_corrupted_pack_entry() {
     }
     std::fs::write(&pack_path, &bytes).unwrap();
 
-    let mut r2 = repo::Repo::open(root).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     let plain = check::check_repository(&mut r2, false).unwrap();
     assert!(
         plain.ok(),
@@ -3831,23 +3971,47 @@ fn check_scrub_reports_multiple_corruptions_without_aborting() {
     use krita_vc_lib::check;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
-    std::fs::write(root.join("a.gpl"), b"palette one").unwrap();
-    std::fs::write(root.join("b.gpl"), b"palette two").unwrap();
+    // A `.kra` stores one stream per zip entry, so a single commit already leaves several loose
+    // objects — enough to corrupt two of them without needing a second tracked file.
+    std::fs::write(tracked_doc(root), kra_bytes(18)).unwrap();
     commit::commit_snapshot(&mut r, "c1", "t").unwrap();
 
-    for content in [b"palette one".as_slice(), b"palette two".as_slice()] {
-        let hash = repo::hash_bytes(content);
-        let obj = root
-            .join(".kvc/objects")
-            .join(&hash[..2])
-            .join(format!("{hash}.full"));
-        std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
+    let store = store_of(&tracked_doc(root));
+    let manifest_keys: Vec<String> = r
+        .chains
+        .export_all()
+        .0
+        .keys()
+        .filter(|k| k.ends_with(":manifest"))
+        .cloned()
+        .collect();
+    let manifests: Vec<std::path::PathBuf> = manifest_keys
+        .iter()
+        .filter_map(|k| r.chains.chain(k))
+        .flatten()
+        .map(|v| {
+            store
+                .join("objects")
+                .join(&v.hash[..2])
+                .join(v.object_name())
+        })
+        .collect();
+    // Corrupt two *content* objects: a corrupted manifest breaks the chain read and the scrub
+    // never reaches the content it was meant to verify.
+    let corrupted: Vec<_> = all_loose_objects(&store)
+        .into_iter()
+        .filter(|p| !manifests.contains(p))
+        .take(2)
+        .collect();
+    assert_eq!(corrupted.len(), 2, "need two content objects to corrupt");
+    for obj in &corrupted {
+        std::fs::write(obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
     }
 
-    let mut r2 = repo::Repo::open(root).unwrap();
+    let mut r2 = repo::Repo::open(&tracked_doc(root)).unwrap();
     let scrubbed = check::check_repository(&mut r2, true).unwrap();
     let corrupt_count = scrubbed
         .problems

@@ -10,7 +10,7 @@
 //! it occasionally costs is trivial next to the operation that triggered it.
 
 use crate::error::{io_at, KvcError, Result};
-use crate::repo::{kvc_dir, write_file_atomic, Repo};
+use crate::repo::{write_file_atomic, Repo};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,8 +29,8 @@ struct OpsLogEntry {
     detail: Option<String>,
 }
 
-fn ops_log_path(root: &Path) -> PathBuf {
-    kvc_dir(root).join("ops.log")
+fn ops_log_path(store: &Path) -> PathBuf {
+    store.join("ops.log")
 }
 
 /// Append one record. Best-effort in spirit (a failure here shouldn't fail the operation it's
@@ -43,7 +43,7 @@ pub fn append(
     tip_after: Option<&str>,
     detail: Option<String>,
 ) -> Result<()> {
-    let path = ops_log_path(&repo.root);
+    let path = ops_log_path(&repo.store);
     rotate_if_needed(&path)?;
 
     let entry = OpsLogEntry {
@@ -94,9 +94,13 @@ mod tests {
     use super::*;
     use crate::repo::Repo;
 
+    /// A store for one document in `dir`. The `.kra` need only exist — these tests never
+    /// commit it, they only exercise the ops log beside it.
     fn repo(dir: &Path) -> Repo {
-        Repo::init(dir).unwrap();
-        Repo::open(dir).unwrap()
+        let doc = dir.join("art.kra");
+        std::fs::write(&doc, b"placeholder").unwrap();
+        Repo::init(&doc).unwrap();
+        Repo::open(&doc).unwrap()
     }
 
     #[test]
@@ -105,7 +109,7 @@ mod tests {
         let repo = repo(tmp.path());
         append(&repo, "undo", Some("a"), Some("b"), None).unwrap();
         append(&repo, "discard", Some("b"), Some("b"), None).unwrap();
-        let text = std::fs::read_to_string(ops_log_path(&repo.root)).unwrap();
+        let text = std::fs::read_to_string(ops_log_path(&repo.store)).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().next().unwrap().contains("\"op\":\"undo\""));
     }
@@ -114,7 +118,7 @@ mod tests {
     fn rotation_keeps_only_the_newest_half_once_over_the_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = repo(tmp.path());
-        let path = ops_log_path(&repo.root);
+        let path = ops_log_path(&repo.store);
         // Fabricate an over-cap log directly rather than appending real entries until 2MB —
         // each line is padded to a known size so the total comfortably clears MAX_BYTES.
         let line = format!("{{\"op\":\"filler\",\"pad\":\"{}\"}}\n", "x".repeat(80));

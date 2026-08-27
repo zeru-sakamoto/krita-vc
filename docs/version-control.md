@@ -1,20 +1,42 @@
 # File Tracking & Version Control
 
 The Rust backend (`src-tauri/src/`) is a **custom local VCS** purpose-built for Krita art
-files — `git2` was evaluated and dropped. It stores history in a `.kvc/` folder inside each
-repository, decomposing `.kra` archives down to individual 64×64 tiles so an edit only stores
-the tiles that actually changed. Local-only: no remotes, no network.
+files — `git2` was evaluated and dropped. It decomposes `.kra` archives down to individual 64×64
+tiles so an edit only stores the tiles that actually changed. Local-only: no remotes, no network.
+
+**One `.kra` document is one history.** The unit the app versions is a single artwork, not a
+folder of them — see [per-document-tracking.md](per-document-tracking.md) for why, and for the
+container-folder layout that keeps a folder of tracked paintings from sprouting a folder each.
 
 The frontend calls into this through Tauri commands (`@tauri-apps/api/core` `invoke`); see
 [Frontend integration](#frontend-integration) for how the UI consumes it (in a plain browser,
 with no backend, the UI renders empty states).
 
-## `.kvc/` store layout
+## Store layout
 
-`init_repository` creates this inside the repo root ([`repo.rs`](../src-tauri/src/repo.rs)):
+Each tracked document gets its own **self-contained** store. They sit side by side in one hidden
+`.kvc/` container beside the artwork, and share nothing — not `objects/`, not `chains/`, not a GC:
 
 ```text
-.kvc/
+artfolder/
+  painting.kra
+  study.kra
+  .kvc/                    hidden; README.txt plus one store per tracked document
+    painting-a3f9c1/       <- `Repo::store`; the layout below
+    study-7b02e4/
+```
+
+A custom store root (Settings → Storage) relocates *new* stores elsewhere; `repo::store_dir_for`
+is the single place that decides. `Repo` therefore carries two paths: `root` (the folder holding
+the document — what working-tree writes are `safe_join`ed onto) and `store` (below).
+
+`init_repository` creates this inside the store ([`repo.rs`](../src-tauri/src/repo.rs)):
+
+```text
+<store>/
+  doc.json       which document this store tracks: { relpath, displayName, createdAt }. Held
+                 apart from index.json, which only knows about files already *committed* —
+                 a freshly-initialised store has an empty index but a defined document
   config.json    engine config: delta-chain threshold (default 20), tile size (64),
                  raster cache byte budget (cacheMaxBytes, default 256 MB; a v1→v2 config
                  migration lowers old 512 MB defaults), the opt-in tilePixelDeltas flag, and
@@ -150,18 +172,17 @@ file against `index.json`:
 | `M` | modified — blake3 differs from the index head |
 | `D` | deleted — in the index but absent on disk |
 
-Unchanged files produce nothing. The `.kvc/` directory and Krita's backup file (`*.kra~`) are
-skipped by the walk. A **tracking guardrail** (`scan::is_supported`) further limits what is *newly*
-tracked to the file types Krita VCS actually understands — `.kra` documents and the palette
-formats (`.gpl`/`.kpl`/`.aco`/`.ase`); any other file in the project folder is ignored outright
-(never staged, hashed, or committed). It also rejects Krita's **autosave** artifact
-(`foo.kra-autosave.kra`, dot-prefixed on Linux/macOS): `is_supported` is a suffix match, not an
-extension parse, so that scratch file ends in `.kra` and would otherwise be tracked as a document
-and get its own chain shard. The guard runs only for files **not already in the index**
-(a cheap short-circuit on the steady-state scan), so already-tracked files stay tracked and a repo
-that predates either rule is never silently pruned — and an unsupported file is now rejected by
-suffix instead of being read and blake3-hashed like before. A file whose **size + mtime still
-match the index** (`TrackedFile.size`/`mtime`,
+Unchanged files produce nothing. **There is no directory walk**: a store tracks exactly one
+document, designated at `init`, so there is nothing to discover — `scan_detailed` stats that one
+path. (This is also why scanning an art folder holding fifty 400 MB `.kra` files costs one
+`stat`.) `scan::is_supported` accordingly no longer gates a walk; it gates `Repo::init`, the only
+place new tracking can begin, and accepts `.kra` alone. Standalone palette files
+(`.gpl`/`.kpl`/`.aco`/`.ase`) are **not** tracked — a `.kra`'s *embedded* document palettes are
+still parsed and diffed off the `.kra` itself, which is where the value was. `is_supported` also
+rejects Krita's **autosave** artifact (`foo.kra-autosave.kra`, dot-prefixed on Linux/macOS): it is
+a suffix match on the whole path, not an extension parse, so that scratch file ends in `.kra` and
+would otherwise be trackable as a document. A document whose **size + mtime still match the
+index** (`TrackedFile.size`/`mtime`,
 nanosecond resolution) **and whose mtime is strictly older than the index file's own on-disk
 mtime** is assumed unchanged and skipped without being read or hashed — the win for big `.kra`
 files. Everything else is hashed and compared against the committed blake3, so a size-preserving
@@ -169,10 +190,10 @@ edit or an mtime touch is still classified correctly. The mtime comparison is gi
 clean"** rule: a quick re-save right after a commit can land in the *same* filesystem mtime tick as
 the index write and, if the byte size is unchanged too (`"v1"` → `"v2"`), size+mtime alone can't
 tell it apart from "untouched". So any working file whose mtime is `>=` the index file's mtime
-(`.kvc/index.json`, statted once per scan) is treated as racy and re-hashed rather than trusted;
-files committed in an earlier tick keep the fast path. Staging is a **selection over the same
-scan**, not a separate index: `commit_selected`'s optional `paths` filters the scanned changes
-down to a subset before committing, leaving everything else dirty.
+(`<store>/index.json`, statted once per scan) is treated as racy and re-hashed rather than
+trusted; a document committed in an earlier tick keeps the fast path. `commit_selected`'s optional
+`paths` filter survives — the CLI still passes it, and layer-level staging will build on the same
+entry point — but with one tracked document there is no longer a file subset for the UI to choose.
 
 ## Committing — `commit_snapshot` / `commit_selected`
 
@@ -181,10 +202,9 @@ down to a subset before committing, leaving everything else dirty.
 
 - **deletion** → drop from the index, record a `D` file entry (no content).
 - **`.kra`** → `kra::commit_kra` decomposes the archive (see below) and returns its manifest hash.
-- **anything else** (a palette file — the guardrail means nothing else reaches a commit) →
-  `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash. Palettes are small,
-  but they ride the same delta-chain store as everything else, so successive versions bsdiff
-  against each other for free (below the 64 KB patch floor they simply snapshot).
+- **anything else** → `Repo::store_stream("file:<path>", bytes)` returns the blob's content hash.
+  Unreachable for new stores (only `.kra` can be tracked), but kept because it is the generic
+  path every non-`.kra` stream still flows through.
 
 Each non-deleted file's blake3 (plus its size + mtime, for the scanner's fast path) is written
 back into the index (the scan hands its already-read bytes to the commit too, so a big `.kra`
@@ -342,7 +362,7 @@ Two higher-level history operations build on this ([`commit.rs`](../src-tauri/sr
   general form of the same in-place rewrite `discard_to_tip` uses, exposed directly to the
   frontend so it can discard less than everything: an optional `paths` filter limits it to those
   relative paths (e.g. the Changes panel's per-file "discard" action, or the sidebar's "Discard
-  current changes" restricted to unstaged files), `None` discards every dirty file. `discard_to_tip`
+  current changes"), `None` discards every dirty file. `discard_to_tip`
   is now a thin wrapper calling this with `None`. Errors `Nothing` if nothing in scope is dirty.
 - **Undo last commit** (`undo_last_commit`) — a *soft* reset of the **current branch tip** (which
   may sit mid-vec after a switch): removes that commit by id, rewinds the branch tip to its first
@@ -430,8 +450,8 @@ Three things in here are load-bearing, and each has a test that fails without it
 
 The operations:
 
-- **Create** (`stash::create`) — scans, filters to `only` (the frontend's staged selection;
-  staging has no backend concept of its own), stores the content, records the stash,
+- **Create** (`stash::create`) — scans, filters to `only` (unused by the UI now that there is
+  one tracked document, but still the CLI's `--paths`), stores the content, records the stash,
   then reverts via `commit::discard_working_changes`. `Nothing` if nothing in scope is dirty;
   `NoCommit` on a repo with no commits — there's no committed state to revert to, and the UI
   gates the menu items on `commits.length` the way undo does.
@@ -526,14 +546,18 @@ Registered in [`lib.rs`](../src-tauri/src/lib.rs); thin wrappers in
 (`spawn_blocking`) so the webview stays responsive, and flatten engine errors to strings. DTOs
 use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 
+Every command's `path` is the **`.kra` document**, not a folder — the engine resolves its store
+from it (`repo::store_dir_for`), so no signature changed when tracking went per-document.
+
 | Command | Purpose |
 |---------|---------|
-| `init_repository(path)` | Create a fresh `.kvc/` store. |
-| `is_repository(path)` | Does `path` already have a `.kvc/` store? |
-| `open_repository(path)` | Validate + load (success = it opened). |
-| `delete_repository(path)` | Delete the folder (guarded by `is_repo`), preferring the OS Recycle Bin. Returns `true` if the Recycle Bin was used, `false` if it fell back to a permanent delete. |
-| `scan_repository(path)` | Working-tree changes as `WorkingChange[]` (`staged: false`). |
-| `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths (the frontend's "staged" set), omitted/`null` commits everything. Returns the `Commit`. |
+| `init_repository(path)` | Start tracking one `.kra`, creating its store in the `.kvc/` container beside it. Refuses a non-`.kra` (`Unsupported`), a file that isn't there, and a document already tracked (`AlreadyRepo`). |
+| `is_repository(path)` | Is this `.kra` already tracked? |
+| `open_repository(path)` | Validate + load (success = it opened). Distinguishes `NotARepo` (never versioned) from `StoreUnreachable` (history is on a drive that isn't mounted) — conflating them would offer to "start tracking" and orphan every saved version. |
+| `delete_repository(path)` | Delete the document's **store**, preferring the OS Recycle Bin, and take the container with it if it held nothing else. **Never touches the artwork.** Returns `true` if the Recycle Bin was used, `false` if it fell back to a permanent delete. |
+| `get_store_root()` / `set_store_root(path?)` | Where new stores are created; `null` = the default, beside each document. App-global (the `kvc` CLI reads the same file), and deliberately does **not** move existing stores. |
+| `scan_repository(path)` | Working-tree changes as `WorkingChange[]` — at most one, the tracked document. |
+| `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths, omitted/`null` commits everything. Returns the `Commit`. |
 | `discard_changes(path, paths)` | Discard uncommitted changes, restoring them to the branch tip's committed content — no new commit. Empty `paths` discards everything dirty; otherwise only those relative paths. |
 | `list_commits(path, allBranches?)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. `allBranches: true` (default false, so every existing caller is unchanged) unions the reachable set over *every* branch tip instead — the Version Map's "show all lines" mode. |
 | `list_branches(path)` | All local branches as `{ name, tip, current }`. |
@@ -542,12 +566,12 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `merge_branch(path, source, author)` | Merge `source` into the current branch; returns the tip/merge `Commit`. |
 | `delete_branch(path, name)` | Remove a branch label (not the current one, and never `main`). Returns the branch list. |
 | `list_stashes(path)` | The set-aside shelf as `StashDto[]` (`{ id, label, author, timestamp, branch, changes }`), newest-first for the UI. Stream hashes stay backend-side. |
-| `create_stash(path, label, author, paths?)` | Set aside working-tree changes and revert those files; `paths` restricts it to those relative paths (the frontend passes its staged selection), omitted/`null` sets aside everything dirty. Returns the shelf. Needs `Repo::open` — storing content writes streams, which a light repo forbids. |
+| `create_stash(path, label, author, paths?)` | Set aside working-tree changes and revert those files; `paths` restricts it to those relative paths, omitted/`null` sets aside everything dirty. Returns the shelf. Needs `Repo::open` — storing content writes streams, which a light repo forbids. |
 | `pop_stash(path, id)` | Bring a stash back into the working tree and drop it from the shelf. Errors `"stash conflict: …"` if anything it holds is dirty (the frontend matches that prefix). Returns the shelf. |
 | `drop_stash(path, id)` / `drop_all_stashes(path)` | Remove stashes without restoring them; storage is reclaimed by the next `cleanup_repository`. |
-| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything unreachable from any branch tip **or stash**. Victims are quarantined to `.kvc/trash/`, not deleted outright (auto-pruned after 14 days). `dryRun` reports what would be freed without touching anything. |
+| `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything in *this document's* store unreachable from any of its branch tips **or stashes**. Stores share no objects, so the sweep can never reach another artwork's history. Victims are quarantined to `<store>/trash/`, not deleted outright (auto-pruned after 14 days). `dryRun` reports what would be freed without touching anything. |
 | `check_repository(path, scrub)` | Read-only integrity check: missing objects, broken chains, dangling branch tips, undecodable commit-log lines, unreadable packs. Takes no lock and writes nothing; findings come back in the report, not as an error. `scrub` (default off) additionally re-hashes every live version's content — IO over the whole store, never run automatically. |
-| `get_repo_config(path)` | The user-editable `.kvc/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
+| `get_repo_config(path)` | The user-editable `<store>/config.json` knobs (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`) for the Settings modal. Uses `Repo::open_light`. |
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Persist those knobs via `Repo::save_config` (config-only write — no index/chain/commit flush). |
 | `layer_diff(path, file, oldCommit, newCommit)` | Per-layer metadata changes for a `.kra`. |
 | `restore_file(path, file, commitId)` | Reconstruct a file at a commit and write it back. |
@@ -557,8 +581,8 @@ use serde `camelCase` to match [`src/types.ts`](../src/types.ts).
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
 | `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
 | `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
-| `export_repository_zip(path, dest)` | Zip the whole repository folder (art files + `.kvc/`) to `dest`, plus a `MANIFEST.json` (repo, branch, tip, timestamp, app version); reopens the archive and verifies it (entry count, manifest readable) before reporting success. Manual backup — see [Backup & recovery](#backup--recovery). |
-| `export_repositories_zip(paths, destDir)` | Zip every repo in `paths` into `destDir`, one `<folder-name>-<date>.zip` each. Returns the paths that failed rather than aborting the batch on one bad repo. |
+| `export_repository_zip(path, dest)` | Zip one document (the `.kra` **plus** its store, rebased under `.kvc/<slug>/` so the archive mirrors the on-disk shape) to `dest`, plus a `MANIFEST.json` (document, branch, tip, timestamp, app version); reopens the archive and verifies it (entry count, manifest readable) before reporting success. Manual backup — see [Backup & recovery](#backup--recovery). |
+| `export_repositories_zip(paths, destDir)` | Zip every artwork in `paths` into `destDir`, one `<name>-<date>.zip` each. Returns the paths that failed rather than aborting the batch on one bad store. |
 
 ## Backup & recovery
 
@@ -566,43 +590,48 @@ There is no automated backup, sync, or cloud storage — this is a local-only ap
 net has to be either OS-level or something the user triggers themselves. Two mechanisms cover
 the two ways a repository can be lost:
 
-- **Deleting a repository through the app** (`delete_repository`, `Repo::delete` in
-  [`repo.rs`](../src-tauri/src/repo.rs)) moves the folder to the OS Recycle Bin (the `trash`
+- **Deleting an artwork's history through the app** (`delete_repository`, `Repo::delete` in
+  [`repo.rs`](../src-tauri/src/repo.rs)) moves the **store** to the OS Recycle Bin (the `trash`
   crate) instead of removing it outright, so an accidental delete from inside the app is
-  recoverable the same way an accidental Explorer/Finder delete is — restore it from the Recycle
-  Bin and re-add it via Browse. `Repo::delete` falls back to a permanent `remove_dir_all` only if
-  the trash move itself fails, and reports which happened (`Ok(true)` = trashed, `Ok(false)` =
+  recoverable the same way an accidental Explorer/Finder delete is. The `.kra` itself is never
+  touched — under the folder model this deleted the project tree, art included, and the change of
+  meaning is why the confirm dialog now asks the artist to type the artwork's *name*: losing
+  history is unrecoverable and the artwork looks perfectly fine afterwards, so a misclick has
+  nothing to announce it. `Repo::delete` falls back to a permanent `remove_dir_all` only if the
+  trash move itself fails, and reports which happened (`Ok(true)` = trashed, `Ok(false)` =
   permanent) so the UI can warn rather than close silently.
-- **Total loss outside the app's control** — the whole project folder deleted via `rm -rf` or
+- **Total loss outside the app's control** — the art folder deleted via `rm -rf` or
   Shift+Delete, disk failure, an external tool corrupting `.kvc/` — isn't something the app can
-  intervene in after the fact. The only protection is a backup made *before* it happens: **"Back
-  up this repository…"** in the Settings modal (`export_repository_zip`) zips the whole folder to
-  a path the user picks via a native Save dialog — the same `.kra` files plus full version
+  intervene in after the fact. The only protection is a backup made *before* it happens: the
+  zip-icon action in the activity bar (`export_repository_zip`) zips the artwork **and its
+  store** to a path the user picks via a native Save dialog — the `.kra` plus its full version
   history, ready to move to an external drive or the user's own cloud storage. **"Back up all
-  repositories…"** in the repository switcher menu (`export_repositories_zip`) does the same for
-  every known repo into one chosen destination folder. An unverified backup isn't a backup: the
-  finished archive carries a `MANIFEST.json` (repo name, branch, tip commit, timestamp, app
-  version) and `Repo::export_zip` reopens it and checks the entry count and manifest readability
-  before reporting success, rather than trusting `zw.finish()` alone. Settings → Storage shows a
+  artworks…"** in the switcher menu (`export_repositories_zip`) does the same for every tracked
+  artwork into one chosen destination folder. An unverified backup isn't a backup: the finished
+  archive carries a `MANIFEST.json` (document, branch, tip commit, timestamp, app version) and
+  `Repo::export_zip` reopens it and checks the entry count and manifest readability before
+  reporting success, rather than trusting `zw.finish()` alone. Settings → Storage shows a
   "last backed up N days ago" hint (`Repository.lastBackupAt`, persisted client-side) so a stale
-  backup doesn't go unnoticed. Recovery is just extraction: since `Repo::is_repo` only checks that
-  `.kvc/config.json` exists, unzipping a backup anywhere and pointing Browse at it reopens it as a
-  fully working repository — no dedicated "restore" command.
+  backup doesn't go unnoticed. Recovery is just extraction: the archive holds `<name>.kra` at the
+  top level with its store under `.kvc/<slug>/`, exactly the on-disk shape, so unzipping it into
+  any folder and pointing the picker at the `.kra` reopens it fully tracked — no dedicated
+  "restore" command. That holds even when the store had been relocated to a custom root, since
+  `export_zip` rebases it back into the default layout.
 
 ## Frontend integration
 
 The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell:
 
 - **In Tauri** — [`useWorkingChanges`](../src/lib/repoData.ts) (shared by `ChangesPanel` and
-  `Sidebar`, so both see the same staged/unstaged split off one scan) calls `scan_repository`;
-  `ChangesPanel` calls `commit_snapshot` with the staged paths (or `null`/the full set, behind a
-  confirm modal, when nothing or only some files are staged); [`useCommits`](../src/lib/repoData.ts)
-  calls `list_commits` and maps `BackendCommit` → the frontend `Commit` shape;
-  [`useBranches`](../src/lib/repoData.ts) calls `list_branches`;
+  `Sidebar`, so both act on one scan) calls `scan_repository`; `ChangesPanel` calls
+  `commit_snapshot` for the whole artwork and describes the pending work as the **layers that
+  changed**, read off `useWorkingDiff`'s existing per-layer `change` rather than any new command;
+  [`useCommits`](../src/lib/repoData.ts) calls `list_commits` and maps `BackendCommit` → the
+  frontend `Commit` shape; [`useBranches`](../src/lib/repoData.ts) calls `list_branches`;
   [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, backup
-  (`export_repository_zip`/`export_repositories_zip`), the native folder/save picker
-  (`tauri-plugin-dialog`), and the mutating actions (rollback/undo, `discardChanges`,
-  branch create/switch/merge/delete).
+  (`export_repository_zip`/`export_repositories_zip`), the native file/save picker
+  (`tauri-plugin-dialog`, filtered to `.kra`), and the mutating actions (rollback/undo,
+  `discardChanges`, branch create/switch/merge/delete).
 - **In a plain browser** (`npm run dev`, no backend) — the hooks return empty results and
   repository/branch actions are no-ops; the status bar shows a "Browser preview" badge. There is
   no mock data.

@@ -24,6 +24,7 @@ import {
 } from "@phosphor-icons/react";
 import { MainPanel } from "../MainPanel";
 import { Inspector } from "../shell/Inspector";
+import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Switch } from "../ui/Switch";
 import { Menu } from "../ui/Menu";
@@ -89,6 +90,8 @@ interface VersionMapPanelProps {
   currentBranch: Branch;
   /** Bumped by any mutating repo op — forwarded to the drilldown diff. */
   nonce?: number;
+  /** Switches the shell to the Changes tab — wired to the empty-state's call to action. */
+  onShowChanges: () => void;
 }
 
 /**
@@ -122,6 +125,7 @@ function VersionMap({
   branches,
   currentBranch,
   nonce = 0,
+  onShowChanges,
 }: VersionMapPanelProps) {
   const { artistMode } = useArtistMode();
   const [openId, setOpenId] = useState<string | null>(null);
@@ -331,6 +335,9 @@ function VersionMap({
                 ? "No versions yet — save your first version from the Changes tab."
                 : "No commits yet — make one from the Changes tab."}
             </p>
+            <Button variant="primary" onClick={onShowChanges}>
+              Go to Changes
+            </Button>
           </div>
         </div>
       ) : (

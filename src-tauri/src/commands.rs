@@ -61,13 +61,14 @@ where
 /// over it. Only worth wrapping around read commands whose staleness is user-visible (history,
 /// diffs, branch list) — the CLI's poll trio (`status`/`branches`/`stash-list`) must stay
 /// exactly as cheap as before and never calls this.
-fn read_consistent<T>(root: &Path, f: impl Fn() -> Result<T>) -> Result<T> {
+fn read_consistent<T>(doc: &Path, f: impl Fn() -> Result<T>) -> Result<T> {
     const MAX_ATTEMPTS: u32 = 3;
+    let store = crate::repo::store_dir_for(doc);
     let mut last = None;
     for _ in 0..MAX_ATTEMPTS {
-        let before = crate::repo::read_branches_generation(root).unwrap_or(0);
+        let before = crate::repo::read_branches_generation(&store).unwrap_or(0);
         let result = f()?;
-        let after = crate::repo::read_branches_generation(root).unwrap_or(0);
+        let after = crate::repo::read_branches_generation(&store).unwrap_or(0);
         if before == after {
             return Ok(result);
         }
@@ -85,13 +86,17 @@ pub async fn set_cpu_budget(percent: u8) -> std::result::Result<(), String> {
 }
 
 // --- kvcimg raster delivery ---------------------------------------------------------------
-// Roots the `kvcimg` URI scheme is allowed to serve from. Only diff commands register here,
-// so the scheme can never be steered at an arbitrary path — and even for registered roots it
-// serves nothing but `<root>/.kvc/cache/<hex key>.png`.
+// Document stores the `kvcimg` URI scheme is allowed to serve from. Only diff commands register
+// here, so the scheme can never be steered at an arbitrary path — and even for a registered
+// store it serves nothing but `<store>/cache/<hex key>.png`.
 
 static SERVED_REPOS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
+/// Allow the `kvcimg` scheme to serve out of one document's cache. Takes the **store** path,
+/// not the document's: `raster::raster_url` hex-encodes the store into the URL (that's the
+/// directory actually holding `cache/`), and `serve_raster` looks the decoded value up here.
+/// Registering the document path instead would 404 every raster.
 fn register_served_repo(path: &str) {
     SERVED_REPOS
         .get_or_init(Default::default)
@@ -138,13 +143,13 @@ pub fn serve_raster(uri: &tauri::http::Uri) -> tauri::http::Response<Vec<u8>> {
     if key.is_empty() || key.len() > 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return not_found();
     }
-    let Some(root) = hex_decode(root_hex).and_then(|b| String::from_utf8(b).ok()) else {
+    let Some(store) = hex_decode(root_hex).and_then(|b| String::from_utf8(b).ok()) else {
         return not_found();
     };
-    if !is_served_repo(&root) {
+    if !is_served_repo(&store) {
         return not_found();
     }
-    let cache_dir = crate::repo::cache_dir(Path::new(&root));
+    let cache_dir = crate::repo::cache_dir(Path::new(&store));
     // cache_read also refreshes the entry's mtime, protecting served images from pruning.
     let Some(png) = crate::raster::cache_read(&cache_dir, key) else {
         return not_found();
@@ -158,6 +163,8 @@ pub fn serve_raster(uri: &tauri::http::Uri) -> tauri::http::Response<Vec<u8>> {
         .unwrap_or_else(|_| not_found())
 }
 
+/// Start tracking one `.kra`. `path` is the **document**, not a folder — its store is created
+/// in the `.kvc/` container beside it (or under the custom store root, if one is set).
 #[tauri::command]
 pub async fn init_repository(path: String) -> std::result::Result<(), String> {
     run(move || Repo::init(Path::new(&path))).await
@@ -168,30 +175,50 @@ pub async fn is_repository(path: String) -> std::result::Result<bool, String> {
     run(move || Ok(Repo::is_repo(Path::new(&path)))).await
 }
 
-/// Validate `.kvc/` and load its state (returns nothing — success means it opened).
+/// Validate the store and load its state (returns nothing — success means it opened).
 #[tauri::command]
 pub async fn open_repository(path: String) -> std::result::Result<(), String> {
     run(move || Repo::open(Path::new(&path)).map(|_| ())).await
 }
 
-/// Delete a repository folder and everything in it (guarded by `is_repo`), preferring the OS
-/// Recycle Bin. Returns `true` if the Recycle Bin was used, `false` if it fell back to a
-/// permanent delete.
+/// Stop tracking a document: delete its **store**, preferring the OS Recycle Bin. Returns `true`
+/// if the Recycle Bin was used, `false` if it fell back to a permanent delete. The artwork
+/// itself is never touched.
 #[tauri::command]
 pub async fn delete_repository(path: String) -> std::result::Result<bool, String> {
     run(move || {
-        let root = Path::new(&path);
-        let _lock = RepoLock::acquire(root, "deleting the repository")?;
-        Repo::delete(root)
+        let doc = Path::new(&path);
+        let _lock = RepoLock::acquire(doc, "removing the version history")?;
+        Repo::delete(doc)
     })
     .await
 }
 
-/// Zip one repository's whole folder to `dest` — a manual, user-triggered backup (see
-/// `Repo::export_zip`). Read-only, so no `RepoLock`.
+/// Zip one document (the `.kra` plus its store) to `dest` — a manual, user-triggered backup
+/// (see `Repo::export_zip`). Read-only, so no `RepoLock`.
 #[tauri::command]
 pub async fn export_repository_zip(path: String, dest: String) -> std::result::Result<(), String> {
     run_heavy(move || Repo::export_zip(Path::new(&path), Path::new(&dest))).await
+}
+
+/// Where new stores are created. `None`/empty = the default, beside each document. App-global
+/// (the `kvc` CLI reads the same file), so it lives outside any one store's `Config`.
+#[tauri::command]
+pub async fn get_store_root() -> std::result::Result<Option<String>, String> {
+    run(move || Ok(crate::repo::custom_store_root().map(|p| p.to_string_lossy().into_owned())))
+        .await
+}
+
+/// Set or clear the custom store root. Existing stores are **not** moved — this only decides
+/// where the next document's store is created, and where documents created under it are looked
+/// up, which is why the UI has to say so rather than implying a migration happened.
+#[tauri::command]
+pub async fn set_store_root(path: Option<String>) -> std::result::Result<(), String> {
+    run(move || {
+        let p = path.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        crate::repo::set_custom_store_root(p.map(Path::new))
+    })
+    .await
 }
 
 /// Zip every repo in `paths` into `dest_dir`, one `<folder-name>-<date>.zip` each. Independent,
@@ -214,10 +241,11 @@ pub async fn export_repositories_zip(
         let mut failed = Vec::new();
         for path in &paths {
             let root = Path::new(path);
+            // Stem, not file_name — otherwise every backup is named "painting.kra-2026-01-01.zip".
             let name = root
-                .file_name()
+                .file_stem()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "repository".to_string());
+                .unwrap_or_else(|| "artwork".to_string());
             let dest = dest_dir.join(format!("{name}-{date}.zip"));
             if Repo::export_zip(root, &dest).is_err() {
                 failed.push(path.clone());
@@ -348,7 +376,7 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// Mirrors GC's object/pack walk (`gc.rs`).
 fn object_size_map(repo: &Repo) -> std::collections::HashMap<String, u64> {
     let mut map = std::collections::HashMap::new();
-    let objects = crate::repo::objects_dir(&repo.root);
+    let objects = repo.objects_dir();
     let pack_dir = crate::delta::pack_dir(&objects);
 
     // Loose objects (sharded `<xx>/<name>` + legacy flat), skipping the pack subdir.
@@ -463,8 +491,8 @@ pub fn compute_storage_stats(repo: &Repo) -> StorageStats {
         })
         .collect();
     let naive_bytes = per_version.iter().map(|r| r.original_bytes).sum();
-    let actual_bytes = dir_bytes(&crate::repo::objects_dir(&repo.root))
-        + dir_bytes(&crate::repo::chains_dir(&repo.root));
+    let actual_bytes =
+        dir_bytes(&repo.objects_dir()) + dir_bytes(&crate::repo::chains_dir(&repo.store));
     StorageStats {
         naive_bytes,
         actual_bytes,
@@ -1180,7 +1208,10 @@ fn composite_data_url(
     if let Some(k) = &key {
         if let Some(png) = crate::raster::cache_read(&cache_dir, k) {
             return Ok(Some(crate::raster::raster_url(
-                &repo.root, &cache_dir, k, &png,
+                &repo.store,
+                &cache_dir,
+                k,
+                &png,
             )));
         }
     }
@@ -1189,7 +1220,10 @@ fn composite_data_url(
     if let Some(k) = &key {
         crate::raster::cache_write(&cache_dir, k, &capped);
         return Ok(Some(crate::raster::raster_url(
-            &repo.root, &cache_dir, k, &capped,
+            &repo.store,
+            &cache_dir,
+            k,
+            &capped,
         )));
     }
     Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
@@ -1214,7 +1248,7 @@ fn diff_overlay_parts(
     let cache_dir = repo.cache_dir();
     let key = kra::diff_cache_key(bh, ah);
     if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &png);
+        let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &png);
         return Ok((Some(url), crate::raster::outline_from_mask_png(&png)));
     }
     let (Some(before), Some(after)) = (before_bytes()?, after_bytes()?) else {
@@ -1224,7 +1258,7 @@ fn diff_overlay_parts(
         return Ok((None, None));
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
-    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
     Ok((Some(url), outline))
 }
 
@@ -1256,7 +1290,7 @@ fn layer_diff_overlay(
     let cache_dir = repo.cache_dir();
     let key = kra::diff_cache_key(&before.key, &after.key);
     if let Some(mask) = crate::raster::cache_read(&cache_dir, &key) {
-        let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+        let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
         let outline = crate::raster::outline_from_mask_png(&mask);
         let regions = region(crate::raster::bbox_from_mask_png(&mask));
         return (Some(url), outline, regions);
@@ -1266,7 +1300,7 @@ fn layer_diff_overlay(
         return (None, None, Vec::new());
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
-    let url = crate::raster::raster_url(&repo.root, &cache_dir, &key, &mask);
+    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
     (Some(url), outline, region(bbox))
 }
 
@@ -1622,9 +1656,9 @@ pub async fn commit_diff(
         let root = Path::new(&path);
         read_consistent(root, || {
             let repo = Repo::open(root)?;
-            // Register only after the path is confirmed to be a real repo, so a failed open
-            // never adds a root to the kvcimg scheme's allowlist.
-            register_served_repo(&path);
+            // Register only after the open succeeds, so a failed open never adds anything to
+            // the kvcimg scheme's allowlist.
+            register_served_repo(&repo.store.to_string_lossy());
             let commit = repo
                 .commits
                 .iter()
@@ -1661,9 +1695,9 @@ pub async fn commit_layers(
 ) -> std::result::Result<(), String> {
     run_heavy(move || {
         let repo = Repo::open(Path::new(&path))?;
-        // Register only after the path is confirmed to be a real repo, so a failed open never
-        // adds a root to the kvcimg scheme's allowlist.
-        register_served_repo(&path);
+        // Register only after the open succeeds, so a failed open never adds anything to the
+        // kvcimg scheme's allowlist.
+        register_served_repo(&repo.store.to_string_lossy());
         let commit = repo
             .commits
             .iter()
@@ -1744,9 +1778,9 @@ pub async fn working_diff(
         let root = Path::new(&path);
         read_consistent(root, || {
             let repo = Repo::open(root)?;
-            // Register only after the path is confirmed to be a real repo, so a failed open
-            // never adds a root to the kvcimg scheme's allowlist.
-            register_served_repo(&path);
+            // Register only after the open succeeds, so a failed open never adds anything to
+            // the kvcimg scheme's allowlist.
+            register_served_repo(&repo.store.to_string_lossy());
             if !file.to_lowercase().ends_with(".kra") {
                 let old = last_committed(&repo, &file);
                 let status = if old.is_some() { "M" } else { "A" };
@@ -1830,9 +1864,9 @@ pub async fn working_layers(
             return Ok(());
         }
         let repo = Repo::open(Path::new(&path))?;
-        // Register only after the path is confirmed to be a real repo, so a failed open never
-        // adds a root to the kvcimg scheme's allowlist.
-        register_served_repo(&path);
+        // Register only after the open succeeds, so a failed open never adds anything to the
+        // kvcimg scheme's allowlist.
+        register_served_repo(&repo.store.to_string_lossy());
         working_art_dto(
             &repo,
             &file,
@@ -1855,7 +1889,8 @@ mod tests {
     #[test]
     fn read_consistent_retries_when_a_write_lands_mid_read() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let root = &dir.path().join("art.kra");
+        std::fs::write(root, b"placeholder").unwrap();
         crate::repo::Repo::init(root).unwrap();
 
         let calls = std::cell::Cell::new(0u32);
@@ -1877,7 +1912,8 @@ mod tests {
     #[test]
     fn read_consistent_gives_up_after_max_attempts_and_returns_last_result() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let root = &dir.path().join("art.kra");
+        std::fs::write(root, b"placeholder").unwrap();
         crate::repo::Repo::init(root).unwrap();
 
         let calls = std::cell::Cell::new(0u32);

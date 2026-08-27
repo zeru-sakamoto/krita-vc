@@ -100,17 +100,16 @@ def verify_binary(path):
         )
 
 
-def in_repo(root, path):
-    """True if `path` is inside `root`. Both are normalized first — a plain string prefix
-    test would match "/art/repo2/a.kra" against root "/art/repo"."""
-    if not root or not path:
+def is_tracked_document(tracked, path):
+    """True if `path` is the tracked document. One document is one history, so membership is
+    exact-path identity rather than the "is it under this folder?" test the folder model used.
+    Both sides are normalized: the same file can arrive spelled differently."""
+    if not tracked or not path:
         return False
     try:
-        root = os.path.abspath(root)
-        path = os.path.abspath(path)
+        return os.path.abspath(tracked) == os.path.abspath(path)
     except (OSError, ValueError):
         return False
-    return path.startswith(root + os.sep)
 
 
 def stat_key(path):
@@ -123,21 +122,25 @@ def stat_key(path):
     return (st.st_mtime_ns, st.st_size)
 
 
-def find_repo(start_path):
-    """Walk up from a file (or folder) looking for a `.kvc` directory. None if none found."""
-    if not start_path:
+def find_doc(doc_path):
+    """The tracked-document path to pass as `--repo`, or None if this document isn't tracked.
+
+    There is no walk any more: a document's history lives in the `.kvc/` container beside it,
+    one self-contained store per artwork, so "is this tracked?" is a question about this file
+    and not about any folder above it. The store's directory name is an internal detail the
+    engine derives, so this only checks that a container exists and lets `kvc` give the
+    authoritative answer — a wrong guess here would show the docker as untracked for a
+    document the engine can open perfectly well.
+    """
+    if not doc_path:
         return None
     try:
-        current = os.path.abspath(start_path)
-        if os.path.isfile(current):
-            current = os.path.dirname(current)
-        while True:
-            if os.path.isdir(os.path.join(current, ".kvc")):
-                return current
-            parent = os.path.dirname(current)
-            if parent == current:
-                return None
-            current = parent
+        path = os.path.abspath(doc_path)
+        if os.path.splitext(path)[1].lower() != ".kra":
+            return None
+        if not os.path.isdir(os.path.join(os.path.dirname(path), ".kvc")):
+            return None
+        return path
     except (OSError, ValueError):
         # Unreadable or malformed path (Krita can hand back a URL-ish name for some
         # documents) — not version-controlled as far as we're concerned.

@@ -7,11 +7,13 @@ import { RepositoryProvider } from "./lib/repository";
 import { WindowChromeProvider } from "./lib/windowChrome";
 import { CpuBudgetProvider } from "./lib/cpuBudget";
 import { ToastProvider } from "./lib/toast";
+import { RightClickGuard } from "./lib/rightClickGuard";
 import { TourProvider } from "./lib/tour";
 
 function App() {
   return (
     <ToastProvider>
+      <RightClickGuard />
       <RepositoryProvider>
         <ThemeProvider>
           <ArtistModeProvider>

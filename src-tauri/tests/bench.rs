@@ -120,6 +120,20 @@ fn doc(layer_tiles: &[Vec<(i64, i64, Vec<u8>)>]) -> Vec<u8> {
     pack_kra(&entries)
 }
 
+/// Track one document in `root` and return its path. One store tracks exactly one `.kra`.
+fn init_doc(root: &std::path::Path) -> std::path::PathBuf {
+    let path = root.join("art.kra");
+    if !path.exists() {
+        std::fs::write(&path, pack_kra(&[("maindoc.xml", &maindoc(1))])).unwrap();
+    }
+    repo::Repo::init(&path).unwrap();
+    path
+}
+
+fn store_of(doc: &std::path::Path) -> std::path::PathBuf {
+    repo::store_dir_for(doc)
+}
+
 fn dir_size(path: &std::path::Path) -> (u64, usize) {
     let mut bytes = 0u64;
     let mut files = 0usize;
@@ -216,8 +230,8 @@ fn initial_commit_phases() {
     use krita_vc_lib::tiles;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    let kra_path = init_doc(root);
+    let mut r = repo::Repo::open(&kra_path).unwrap();
     let mut rng = Rng(0x9E3779B97F4A7C15);
 
     let layers: Vec<Vec<(i64, i64, Vec<u8>)>> = (0..LAYERS).map(|_| full_grid(&mut rng)).collect();
@@ -301,8 +315,8 @@ fn initial_commit_phases() {
 fn large_canvas_baseline() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    let kra_path = init_doc(root);
+    let mut r = repo::Repo::open(&kra_path).unwrap();
     let mut rng = Rng(0x9E3779B97F4A7C15);
 
     // --- build the initial document -----------------------------------------------------
@@ -346,7 +360,7 @@ fn large_canvas_baseline() {
     // --- Repo::open / open_light (chains parse cost) -------------------------------------
     drop(r);
     let t = Instant::now();
-    let r = repo::Repo::open(root).unwrap();
+    let r = repo::Repo::open(&kra_path).unwrap();
     println!("Repo::open:          {:>8.2?}", t.elapsed());
     let t = Instant::now();
     let _light = repo::Repo::open_light(root).unwrap();
@@ -447,9 +461,9 @@ fn large_canvas_baseline() {
     );
 
     // --- storage ---------------------------------------------------------------------------
-    let (obj_bytes, obj_files) = dir_size(&root.join(".kvc/objects"));
-    let (cache_bytes, cache_files) = dir_size(&root.join(".kvc/cache"));
-    let (kvc_bytes, _) = dir_size(&root.join(".kvc"));
+    let (obj_bytes, obj_files) = dir_size(&store_of(&kra_path).join("objects"));
+    let (cache_bytes, cache_files) = dir_size(&store_of(&kra_path).join("cache"));
+    let (kvc_bytes, _) = dir_size(&store_of(&kra_path));
     println!(
         "objects/:            {:>8.1} MB in {} files",
         mb(obj_bytes),
@@ -460,7 +474,7 @@ fn large_canvas_baseline() {
         mb(cache_bytes),
         cache_files
     );
-    let (chains_bytes, chains_files) = dir_size(&root.join(".kvc/chains"));
+    let (chains_bytes, chains_files) = dir_size(&store_of(&kra_path).join("chains"));
     println!(
         "chains/:             {:>8.1} MB in {} shards",
         mb(chains_bytes),
@@ -478,8 +492,8 @@ fn large_canvas_baseline() {
 fn composite_commit_growth() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    repo::Repo::init(root).unwrap();
-    let mut r = repo::Repo::open(root).unwrap();
+    let kra_path = init_doc(root);
+    let mut r = repo::Repo::open(&kra_path).unwrap();
     let mut rng = Rng(0xB105F00D);
 
     let px = (TILE_GRID * 64) as u32; // 3200
@@ -501,7 +515,7 @@ fn composite_commit_growth() {
     std::fs::write(root.join("art.kra"), build(&layer, &comp)).unwrap();
     let t = Instant::now();
     commit::commit_snapshot(&mut r, "initial", "bench").unwrap();
-    let (mut prev_bytes, _) = dir_size(&root.join(".kvc"));
+    let (mut prev_bytes, _) = dir_size(&store_of(&kra_path));
     println!(
         "initial commit (with {:.0} MB composite): {:>8.2?}  .kvc = {:.1} MB",
         mb((px as u64 * px as u64 * 4) as u64),
@@ -527,7 +541,7 @@ fn composite_commit_growth() {
         let t = Instant::now();
         commit::commit_snapshot(&mut r, &format!("edit {round}"), "bench").unwrap();
         let el = t.elapsed();
-        let (now_bytes, _) = dir_size(&root.join(".kvc"));
+        let (now_bytes, _) = dir_size(&store_of(&kra_path));
         println!(
             "round {round}: commit {:>8.2?}  .kvc +{:.1} MB",
             el,
@@ -583,8 +597,8 @@ fn cpu_budget_sweep() {
         // dedup the next run's tiles away and time nothing.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        repo::Repo::init(root).unwrap();
-        let mut r = repo::Repo::open(root).unwrap();
+        let kra_path = init_doc(root);
+        let mut r = repo::Repo::open(&kra_path).unwrap();
         let mut rng = Rng(0x9E3779B97F4A7C15);
         let layers: Vec<Vec<(i64, i64, Vec<u8>)>> =
             (0..LAYERS).map(|_| full_grid(&mut rng)).collect();

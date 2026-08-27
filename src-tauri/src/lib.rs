@@ -67,6 +67,8 @@ pub fn run() {
             commands::set_repo_config,
             commands::repo_storage_stats,
             commands::set_cpu_budget,
+            commands::get_store_root,
+            commands::set_store_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

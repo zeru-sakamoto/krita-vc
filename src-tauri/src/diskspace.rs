@@ -46,11 +46,13 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Refuse up front if the volume holding `repo.root` doesn't look like it has room for
-/// `needed_bytes` (doubled — see module docs). A `None` from [`free_bytes`] always passes: the
-/// check is a belt-and-suspenders precaution, not a hard dependency of any write.
+/// Refuse up front if the volume holding the **store** doesn't look like it has room for
+/// `needed_bytes` (doubled — see module docs). The store, not `repo.root`: these bytes are
+/// objects and chains, and a custom store root can put them on a different drive than the
+/// artwork. A `None` from [`free_bytes`] always passes: the check is a belt-and-suspenders
+/// precaution, not a hard dependency of any write.
 pub fn check_available(repo: &Repo, needed_bytes: u64) -> Result<()> {
-    evaluate(free_bytes(&repo.root), needed_bytes)
+    evaluate(free_bytes(&repo.store), needed_bytes)
 }
 
 /// The comparison itself, split out from the syscall so it's unit-testable without faking a

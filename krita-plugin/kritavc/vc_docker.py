@@ -97,7 +97,7 @@ class VcDocker(DockWidget):
         super().__init__()
         self.setWindowTitle("Version Control")
 
-        self.repo_root = None
+        self.tracked_doc = None
         self.doc_path = None
         self.busy = False
         # Source of truth for the ticks: the list widget is rebuilt from this, never the
@@ -244,7 +244,7 @@ class VcDocker(DockWidget):
         self.status_label.setText(f"⚠ {message}")
 
     def _show_empty(self, message):
-        self.repo_root = None
+        self.tracked_doc = None
         self.empty_label.setText(message)
         self.stack.setCurrentIndex(PAGE_EMPTY)
 
@@ -286,15 +286,15 @@ class VcDocker(DockWidget):
                 f"Save “{os.path.basename(doc_path)}” as .kra to version it."
             )
 
-        self.repo_root = kvc.find_repo(doc_path)
-        if not self.repo_root:
+        self.tracked_doc = kvc.find_doc(doc_path)
+        if not self.tracked_doc:
             return self._show_empty(
-                "This document isn't version-controlled.\n"
-                "Open it in the Krita VC app to start tracking."
+                "This artwork isn't version-controlled.\n"
+                "Open it in the Krita VC app to start tracking it."
             )
 
         self.stack.setCurrentIndex(PAGE_MAIN)
-        self.repo_label.setText(os.path.basename(self.repo_root))
+        self.repo_label.setText(os.path.basename(self.tracked_doc))
 
         # Nothing above this point spawns a process, so document/repo switching stays instant
         # even while hidden. Below it we'd pay a `kvc` spawn on Krita's UI thread — pointless
@@ -317,7 +317,7 @@ class VcDocker(DockWidget):
             # One spawn per tick, not two: `status` carries the branch list as well, and it's
             # free there (open_light already parsed branches.json). A separate `kvc branches`
             # re-parsed the whole commit log in a second process for data we already had.
-            result = kvc.status(self.repo_root)
+            result = kvc.status(self.tracked_doc)
         except kvc.KvcError as e:
             self._show_error(str(e))
             self.commit_button.setEnabled(False)
@@ -452,7 +452,10 @@ class VcDocker(DockWidget):
     # --- keeping disk and canvas in step ---------------------------------------------
 
     def _repo_docs(self):
-        """{abspath: (Document, has_unsaved_changes)} for open .kra documents inside this repo.
+        """{abspath: (Document, has_unsaved_changes)} for the tracked document, if it's open.
+
+        At most one entry: a store tracks exactly one `.kra`. Still keyed by path so the
+        save/reopen loops below keep their shape.
 
         Reads fileName/modified in one try, same reason as `_document_state`: Krita's wrapper
         outlives its C++ document and raises on touch.
@@ -473,13 +476,13 @@ class VcDocker(DockWidget):
                 continue
             if not path or os.path.splitext(path)[1].lower() != ".kra":
                 continue
-            if kvc.in_repo(self.repo_root, path):
+            if kvc.is_tracked_document(self.tracked_doc, path):
                 docs[os.path.abspath(path)] = (doc, dirty)
         return docs
 
     # memory -> disk
     def _save_tracked(self):
-        """Write every modified tracked document to disk. Returns (saved, failed) basenames.
+        """Write the tracked document to disk if modified. Returns (saved, failed) basenames.
 
         The engine only sees the disk, so unsaved work is invisible to a commit — without this
         the changelist describes the last Ctrl+S rather than the canvas.
@@ -507,7 +510,7 @@ class VcDocker(DockWidget):
     def _on_focus_changed(self, old, new):
         """Save on the way into the docker: reaching for this panel is the artist saying they're
         done painting for a moment, which is exactly when their work should hit the disk."""
-        if self.busy or not self.repo_root:
+        if self.busy or not self.tracked_doc:
             return
         # Only on entry — not while tabbing between our own widgets, and not on the way out.
         if not self._contains(new) or self._contains(old):
@@ -577,7 +580,7 @@ class VcDocker(DockWidget):
 
     def _require_repo(self):
         """A menu left open across a document close can still fire at a stale repo."""
-        if self.repo_root:
+        if self.tracked_doc:
             return True
         self._show_error("No version-controlled document is open.")
         return False
@@ -618,7 +621,7 @@ class VcDocker(DockWidget):
         self._set_busy(True)
         try:
             # Committing doesn't rewrite the working tree, so no reopen needed here.
-            kvc.commit(self.repo_root, message, author, self._selected_paths())
+            kvc.commit(self.tracked_doc, message, author, self._selected_paths())
             self.message_box.setPlainText("")
             self.status_label.setText("Saved version ✓")
         except kvc.KvcError as e:
@@ -645,7 +648,7 @@ class VcDocker(DockWidget):
             "reopened document's undo history.",
         ):
             return
-        if self._rebuild_docs(lambda: kvc.discard(self.repo_root, paths)):
+        if self._rebuild_docs(lambda: kvc.discard(self.tracked_doc, paths)):
             self.status_label.setText("Discarded ✓")
         self.refresh()
 
@@ -664,7 +667,7 @@ class VcDocker(DockWidget):
             return
         author = self.author_edit.text().strip() or "You"
         if self._rebuild_docs(
-            lambda: kvc.stash(self.repo_root, author, label.strip(), paths)
+            lambda: kvc.stash(self.tracked_doc, author, label.strip(), paths)
         ):
             self.status_label.setText("Set aside ✓")
         self.refresh()
@@ -673,7 +676,7 @@ class VcDocker(DockWidget):
     def _on_pop_latest(self):
         if not self._require_repo():
             return
-        stashes = kvc.stash_list(self.repo_root).get("stashes") or []
+        stashes = kvc.stash_list(self.tracked_doc).get("stashes") or []
         if not stashes:
             self._show_error("Nothing has been set aside.")
             return
@@ -683,7 +686,7 @@ class VcDocker(DockWidget):
     def _on_pick_stash(self):
         if not self._require_repo():
             return
-        stashes = kvc.stash_list(self.repo_root).get("stashes") or []
+        stashes = kvc.stash_list(self.tracked_doc).get("stashes") or []
         if not stashes:
             self._show_error("Nothing has been set aside.")
             return
@@ -699,7 +702,7 @@ class VcDocker(DockWidget):
     def _pop(self, stash):
         stash_id = stash.get("id") or ""
         try:
-            if self._rebuild_docs(lambda: kvc.stash_pop(self.repo_root, stash_id)):
+            if self._rebuild_docs(lambda: kvc.stash_pop(self.tracked_doc, stash_id)):
                 self.status_label.setText("Brought back ✓")
         except kvc.KvcError as e:
             # Its own prefix, deliberately distinct from the dirty-tree one — the stash is
@@ -727,7 +730,7 @@ class VcDocker(DockWidget):
         if not self._require_repo():
             return
         try:
-            self._rebuild_docs(lambda: kvc.switch(self.repo_root, name))
+            self._rebuild_docs(lambda: kvc.switch(self.tracked_doc, name))
         except kvc.KvcError as e:
             # The engine's dirty-tree error carries a stable "unsaved changes" prefix
             # (see src-tauri/src/error.rs) — same contract the desktop frontend matches.
@@ -757,8 +760,8 @@ class VcDocker(DockWidget):
         author = self.author_edit.text().strip() or "You"
 
         def op():
-            kvc.stash(self.repo_root, author, "", None)
-            kvc.switch(self.repo_root, name)
+            kvc.stash(self.tracked_doc, author, "", None)
+            kvc.switch(self.tracked_doc, name)
 
         return self._rebuild_docs(op)
 
@@ -771,7 +774,7 @@ class VcDocker(DockWidget):
             return
         self._set_busy(True)
         try:
-            kvc.create_branch(self.repo_root, name.strip())
+            kvc.create_branch(self.tracked_doc, name.strip())
         except kvc.KvcError as e:
             self._show_error(str(e))
         finally:

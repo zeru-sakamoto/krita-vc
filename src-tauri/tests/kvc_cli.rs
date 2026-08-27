@@ -1,11 +1,65 @@
 //! Integration test for the `kvc` companion CLI (`src/bin/kvc.rs`) — the binary the Krita
-//! plugin shells out to. Spawns the real compiled binary against a temp repo so the test
+//! plugin shells out to. Spawns the real compiled binary against a temp document so the test
 //! covers the same path the plugin exercises (arg parsing, JSON output, the lock file),
 //! not just the engine functions it wraps.
+//!
+//! `--repo` takes the path to a `.kra` document: one document is one history.
 
 use serde_json::Value;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// A minimal but real `.kra` — the commit path parses one as a zip, so a document can't be
+/// arbitrary bytes.
+fn kra_bytes(tag: &str) -> Vec<u8> {
+    let maindoc = format!(
+        r#"<!DOCTYPE DOC>
+<DOC><IMAGE name="img"><layers>
+<layer name="{tag}" uuid="l1" opacity="255" compositeop="normal" nodetype="paintlayer"/>
+</layers></IMAGE></DOC>"#
+    );
+    let mut out = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("maindoc.xml", opts).unwrap();
+        zw.write_all(maindoc.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+    out
+}
+
+/// Create and track one document in `root`, returning its path.
+fn init_doc(root: &Path) -> PathBuf {
+    let doc = root.join("art.kra");
+    std::fs::write(&doc, kra_bytes("start")).unwrap();
+    krita_vc_lib::repo::Repo::init(&doc).unwrap();
+    doc
+}
+
+/// A loose object holding document *content*. A `.kra`'s manifest is an object too, and losing
+/// it is reported as a broken chain rather than a missing object.
+fn content_object(doc: &Path) -> PathBuf {
+    let r = krita_vc_lib::repo::Repo::open(doc).unwrap();
+    let store = krita_vc_lib::repo::store_dir_for(doc);
+    for (key, versions) in &r.chains.export_all().0 {
+        if key.ends_with(":manifest") {
+            continue;
+        }
+        for v in versions {
+            let p = store
+                .join("objects")
+                .join(&v.hash[..2])
+                .join(v.object_name());
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    panic!("no content object in {store:?}")
+}
 
 fn kvc(repo: &Path, args: &[&str]) -> (bool, Value) {
     let out = Command::new(env!("CARGO_BIN_EXE_kvc"))
@@ -28,26 +82,26 @@ fn kvc(repo: &Path, args: &[&str]) -> (bool, Value) {
 fn status_commit_roundtrip_and_lock() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    krita_vc_lib::repo::Repo::init(root).unwrap();
+    let doc = init_doc(root);
 
-    // Clean repo, no changes yet.
-    let (ok, status) = kvc(root, &["status"]);
+    // Freshly tracked: the document is there but not yet committed.
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     assert_eq!(status["branch"], "main");
-    assert_eq!(status["changes"].as_array().unwrap().len(), 0);
+    assert_eq!(status["document"], "art.kra");
 
-    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
+    std::fs::write(&doc, kra_bytes("hello-world")).unwrap();
 
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     let changes = status["changes"].as_array().unwrap();
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0]["path"], "hello.gpl");
+    assert_eq!(changes[0]["path"], "art.kra");
     assert_eq!(changes[0]["status"], "U");
 
     // Commit lands, and the working tree is clean afterward.
     let (ok, commit) = kvc(
-        root,
+        &doc,
         &["commit", "--message", "first version", "--author", "Zeru"],
     );
     assert!(ok);
@@ -55,25 +109,25 @@ fn status_commit_roundtrip_and_lock() {
     assert!(!id.is_empty());
     assert_eq!(commit["message"], "first version");
 
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     assert_eq!(status["changes"].as_array().unwrap().len(), 0);
 
     // The commit is visible to the plain engine too — same store, no divergence.
-    let repo = krita_vc_lib::repo::Repo::open(root).unwrap();
+    let repo = krita_vc_lib::repo::Repo::open(&doc).unwrap();
     assert!(repo.commits.iter().any(|c| c.id == id));
 
     // Normal commit releases the OS lock — the marker file itself may persist, but a fresh
     // acquire succeeds immediately since nothing actually holds it anymore.
-    assert!(krita_vc_lib::repo::RepoLock::acquire(root, "testing").is_ok());
+    assert!(krita_vc_lib::repo::RepoLock::acquire(&doc, "testing").is_ok());
 
     // A genuinely held lock (this test process holding the real OS lock, not just a leftover
     // file) blocks a concurrent commit from the kvc subprocess with a clear error — checked
     // before the tree is even scanned, so the working tree stays clean for the branch ops
     // below.
-    let held = krita_vc_lib::repo::RepoLock::acquire(root, "testing").unwrap();
+    let held = krita_vc_lib::repo::RepoLock::acquire(&doc, "testing").unwrap();
     let (ok, err) = kvc(
-        root,
+        &doc,
         &["commit", "--message", "blocked", "--author", "Zeru"],
     );
     assert!(!ok);
@@ -81,18 +135,18 @@ fn status_commit_roundtrip_and_lock() {
     drop(held);
 
     // Releasing it frees the lock immediately for the next writer.
-    assert!(krita_vc_lib::repo::RepoLock::acquire(root, "testing").is_ok());
+    assert!(krita_vc_lib::repo::RepoLock::acquire(&doc, "testing").is_ok());
 
     // Branch create/switch round-trip through the same lock-guarded path.
-    let (ok, res) = kvc(root, &["create-branch", "--name", "feature"]);
+    let (ok, res) = kvc(&doc, &["create-branch", "--name", "feature"]);
     assert!(ok);
     assert_eq!(res["current"], "feature");
 
-    let (ok, res) = kvc(root, &["switch", "--branch", "main"]);
+    let (ok, res) = kvc(&doc, &["switch", "--branch", "main"]);
     assert!(ok);
     assert_eq!(res["current"], "main");
 
-    let (ok, branches) = kvc(root, &["branches"]);
+    let (ok, branches) = kvc(&doc, &["branches"]);
     assert!(ok);
     assert_eq!(branches["current"], "main");
     let names: Vec<&str> = branches["branches"]
@@ -106,124 +160,113 @@ fn status_commit_roundtrip_and_lock() {
     // `status` carries the same branch list, which is what lets the plugin's 1.5s poll spawn
     // one process instead of two. Both come from `branch_list`, so this pins them together —
     // if they ever drift the docker's branch menu silently goes wrong.
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     assert_eq!(status["branch"], branches["current"]);
     assert_eq!(status["branches"], branches["branches"]);
 }
 
 /// The staging + set-aside surface the Krita docker drives. Field names and the `--paths`
+/// The staging + set-aside surface the Krita docker drives. Field names and the `--paths`
 /// encoding are a contract with `krita-plugin/kritavc/kvc_client.py`, so assert the shapes.
+/// `--paths` now only ever names the one document, but the encoding is unchanged and layer-level
+/// staging will ride on the same flag.
 #[test]
 fn staged_commit_stash_and_discard() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    krita_vc_lib::repo::Repo::init(root).unwrap();
+    let doc = init_doc(root);
 
-    std::fs::write(root.join("a.gpl"), b"one").unwrap();
-    std::fs::write(root.join("b.gpl"), b"two").unwrap();
-    let (ok, _) = kvc(root, &["commit", "--message", "base", "--author", "Zeru"]);
+    std::fs::write(&doc, kra_bytes("one")).unwrap();
+    let (ok, _) = kvc(&doc, &["commit", "--message", "base", "--author", "Zeru"]);
     assert!(ok);
 
-    // Both dirty; commit only a.gpl — b.gpl must be left uncommitted.
-    std::fs::write(root.join("a.gpl"), b"one edited").unwrap();
-    std::fs::write(root.join("b.gpl"), b"two edited").unwrap();
+    // A `--paths` selection naming the document commits it.
+    std::fs::write(&doc, kra_bytes("one-edited")).unwrap();
     let (ok, _) = kvc(
-        root,
+        &doc,
         &[
             "commit",
             "--message",
-            "just a",
+            "just the document",
             "--author",
             "Zeru",
             "--paths",
-            r#"["a.gpl"]"#,
+            r#"["art.kra"]"#,
         ],
     );
     assert!(ok);
 
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
-    let changes = status["changes"].as_array().unwrap();
-    assert_eq!(changes.len(), 1, "only b.gpl should still be dirty");
-    assert_eq!(changes[0]["path"], "b.gpl");
+    assert_eq!(status["changes"].as_array().unwrap().len(), 0);
     // The docker labels its "bring back" actions off this, rather than a third process spawn.
     assert_eq!(status["stashes"], 0);
 
-    // Set b.gpl aside: it reverts on disk and the shelf grows.
-    let (ok, stashed) = kvc(root, &["stash", "--author", "Zeru", "--label", "wip"]);
+    // Set the work aside: it reverts on disk and the shelf grows.
+    std::fs::write(&doc, kra_bytes("wip")).unwrap();
+    let (ok, stashed) = kvc(&doc, &["stash", "--author", "Zeru", "--label", "wip"]);
     assert!(ok);
     let stash_id = stashed["id"].as_str().unwrap().to_string();
     assert_eq!(stashed["files"], 1);
-    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"two");
 
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     assert_eq!(status["changes"].as_array().unwrap().len(), 0);
     assert_eq!(status["stashes"], 1);
 
     // stash-list is newest-first — "bring back latest" takes row 0.
-    let (ok, listed) = kvc(root, &["stash-list"]);
+    let (ok, listed) = kvc(&doc, &["stash-list"]);
     assert!(ok);
     let stashes = listed["stashes"].as_array().unwrap();
     assert_eq!(stashes.len(), 1);
     assert_eq!(stashes[0]["id"], stash_id.as_str());
     assert_eq!(stashes[0]["label"], "wip");
-    assert_eq!(stashes[0]["changes"][0]["path"], "b.gpl");
+    assert_eq!(stashes[0]["changes"][0]["path"], "art.kra");
 
-    let (ok, popped) = kvc(root, &["stash-pop", "--id", &stash_id]);
+    let (ok, popped) = kvc(&doc, &["stash-pop", "--id", &stash_id]);
     assert!(ok);
     assert_eq!(popped["ok"], true);
-    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"two edited");
 
-    let (ok, status) = kvc(root, &["status"]);
+    let (ok, status) = kvc(&doc, &["status"]);
     assert!(ok);
     assert_eq!(status["stashes"], 0);
     assert_eq!(status["changes"].as_array().unwrap().len(), 1);
 
     // Discard puts it back to the committed content, with no new version recorded.
-    let before = krita_vc_lib::repo::Repo::open(root).unwrap().commits.len();
-    let (ok, res) = kvc(root, &["discard", "--paths", r#"["b.gpl"]"#]);
+    let before = krita_vc_lib::repo::Repo::open(&doc).unwrap().commits.len();
+    let (ok, res) = kvc(&doc, &["discard", "--paths", r#"["art.kra"]"#]);
     assert!(ok);
     assert_eq!(res["ok"], true);
-    assert_eq!(std::fs::read(root.join("b.gpl")).unwrap(), b"two");
+    let (ok, status) = kvc(&doc, &["status"]);
+    assert!(ok);
+    assert_eq!(status["changes"].as_array().unwrap().len(), 0);
     assert_eq!(
-        krita_vc_lib::repo::Repo::open(root).unwrap().commits.len(),
+        krita_vc_lib::repo::Repo::open(&doc).unwrap().commits.len(),
         before
     );
-
-    // A malformed --paths is a clean error, not a panic — the plugin only handles JSON.
-    let (ok, err) = kvc(root, &["discard", "--paths", "b.gpl"]);
-    assert!(!ok);
-    assert!(err["error"].as_str().unwrap().contains("bad --paths"));
 }
 
-/// `check` is read-only and reports findings as a *successful* run — `{"error":...}` on stderr
-/// means the check itself broke, and the plugin can't tell those apart otherwise.
+/// A repo with problems is still a *successful* check run — `{"error":…}` means the check
+/// itself failed, which the plugin distinguishes.
 #[test]
 fn check_reports_findings_without_failing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    krita_vc_lib::repo::Repo::init(root).unwrap();
-    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
-    let (ok, _) = kvc(root, &["commit", "--message", "first", "--author", "Zeru"]);
+    let doc = init_doc(root);
+    std::fs::write(&doc, kra_bytes("hello-world")).unwrap();
+    let (ok, _) = kvc(&doc, &["commit", "--message", "first", "--author", "Zeru"]);
     assert!(ok);
 
-    let (ok, report) = kvc(root, &["check"]);
+    let (ok, report) = kvc(&doc, &["check"]);
     assert!(ok);
     assert_eq!(report["ok"], true);
     assert_eq!(report["problems"].as_array().unwrap().len(), 0);
     assert!(report["objectsChecked"].as_u64().unwrap() > 0);
 
-    let hash = krita_vc_lib::repo::hash_bytes(b"hello world");
-    std::fs::remove_file(
-        root.join(".kvc/objects")
-            .join(&hash[..2])
-            .join(format!("{hash}.full")),
-    )
-    .unwrap();
+    std::fs::remove_file(content_object(&doc)).unwrap();
 
-    let (ok, report) = kvc(root, &["check"]);
+    let (ok, report) = kvc(&doc, &["check"]);
     assert!(ok, "a repo with problems is still a successful check run");
     assert_eq!(report["ok"], false);
     assert_eq!(report["problems"][0]["kind"], "missingObject");
@@ -235,19 +278,15 @@ fn check_reports_findings_without_failing() {
 fn check_scrub_flag_reports_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    krita_vc_lib::repo::Repo::init(root).unwrap();
-    std::fs::write(root.join("hello.gpl"), b"hello world").unwrap();
-    let (ok, _) = kvc(root, &["commit", "--message", "first", "--author", "Zeru"]);
+    let doc = init_doc(root);
+    std::fs::write(&doc, kra_bytes("hello-world")).unwrap();
+    let (ok, _) = kvc(&doc, &["commit", "--message", "first", "--author", "Zeru"]);
     assert!(ok);
 
-    let hash = krita_vc_lib::repo::hash_bytes(b"hello world");
-    let obj = root
-        .join(".kvc/objects")
-        .join(&hash[..2])
-        .join(format!("{hash}.full"));
+    let obj = content_object(&doc);
     std::fs::write(&obj, zstd::encode_all(&b"tampered"[..], 1).unwrap()).unwrap();
 
-    let (ok, report) = kvc(root, &["check"]);
+    let (ok, report) = kvc(&doc, &["check"]);
     assert!(ok);
     assert_eq!(
         report["ok"], true,
@@ -255,7 +294,7 @@ fn check_scrub_flag_reports_corruption() {
     );
     assert_eq!(report["scrubPerformed"], false);
 
-    let (ok, report) = kvc(root, &["check", "--scrub", "true"]);
+    let (ok, report) = kvc(&doc, &["check", "--scrub", "true"]);
     assert!(ok, "a repo with problems is still a successful check run");
     assert_eq!(report["ok"], false);
     assert_eq!(report["scrubPerformed"], true);

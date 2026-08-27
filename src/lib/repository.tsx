@@ -18,11 +18,16 @@ const BRANCH_OP: Record<string, string> = {
 };
 
 /**
- * Selected local repository. The app is local-only (no remotes); a repository is a
- * folder the user designates. In the Tauri shell "Add repository…" opens a native
- * folder picker, initializes a `.kvc/` store there if needed (`init_repository`),
- * and the list is persisted to localStorage. In a plain browser (`npm run dev`,
- * no backend) the list starts empty and repository actions are no-ops.
+ * The selected artwork. The app is local-only (no remotes), and the unit it versions is **one
+ * `.kra` document**, not a folder: artists work per painting, and a folder-wide history with a
+ * "which files go in this version" step is the single biggest thing standing between them and
+ * the app. In the Tauri shell "Track an artwork…" opens a native *file* picker filtered to
+ * `.kra`, creates that document's store beside it if absent (`init_repository`), and the list is
+ * persisted to localStorage. In a plain browser (`npm run dev`, no backend) the list starts empty
+ * and these actions are no-ops.
+ *
+ * The context is still named `Repository` throughout — the type is the app-wide contract with
+ * `repoData.ts` and every panel, and renaming it buys nothing the doc comments don't.
  */
 
 const STORAGE_KEY = "krita-vc:repository";
@@ -34,16 +39,15 @@ interface RepositoryValue {
   current: Repository | null;
   currentId: string;
   setCurrent: (id: string) => void;
-  /** Open an existing folder as a repository (init `.kvc/` if absent). */
+  /** Pick a `.kra` to track (creating its store if absent) and select it. */
   browseRepository: () => void;
-  /** Create a new folder named `name` inside `parentPath`, init it, and select it. */
-  createRepository: (parentPath: string, name: string) => Promise<void>;
   /**
-   * Drop a repo from the list; if `deleteFolder`, also delete it on disk (preferring the OS
-   * Recycle Bin). Resolves `false` only when a folder delete fell back to a permanent one.
+   * Drop an artwork from the list; if `deleteHistory`, also delete its store on disk (preferring
+   * the OS Recycle Bin). Resolves `false` only when that delete fell back to a permanent one.
+   * The `.kra` itself is never touched.
    */
-  removeRepository: (id: string, deleteFolder: boolean) => Promise<boolean>;
-  /** Zip a repository's whole folder to a user-chosen path. Null if canceled or in a browser. */
+  removeRepository: (id: string, deleteHistory: boolean) => Promise<boolean>;
+  /** Zip an artwork and its history to a user-chosen path. Null if canceled or in a browser. */
   backupRepository: (id: string) => Promise<string | null>;
   /**
    * Zip every known repository into a user-chosen destination folder. Resolves the list of
@@ -139,15 +143,22 @@ export interface CheckReport {
   problems: { kind: string; detail: string }[];
 }
 
-function joinPath(parent: string, name: string): string {
-  const sep = parent.includes("\\") ? "\\" : "/";
-  return `${parent.replace(/[/\\]+$/, "")}${sep}${name}`;
-}
-
 const RepositoryContext = createContext<RepositoryValue | null>(null);
 
+/** Display name for an artwork: its filename without the `.kra` extension. */
 function basename(path: string): string {
-  return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+  const file = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+  return file.replace(/\.kra$/i, "");
+}
+
+/**
+ * The backend refuses to open an artwork whose store isn't currently reachable (a custom store
+ * root on a drive that isn't plugged in) with this stable prefix, rather than "not tracked" —
+ * answering that with "start tracking?" would mint an empty store and orphan every saved
+ * version. Matched on the message the way `isStashConflictError` matches its own.
+ */
+export function isStoreUnreachableError(e: unknown): boolean {
+  return String(e).includes("history isn't reachable");
 }
 
 function readStoredList(): Repository[] {
@@ -198,16 +209,18 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
 
   const setCurrent = useCallback((id: string) => setCurrentId(id), []);
 
-  // Add (or re-select) a repo at `path`, initializing its `.kvc/` store if absent.
+  // Add (or re-select) the artwork at `path`, creating its store if absent.
   const addPath = useCallback(
     async (path: string) => {
       try {
         const exists = await invoke<boolean>("is_repository", { path });
         if (!exists) await invoke("init_repository", { path });
       } catch (e) {
-        // Don't leave a rejected invoke as an unhandled rejection, and don't add a repo we
-        // failed to initialize — tell the user instead.
-        show(`Couldn't open that folder as a repository: ${String(e)}`, "error");
+        // Don't leave a rejected invoke as an unhandled rejection, and don't add an artwork we
+        // failed to set up — tell the user instead. This is also the path that surfaces
+        // `StoreUnreachable`: an artwork whose history lives somewhere not currently mounted
+        // must say so, never quietly get a fresh empty store (see `isStoreUnreachableError`).
+        show(`Couldn't start tracking that artwork: ${String(e)}`, "error");
         return;
       }
       const repo: Repository = { id: path, name: basename(path), path };
@@ -218,31 +231,25 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
   );
 
   const browseRepository = useCallback(async () => {
-    // No native picker in a plain browser — repository management needs the desktop shell.
+    // No native picker in a plain browser — this needs the desktop shell.
     if (!inTauri()) return;
-    const picked = await open({ directory: true, title: "Select a folder to version-control" });
+    const picked = await open({
+      title: "Choose a Krita artwork to track",
+      filters: [{ name: "Krita artwork", extensions: ["kra"] }],
+    });
     if (typeof picked === "string") await addPath(picked);
   }, [addPath]);
 
-  const createRepository = useCallback(
-    async (parentPath: string, name: string) => {
-      if (!inTauri()) return;
-      // init_repository's create_dir_all makes the new folder (and parents) if missing.
-      await addPath(joinPath(parentPath, name.trim()));
-    },
-    [addPath]
-  );
-
   const removeRepository = useCallback(
-    async (id: string, deleteFolder: boolean) => {
+    async (id: string, deleteHistory: boolean) => {
       const repo = repositories.find((r) => r.id === id);
       if (!repo) return true;
       let usedTrash = true;
-      if (deleteFolder && inTauri()) {
+      if (deleteHistory && inTauri()) {
         try {
           usedTrash = await invoke<boolean>("delete_repository", { path: repo.path });
         } catch (e) {
-          show(`Couldn't delete the repository folder: ${String(e)}`, "error");
+          show(`Couldn't delete the version history: ${String(e)}`, "error");
           usedTrash = false;
         }
       }
@@ -269,7 +276,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
         filters: [{ name: "Zip archive", extensions: ["zip"] }],
       });
       if (!dest) return null;
-      setBusyMessage("Backing up repository — please wait…");
+      setBusyMessage("Backing up artwork — please wait…");
       try {
         await invoke("export_repository_zip", { path: repo.path, dest });
         const lastBackupAt = new Date().toISOString();
@@ -286,7 +293,7 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     if (!inTauri() || repositories.length === 0) return null;
     const destDir = await open({ directory: true, title: "Choose a folder for the backups" });
     if (typeof destDir !== "string") return null;
-    setBusyMessage("Backing up repositories — please wait…");
+    setBusyMessage("Backing up artworks — please wait…");
     try {
       return await invoke<string[]>("export_repositories_zip", {
         paths: repositories.map((r) => r.path),
@@ -534,7 +541,6 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       currentId,
       setCurrent,
       browseRepository,
-      createRepository,
       removeRepository,
       backupRepository,
       backupAllRepositories,
@@ -566,7 +572,6 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       currentId,
       setCurrent,
       browseRepository,
-      createRepository,
       removeRepository,
       backupRepository,
       backupAllRepositories,

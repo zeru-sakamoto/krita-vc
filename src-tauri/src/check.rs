@@ -11,7 +11,7 @@
 //! cached` + `Repo::verify_reads` exactly as the restore path does — no new hashing logic.
 
 use crate::error::{KvcError, Result};
-use crate::repo::{kvc_dir, Commit, Repo};
+use crate::repo::{Commit, Repo};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone)]
@@ -72,7 +72,7 @@ pub fn check_repository(repo: &mut Repo, scrub: bool) -> Result<CheckReport> {
     // `read_commits` stops at the first bad line and silently drops everything after it — right
     // for a torn tail from a crash mid-append, wrong for damage in the middle of the file, which
     // would quietly shorten history. Scan the whole thing here.
-    let log = kvc_dir(&repo.root).join("commits.log");
+    let log = repo.store.join("commits.log");
     if log.is_file() {
         let bytes = std::fs::read(&log).map_err(|e| crate::error::io_at(&log, e))?;
         for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {

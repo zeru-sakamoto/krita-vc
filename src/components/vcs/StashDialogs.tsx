@@ -20,8 +20,10 @@ export function isStashConflictError(e: unknown): boolean {
   return String(e).startsWith("stash conflict");
 }
 
-/** What a set-aside action should capture: just the staged files, or every working change. */
-export type StashScope = "staged" | "all";
+/** What a set-aside action captures. Only "all" survives per-document tracking — there is no
+ *  subset of a one-artwork working tree — but the parameter stays so layer-scoped set-aside has
+ *  somewhere to land. */
+export type StashScope = "all";
 
 /** One-line summary of a stash's contents: "3 files · on main · 2h ago". */
 export function stashSummary(s: Stash): string {

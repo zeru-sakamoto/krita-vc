@@ -876,14 +876,16 @@ fn img_protocol_enabled() -> bool {
 /// really on disk (the handler serves exactly that file), else an inline data URL.
 /// The repo root rides in the URL hex-encoded; the handler only serves roots that commands
 /// have registered (`commands::register_served_repo`), so the scheme can't read arbitrary paths.
+/// `store` is the document store — the kvcimg handler resolves `<store>/cache/<key>.png` from
+/// the hex-encoded path in the URL, so it must be the folder that actually holds `cache/`.
 pub fn raster_url(
-    root: &std::path::Path,
+    store: &std::path::Path,
     cache_dir: &std::path::Path,
     key: &str,
     png: &[u8],
 ) -> String {
     if img_protocol_enabled() && cache_dir.join(format!("{key}.png")).is_file() {
-        let root_hex = hex(root.to_string_lossy().as_bytes());
+        let root_hex = hex(store.to_string_lossy().as_bytes());
         // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
         // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
         #[cfg(windows)]

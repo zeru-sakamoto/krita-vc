@@ -47,7 +47,6 @@ import type { Branch, Commit } from "../../types";
 const PANEL_OPTION_TOUR_IDS = new Set([
   "panel-option-undo",
   "panel-option-discard-all",
-  "panel-option-stash-staged",
   "panel-option-stash-all",
   "panel-option-stash-pop-latest",
   "panel-option-stash-pick",
@@ -72,7 +71,7 @@ interface SidebarProps {
   onSelect: (id: string) => void;
   /** Working-tree file whose diff is shown in the main panel (Changes view). */
   focusedFile: string | null;
-  onFocusFile: (path: string) => void;
+  onFocusFile: (path: string | null) => void;
   /** Jump to the Changes view (used by the save-first prompt). */
   onShowChanges: () => void;
 }
@@ -124,15 +123,14 @@ export function Sidebar({
   // work aside can complete the switch the user actually asked for.
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
 
-  // Lifted here (not local to ChangesPanel) so "Discard current changes" can see the same
-  // staged/unstaged split without a second scan — staging has no backend concept of its own.
-  const {
-    items: workingItems,
-    setItems: setWorkingItems,
-    error: workingError,
-  } = useWorkingChanges(current?.path ?? null, refreshNonce, setScanning);
-  const unstagedPaths = workingItems.filter((c) => !c.staged).map((c) => c.change.path);
-  const stagedPaths = workingItems.filter((c) => c.staged).map((c) => c.change.path);
+  // Lifted here (not local to ChangesPanel) so the panel-options actions and the panel itself
+  // share one scan of the tracked artwork.
+  const { items: workingItems, error: workingError } = useWorkingChanges(
+    current?.path ?? null,
+    refreshNonce,
+    setScanning
+  );
+  const changedPaths = workingItems.map((c) => c.change.path);
   const stashes = useStashes(current?.path ?? null, refreshNonce);
 
   const onSwitch = async (name: string) => {
@@ -173,7 +171,7 @@ export function Sidebar({
   const onDiscardAll = async () => {
     setDiscardAllError(null);
     try {
-      await discardChanges(unstagedPaths);
+      await discardChanges(changedPaths);
       setConfirmDiscardAll(false);
     } catch (e) {
       setDiscardAllError(String(e));
@@ -204,20 +202,14 @@ export function Sidebar({
     view === "changes"
       ? [
           {
-            id: "stash-staged",
-            label: artistMode ? "Set aside staged files" : "Stash staged",
+            // One tracked artwork means there is no subset to set aside — the old
+            // "staged files" row would have been a second button doing the same thing.
+            id: "stash-all",
+            label: artistMode ? "Set this aside" : "Stash changes",
             icon: <StashIcon size={14} />,
             separator: true,
-            tourId: "panel-option-stash-staged",
-            // Needs a commit to revert back to, same guard as undo.
-            disabled: stagedPaths.length === 0 || commits.length === 0 || saving,
-            onSelect: () => openSetAside("staged", stagedPaths),
-          },
-          {
-            id: "stash-all",
-            label: artistMode ? "Set aside everything" : "Stash all",
-            icon: <StashIcon size={14} />,
             tourId: "panel-option-stash-all",
+            // Needs a commit to revert back to, same guard as undo.
             disabled: workingItems.length === 0 || commits.length === 0 || saving,
             onSelect: () => openSetAside("all", null),
           },
@@ -289,7 +281,7 @@ export function Sidebar({
                 label: "Discard current changes",
                 icon: <ArrowCounterClockwise size={14} />,
                 tourId: "panel-option-discard-all",
-                disabled: unstagedPaths.length === 0 || saving,
+                disabled: changedPaths.length === 0 || saving,
                 onSelect: () => {
                   setDiscardAllError(null);
                   setConfirmDiscardAll(true);
@@ -382,7 +374,6 @@ export function Sidebar({
             focusedFile={focusedFile}
             onFocusFile={onFocusFile}
             items={workingItems}
-            setItems={setWorkingItems}
             error={workingError}
           />
         )}
@@ -491,9 +482,8 @@ export function Sidebar({
           }
         >
           <p className="text-[13px] leading-relaxed text-text-muted">
-            This permanently reverts {unstagedPaths.length}{" "}
-            {unstagedPaths.length === 1 ? "file" : "files"} to their last saved version. Staged
-            files aren't touched. Any unsaved edits are lost.
+            This permanently reverts this artwork to its latest saved version. Everything painted
+            since is lost — including Krita's undo history for it.
           </p>
           {discardAllError && <p className="mt-3 text-[12px] text-danger">{discardAllError}</p>}
         </Modal>

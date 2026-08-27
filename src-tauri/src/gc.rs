@@ -11,7 +11,7 @@
 use crate::commit::ancestors;
 use crate::error::{io_at, Result};
 use crate::kra;
-use crate::repo::{kvc_dir, Chains, Repo};
+use crate::repo::{Chains, Repo};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -328,11 +328,11 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     // --- write state FIRST (crash between = harmless re-collectable orphans) -------------
     repo.commits.retain(|c| reachable.contains(&c.id));
     repo.note_commits_truncated(); // dropped commits must leave the log
-    repo.chains.rewrite_all(&kvc_dir(&repo.root), new_chains)?;
+    repo.chains.rewrite_all(&repo.store.clone(), new_chains)?;
     repo.save()?;
 
     // --- quarantine loose (moved to .kvc/trash/, not deleted outright — see gap #5) --------
-    let kvc = kvc_dir(&repo.root);
+    let kvc = repo.store.clone();
     let trash_dir = trash_run_dir(&kvc);
     for (path, _) in &dead_loose {
         let _ = quarantine(&trash_dir, &objects, path);
@@ -476,11 +476,11 @@ fn prune_trash(kvc: &Path, cutoff: std::time::SystemTime) -> u64 {
 /// anything else. Only files older than an hour qualify (paranoia margin; the app is
 /// single-process, so anything old is definitively dead).
 fn stale_tmp_files(repo: &Repo) -> Vec<(PathBuf, u64)> {
-    let kvc = kvc_dir(&repo.root);
+    let kvc = repo.store.clone();
     let mut out = Vec::new();
     for dir in [
         kvc.clone(),
-        crate::repo::chains_dir(&repo.root),
+        crate::repo::chains_dir(&repo.store),
         crate::delta::pack_dir(&repo.objects_dir()),
     ] {
         let Ok(rd) = std::fs::read_dir(&dir) else {

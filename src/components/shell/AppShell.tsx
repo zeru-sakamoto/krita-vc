@@ -56,10 +56,10 @@ function WelcomeShell() {
       <div className="mx-2 mb-2 grid min-h-0 flex-1 place-items-center rounded-well bg-bg p-2">
         <div className="raised flex max-w-sm flex-col items-center gap-3 rounded-panel bg-surface px-8 py-10 text-center">
           <FolderOpen size={40} className="text-text-muted" />
-          <h1 className="text-[15px] font-medium">No repository yet</h1>
+          <h1 className="text-[15px] font-medium">No artwork yet</h1>
           <p className="text-[13px] leading-relaxed text-text-muted">
-            Use the switcher in the top-left corner to create a repository or open an existing
-            folder of artwork. Its version history will appear here.
+            Use the switcher in the top-left corner to pick a Krita artwork to track. Its version
+            history will appear here.
           </p>
         </div>
       </div>
@@ -198,6 +198,7 @@ function RepoShell({ repo }: { repo: Repository }) {
               branches={branches}
               currentBranch={currentBranch}
               nonce={refreshNonce}
+              onShowChanges={() => setActiveView("changes")}
             />
           </div>
 
