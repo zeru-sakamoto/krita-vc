@@ -14,6 +14,7 @@ import { IconButton } from "../ui/IconButton";
 import { Button } from "../ui/Button";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
+import { Tooltip } from "../ui/Tooltip";
 import { BranchBadge } from "../vcs/BranchBadge";
 import { CommitGraph } from "../vcs/CommitGraph";
 import { ChangesPanel } from "../vcs/ChangesPanel";
@@ -238,20 +239,21 @@ export function Sidebar({
       // could change out from under a click while a rescan or diff is in flight.
       disabled={checking}
       trigger={(open) => (
-        <span
-          title={checking ? "Checking for changes…" : "Panel options"}
-          aria-label="Panel options"
-          data-tour-id="panel-options"
-          className={[
-            "grid h-8 w-8 place-items-center rounded-button text-text-muted",
-            checking
-              ? "cursor-not-allowed opacity-40"
-              : "transition-colors hover:bg-state-hover hover:text-text",
-            open ? "bg-white/5 text-text" : "",
-          ].join(" ")}
-        >
-          <DotsThreeVertical size={16} />
-        </span>
+        <Tooltip label={checking ? "Checking for changes…" : "Panel options"}>
+          <span
+            aria-label="Panel options"
+            data-tour-id="panel-options"
+            className={[
+              "grid h-8 w-8 place-items-center rounded-button text-text-muted",
+              checking
+                ? "cursor-not-allowed opacity-40"
+                : "transition-colors hover:bg-state-hover hover:text-text",
+              open ? "bg-white/5 text-text" : "",
+            ].join(" ")}
+          >
+            <DotsThreeVertical size={16} />
+          </span>
+        </Tooltip>
       )}
       items={[
         {
@@ -317,13 +319,21 @@ export function Sidebar({
             <div className="flex items-center justify-between gap-2 h-8 border-b border-border px-3 py-1.5">
               <Menu
                 trigger={() => (
+                  // Tooltip scoped to the caret, not the whole trigger: BranchBadge already
+                  // carries its own tooltip (the full name when truncated) — wrapping the
+                  // whole span would stack both tooltips when hovering the badge itself.
                   <span
                     data-tour-id="history-branch"
                     className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-state-hover"
-                    title={artistMode ? "Choose which version line to view" : "Switch branch"}
                   >
                     <BranchBadge branch={currentBranch} />
-                    <CaretDown size={12} className="text-text-muted" />
+                    <Tooltip
+                      label={artistMode ? "Choose which version line to view" : "Switch branch"}
+                    >
+                      <span className="flex items-center">
+                        <CaretDown size={12} className="text-text-muted" />
+                      </span>
+                    </Tooltip>
                   </span>
                 )}
                 items={branches.map((b) => ({

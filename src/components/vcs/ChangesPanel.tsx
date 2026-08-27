@@ -6,6 +6,7 @@ import { BranchBadge } from "./BranchBadge";
 import { FileStatusChip } from "./FileStatusChip";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
+import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWorkingDiff } from "../../lib/repoData";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
@@ -97,9 +98,9 @@ function LayerRowItem({ row }: { row: LayerRow }) {
     <li className="flex items-center gap-2 px-3 py-1">
       <FileStatusChip status={CHANGE_STATUS[row.change] ?? "M"} />
       <Icon size={14} weight="regular" className="shrink-0 text-text-muted" />
-      <span className="min-w-0 flex-1 truncate text-[12px] text-text" title={row.name}>
-        {row.name}
-      </span>
+      <Tooltip label={row.name}>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-text">{row.name}</span>
+      </Tooltip>
       {row.nested > 0 && (
         <span className="shrink-0 text-[10px] text-text-muted">+{row.nested} inside</span>
       )}
@@ -211,16 +212,19 @@ export function ChangesPanel({
             {rows.length > 0 && <span className="text-text-muted/70">{rows.length}</span>}
           </span>
           {changed && (
-            <button
-              type="button"
-              onClick={() => setConfirmDiscard(true)}
-              disabled={saving || checking}
-              title={checking ? "Checking for changes…" : "Undo everything since the last version"}
-              className="flex items-center gap-1 rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+            <Tooltip
+              label={checking ? "Checking for changes…" : "Undo everything since the last version"}
             >
-              <ArrowCounterClockwise size={11} />
-              Undo all
-            </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDiscard(true)}
+                disabled={saving || checking}
+                className="flex items-center gap-1 rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                <ArrowCounterClockwise size={11} />
+                Undo all
+              </button>
+            </Tooltip>
           )}
         </h3>
 

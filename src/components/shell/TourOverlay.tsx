@@ -189,6 +189,9 @@ function HoldToSkip({ onSkip }: { onSkip: () => void }) {
       onPointerDown={startHold}
       onPointerUp={cancelHold}
       onPointerLeave={cancelHold}
+      // Left as a native title=, not the custom Tooltip: this button lives inside the tour's
+      // own full-screen overlay (`--z-tour`, above `--z-tooltip` in the z-scale on purpose), so
+      // a portaled Tooltip would render underneath the dimming bands and never be seen.
       title="Press and hold to skip the tour"
       className="glass fixed bottom-4 right-4 flex items-center gap-1.5 rounded-button px-2.5 py-1.5 text-[12px] text-text-muted hover:text-text"
     >

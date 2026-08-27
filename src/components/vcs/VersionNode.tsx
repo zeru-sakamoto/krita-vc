@@ -13,6 +13,7 @@ import {
   versionLabel,
 } from "../../lib/friendly";
 import { wrapSvg } from "../../lib/svgArt";
+import { Tooltip } from "../ui/Tooltip";
 
 /** Node column width — React Flow lays out with it, so the panel imports it too. */
 export const NODE_W = 208;
@@ -124,42 +125,43 @@ export const VersionNode = memo(function VersionNode({
       <SpineHandle type="target" position={Position.Left} />
       <SpineHandle type="source" position={Position.Right} />
 
-      <button
-        type="button"
-        onClick={() => onOpen(commit.id)}
-        aria-pressed={selected}
-        title={commit.message}
-        className={[
-          // React Flow sets the node wrapper's `pointer-events` to `none` unless the node is
-          // selectable/draggable or an `onNode*` handler is passed to <ReactFlow> — none of which
-          // apply here, since this map handles opening a version via its own button `onClick`
-          // instead. `pointer-events: none` is inherited, so descendants need to opt back in
-          // (`pointer-events-auto`) or every click falls through to the pane and pans instead.
-          // `nopan` then stops that pane pan-drag from starting on this button in the first place.
-          "nopan pointer-events-auto raised block w-full overflow-hidden rounded-panel bg-surface-2",
-          "transition-[box-shadow,transform] duration-100 ease-out",
-          "hover:-translate-y-0.5 active:translate-y-0",
-          selected ? "ring-1 ring-accent" : "",
-        ].join(" ")}
-        style={
-          isTip
-            ? { height: THUMB_H, outline: `2px solid ${laneColor}`, outlineOffset: 4 }
-            : { height: THUMB_H }
-        }
-      >
-        {thumb ? (
-          <div
-            className={`h-full w-full ${CHECKER} [&>svg]:h-full [&>svg]:w-full`}
-            dangerouslySetInnerHTML={{ __html: thumb }}
-          />
-        ) : loading ? (
-          <div className="h-full w-full animate-pulse bg-surface-3" />
-        ) : (
-          <div className="grid h-full w-full place-items-center bg-surface-2">
-            <KindIcon size={28} className="text-text-muted" />
-          </div>
-        )}
-      </button>
+      <Tooltip label={commit.message}>
+        <button
+          type="button"
+          onClick={() => onOpen(commit.id)}
+          aria-pressed={selected}
+          className={[
+            // React Flow sets the node wrapper's `pointer-events` to `none` unless the node is
+            // selectable/draggable or an `onNode*` handler is passed to <ReactFlow> — none of which
+            // apply here, since this map handles opening a version via its own button `onClick`
+            // instead. `pointer-events: none` is inherited, so descendants need to opt back in
+            // (`pointer-events-auto`) or every click falls through to the pane and pans instead.
+            // `nopan` then stops that pane pan-drag from starting on this button in the first place.
+            "nopan pointer-events-auto raised block w-full overflow-hidden rounded-panel bg-surface-2",
+            "transition-[box-shadow,transform] duration-100 ease-out",
+            "hover:-translate-y-0.5 active:translate-y-0",
+            selected ? "ring-1 ring-accent" : "",
+          ].join(" ")}
+          style={
+            isTip
+              ? { height: THUMB_H, outline: `2px solid ${laneColor}`, outlineOffset: 4 }
+              : { height: THUMB_H }
+          }
+        >
+          {thumb ? (
+            <div
+              className={`h-full w-full ${CHECKER} [&>svg]:h-full [&>svg]:w-full`}
+              dangerouslySetInnerHTML={{ __html: thumb }}
+            />
+          ) : loading ? (
+            <div className="h-full w-full animate-pulse bg-surface-3" />
+          ) : (
+            <div className="grid h-full w-full place-items-center bg-surface-2">
+              <KindIcon size={28} className="text-text-muted" />
+            </div>
+          )}
+        </button>
+      </Tooltip>
 
       {/* Connector dot. The line through it is the React Flow edge itself — edges render beneath
           nodes and both handles sit at this dot's center, so the spine passes behind the opaque
@@ -198,17 +200,20 @@ export const VersionNode = memo(function VersionNode({
                   <span className="text-[10px] text-text-muted">{branch}</span>
                 )}
                 {tipOf.map((name) => (
-                  <span
+                  <Tooltip
                     key={name}
-                    title={artistMode ? `Newest version on "${name}"` : `Branch tip: ${name}`}
-                    className="rounded-badge border px-1.5 py-px text-[10px] leading-tight"
-                    style={{
-                      color: laneColor,
-                      borderColor: `color-mix(in srgb, ${laneColor} 45%, transparent)`,
-                    }}
+                    label={artistMode ? `Newest version on "${name}"` : `Branch tip: ${name}`}
                   >
-                    {name}
-                  </span>
+                    <span
+                      className="rounded-badge border px-1.5 py-px text-[10px] leading-tight"
+                      style={{
+                        color: laneColor,
+                        borderColor: `color-mix(in srgb, ${laneColor} 45%, transparent)`,
+                      }}
+                    >
+                      {name}
+                    </span>
+                  </Tooltip>
                 ))}
               </div>
             )}
@@ -222,15 +227,16 @@ export const VersionNode = memo(function VersionNode({
                   CHANGE_GLYPH[l.change as keyof typeof CHANGE_GLYPH] ?? CHANGE_GLYPH.modified;
                 const GlyphIcon = glyph.icon;
                 return (
-                  <span
+                  <Tooltip
                     key={l.id}
-                    title={`${l.name} — ${layerTypeLabel(l.layerType ?? "")}, ${layerChangeLabel(l.change)}`}
-                    className="raised flex min-w-0 items-center gap-1 rounded-badge bg-surface-2 px-1.5 py-1 text-[11px] leading-none"
+                    label={`${l.name} — ${layerTypeLabel(l.layerType ?? "")}, ${layerChangeLabel(l.change)}`}
                   >
-                    <TypeIcon size={12} className="shrink-0 text-text-muted" />
-                    <span className="min-w-0 flex-1 truncate text-text">{l.name}</span>
-                    <GlyphIcon size={11} weight="bold" className={`shrink-0 ${glyph.color}`} />
-                  </span>
+                    <span className="raised flex min-w-0 items-center gap-1 rounded-badge bg-surface-2 px-1.5 py-1 text-[11px] leading-none">
+                      <TypeIcon size={12} className="shrink-0 text-text-muted" />
+                      <span className="min-w-0 flex-1 truncate text-text">{l.name}</span>
+                      <GlyphIcon size={11} weight="bold" className={`shrink-0 ${glyph.color}`} />
+                    </span>
+                  </Tooltip>
                 );
               })}
               {overflow > 0 && (
@@ -294,23 +300,26 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
       <SpineHandle type="target" position={Position.Left} />
       <SpineHandle type="source" position={Position.Right} />
 
-      <button
-        type="button"
-        onClick={onOpen}
-        disabled={picking}
-        title={artistMode ? "Unsaved changes — open the Changes tab" : "Working tree (uncommitted)"}
-        // No `raised`: a shadow would make an empty frame read as a real, present thing.
-        className={[
-          "nopan pointer-events-auto block w-full overflow-hidden rounded-panel border-2 border-dashed bg-bg",
-          "transition-transform duration-100 ease-out",
-          picking ? "" : "hover:-translate-y-0.5 active:translate-y-0",
-        ].join(" ")}
-        style={{ height: THUMB_H, borderColor: dashed }}
+      <Tooltip
+        label={artistMode ? "Unsaved changes — open the Changes tab" : "Working tree (uncommitted)"}
       >
-        <div className="grid h-full w-full place-items-center">
-          <Plus size={28} className="text-text-muted" />
-        </div>
-      </button>
+        <button
+          type="button"
+          onClick={onOpen}
+          disabled={picking}
+          // No `raised`: a shadow would make an empty frame read as a real, present thing.
+          className={[
+            "nopan pointer-events-auto block w-full overflow-hidden rounded-panel border-2 border-dashed bg-bg",
+            "transition-transform duration-100 ease-out",
+            picking ? "" : "hover:-translate-y-0.5 active:translate-y-0",
+          ].join(" ")}
+          style={{ height: THUMB_H, borderColor: dashed }}
+        >
+          <div className="grid h-full w-full place-items-center">
+            <Plus size={28} className="text-text-muted" />
+          </div>
+        </button>
+      </Tooltip>
 
       {/* Hollow connector dot. A 10px circle can't render a legible dash, so the ring is what
           says "not real yet" while still sitting on the spine like every other dot. */}
@@ -338,13 +347,14 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
               {artistMode ? "not saved yet" : "uncommitted"}
             </p>
             <div className="mt-1 flex flex-wrap justify-center gap-1">
-              <span
-                title={artistMode ? `Would be saved on "${branch}"` : `Branch: ${branch}`}
-                className="rounded-badge border border-dashed px-1.5 py-px text-[10px] leading-tight"
-                style={{ color: laneColor, borderColor: dashed }}
-              >
-                {branch}
-              </span>
+              <Tooltip label={artistMode ? `Would be saved on "${branch}"` : `Branch: ${branch}`}>
+                <span
+                  className="rounded-badge border border-dashed px-1.5 py-px text-[10px] leading-tight"
+                  style={{ color: laneColor, borderColor: dashed }}
+                >
+                  {branch}
+                </span>
+              </Tooltip>
             </div>
           </div>
 

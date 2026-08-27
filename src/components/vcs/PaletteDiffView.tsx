@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { PaletteDiff, PaletteSwatch, SwatchChange } from "../../types";
+import { Tooltip } from "../ui/Tooltip";
 
 /** Small diagonal-split square: top-left = before, bottom-right = after. */
 function SplitSwatch({ before, after }: { before: string; after: string }) {
@@ -46,92 +47,96 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
   }
 
   return (
-    <div className="group relative flex flex-col gap-0.5" title={`${name}: ${hexLabel}`}>
-      {/* Color square */}
-      <div
-        className={[
-          "relative h-10 w-full overflow-hidden rounded-badge border border-border",
-          CHANGE_RING[change],
-        ]
-          .filter(Boolean)
-          .join(" ")}
-      >
-        {change === "modified" && before && after ? (
-          <>
-            <SplitSwatch before={before} after={after} />
-            {/* Old hex — top-left (matches the before triangle); diagonal placement keeps the
+    <Tooltip label={`${name}: ${hexLabel}`}>
+      <div className="group relative flex flex-col gap-0.5">
+        {/* Color square */}
+        <div
+          className={[
+            "relative h-10 w-full overflow-hidden rounded-badge border border-border",
+            CHANGE_RING[change],
+          ]
+            .filter(Boolean)
+            .join(" ")}
+        >
+          {change === "modified" && before && after ? (
+            <>
+              <SplitSwatch before={before} after={after} />
+              {/* Old hex — top-left (matches the before triangle); diagonal placement keeps the
                 two labels from overlapping in a narrow cell. */}
-            <span
-              className={[
-                "absolute left-1 top-1",
-                HEX_BASE,
-                copied === before ? "text-diff-add-fg" : "text-white",
-              ].join(" ")}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCopy(before);
-              }}
-            >
-              {copied === before ? "✓" : before}
-            </span>
-            {/* New hex — bottom-right (matches the after triangle). */}
-            <span
-              className={[
-                "absolute bottom-1 right-1",
-                HEX_BASE,
-                copied === after ? "text-diff-add-fg" : "text-white",
-              ].join(" ")}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCopy(after);
-              }}
-            >
-              {copied === after ? "✓" : after}
-            </span>
-          </>
-        ) : (
-          <>
-            <div className="h-full w-full" style={{ backgroundColor: displayColor }} />
-            {/* Hex code centered inside the color block */}
-            <span
-              className={[
-                "absolute inset-0 flex items-center justify-center",
-                HEX_BASE,
-                copied === displayColor ? "text-diff-add-fg" : "text-white",
-              ].join(" ")}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleCopy(displayColor);
-              }}
-            >
-              {copied === displayColor ? "✓" : displayColor}
-            </span>
-          </>
-        )}
+              <span
+                className={[
+                  "absolute left-1 top-1",
+                  HEX_BASE,
+                  copied === before ? "text-diff-add-fg" : "text-white",
+                ].join(" ")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleCopy(before);
+                }}
+              >
+                {copied === before ? "✓" : before}
+              </span>
+              {/* New hex — bottom-right (matches the after triangle). */}
+              <span
+                className={[
+                  "absolute bottom-1 right-1",
+                  HEX_BASE,
+                  copied === after ? "text-diff-add-fg" : "text-white",
+                ].join(" ")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleCopy(after);
+                }}
+              >
+                {copied === after ? "✓" : after}
+              </span>
+            </>
+          ) : (
+            <>
+              <div className="h-full w-full" style={{ backgroundColor: displayColor }} />
+              {/* Hex code centered inside the color block */}
+              <span
+                className={[
+                  "absolute inset-0 flex items-center justify-center",
+                  HEX_BASE,
+                  copied === displayColor ? "text-diff-add-fg" : "text-white",
+                ].join(" ")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleCopy(displayColor);
+                }}
+              >
+                {copied === displayColor ? "✓" : displayColor}
+              </span>
+            </>
+          )}
 
-        {/* Change badge overlay (added / removed only) */}
-        {badge && (
-          <span
-            className={[
-              "pointer-events-none absolute bottom-0.5 right-0.5 rounded-badge px-1 py-px text-[9px] font-semibold uppercase leading-none",
-              change === "added" ? "bg-diff-add text-diff-add-fg" : "bg-diff-del text-diff-del-fg",
-            ].join(" ")}
-          >
-            {badge}
-          </span>
-        )}
+          {/* Change badge overlay (added / removed only) */}
+          {badge && (
+            <span
+              className={[
+                "pointer-events-none absolute bottom-0.5 right-0.5 rounded-badge px-1 py-px text-[9px] font-semibold uppercase leading-none",
+                change === "added"
+                  ? "bg-diff-add text-diff-add-fg"
+                  : "bg-diff-del text-diff-del-fg",
+              ].join(" ")}
+            >
+              {badge}
+            </span>
+          )}
+        </div>
+
+        {/* Name */}
+        <span
+          className={[
+            "truncate text-center font-mono text-[10px] leading-tight",
+            change === "removed" ? "text-text-muted line-through" : "text-text-muted",
+          ].join(" ")}
+        >
+          {name}
+        </span>
       </div>
-
-      {/* Name */}
-      <span
-        className={[
-          "truncate text-center font-mono text-[10px] leading-tight",
-          change === "removed" ? "text-text-muted line-through" : "text-text-muted",
-        ].join(" ")}
-      >
-        {name}
-      </span>
-    </div>
+    </Tooltip>
   );
 }
 

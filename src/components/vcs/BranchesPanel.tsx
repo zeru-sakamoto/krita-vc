@@ -2,6 +2,7 @@ import { Check, GitMerge, Plus, Trash } from "@phosphor-icons/react";
 import type { Branch } from "../../types";
 import { BranchBadge } from "./BranchBadge";
 import { IconButton } from "../ui/IconButton";
+import { Tooltip } from "../ui/Tooltip";
 import { useBranchActions } from "./useBranchActions";
 import { useArtistMode } from "../../lib/artistMode";
 
@@ -35,24 +36,24 @@ export function BranchesPanel({
             const active = b.kind === "current";
             return (
               <li key={b.name} className="group relative">
+                {/* No tooltip on the button itself — BranchBadge already carries its own
+                    (the full name on truncation); wrapping the whole row would stack a
+                    second tooltip on top of it whenever the badge is hovered. */}
                 <button
                   type="button"
                   onClick={() => actions.switchTo(b.name)}
                   disabled={saving}
-                  title={
-                    active
-                      ? artistMode
-                        ? "You're working here"
-                        : "Current branch"
-                      : `Switch to ${b.name}`
-                  }
                   className={[
                     "flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors",
                     active ? "row-selected" : "hover:bg-state-hover",
                   ].join(" ")}
                 >
                   <BranchBadge branch={b} />
-                  {active && <Check size={13} className="ml-auto text-accent" />}
+                  {active && (
+                    <Tooltip label={artistMode ? "You're working here" : "Current branch"}>
+                      <Check size={13} className="ml-auto text-accent" />
+                    </Tooltip>
+                  )}
                 </button>
                 {!active && (
                   <span className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">

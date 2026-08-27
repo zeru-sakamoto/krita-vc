@@ -1,4 +1,5 @@
 import { GitBranch } from "@phosphor-icons/react";
+import { Tooltip } from "../ui/Tooltip";
 import type { Branch } from "../../types";
 
 const KIND_STYLES: Record<Branch["kind"], string> = {
@@ -12,16 +13,17 @@ const KIND_STYLES: Record<Branch["kind"], string> = {
  */
 export function BranchBadge({ branch }: { branch: Branch }) {
   return (
-    <span
-      className={[
-        "inline-flex max-w-full min-w-0 items-center gap-1 rounded-panel bg-surface-3 px-1.5 py-0.5",
-        "font-mono text-[11px] leading-none",
-        KIND_STYLES[branch.kind],
-      ].join(" ")}
-      title={branch.name}
-    >
-      <GitBranch size={11} weight="regular" className="shrink-0" />
-      <span className="truncate">{branch.name}</span>
-    </span>
+    <Tooltip label={branch.name}>
+      <span
+        className={[
+          "inline-flex max-w-full min-w-0 items-center gap-1 rounded-panel bg-surface-3 px-1.5 py-0.5",
+          "font-mono text-[11px] leading-none",
+          KIND_STYLES[branch.kind],
+        ].join(" ")}
+      >
+        <GitBranch size={11} weight="regular" className="shrink-0" />
+        <span className="truncate">{branch.name}</span>
+      </span>
+    </Tooltip>
   );
 }

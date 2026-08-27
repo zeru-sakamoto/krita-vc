@@ -9,6 +9,7 @@ import {
 } from "@phosphor-icons/react";
 import type { FileStatus } from "../../types";
 import { useArtistMode } from "../../lib/artistMode";
+import { Tooltip } from "../ui/Tooltip";
 
 const STATUS: Record<FileStatus, { color: string; label: string; icon: Icon }> = {
   M: { color: "text-warning-fg", label: "Modified", icon: PencilSimple },
@@ -31,25 +32,25 @@ export function FileStatusChip({ status }: { status: FileStatus }) {
 
   if (artistMode) {
     return (
-      <span
-        title={label}
-        className={[
-          "inline-flex items-center gap-1 text-[11px] font-medium leading-none",
-          color,
-        ].join(" ")}
-      >
-        <Icon size={12} weight="bold" />
-        {label}
-      </span>
+      <Tooltip label={label}>
+        <span
+          className={[
+            "inline-flex items-center gap-1 text-[11px] font-medium leading-none",
+            color,
+          ].join(" ")}
+        >
+          <Icon size={12} weight="bold" />
+          {label}
+        </span>
+      </Tooltip>
     );
   }
 
   return (
-    <span
-      title={label}
-      className={["font-mono text-[11px] font-medium leading-none", color].join(" ")}
-    >
-      {status}
-    </span>
+    <Tooltip label={label}>
+      <span className={["font-mono text-[11px] font-medium leading-none", color].join(" ")}>
+        {status}
+      </span>
+    </Tooltip>
   );
 }

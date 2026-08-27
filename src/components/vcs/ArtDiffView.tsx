@@ -9,6 +9,7 @@ import {
 } from "@phosphor-icons/react";
 import type { ArtDiff, ChangeRegion, DiffState, PaletteDiff } from "../../types";
 import { IconButton } from "../ui/IconButton";
+import { Tooltip } from "../ui/Tooltip";
 import { FileStatusChip } from "./FileStatusChip";
 import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
@@ -269,30 +270,31 @@ export function ArtDiffView({
                   {Math.round(zoom.scale * 100)}%
                 </span>
                 <span className="mx-1 h-4 w-px bg-text-muted/40" />
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={highlightOn}
-                  title={highlightOn ? "Hide change highlight" : "Show change highlight"}
-                  onClick={() => setHighlightOn((v) => !v)}
-                  className="tactile flex h-8 items-center gap-1.5 rounded-button bg-surface-2 px-2 text-[12px] text-text-muted hover:bg-surface-3 hover:text-text"
-                >
-                  Show Diff
-                  <span
-                    aria-hidden
-                    className={[
-                      "inset-well relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200",
-                      highlightOn ? "bg-accent" : "bg-surface-3",
-                    ].join(" ")}
+                <Tooltip label={highlightOn ? "Hide change highlight" : "Show change highlight"}>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={highlightOn}
+                    onClick={() => setHighlightOn((v) => !v)}
+                    className="tactile flex h-8 items-center gap-1.5 rounded-button bg-surface-2 px-2 text-[12px] text-text-muted hover:bg-surface-3 hover:text-text"
                   >
+                    Show Diff
                     <span
+                      aria-hidden
                       className={[
-                        "raised absolute left-0.5 top-1/2 size-3 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
-                        highlightOn ? "translate-x-3" : "translate-x-0",
+                        "inset-well relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200",
+                        highlightOn ? "bg-accent" : "bg-surface-3",
                       ].join(" ")}
-                    />
-                  </span>
-                </button>
+                    >
+                      <span
+                        className={[
+                          "raised absolute left-0.5 top-1/2 size-3 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
+                          highlightOn ? "translate-x-3" : "translate-x-0",
+                        ].join(" ")}
+                      />
+                    </span>
+                  </button>
+                </Tooltip>
                 <IconButton
                   icon={Sparkle}
                   label="Highlight: changed pixels"

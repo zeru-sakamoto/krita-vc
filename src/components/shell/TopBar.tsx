@@ -14,6 +14,7 @@ import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Radio } from "../ui/Radio";
+import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
@@ -49,18 +50,19 @@ export function TopBar() {
     icon: <PaintBrush size={15} weight="regular" />,
     onSelect: () => setCurrent(repo.id),
     action: (
-      <button
-        type="button"
-        title="Stop tracking this artwork"
-        aria-label={`Stop tracking ${repo.name}`}
-        onClick={(e) => {
-          e.stopPropagation();
-          setModal({ kind: "remove", repo });
-        }}
-        className="grid h-5 w-5 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted"
-      >
-        <X size={13} />
-      </button>
+      <Tooltip label="Stop tracking this artwork">
+        <button
+          type="button"
+          aria-label={`Stop tracking ${repo.name}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            setModal({ kind: "remove", repo });
+          }}
+          className="grid h-5 w-5 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted"
+        >
+          <X size={13} />
+        </button>
+      </Tooltip>
     ),
   }));
 
@@ -148,47 +150,49 @@ function WindowControls() {
   const win = getCurrentWindow();
   return (
     <div className="ml-auto flex items-center gap-0.5">
-      <button
-        type="button"
-        title="Minimize"
-        aria-label="Minimize"
-        onClick={() => win.minimize()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
-      >
-        <Minus size={13} />
-      </button>
-      <button
-        type="button"
-        title="Maximize"
-        aria-label="Maximize"
-        onClick={() => win.toggleMaximize()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
-      >
-        <Square size={11} />
-      </button>
-      <button
-        type="button"
-        title="Close"
-        aria-label="Close"
-        onClick={() => win.close()}
-        className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-danger hover:text-bg"
-      >
-        <X size={13} />
-      </button>
+      <Tooltip label="Minimize">
+        <button
+          type="button"
+          aria-label="Minimize"
+          onClick={() => win.minimize()}
+          className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
+        >
+          <Minus size={13} />
+        </button>
+      </Tooltip>
+      <Tooltip label="Maximize">
+        <button
+          type="button"
+          aria-label="Maximize"
+          onClick={() => win.toggleMaximize()}
+          className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-state-hover hover:text-text"
+        >
+          <Square size={11} />
+        </button>
+      </Tooltip>
+      <Tooltip label="Close">
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={() => win.close()}
+          className="grid h-7 w-8 place-items-center rounded-button text-text-muted hover:bg-danger hover:text-bg"
+        >
+          <X size={13} />
+        </button>
+      </Tooltip>
     </div>
   );
 }
 
 function RepoTrigger({ name }: { name: string }) {
   return (
-    <span
-      title="Switch artwork"
-      className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[13px] text-text transition-colors hover:bg-state-hover"
-    >
-      <PaintBrush size={15} weight="regular" className="text-text-muted" />
-      <span className="max-w-55 truncate font-medium">{name}</span>
-      <CaretDown size={12} className="text-text-muted" />
-    </span>
+    <Tooltip label="Switch artwork">
+      <span className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[13px] text-text transition-colors hover:bg-state-hover">
+        <PaintBrush size={15} weight="regular" className="text-text-muted" />
+        <span className="max-w-55 truncate font-medium">{name}</span>
+        <CaretDown size={12} className="text-text-muted" />
+      </span>
+    </Tooltip>
   );
 }
 

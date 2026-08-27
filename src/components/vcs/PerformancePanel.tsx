@@ -10,6 +10,7 @@ import {
   type PerfOp,
 } from "../../lib/perf";
 import { relativeTime } from "../../lib/format";
+import { Tooltip } from "../ui/Tooltip";
 
 /** 1.4 KB, 12.0 MB … (base-1024, one decimal above bytes). */
 function formatBytes(n: number): string {
@@ -137,9 +138,9 @@ function VersionCard({
         )}
       </div>
       {row.message && (
-        <div className="mt-0.5 truncate text-[11px] text-text-muted" title={row.message}>
-          {row.message}
-        </div>
+        <Tooltip label={row.message}>
+          <div className="mt-0.5 truncate text-[11px] text-text-muted">{row.message}</div>
+        </Tooltip>
       )}
       {hasData ? (
         <div className="mt-1.5 text-[11px] text-text-muted">

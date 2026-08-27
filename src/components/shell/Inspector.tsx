@@ -9,6 +9,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
+import { Tooltip } from "../ui/Tooltip";
 import { FileStatusChip } from "../vcs/FileStatusChip";
 import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
 import type { ArtDiff, ArtLayer, Commit, DiffEntry, FileChange, PaletteDiff } from "../../types";
@@ -206,16 +207,17 @@ export function Inspector({
                       {artistMode ? assetName(focusedFile) : focusedFile}
                     </span>
                     {current && (
-                      <button
-                        type="button"
-                        title="Go to file"
-                        aria-label="Go to file"
-                        disabled={!inTauri()}
-                        onClick={() => void revealItemInDir(current.path)}
-                        className="shrink-0 rounded-button p-0.5 text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
-                      >
-                        <FolderOpen size={13} />
-                      </button>
+                      <Tooltip label="Go to file">
+                        <button
+                          type="button"
+                          aria-label="Go to file"
+                          disabled={!inTauri()}
+                          onClick={() => void revealItemInDir(current.path)}
+                          className="shrink-0 rounded-button p-0.5 text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                        >
+                          <FolderOpen size={13} />
+                        </button>
+                      </Tooltip>
                     )}
                   </span>
                 </MetaRow>

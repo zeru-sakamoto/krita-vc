@@ -1,4 +1,5 @@
 import type { Icon } from "@phosphor-icons/react";
+import { Tooltip } from "./Tooltip";
 
 interface IconButtonProps {
   icon: Icon;
@@ -38,31 +39,35 @@ export function IconButton({
   iconClassName,
 }: IconButtonProps) {
   return (
-    <button
-      type="button"
-      title={label}
-      aria-label={label}
-      aria-pressed={active}
-      disabled={disabled}
-      onClick={onClick}
-      data-tour-id={tourId}
-      data-pressed={active ? "true" : undefined}
-      className={[
-        "tactile grid h-8 w-8 place-items-center rounded-button bg-surface-2",
-        "transition-[transform,background-color,box-shadow,color] duration-100 ease-out",
-        "hover:bg-surface-3 hover:text-text active:translate-y-px",
-        "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface-2",
-        active ? "text-accent" : "text-text-muted",
-      ].join(" ")}
-    >
-      <IconCmp
-        size={size}
-        weight="regular"
-        className={
-          [spinning ? "animate-spin" : "", iconClassName ?? ""].filter(Boolean).join(" ") ||
-          undefined
-        }
-      />
-    </button>
+    // Not gated on `disabled` — the button's native `disabled` already blocks clicks;
+    // the tooltip should still explain what a greyed-out action is, same as the old
+    // native `title=` did regardless of disabled state.
+    <Tooltip label={label}>
+      <button
+        type="button"
+        aria-label={label}
+        aria-pressed={active}
+        disabled={disabled}
+        onClick={onClick}
+        data-tour-id={tourId}
+        data-pressed={active ? "true" : undefined}
+        className={[
+          "tactile grid h-8 w-8 place-items-center rounded-button bg-surface-2",
+          "transition-[transform,background-color,box-shadow,color] duration-100 ease-out",
+          "hover:bg-surface-3 hover:text-text active:translate-y-px",
+          "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-surface-2",
+          active ? "text-accent" : "text-text-muted",
+        ].join(" ")}
+      >
+        <IconCmp
+          size={size}
+          weight="regular"
+          className={
+            [spinning ? "animate-spin" : "", iconClassName ?? ""].filter(Boolean).join(" ") ||
+            undefined
+          }
+        />
+      </button>
+    </Tooltip>
   );
 }

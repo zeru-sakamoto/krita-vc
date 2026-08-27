@@ -31,6 +31,7 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Switch } from "../ui/Switch";
 import { Menu } from "../ui/Menu";
+import { Tooltip } from "../ui/Tooltip";
 import { useBranchActions, type BranchActions } from "./useBranchActions";
 import {
   NODE_H,
@@ -576,18 +577,21 @@ function MapActionBar({
             <Menu
               minWidth={220}
               trigger={(open) => (
-                <span
-                  className={[
-                    "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text",
-                    "hover:bg-state-hover",
-                    open ? "bg-state-active" : "",
-                  ].join(" ")}
-                  title={artistMode ? "Choose which version line you're on" : "Switch branch"}
+                <Tooltip
+                  label={artistMode ? "Choose which version line you're on" : "Switch branch"}
                 >
-                  <GitBranch size={13} className="text-text-muted" />
-                  <span className="max-w-40 truncate">{currentBranch.name}</span>
-                  <CaretDown size={12} className="text-text-muted" />
-                </span>
+                  <span
+                    className={[
+                      "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text",
+                      "hover:bg-state-hover",
+                      open ? "bg-state-active" : "",
+                    ].join(" ")}
+                  >
+                    <GitBranch size={13} className="text-text-muted" />
+                    <span className="max-w-40 truncate">{currentBranch.name}</span>
+                    <CaretDown size={12} className="text-text-muted" />
+                  </span>
+                </Tooltip>
               )}
               items={branches.map((b) => ({
                 id: b.name,
@@ -634,20 +638,23 @@ function MapActionBar({
               ]}
             />
             <span className="mx-0.5 h-4 w-px bg-text-muted/40" />
-            <button
-              type="button"
-              onClick={onStartPicking}
-              disabled={saving}
-              title={
+            <Tooltip
+              label={
                 artistMode
                   ? "Go back to an earlier version and take a different direction from there"
                   : "Create a branch starting at any commit"
               }
-              className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:opacity-40"
             >
-              <GitBranch size={13} />
-              {artistMode ? "Start a line here…" : "Branch from a commit…"}
-            </button>
+              <button
+                type="button"
+                onClick={onStartPicking}
+                disabled={saving}
+                className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:opacity-40"
+              >
+                <GitBranch size={13} />
+                {artistMode ? "Start a line here…" : "Branch from a commit…"}
+              </button>
+            </Tooltip>
           </>
         )}
       </div>
@@ -777,14 +784,15 @@ function ZoomReadout() {
   const zoom = useStore((s) => s.transform[2]);
   const { zoomTo } = useReactFlow();
   return (
-    <button
-      type="button"
-      title="Reset zoom to 100%"
-      onClick={() => void zoomTo(1, { duration: 200 })}
-      className="rounded-button px-1.5 py-0.5 font-mono text-[11px] text-text-muted transition-colors hover:bg-state-hover hover:text-text"
-    >
-      {Math.round(zoom * 100)}%
-    </button>
+    <Tooltip label="Reset zoom to 100%">
+      <button
+        type="button"
+        onClick={() => void zoomTo(1, { duration: 200 })}
+        className="rounded-button px-1.5 py-0.5 font-mono text-[11px] text-text-muted transition-colors hover:bg-state-hover hover:text-text"
+      >
+        {Math.round(zoom * 100)}%
+      </button>
+    </Tooltip>
   );
 }
 
@@ -842,17 +850,18 @@ function CommitDrilldown({
             <Menu
               align="right"
               trigger={(open) => (
-                <span
-                  className={[
-                    "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted",
-                    "hover:bg-state-hover hover:text-text",
-                    open ? "bg-state-active text-text" : "",
-                  ].join(" ")}
-                  title="Choose which file to view"
-                >
-                  {active ? (artistMode ? assetName(active) : active) : "Files"}
-                  <CaretDown size={12} />
-                </span>
+                <Tooltip label="Choose which file to view">
+                  <span
+                    className={[
+                      "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted",
+                      "hover:bg-state-hover hover:text-text",
+                      open ? "bg-state-active text-text" : "",
+                    ].join(" ")}
+                  >
+                    {active ? (artistMode ? assetName(active) : active) : "Files"}
+                    <CaretDown size={12} />
+                  </span>
+                </Tooltip>
               )}
               items={files.map((f) => ({
                 id: f,

@@ -685,7 +685,21 @@ app-global but orthogonal to `AppShell`'s own layout/view state.
 Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (tactile icon chip),
 [`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
 outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStatusChip.tsx),
-[`BranchBadge`](../src/components/vcs/BranchBadge.tsx).
+[`BranchBadge`](../src/components/vcs/BranchBadge.tsx),
+[`Tooltip`](../src/components/ui/Tooltip.tsx) — the app's only hover/focus tooltip, replacing every
+native `title=` (the ~13 places still using `title` are the unrelated `Modal` heading prop, not a
+tooltip). Positioning mirrors `Menu`'s measure-then-place approach (portal to `document.body`, a
+`useLayoutEffect` reads the trigger's and the popover's own rects to flip above/below and clamp
+horizontally within the viewport), and it animates in per [`DESIGN.md`](../DESIGN.md)'s
+state/animation matrix (`--dur-fast`/`--ease-out`, `scale(0.97)→1` + `opacity 0→1`) on the
+previously-unused `--z-tooltip` layer. `IconButton` and `Switch` wrap themselves in it internally, so every call site
+that already passed a `label` picked it up for free. Two deliberate exceptions: it's never nested
+inside another `Tooltip` (e.g. a "Switch branch" trigger wrapping `BranchBadge` scopes its own
+label to the non-badge chrome, since `BranchBadge` already tooltips its own truncated name — two
+tooltips stacking on hover would be worse than native `title`'s single-innermost-wins behavior),
+and `TourOverlay`'s "Skip" button keeps native `title=` since it sits inside the tour's full-screen
+overlay, whose `--z-tour` layer sits *above* `--z-tooltip` by design — a portaled Tooltip there
+would render invisibly behind the dimming bands.
 
 Cross-cutting libs: [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx) (the toggle context),
 [`src/lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx) (the Legacy version history toggle
