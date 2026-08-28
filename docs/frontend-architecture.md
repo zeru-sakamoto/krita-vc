@@ -455,6 +455,13 @@ left to drive a diff viewer, so `AppShell`'s `perfShowsMap` flag shows the map b
 Sidebar instead of Main Panel + Inspector, reusing the same persistent `VersionMapPanel` instance
 above. Legacy on restores the old diff-viewer layout there, unchanged.
 
+**Tour hooks.** Three of the map's own details exist for the first-launch tour (see
+[Application tour](#application-tour)): `VersionNodeData.tourTarget` marks the current branch's
+tip as the stand-in for "a saved version" (the node `jumpToLatest` centres on, so
+`onlyRenderVisibleElements` keeps it mounted), `MapActionBar` force-opens its branch `Menu` for
+the "New version line…" step, and `VersionMap` clears any open drilldown while the tour is active
+— a drilldown replaces the canvas outright, taking every map spotlight target with it.
+
 ## Stashes — setting work aside
 
 "Set aside" (Artist Mode) / "Stash" parks working-tree changes off to the side of history so
@@ -598,19 +605,54 @@ Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cy
 A first-launch, one-time spotlight walkthrough of the shell — fired once and never again
 automatically.
 
-- [`src/lib/tour.tsx`](../src/lib/tour.tsx) (`TourProvider`/`useTour()`) holds a flat, linear
-  `TOUR_STEPS` array (`{tourId, title, body, view?}`, ~28 steps covering every zone) and a
+- [`src/lib/tour.tsx`](../src/lib/tour.tsx) (`TourProvider`/`useTour()`) holds a linear
+  `TOUR_STEPS` array (`{tourId, title, body, view?, when?}`, ~33 steps covering every zone) and a
   `stepIndex` state machine (`next`/`back`/`skip`/`restart`/`beginIfFirstTime`). Completion is a
   `localStorage` flag (`krita-vc:tour-completed`) — the same context-plus-flag pattern as Artist
   Mode and the custom title bar toggle. `RepoShell` calls `beginIfFirstTime()` once on mount; it's
   a no-op once the flag is set. A step with a `view` drives `setActiveView` as a side effect, so
-  the tour can walk the user through Changes, History, Branches, and Performance without them
-  switching tabs themselves.
+  the tour can walk the user through Changes, the Version Map, History, Branches, and Performance
+  without them switching tabs themselves.
+- The **Version Map group** sits between the Changes steps and the legacy History ones, matching
+  the activity bar's own order (changes → map → history → …). It covers every control the map
+  offers:
+
+  | `tourId` | gate | what it points at |
+  |---|---|---|
+  | `map` | — | the activity-bar icon; what the map is, and that drag pans / scroll zooms |
+  | `map-empty` | `!hasVersions` | the empty state — the only thing on screen on a fresh install |
+  | `map-version` | `hasVersions` | one version card: composite, number + note, changed-layer chips, the tip ring, and that clicking opens the full comparison (which is where non-legacy users hear about the Inspector) |
+  | `map-preview` | `dirty` | the dashed pending-version node |
+  | `map-branch` | `hasVersions` | the action bar's branch switcher, incl. its hover-revealed merge/delete |
+  | `map-branch-new` | `hasVersions` | "New version line…", with the menu force-opened |
+  | `map-pick` | `hasVersions` | "Start a line here…" — pick-a-version branching |
+  | `map-all-lines` | `hasVersions && hasOtherBranches` | the all-branches lane toggle |
+  | `map-view-controls` | `hasVersions` | zoom readout + fit-all + jump-to-newest, as **one** spotlight — three consecutive holes over adjacent 16px buttons read as padding, not as teaching |
+  | `map-minimap` | `hasVersions` | the overview, via `MinimapViewport`'s panel |
+
+- **Not every step applies to every shell.** A step whose target isn't in the DOM leaves
+  `TourOverlay` with nothing to spotlight, and it renders `null` — no card, no Next, no Skip. So a
+  step can carry a `when?: (c: TourConditions) => boolean` predicate over four facts the shell
+  knows: `legacy` (the History/Branches tabs exist at all — off by default), `hasVersions` (the
+  map draws nodes rather than its empty state), `hasOtherBranches` (the map's "All lines" toggle
+  is rendered) and `dirty` (the map draws its pending-version preview node). A plain predicate,
+  not a key registry, so negation (`map-empty`) and compound gates (`map-all-lines`) need no
+  syntax. `RepoShell` reports the conditions **live** in an effect rather than the provider
+  snapshotting them at start: the tour fires from a mount effect while `useCommits`/`useBranches`
+  are still in flight, so a snapshot would drop every map step on a repo that does have history.
+  The cursor stays an index into `TOUR_STEPS` — not into the filtered list, which resizes
+  underneath it — while `stepIndex`/`totalSteps` come from the filtered list, so "Step N of M"
+  matches what the user will actually see (19 steps on a fresh install, ~25 on a real repo with
+  legacy off, 33 with it on).
 - [`TourOverlay`](../src/components/shell/TourOverlay.tsx) renders `null` when inactive. Spotlight
   targets are plain `data-tour-id` attributes: `IconButton` and `Menu`'s `MenuItem` both take an
   optional `tourId` prop that sets it, and a handful of other targets (the repo switcher, the
-  branch badge row, the changed-layer list, the commit-graph, the commit message/button) carry
+  branch badge row, the changed-layer list, the commit-graph, the commit message/button, and the
+  Version Map's empty state, header controls, action bar and minimap overlay) carry
   `data-tour-id` directly on a wrapper — so no ref plumbing is needed to locate a step's target.
+  The one target that isn't literal markup is a map node: `VersionNodeData.tourTarget` flags the
+  **current branch's tip**, which is the node `jumpToLatest` centres on and therefore the one
+  `onlyRenderVisibleElements` reliably keeps mounted.
   The dim-with-a-hole effect is **four plain opaque `fixed` bands** tiling the viewport around the
   target rect (top/bottom/left/right) plus a fifth, transparent, non-interactive div over the hole
   itself so it never intercepts clicks — deliberately not a box-shadow spread or an SVG mask, both
@@ -619,12 +661,25 @@ automatically.
   from `getBoundingClientRect()` risked a hairline seam between adjoining bands). The callout card
   anchors beside the target for ActivityBar rows and rows inside an open dropdown (whichever edge
   of the target has room to grow into, so a card near the bottom of the window never clips past
-  it), and below the target otherwise, clamped so it never pushes past the right edge either.
-- Steps that spotlight a row **inside** the panel-options `Menu` (undo, discard, and the four
-  set-aside/bring-back rows) need that menu open while the overlay is blocking the real click that
-  would normally open it — [`Menu`](../src/components/ui/Menu.tsx) gained a `forceOpen` prop (ORed
-  with its normal click-toggled state, so it never fights outside-click/Escape handling), driven
-  by `Sidebar`'s `PANEL_OPTION_TOUR_IDS` set.
+  it), and below the target otherwise, clamped on **both** axes — a bottom-right target (the map's
+  minimap) or a tall one (a version card) flips the card above the target instead of running off
+  the bottom.
+- Measurement retries on rAF for ~400ms rather than measuring once. The Version Map is kept
+  mounted under `display: none` when another tab is active (see [Version Map](#version-map)) and
+  React Flow re-measures its nodes a frame or two after it becomes visible, so a single rAF can
+  read a stale or zero-size rect. A target still missing at the deadline makes the tour **step
+  over it in the direction of travel** (a `dir` ref, so a Back press doesn't bounce forward);
+  that's the backstop that keeps a missing target from blanking the overlay, whatever `when`
+  predicates miss.
+- Steps that spotlight a row **inside** a `Menu` (the panel-options undo/discard/set-aside rows,
+  and the map action bar's "New version line…") need that menu open while the overlay is blocking
+  the real click that would normally open it — [`Menu`](../src/components/ui/Menu.tsx) gained a
+  `forceOpen` prop (ORed with its normal click-toggled state, so it never fights
+  outside-click/Escape handling), driven by `Sidebar`'s `PANEL_OPTION_TOUR_IDS` set and by
+  `MapActionBar`'s single-step check.
+- `VersionMap` clears any open commit drilldown while the tour is active: a drilldown replaces the
+  canvas outright, taking every map spotlight target with it. The first-launch tour can't hit
+  that, but "Replay tour" from Settings can.
 - Arrow Left/Right step back/forward as well as the card's Back/Next buttons. A press-and-hold
   "Skip" button (`HoldToSkip`, 300ms hold) guards against a single stray click dismissing the
   whole tour.

@@ -44,6 +44,7 @@ import {
 } from "./VersionNode";
 import { useCommitDiff, useCommits } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
+import { useTour } from "../../lib/tour";
 import { assetName, versionLabel } from "../../lib/friendly";
 import { bendFraction, buildVersionMap } from "../../lib/versionMap";
 import type { Branch, Commit } from "../../types";
@@ -166,6 +167,14 @@ function VersionMap({
   const [picking, setPicking] = useState(false);
   const { fitView, setCenter, getViewport } = useReactFlow();
   const actions = useBranchActions({ currentBranch: currentBranch.name, onShowChanges });
+  const { active: tourActive } = useTour();
+
+  // A drilldown replaces the canvas outright, taking every map spotlight target with it. The tour
+  // auto-fires on a fresh install where nothing is open, but "Replay tour" from Settings can fire
+  // with a version open — so hand the canvas back before the map steps run.
+  useEffect(() => {
+    if (tourActive) setOpenId(null);
+  }, [tourActive]);
 
   // Only fetched while the toggle is on: an empty path makes `useCommits` a no-op, so the off
   // state costs nothing and stays byte-identical to the commits the shell already loaded.
@@ -255,13 +264,14 @@ function VersionMap({
             isTip: layout.tips.has(commit.id),
             tipOf: layout.tips.get(commit.id) ?? [],
             branch: at?.branch ?? null,
+            tourTarget: commit.id === currentBranch.tip,
             repoPath,
             onOpen: onNodeClick,
             laneColor: laneColor(lane, layout.currentLane),
           },
         };
       }),
-    [drawn, layout, repoPath, openId, onNodeClick]
+    [drawn, layout, repoPath, openId, onNodeClick, currentBranch.tip]
   );
 
   const allNodes = useMemo<Node<VersionNodeData | PreviewNodeData>[]>(() => {
@@ -404,44 +414,55 @@ function VersionMap({
           <>
             {otherBranches > 0 && (
               <>
-                <Switch
-                  active={showAll}
-                  icon={GitBranch}
-                  text={artistMode ? "All lines" : "All branches"}
-                  label={
-                    artistMode
-                      ? showAll
-                        ? "Show only the line you're on"
-                        : `Show all version lines (${otherBranches} other)`
-                      : showAll
-                        ? "Show only the current branch"
-                        : `Show all branches (${otherBranches} other)`
-                  }
-                  onClick={toggleShowAll}
-                />
+                {/* Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
+                    every other map target is a plain `data-tour-id` too. */}
+                <span data-tour-id="map-all-lines" className="flex items-center">
+                  <Switch
+                    active={showAll}
+                    icon={GitBranch}
+                    text={artistMode ? "All lines" : "All branches"}
+                    label={
+                      artistMode
+                        ? showAll
+                          ? "Show only the line you're on"
+                          : `Show all version lines (${otherBranches} other)`
+                        : showAll
+                          ? "Show only the current branch"
+                          : `Show all branches (${otherBranches} other)`
+                    }
+                    onClick={toggleShowAll}
+                  />
+                </span>
                 <span className="mx-1 h-4 w-px bg-text-muted/40" />
               </>
             )}
-            <ZoomReadout />
-            <IconButton
-              icon={ArrowsOut}
-              label="Fit all versions"
-              size={16}
-              onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
-            />
-            <IconButton
-              icon={CaretLineRight}
-              label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
-              size={16}
-              onClick={jumpToLatest}
-            />
+            {/* One spotlight for all three: consecutive holes over adjacent 16px buttons read as
+                padding, not as teaching. `gap-2` reproduces what the header was giving them. */}
+            <span data-tour-id="map-view-controls" className="flex items-center gap-2">
+              <ZoomReadout />
+              <IconButton
+                icon={ArrowsOut}
+                label="Fit all versions"
+                size={16}
+                onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
+              />
+              <IconButton
+                icon={CaretLineRight}
+                label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
+                size={16}
+                onClick={jumpToLatest}
+              />
+            </span>
           </>
         )}
       </header>
 
       {drawn.length === 0 ? (
         <div className="grid flex-1 place-items-center">
-          <div className="flex max-w-xs flex-col items-center gap-2 px-4 text-center text-text-muted">
+          <div
+            data-tour-id="map-empty"
+            className="flex max-w-xs flex-col items-center gap-2 px-4 text-center text-text-muted"
+          >
             <MapTrifold size={32} />
             <p className="text-[13px]">
               {artistMode
@@ -556,6 +577,10 @@ function MapActionBar({
 }) {
   const { artistMode } = useArtistMode();
   const { saving } = actions;
+  // The tour's "Start a new line" step spotlights a row inside this menu, and the overlay blocks
+  // the real click that would open it — same pattern as Sidebar's panel-options steps.
+  const { active: tourActive, step: tourStep } = useTour();
+  const forceBranchMenuOpen = tourActive && tourStep.tourId === "map-branch-new";
 
   return (
     // `nopan` for the same reason VersionNode's thumbnail has it — without it a drag started on
@@ -576,11 +601,13 @@ function MapActionBar({
           <>
             <Menu
               minWidth={220}
+              forceOpen={forceBranchMenuOpen}
               trigger={(open) => (
                 <Tooltip
                   label={artistMode ? "Choose which version line you're on" : "Switch branch"}
                 >
                   <span
+                    data-tour-id="map-branch"
                     className={[
                       "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text",
                       "hover:bg-state-hover",
@@ -632,6 +659,7 @@ function MapActionBar({
                   id: "new-branch",
                   label: artistMode ? "New version line…" : "New branch…",
                   icon: <Plus size={13} />,
+                  tourId: "map-branch-new",
                   disabled: saving,
                   onSelect: () => actions.askCreate(),
                 },
@@ -649,6 +677,7 @@ function MapActionBar({
                 type="button"
                 onClick={onStartPicking}
                 disabled={saving}
+                data-tour-id="map-pick"
                 className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:opacity-40"
               >
                 <GitBranch size={13} />
@@ -721,6 +750,9 @@ function MinimapViewport({ nodes }: { nodes: Node[] }) {
     // panel and lands exactly on top of it; the transparent border stands in for the MiniMap's.
     <Panel
       position="bottom-right"
+      // Also the tour's minimap target: this sits pixel-exactly on the MiniMap with the same
+      // geometry, so it saves reaching into React Flow's own component for a rect.
+      data-tour-id="map-minimap"
       className="pointer-events-none !overflow-hidden !rounded-panel !border !border-transparent !bottom-3 !right-3"
       style={{ width: MINIMAP_W, height: MINIMAP_H }}
     >

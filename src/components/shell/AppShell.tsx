@@ -70,7 +70,7 @@ function WelcomeShell() {
 
 function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
-  const { beginIfFirstTime } = useTour();
+  const { beginIfFirstTime, setConditions } = useTour();
   const { legacy } = useLegacyHistory();
   const { refreshNonce, setScanning } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
@@ -99,6 +99,17 @@ function RepoShell({ repo }: { repo: Repository }) {
   useEffect(() => {
     beginIfFirstTime();
   }, []);
+
+  // Which tour steps have anything to point at. Reported live rather than read once at the start:
+  // the tour fires on mount, while `useCommits`/`useBranches` are still in flight.
+  useEffect(() => {
+    setConditions({
+      legacy,
+      hasVersions: commits.length > 0,
+      hasOtherBranches: branches.length > 1,
+      dirty: workingItems.length > 0,
+    });
+  }, [setConditions, legacy, commits.length, branches.length, workingItems.length]);
 
   // Turning legacy history off while sitting on History/Branches would strand the user on a view
   // with no icon to leave it by — fall back to the map.

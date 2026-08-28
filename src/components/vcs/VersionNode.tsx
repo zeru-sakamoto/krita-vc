@@ -57,6 +57,10 @@ export interface VersionNodeData {
   /** This branch's lane color (see VersionMapPanel's BRANCH_LANE_COLORS) — shared by every node
    *  on the line, so the connector dots read as one continuous branch identity. */
   laneColor: string;
+  /** The product tour spotlights this node as its stand-in for "a saved version". Set on the
+   *  current branch's tip only — the one node `jumpToLatest` centres on, so it's reliably on
+   *  screen and not culled by `onlyRenderVisibleElements`. */
+  tourTarget?: boolean;
   repoPath: string;
   onOpen: (id: string) => void;
   [key: string]: unknown;
@@ -101,7 +105,7 @@ export const VersionNode = memo(function VersionNode({
   data: VersionNodeData;
   selected?: boolean;
 }) {
-  const { commit, version, isTip, tipOf, branch, laneColor, repoPath, onOpen } = data;
+  const { commit, version, isTip, tipOf, branch, laneColor, tourTarget, repoPath, onOpen } = data;
   const { artistMode } = useArtistMode();
   // A boolean selector, so a node re-renders only when the threshold is actually crossed —
   // not on every frame of a zoom gesture.
@@ -121,7 +125,13 @@ export const VersionNode = memo(function VersionNode({
   const { icon: KindIcon } = assetKind(art?.path ?? commit.changes[0]?.path ?? "");
 
   return (
-    <div className="flex flex-col items-center" style={{ width: NODE_W }}>
+    <div
+      className="flex flex-col items-center"
+      style={{ width: NODE_W }}
+      // The whole card, not just the thumbnail — the tour step describes the artwork, the
+      // caption and the changed-layer chips as one thing.
+      data-tour-id={tourTarget ? "map-version" : undefined}
+    >
       <SpineHandle type="target" position={Position.Left} />
       <SpineHandle type="source" position={Position.Right} />
 
@@ -296,6 +306,8 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
     <div
       className={`flex flex-col items-center ${picking ? "opacity-50" : ""}`}
       style={{ width: NODE_W }}
+      // Unconditional — there is only ever one preview node on the map.
+      data-tour-id="map-preview"
     >
       <SpineHandle type="target" position={Position.Left} />
       <SpineHandle type="source" position={Position.Right} />

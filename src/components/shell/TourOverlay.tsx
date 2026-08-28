@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTour } from "../../lib/tour";
 import type { ActivityView } from "./ActivityBar";
 
 const HOLD_MS = 300;
 const RING_R = 9;
 const RING_CIRC = 2 * Math.PI * RING_R;
+/** How long to keep looking for a step's target before giving up on it and stepping over. */
+const MEASURE_TIMEOUT_MS = 400;
+/** Nominal callout height — only used to pick which side of the target has room for it. */
+const CARD_H = 160;
 
 /**
  * Full-launch spotlight tour. Renders `null` when inactive. The dim-with-a-hole
@@ -23,39 +27,70 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
     if (step.view) setActiveView(step.view);
   }, [step.view, setActiveView]);
 
+  // Which way the user is travelling — so stepping over a target that turns out not to exist
+  // continues in that direction instead of bouncing them forward out of a Back press.
+  const dir = useRef<1 | -1>(1);
+  const goNext = useCallback(() => {
+    dir.current = 1;
+    next();
+  }, [next]);
+  const goBack = useCallback(() => {
+    dir.current = -1;
+    back();
+  }, [back]);
+
   useEffect(() => {
     if (!active) return;
+    let raf = 0;
+    const deadline = performance.now() + MEASURE_TIMEOUT_MS;
     const measure = () => {
+      cancelAnimationFrame(raf);
       const el = document.querySelector(`[data-tour-id="${step.tourId}"]`);
-      setRect(el ? el.getBoundingClientRect() : null);
-      // Spotlighting a row inside an open dropdown (e.g. panel options) — put the
-      // callout beside it instead of below, so it doesn't cover the rest of the list.
-      setInMenu(!!el?.closest('[role="menu"]'));
+      const found = el?.getBoundingClientRect() ?? null;
+      // A zero-size rect means the target is in the DOM but not laid out yet. The Version Map is
+      // kept mounted under `display: none` and React Flow re-measures its nodes a frame or two
+      // after it becomes visible, so one rAF isn't always enough — keep looking until the
+      // deadline.
+      if (found && (found.width > 0 || found.height > 0)) {
+        setRect(found);
+        // Spotlighting a row inside an open dropdown (e.g. panel options) — put the
+        // callout beside it instead of below, so it doesn't cover the rest of the list.
+        setInMenu(!!el?.closest('[role="menu"]'));
+        return;
+      }
+      if (performance.now() < deadline) {
+        raf = requestAnimationFrame(measure);
+        return;
+      }
+      // Nothing to point at and no chance it's still settling. Leaving `rect` null blanks the
+      // whole overlay — no card, no Next, no Skip — so step over instead. `stepIndex === 0` has
+      // nowhere further back to go, so it goes forward regardless.
+      setRect(null);
+      if (dir.current === -1 && stepIndex > 0) back();
+      else next();
     };
     measure();
-    // Layout may still be settling right after a view switch.
-    const raf = requestAnimationFrame(measure);
     window.addEventListener("resize", measure);
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", measure);
     };
-  }, [active, step.tourId]);
+  }, [active, step.tourId, stepIndex, next, back]);
 
   useEffect(() => {
     if (!active) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "ArrowRight") {
         e.preventDefault();
-        next();
+        goNext();
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
-        back();
+        goBack();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [active, next, back]);
+  }, [active, goNext, goBack]);
 
   if (!active || !rect) return null;
 
@@ -88,14 +123,18 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
   // switcher itself sits near the same left edge) gets the callout below instead.
   const inActivityBar = rect.left < 64 && rect.top > 40;
   const cardWidth = 288; // matches the callout's `w-72` className below
+  // Clamp so a target near the right edge (e.g. the Inspector toggle) doesn't push the card past
+  // the window edge, and one near the bottom (the map's minimap, a full-height version card)
+  // grows upwards instead of off screen.
+  const clampedLeft = Math.max(16, Math.min(rect.left, vw - cardWidth - 16));
   const calloutStyle: React.CSSProperties =
     inActivityBar || inMenu
       ? rect.top < vh / 2
         ? { left: rect.right + 16, top: rect.top }
         : { left: rect.right + 16, bottom: vh - rect.bottom }
-      : // Clamp so a target near the right edge (e.g. the Inspector toggle) doesn't push
-        // the card past the window edge.
-        { left: Math.min(rect.left, vw - cardWidth - 16), top: rect.bottom + 12 };
+      : rect.bottom + 12 + CARD_H > vh
+        ? { left: clampedLeft, bottom: vh - rect.top + 12 }
+        : { left: clampedLeft, top: rect.bottom + 12 };
 
   return (
     <div className="fixed inset-0 z-(--z-tour)">
@@ -147,7 +186,7 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
             {stepIndex > 0 && (
               <button
                 type="button"
-                onClick={back}
+                onClick={goBack}
                 className="rounded-button px-2 py-1 text-[12px] text-text-muted hover:bg-state-hover hover:text-text"
               >
                 Back
@@ -155,7 +194,7 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
             )}
             <button
               type="button"
-              onClick={next}
+              onClick={goNext}
               className="tactile rounded-button bg-accent px-2.5 py-1 text-[12px] font-medium text-bg hover:brightness-110"
             >
               {stepIndex + 1 >= totalSteps ? "Done" : "Next"}

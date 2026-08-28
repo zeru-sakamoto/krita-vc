@@ -584,18 +584,36 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   (`src/lib/tour.tsx` `TourProvider`/`useTour`, `src/components/shell/TourOverlay.tsx`), fired via
   `beginIfFirstTime()` (called once from `RepoShell` on mount) and gated on a `localStorage` flag
   (`krita-vc:tour-completed`) — same context-plus-flag pattern as Artist Mode and the custom title
-  bar toggle. `TOUR_STEPS` is a flat, linear array (`{tourId, title, body, view?}`); a step with a
-  `view` drives `setActiveView` as a side effect so the tour can walk through Changes, History,
-  Branches, and Performance without the user switching tabs. Spotlight targets are plain
-  `data-tour-id` attributes (`IconButton`/`MenuItem` both take an optional `tourId` prop; a few
-  other targets carry `data-tour-id` directly) — no ref plumbing. The dim-with-a-hole effect is
+  bar toggle. `TOUR_STEPS` is a linear array (`{tourId, title, body, view?, when?}`); a step with a
+  `view` drives `setActiveView` as a side effect so the tour can walk through Changes, the Version
+  Map, History, Branches, and Performance without the user switching tabs. **`when` is what keeps
+  the list honest**: a step whose target isn't in the DOM makes `TourOverlay` render `null` — no
+  card, no Next, no Skip — so the legacy History/Branches steps (`legacy` off by default), the map's
+  node/branch/minimap steps (a fresh install has no commits), its "All lines" toggle (needs a second
+  branch) and its pending-version preview (needs a dirty tree) are each gated on a
+  `TourConditions` predicate. Conditions are reported **live** by `RepoShell`, never snapshotted at
+  start: `beginIfFirstTime()` fires from a mount effect while `useCommits`/`useBranches` are still
+  in flight, so a snapshot drops every map step on a repo that does have history. The cursor stays
+  an index into `TOUR_STEPS` (not the filtered list, which resizes underneath it); `stepIndex`/
+  `totalSteps` come from the filtered list so "Step N of M" matches what the user will see.
+  Spotlight targets are plain `data-tour-id` attributes (`IconButton`/`MenuItem` both take an
+  optional `tourId` prop; a few other targets carry `data-tour-id` directly, including one
+  `VersionNode` flagged via `VersionNodeData.tourTarget` — the current branch's tip, the one node
+  `jumpToLatest` centres on and `onlyRenderVisibleElements` therefore won't cull) — no ref plumbing.
+  The dim-with-a-hole effect is
   four opaque `fixed` bands tiling the viewport around the target rect plus a fifth transparent
   non-interactive div over the hole itself — deliberately not a box-shadow spread or an SVG mask,
   both of which silently failed to paint in this WebView build. Steps that spotlight a row inside
-  the panel-options `Menu` force it open via a new `Menu.forceOpen` prop (ORed with the normal
-  click-toggled state so it never fights outside-click/Escape handling), since the overlay blocks
-  the real click that would otherwise open it. Replay anytime via Settings → Appearance →
-  "Replay tour" (`restart()`). See
+  a `Menu` (panel options, the map action bar's branch list) force it open via a `Menu.forceOpen`
+  prop (ORed with the normal click-toggled state so it never fights outside-click/Escape handling),
+  since the overlay blocks the real click that would otherwise open it. Measurement retries on rAF
+  for ~400ms before giving up — the map is kept mounted under `display: none` and React Flow
+  re-measures its nodes a frame or two after it becomes visible — and a target still missing at the
+  deadline **steps over in the direction of travel** rather than blanking the overlay; the callout
+  is clamped on both axes so a bottom-right target (the minimap) or a tall one (a version card)
+  can't push it off screen. `VersionMap` also drops any open drilldown while the tour is active,
+  since that unmounts the canvas and every map target on it. Replay anytime via Settings →
+  Appearance → "Replay tour" (`restart()`). See
   [`docs/frontend-architecture.md`](docs/frontend-architecture.md#application-tour).
 
 All data flows through Tauri `invoke` keyed by the selected repository path; the component/prop

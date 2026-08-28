@@ -18,7 +18,7 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   background, and the Legacy version history toggle that brings the old History/Branches tabs
   back), **Artist Mode** (the global friendly-labels toggle), the **theme selector** (color themes
   + the theme-reactive diff highlight), and the **application tour** (the first-launch spotlight
-  walkthrough).
+  walkthrough — including how a step gates itself on the shell state its target needs).
 - [**Backend architecture**](backend-architecture.md) — the Rust crate's structural map: module
   layout, the request flow from a Tauri command or the `kvc` CLI into the engine and back, the
   concurrency model (`RepoLock` + the CPU-budgeted pool), the two binaries that share one crate,
