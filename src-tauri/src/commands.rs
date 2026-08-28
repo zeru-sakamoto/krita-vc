@@ -194,13 +194,6 @@ pub async fn delete_repository(path: String) -> std::result::Result<bool, String
     .await
 }
 
-/// Zip one document (the `.kra` plus its store) to `dest` — a manual, user-triggered backup
-/// (see `Repo::export_zip`). Read-only, so no `RepoLock`.
-#[tauri::command]
-pub async fn export_repository_zip(path: String, dest: String) -> std::result::Result<(), String> {
-    run_heavy(move || Repo::export_zip(Path::new(&path), Path::new(&dest))).await
-}
-
 /// Where new stores are created. `None`/empty = the default, beside each document. App-global
 /// (the `kvc` CLI reads the same file), so it lives outside any one store's `Config`.
 #[tauri::command]
@@ -221,39 +214,93 @@ pub async fn set_store_root(path: Option<String>) -> std::result::Result<(), Str
     .await
 }
 
-/// Zip every repo in `paths` into `dest_dir`, one `<folder-name>-<date>.zip` each. Independent,
-/// user-picked folders — one failing (e.g. permission denied) shouldn't abort the rest, so
-/// failures are collected and returned instead of short-circuiting the whole batch.
+/// Zip the given documents (each `.kra` plus its store) into **one** archive at `dest` — a
+/// manual, user-triggered backup (see `Repo::export_zip_multi`). Read-only, so no `RepoLock`.
+/// Independent artworks, so one failing shouldn't abort the rest: failures are collected and
+/// returned rather than short-circuiting the batch.
 #[tauri::command]
 pub async fn export_repositories_zip(
     paths: Vec<String>,
-    dest_dir: String,
+    dest: String,
 ) -> std::result::Result<Vec<String>, String> {
     run_heavy(move || {
-        let dest_dir = Path::new(&dest_dir);
-        let today = crate::repo::epoch_to_iso(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-        );
-        let date = &today[..10];
-        let mut failed = Vec::new();
-        for path in &paths {
-            let root = Path::new(path);
-            // Stem, not file_name — otherwise every backup is named "painting.kra-2026-01-01.zip".
-            let name = root
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "artwork".to_string());
-            let dest = dest_dir.join(format!("{name}-{date}.zip"));
-            if Repo::export_zip(root, &dest).is_err() {
-                failed.push(path.clone());
-            }
-        }
-        Ok(failed)
+        let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        Repo::export_zip_multi(&paths, Path::new(&dest))
     })
     .await
+}
+
+/// What's inside a backup archive, so the restore UI can list it and resolve destinations
+/// before anything is written. Cheap and read-only.
+#[tauri::command]
+pub async fn read_backup_manifest(
+    archive: String,
+) -> std::result::Result<crate::repo::BackupManifest, String> {
+    run(move || Repo::read_backup_manifest(Path::new(&archive))).await
+}
+
+/// Where each artwork in a backup would land, and what's already sitting there — so the restore
+/// UI can show destinations and clashes before anything is written. `fallback_dir` is used only
+/// for artworks whose original folder is gone.
+#[tauri::command]
+pub async fn plan_restore(
+    archive: String,
+    fallback_dir: Option<String>,
+) -> std::result::Result<Vec<crate::repo::RestorePlan>, String> {
+    run(move || Repo::plan_restore(Path::new(&archive), fallback_dir.as_deref().map(Path::new)))
+        .await
+}
+
+/// Both sides of a restore clash. See `compare_restore_versions`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareVersions {
+    pub backup: Vec<crate::repo::VersionRow>,
+    pub current: Vec<crate::repo::VersionRow>,
+}
+
+/// The versions in a backup vs the versions already tracked at the destination — the one thing
+/// the artist needs before choosing Replace, which deletes the on-disk history. Both sides come
+/// back **newest first** and are scoped to their own branch tip, the same scope `list_commits`
+/// uses by default, so "5 here, 8 in the backup" counts the same thing on both sides.
+///
+/// Read-only and cheap (one zip entry plus `open_light`), so plain `run`, not `run_heavy`.
+#[tauri::command]
+pub async fn compare_restore_versions(
+    archive: String,
+    dir: String,
+    dest_path: String,
+) -> std::result::Result<CompareVersions, String> {
+    run(move || {
+        let backup = Repo::backup_versions(Path::new(&archive), &dir)?;
+        let repo = Repo::open_light(Path::new(&dest_path))?;
+        let current = match repo.branches.tip() {
+            Some(tip) => {
+                let reach = commit::ancestors(&repo.commits, tip);
+                repo.commits
+                    .iter()
+                    .filter(|c| reach.contains(&c.id))
+                    .rev()
+                    .map(crate::repo::VersionRow::from)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        Ok(CompareVersions { backup, current })
+    })
+    .await
+}
+
+/// Restore artworks out of a backup archive (see `Repo::import_zip`). Each item names an
+/// artwork in the archive and the folder to put it in; its **history** goes wherever this
+/// machine keeps history — beside the artwork, or under the custom store root — which is
+/// re-derived here rather than taken from the archive.
+#[tauri::command]
+pub async fn import_repository_zip(
+    archive: String,
+    items: Vec<crate::repo::ImportItem>,
+) -> std::result::Result<Vec<crate::repo::ImportResult>, String> {
+    run_heavy(move || Repo::import_zip(Path::new(&archive), &items)).await
 }
 
 /// Reclaim storage unreachable from any branch tip (orphans from undo, deleted branches).

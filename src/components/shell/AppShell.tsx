@@ -62,6 +62,12 @@ function WelcomeShell() {
             Use the switcher in the top-left corner to pick a Krita artwork to track. Its version
             history will appear here.
           </p>
+          {/* The other half of an empty list is "I already had artworks" — after a reinstall or
+              a lost drive, this screen is exactly where that person lands. */}
+          <p className="text-[12px] leading-relaxed text-text-muted">
+            Got a backup? The same menu has{" "}
+            <span className="text-text">Restore from a backup…</span>
+          </p>
         </div>
       </div>
     </div>

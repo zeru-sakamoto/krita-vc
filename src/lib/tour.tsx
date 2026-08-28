@@ -276,7 +276,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     tourId: "backup",
     title: "Back up",
-    body: "One click zips the whole repository as a safety copy.",
+    body: "Pick any of your artworks and zip them — art and full history — into one safety copy. Restoring one is in the artwork switcher.",
   },
 ];
 

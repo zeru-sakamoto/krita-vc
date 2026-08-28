@@ -16,7 +16,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   canvas of versions, replacing the History graph; branch lanes, branch color, the floating
   branch action bar and pick-a-version branching, the pending-version preview node, the grid
   background, and the Legacy version history toggle that brings the old History/Branches tabs
-  back), **Artist Mode** (the global friendly-labels toggle), the **theme selector** (color themes
+  back), **backup & restore** (the multi-artwork archive, and the version comparison a restore
+  offers when the destination is already tracked), **Artist Mode** (the global friendly-labels
+  toggle), the **theme selector** (color themes
   + the theme-reactive diff highlight), and the **application tour** (the first-launch spotlight
   walkthrough — including how a step gates itself on the shell state its target needs).
 - [**Backend architecture**](backend-architecture.md) — the Rust crate's structural map: module
@@ -35,8 +37,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   a previous-generation `.bak` for the small state files), write-time patch verification, verified
   reads on the restore paths, the read-only repository check (with an opt-in full-store bit-rot
   scrub), the GC safety model (quarantine-to-trash instead of outright delete), verified
-  self-describing backups, stash ordering invariants, and the input-validation caps at the trust
-  boundaries.
+  self-describing backups (and the side-by-side version comparison shown before a restore is
+  allowed to replace an existing history), stash ordering invariants, and the input-validation
+  caps at the trust boundaries.
 - [**Visual diff viewer**](visual-diff-viewer.md) — how art (`.kra`) files render as layer images
   and visual diffs: the data model, SVG compositing, and the highlight/compare modes.
 - [**Performance**](performance.md) — why the `.kra` diff path is fast: two-stage/streamed loading,

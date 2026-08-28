@@ -165,7 +165,10 @@ error still names the artwork rather than an internal directory.
   forcing — every one able to produce a `.kra` Krita won't open, discovered by the artist, in
   their art, later.
 - **Rename re-pointing.** Renaming a tracked `.kra` currently reads as untracked. `doc.json` holds
-  what a content-hash re-point would need.
+  what a content-hash re-point would need. The same gap is why restoring a backup never renames an
+  artwork on the way in — the filename is baked into `doc.json`, `index.json` keys, chain shard
+  filenames, `Commit.files[].path` and every `kra:{relpath}:…` stream key, so a clash at the
+  destination is Replace-or-skip. A content-hash re-point would unlock both at once.
 - **Migration from folder repositories.** There was none to do — the app had no users at v1.
 - **Sharing `objects/` between sibling stores.** See above; it is the thing this design exists to
   avoid.

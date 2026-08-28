@@ -47,13 +47,22 @@ interface RepositoryValue {
    * The `.kra` itself is never touched.
    */
   removeRepository: (id: string, deleteHistory: boolean) => Promise<boolean>;
-  /** Zip an artwork and its history to a user-chosen path. Null if canceled or in a browser. */
-  backupRepository: (id: string) => Promise<string | null>;
   /**
-   * Zip every known repository into a user-chosen destination folder. Resolves the list of
-   * repo paths that failed (empty = all succeeded), or null if canceled or in a browser.
+   * Zip the chosen artworks — each `.kra` plus its history — into **one** archive at a
+   * user-chosen path. Resolves the destination plus the artwork paths that failed (empty = all
+   * succeeded), or null if canceled or in a browser.
    */
-  backupAllRepositories: () => Promise<string[] | null>;
+  backupRepositories: (ids: string[]) => Promise<{ dest: string; failed: string[] } | null>;
+  /** What's inside a backup archive, so restore can list it before writing anything. */
+  readBackupManifest: (archive: string) => Promise<BackupManifest | null>;
+  /**
+   * Restore artworks out of a backup archive. Each artwork's **history** goes wherever this
+   * machine keeps history (beside the artwork, or under the custom store root) — the backend
+   * re-derives it rather than copying the path baked into the archive.
+   */
+  importBackup: (archive: string, items: ImportItem[]) => Promise<ImportResult[]>;
+  /** Track an artwork by path, creating its store if absent, and select it. */
+  addRepositoryPath: (path: string) => Promise<void>;
   /** Restore the working tree to `commitId` and record it as a new commit. */
   rollbackToCommit: (commitId: string) => Promise<void>;
   /** Undo the last commit, keeping working-tree changes. */
@@ -143,6 +152,44 @@ export interface CheckReport {
   /** Live versions re-hashed (only non-zero when `scrubPerformed`). */
   versionsScrubbed: number;
   problems: { kind: string; detail: string }[];
+}
+
+/** One artwork inside a backup archive (`read_backup_manifest`, serde camelCase). */
+export interface BackupEntry {
+  /** Folder inside the archive holding this artwork and its `.kvc/`. */
+  dir: string;
+  /** The document's filename. Restore can never change it — see `Repo::import_zip`. */
+  relpath: string;
+  /** Absolute directory it lived in when backed up. A restore *hint*, nothing depends on it. */
+  originalDir: string;
+  branch: string;
+  tipCommit: string;
+}
+
+export interface BackupManifest {
+  version: number;
+  timestamp: string;
+  appVersion: string;
+  entries: BackupEntry[];
+}
+
+/** One artwork to restore, and the folder to put it in. Skipped artworks simply aren't sent. */
+export interface ImportItem {
+  dir: string;
+  destDir: string;
+}
+
+/** Shape returned per artwork by the `import_repository_zip` Tauri command. */
+export interface ImportResult {
+  dir: string;
+  /** Absolute path of the restored `.kra`. */
+  path: string;
+  name: string;
+  /** Where this machine decided the history goes — shown so it's never a surprise. */
+  store: string;
+  /** Findings from the post-import integrity check. Non-fatal. */
+  problems: string[];
+  error: string | null;
 }
 
 const RepositoryContext = createContext<RepositoryValue | null>(null);
@@ -265,25 +312,32 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     [repositories, show]
   );
 
-  // Manual last-resort backup: zips the whole project folder (art + `.kvc/`) to a user-chosen
-  // path/folder. Doesn't touch `saving` (nothing here is mutated) but still drives the
-  // BusyOverlay via `busyMessage` since zipping a large `objects/` dir isn't instant.
-  const backupRepository = useCallback(
-    async (id: string): Promise<string | null> => {
-      if (!inTauri()) return null;
-      const repo = repositories.find((r) => r.id === id);
-      if (!repo) return null;
+  // Manual last-resort backup: zips the chosen artworks (art + history) into ONE archive at a
+  // user-chosen path. Doesn't touch `saving` (nothing here is mutated) but still drives the
+  // BusyOverlay via `busyMessage` — zipping several `objects/` dirs isn't instant.
+  const backupRepositories = useCallback(
+    async (ids: string[]): Promise<{ dest: string; failed: string[] } | null> => {
+      if (!inTauri() || ids.length === 0) return null;
+      const picked = repositories.filter((r) => ids.includes(r.id));
+      if (picked.length === 0) return null;
       const dest = await save({
-        defaultPath: `${repo.name}-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+        defaultPath: `krita-backup-${new Date().toISOString().slice(0, 10)}.zip`,
         filters: [{ name: "Zip archive", extensions: ["zip"] }],
       });
       if (!dest) return null;
-      setBusyMessage("Backing up artwork — please wait…");
+      setBusyMessage("Backing up — please wait…");
       try {
-        await invoke("export_repository_zip", { path: repo.path, dest });
+        const failed = await invoke<string[]>("export_repositories_zip", {
+          paths: picked.map((r) => r.path),
+          dest,
+        });
         const lastBackupAt = new Date().toISOString();
-        setRepositories((prev) => prev.map((r) => (r.id === id ? { ...r, lastBackupAt } : r)));
-        return dest;
+        setRepositories((prev) =>
+          prev.map((r) =>
+            ids.includes(r.id) && !failed.includes(r.path) ? { ...r, lastBackupAt } : r
+          )
+        );
+        return { dest, failed };
       } finally {
         setBusyMessage(null);
       }
@@ -291,20 +345,28 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
     [repositories]
   );
 
-  const backupAllRepositories = useCallback(async (): Promise<string[] | null> => {
-    if (!inTauri() || repositories.length === 0) return null;
-    const destDir = await open({ directory: true, title: "Choose a folder for the backups" });
-    if (typeof destDir !== "string") return null;
-    setBusyMessage("Backing up artworks — please wait…");
-    try {
-      return await invoke<string[]>("export_repositories_zip", {
-        paths: repositories.map((r) => r.path),
-        destDir,
-      });
-    } finally {
-      setBusyMessage(null);
-    }
-  }, [repositories]);
+  // Read-only, so no busy overlay: the restore modal calls this to list an archive before the
+  // user has committed to anything.
+  const readBackupManifest = useCallback(
+    async (archive: string): Promise<BackupManifest | null> => {
+      if (!inTauri()) return null;
+      return await invoke<BackupManifest>("read_backup_manifest", { archive });
+    },
+    []
+  );
+
+  const importBackup = useCallback(
+    async (archive: string, items: ImportItem[]): Promise<ImportResult[]> => {
+      if (!inTauri() || items.length === 0) return [];
+      setBusyMessage("Restoring from backup — please wait…");
+      try {
+        return await invoke<ImportResult[]>("import_repository_zip", { archive, items });
+      } finally {
+        setBusyMessage(null);
+      }
+    },
+    []
+  );
 
   const current = useMemo(
     () => repositories.find((r) => r.id === currentId) ?? repositories[0] ?? null,
@@ -545,9 +607,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       currentId,
       setCurrent,
       browseRepository,
+      addRepositoryPath: addPath,
       removeRepository,
-      backupRepository,
-      backupAllRepositories,
+      backupRepositories,
+      readBackupManifest,
+      importBackup,
       rollbackToCommit,
       undoLastCommit,
       discardChanges,
@@ -576,9 +640,11 @@ export function RepositoryProvider({ children }: { children: React.ReactNode }) 
       currentId,
       setCurrent,
       browseRepository,
+      addPath,
       removeRepository,
-      backupRepository,
-      backupAllRepositories,
+      backupRepositories,
+      readBackupManifest,
+      importBackup,
       rollbackToCommit,
       undoLastCommit,
       discardChanges,

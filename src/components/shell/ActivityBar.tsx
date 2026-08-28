@@ -10,8 +10,8 @@ import {
 } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
 import { SettingsModal } from "./SettingsModal";
+import { BackupModal } from "./BackupModal";
 import { useRepository } from "../../lib/repository";
-import { useToast } from "../../lib/toast";
 import { useLegacyHistory } from "../../lib/legacyHistory";
 
 export type ActivityView = "changes" | "map" | "history" | "branches" | "performance";
@@ -36,19 +36,9 @@ const ITEMS: { view: ActivityView; icon: typeof Stack; label: string; legacy?: b
  */
 export function ActivityBar({ active, onChange }: ActivityBarProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const { current, backupRepository, busyMessage } = useRepository();
-  const { show } = useToast();
+  const [backupOpen, setBackupOpen] = useState(false);
+  const { repositories, busyMessage } = useRepository();
   const { legacy } = useLegacyHistory();
-
-  const doBackup = async () => {
-    if (!current) return;
-    try {
-      const dest = await backupRepository(current.id);
-      if (dest) show(`Backed up to ${dest}`);
-    } catch (e) {
-      show(String(e), "error");
-    }
-  };
 
   return (
     // py-2 matches the well's padding, so the first chip's top edge and the last
@@ -70,10 +60,10 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
       <div className="mt-auto flex flex-col items-center gap-2">
         <IconButton
           icon={FileZip}
-          label="Back up this repository…"
+          label="Back up artworks…"
           size={24}
-          disabled={!current || !!busyMessage}
-          onClick={doBackup}
+          disabled={repositories.length === 0 || !!busyMessage}
+          onClick={() => setBackupOpen(true)}
           tourId="backup"
         />
         <IconButton
@@ -84,6 +74,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
           tourId="settings"
         />
       </div>
+      {backupOpen && <BackupModal onClose={() => setBackupOpen(false)} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </nav>
   );

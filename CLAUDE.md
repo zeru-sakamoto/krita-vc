@@ -127,13 +127,50 @@ settings that render *outside* the tab's artwork gate so they're reachable with 
 **"Where version history is kept"** (`get_store_root`/`set_store_root`; default is the hidden
 `.kvc/` container beside each artwork, and changing it moves nothing — it only decides where the
 *next* artwork's store is created, which the copy says plainly rather than implying a migration)
-and **"Background CPU use"** — see the CPU headroom note below). Backing up an artwork
-(`backupRepository` in `repository.tsx`, zips the `.kra` **and its store** via
-`export_repository_zip`, rebased under `.kvc/<slug>/` so extracting the archive anywhere gives a
-tracked document there) is **not** in Settings — it's its own one-click zip-icon `IconButton` in `ActivityBar.tsx`, directly above
-the Settings gear, wired to a small global toast (`lib/toast.tsx`, `ToastProvider`/`useToast`,
-single-slot, auto-dismissing, bottom-right, reusing the `--z-toast` token) for the "Saved to …"/
-error result, since the busy overlay covers only the in-flight zip itself. **Branching is real**:
+and **"Background CPU use"** — see the CPU headroom note below). **Backup/restore** is **not** in Settings.
+Backup is its own zip-icon `IconButton` in `ActivityBar.tsx`, directly above the Settings gear,
+opening `BackupModal.tsx` — a **multi-select** of tracked artworks (all pre-ticked; more backup is
+the safer default for a safety feature) that writes **one** archive via `backupRepositories` →
+`export_repositories_zip` → `Repo::export_zip_multi`. Layout is `MANIFEST.json` plus one
+`<dir>/` per artwork holding `<name>.kra` + `.kvc/<slug>/`, i.e. N copies of the single-document
+on-disk shape, so plain extraction still yields tracked documents. `skip_in_backup` drops
+`cache/` (regenerable, budgeted 256 MB *per store* — the largest disposable chunk), `trash/`,
+`kvc.lock*` and `*.tmp`. This **replaced** the old one-zip-per-artwork "back up all"
+(`export_repository_zip`, `backupAllRepositories`, `BackupAllResultModal` are gone).
+Restore is **"Restore from a backup…"** in the `TopBar` switcher menu (and pointed at from the
+welcome screen — where a reinstall lands you), opening `RestoreModal.tsx`: `plan_restore`
+resolves each artwork to its **original folder if it still exists**, else a per-artwork subfolder
+of one you pick, and flags an occupied destination so that row defaults to **Skip** (Replace is
+the only alternative — see below). A row occupied by an **already-tracked** artwork also offers
+**"Compare versions"** (`RestoreCompareModal.tsx` → `compare_restore_versions` →
+`Repo::backup_versions` + `open_light`), which is the only thing that makes Replace a decision
+rather than a coin flip: Replace deletes the on-disk history, and nothing else in the UI says
+whether the backup is ahead of it or behind. Two text-only columns — `Version N`, message, age,
+newest first, each side numbered positionally within itself the way `friendly.ts`'s
+`versionNumbers` does (so the columns line up only when one history is a superset, which is the
+case this exists for), with ids absent from the other side tagged — plus a "N only in the backup /
+M only on this computer" summary, and Keep-mine/Use-the-backup buttons that just write the row's
+tick. Deliberately no composites or diffs: imagery would need `commit_diff` per version
+(`run_heavy`, uncached), and the question is answered by counts and messages.
+`Repo::backup_versions` reads `commits.log` straight out of the zip (finding it by shape —
+`<dir>/.kvc/<slug>/commits.log`, the slug being payload as everywhere else) through the shared
+`parse_commit_log`, scoped to the manifest's `tipCommit` via `commit::ancestors` so both sides are
+counted with `list_commits`' default scope. Then `import_repository_zip` → `Repo::import_zip`.
+**The load-bearing rule: import treats the archive's `.kvc/<slug>/` path as payload, not a
+destination.** It extracts the `.kra`, then recomputes `store_dir_for(&dest)` on *this* machine —
+so with a custom store root set the tracking folders land under it and **no `.kvc/` is created
+beside the artwork**, and with none they land beside it. Writing history anywhere other than what
+`store_dir_for` returns would make every later `open`/`is_repo`/scan/commit and the `kvc` CLI look
+straight past it; plain extraction under a custom root does exactly that, which is the pre-existing
+bug restore exists to close (`import_follows_this_machines_store_root_in_both_directions` in
+`tests/backup_store_root.rs` — its own test *binary*, since the store root is process-global state,
+and it redirects the app-data dir so the suite never touches the developer's real setting).
+Import **never renames**: the filename is baked into `doc.json`, `index.json` keys, chain shard
+filenames, `Commit.files[].path` and every `kra:{relpath}:…` stream key, so a clash is
+Replace-or-skip. Extraction is guarded by `safe_join` (zip-slip) and `read_entry_capped`
+(decompression bomb), Replace sends the old store to the Recycle Bin via `Repo::delete`, and every
+restored store is gated on `check::check_repository` before `addRepositoryPath` puts it back in
+the list. **Branching is real**:
 `branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first, and `branch::create_branch_at` starts one at an **arbitrary commit** —

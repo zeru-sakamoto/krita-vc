@@ -8,72 +8,8 @@ use std::io::Write;
 
 // --- fixtures --------------------------------------------------------------------------
 
-/// Build a real Krita-style tiled layer block.
-fn tiled(items: &[(i64, i64, &[u8])]) -> Vec<u8> {
-    let mut out = format!(
-        "VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE 4\nDATA {}\n",
-        items.len()
-    )
-    .into_bytes();
-    for (x, y, d) in items {
-        out.extend_from_slice(format!("{x},{y},LZF,{}\n", d.len()).as_bytes());
-        out.extend_from_slice(d);
-    }
-    out
-}
-
-/// Pack a minimal but valid .kra ZIP (mimetype stored first, like Krita writes it).
-fn pack_kra(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    use zip::write::SimpleFileOptions;
-    use zip::CompressionMethod;
-    let mut out = Vec::new();
-    {
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
-        for (name, data) in entries {
-            let method = if *name == "mimetype" {
-                CompressionMethod::Stored
-            } else {
-                CompressionMethod::Deflated
-            };
-            zw.start_file(
-                *name,
-                SimpleFileOptions::default().compression_method(method),
-            )
-            .unwrap();
-            zw.write_all(data).unwrap();
-        }
-        zw.finish().unwrap();
-    }
-    out
-}
-
-fn maindoc(lines_opacity: i64) -> Vec<u8> {
-    format!(
-        r#"<!DOCTYPE DOC>
-<DOC><IMAGE name="img"><layers>
-<layer name="Background" uuid="bg" opacity="255" compositeop="normal" nodetype="paintlayer"/>
-<layer name="Lines" uuid="lines" opacity="{lines_opacity}" compositeop="normal" nodetype="paintlayer"/>
-</layers></IMAGE></DOC>"#
-    )
-    .into_bytes()
-}
-
-/// A tiny but *real* `.kra`. Tracked documents can't be arbitrary bytes the way the old `.gpl`
-/// fixtures were — the commit path parses a `.kra` as a zip.
-fn kra_bytes(lines_opacity: i64) -> Vec<u8> {
-    // Shaped like a real document, not a one-entry stub: a mimetype, a maindoc, and a tiled
-    // layer. That matters because a `.kra` is stored as one stream per zip entry (and one per
-    // tile) — a stub yields a single content object, too few for the dedup, storage-stats and
-    // corruption tests to say anything. The tile payloads vary with `lines_opacity` so two
-    // revisions genuinely differ and something is left to delta.
-    let a = format!("tileA{lines_opacity:03}").into_bytes();
-    let b = format!("tileB{lines_opacity:03}").into_bytes();
-    pack_kra(&[
-        ("mimetype", b"application/x-krita".to_vec()),
-        ("maindoc.xml", maindoc(lines_opacity)),
-        ("img/layers/layer1", tiled(&[(0, 0, &a), (0, 64, &b)])),
-    ])
-}
+mod common;
+use common::{kra_bytes, maindoc, pack_kra, tiled};
 
 /// Track one document in `root` and return its path. One store tracks exactly one `.kra`, so
 /// this replaces the old "init a folder as a repo" setup that every test opened with.
@@ -782,37 +718,221 @@ fn delete_guarded_then_removes() {
     );
 }
 
+/// Every artwork in an archive, restored into `dest`.
+fn import_all(zip_path: &std::path::Path, dest: &std::path::Path) -> Vec<repo::ImportResult> {
+    let manifest = repo::Repo::read_backup_manifest(zip_path).unwrap();
+    let items: Vec<repo::ImportItem> = manifest
+        .entries
+        .iter()
+        .map(|e| repo::ImportItem {
+            dir: e.dir.clone(),
+            dest_dir: dest.to_string_lossy().into_owned(),
+        })
+        .collect();
+    repo::Repo::import_zip(zip_path, &items).unwrap()
+}
+
 #[test]
-fn export_zip_round_trips_into_a_reopenable_repo() {
+fn export_multi_round_trips_two_documents() {
     let dir = tempfile::tempdir().unwrap();
-    let r = seeded_repo(&dir);
     let root = dir.path();
+
+    // Two tracked documents side by side — the case the old one-zip-per-artwork backup made
+    // the artist shepherd by hand.
+    let a = init_doc_named(root, "art.kra");
+    let b = init_doc_named(root, "study.kra");
+    let mut ra = repo::Repo::open(&a).unwrap();
+    std::fs::write(&a, kra_bytes(1)).unwrap();
+    let ca = commit::commit_snapshot(&mut ra, "c1", "t").unwrap();
+    let mut rb = repo::Repo::open(&b).unwrap();
+    std::fs::write(&b, kra_bytes(7)).unwrap();
+    let cb = commit::commit_snapshot(&mut rb, "c1", "t").unwrap();
 
     // Destination lives outside `root` — zipping into a folder being walked would grow forever.
     let out = tempfile::tempdir().unwrap();
     let zip_path = out.path().join("backup.zip");
-    repo::Repo::export_zip(&tracked_doc(root), &zip_path).unwrap();
+    let failed = repo::Repo::export_zip_multi(&[a.clone(), b.clone()], &zip_path).unwrap();
+    assert!(
+        failed.is_empty(),
+        "both artworks should back up: {failed:?}"
+    );
 
-    let extracted = out.path().join("extracted");
-    std::fs::create_dir(&extracted).unwrap();
+    let manifest = repo::Repo::read_backup_manifest(&zip_path).unwrap();
+    assert_eq!(manifest.version, 2);
+    assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(manifest.app_version, env!("CARGO_PKG_VERSION"));
+    assert!(manifest.timestamp.ends_with('Z'));
+    let art = manifest
+        .entries
+        .iter()
+        .find(|e| e.relpath == "art.kra")
+        .unwrap();
+    assert_eq!(art.branch, "main");
+    assert_eq!(art.tip_commit, ca.id);
+    assert_eq!(std::path::Path::new(&art.original_dir), root);
+
+    // Restore into a folder that has never seen either of them.
+    let dest = tempfile::tempdir().unwrap();
+    let results = import_all(&zip_path, dest.path());
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.error.is_none(), "{r:?}");
+        assert!(
+            r.problems.is_empty(),
+            "a restored store should pass the integrity check: {r:?}"
+        );
+    }
+
+    let ra2 = repo::Repo::open(&dest.path().join("art.kra")).unwrap();
+    assert_eq!(ra2.commits.len(), 1);
+    assert_eq!(ra2.commits[0].id, ca.id);
+    assert_eq!(doc_content(&dest.path().join("art.kra")), maindoc(1));
+    let rb2 = repo::Repo::open(&dest.path().join("study.kra")).unwrap();
+    assert_eq!(rb2.commits[0].id, cb.id);
+    assert_eq!(doc_content(&dest.path().join("study.kra")), maindoc(7));
+}
+
+#[test]
+fn import_without_a_custom_root_lands_beside_the_artwork() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_repo(&dir);
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip_multi(&[tracked_doc(dir.path())], &zip_path).unwrap();
+
+    let dest = tempfile::tempdir().unwrap();
+    let results = import_all(&zip_path, dest.path());
+    let doc = dest.path().join("art.kra");
+
+    // Default layout: the hidden container beside the artwork, at the slug this machine derives
+    // — not whatever path the archive happened to carry.
+    assert_eq!(
+        std::path::Path::new(&results[0].store),
+        repo::store_dir_for(&doc)
+    );
+    assert!(dest.path().join(".kvc").is_dir());
+    assert!(repo::Repo::is_repo(&doc));
+    assert_eq!(repo::Repo::open(&doc).unwrap().commits.len(), 1);
+}
+
+#[test]
+fn import_replaces_an_existing_artwork_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = seeded_repo(&dir);
+    let root = dir.path();
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip_multi(&[tracked_doc(root)], &zip_path).unwrap();
+
+    // Work on past the backup, then restore over it — the "my store got corrupted" case.
+    std::fs::write(tracked_doc(root), kra_bytes(9)).unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    assert_eq!(
+        repo::Repo::open(&tracked_doc(root)).unwrap().commits.len(),
+        2
+    );
+
+    let results = import_all(&zip_path, root);
+    assert!(results[0].error.is_none(), "{:?}", results[0]);
+    let restored = repo::Repo::open(&tracked_doc(root)).unwrap();
+    assert_eq!(
+        restored.commits.len(),
+        1,
+        "history is the backup's, not the newer one"
+    );
+    assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
+}
+
+#[test]
+fn backup_skips_the_raster_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded_repo(&dir);
+    let store = store_of(&tracked_doc(dir.path()));
+
+    // The cache is content-addressed and regenerates on demand, and is budgeted at 256 MB per
+    // store — carrying it would dominate an archive for no recoverable value. Same for the
+    // lock sidecars and any crash-leftover temp file.
+    std::fs::create_dir_all(store.join("cache")).unwrap();
+    std::fs::write(store.join("cache").join("big.png"), vec![7u8; 4096]).unwrap();
+    std::fs::write(store.join("kvc.lock"), b"").unwrap();
+    std::fs::write(store.join("index.tmp"), b"leftover").unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip_multi(&[tracked_doc(dir.path())], &zip_path).unwrap();
+
     let file = std::fs::File::open(&zip_path).unwrap();
-    let mut za = zip::ZipArchive::new(file).unwrap();
-    za.extract(&extracted).unwrap();
+    let za = zip::ZipArchive::new(file).unwrap();
+    for name in za.file_names() {
+        assert!(
+            !name.contains("/cache/") && !name.contains("kvc.lock") && !name.ends_with(".tmp"),
+            "disposable file {name} should not be in the archive"
+        );
+    }
 
-    // The archive holds `<name>.kra` plus `.kvc/<slug>/`, i.e. the on-disk shape — so extracting
-    // it anywhere gives a tracked document there.
-    assert!(repo::Repo::is_repo(&extracted.join("art.kra")));
-    let r2 = repo::Repo::open(&extracted.join("art.kra")).unwrap();
-    assert_eq!(r2.commits.len(), 1);
-    assert_eq!(doc_content(&extracted.join("art.kra")), maindoc(1));
+    // And the artwork still restores to a working, intact store without it.
+    let dest = tempfile::tempdir().unwrap();
+    let results = import_all(&zip_path, dest.path());
+    assert!(results[0].error.is_none(), "{:?}", results[0]);
+    assert!(results[0].problems.is_empty(), "{:?}", results[0]);
+    assert_eq!(
+        repo::Repo::open(&dest.path().join("art.kra"))
+            .unwrap()
+            .commits
+            .len(),
+        1
+    );
+}
 
-    // The manifest describes the backup so a recovered zip is self-describing.
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(extracted.join("MANIFEST.json")).unwrap()).unwrap();
-    assert_eq!(manifest["branch"], "main");
-    assert_eq!(manifest["tipCommit"], r.commits[0].id);
-    assert_eq!(manifest["appVersion"], env!("CARGO_PKG_VERSION"));
-    assert!(manifest["timestamp"].as_str().unwrap().ends_with('Z'));
+#[test]
+fn import_rejects_zip_slip() {
+    use zip::write::SimpleFileOptions;
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("evil.zip");
+
+    // Two escapes: one via the document's own relpath, one via a store entry's path. Entry
+    // names are attacker-controlled, so both are joined through `safe_join`.
+    let manifest = serde_json::json!({
+        "version": 2,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "appVersion": "2.0.0",
+        "entries": [
+            { "dir": "esc", "relpath": "../escaped.kra", "originalDir": "/x",
+              "branch": "main", "tipCommit": "" },
+            { "dir": "ok", "relpath": "art.kra", "originalDir": "/x",
+              "branch": "main", "tipCommit": "" }
+        ]
+    })
+    .to_string();
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        for (name, data) in [
+            ("MANIFEST.json", manifest.into_bytes()),
+            ("esc/../escaped.kra", b"pwned".to_vec()),
+            ("ok/art.kra", kra_bytes(1)),
+            ("ok/.kvc/slug/../../../../evil.txt", b"pwned".to_vec()),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(&data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    let dest = tempfile::tempdir().unwrap();
+    let results = import_all(&zip_path, dest.path());
+    assert!(
+        results[0].error.is_some(),
+        "an escaping relpath must be refused"
+    );
+    assert!(
+        !dest.path().parent().unwrap().join("escaped.kra").exists(),
+        "nothing may be written outside the destination"
+    );
+    // The second artwork's *store* entry escapes, so that item fails too — and nothing landed
+    // outside either.
+    assert!(results[1].error.is_some(), "{:?}", results[1]);
+    assert!(!dest.path().parent().unwrap().join("evil.txt").exists());
 }
 
 // --- maindoc.xml layer metadata diff ---------------------------------------------------
@@ -4052,4 +4172,59 @@ fn check_scrub_reports_multiple_corruptions_without_aborting() {
         "both corruptions must surface, not just the first: {:?}",
         scrubbed.problems
     );
+}
+
+/// A restore clash needs both histories side by side: the archive holds the versions as of the
+/// backup, the working copy has moved on since. Read straight out of the zip — nothing extracted,
+/// nothing on disk touched.
+#[test]
+fn backup_versions_reads_the_archived_history_without_extracting() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let doc = init_doc_named(root, "art.kra");
+    let mut r = repo::Repo::open(&doc).unwrap();
+
+    let mut backed_up = Vec::new();
+    for i in 1..=3i64 {
+        std::fs::write(&doc, kra_bytes(i)).unwrap();
+        backed_up.push(
+            commit::commit_snapshot(&mut r, &format!("v{i}"), "t")
+                .unwrap()
+                .id,
+        );
+    }
+
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip_multi(std::slice::from_ref(&doc), &zip_path).unwrap();
+
+    // Two more versions land on disk *after* the backup — the case the compare view exists for.
+    let mut r = repo::Repo::open(&doc).unwrap();
+    for i in 4..=5i64 {
+        std::fs::write(&doc, kra_bytes(i)).unwrap();
+        commit::commit_snapshot(&mut r, &format!("v{i}"), "t").unwrap();
+    }
+
+    let manifest = repo::Repo::read_backup_manifest(&zip_path).unwrap();
+    let entry_dir = manifest.entries[0].dir.clone();
+    let archived = repo::Repo::backup_versions(&zip_path, &entry_dir).unwrap();
+    assert_eq!(archived.len(), 3, "the archive froze at three versions");
+    // Newest first, so the compare columns read top-down like the rest of the app.
+    assert_eq!(archived[0].message, "v3");
+    assert_eq!(archived[2].message, "v1");
+
+    let current = repo::Repo::open_light(&doc).unwrap();
+    assert_eq!(current.commits.len(), 5, "the working copy moved on");
+    // The backup is a strict prefix of what's on disk — restoring it would lose two versions.
+    let live: std::collections::HashSet<&str> =
+        current.commits.iter().map(|c| c.id.as_str()).collect();
+    for id in &backed_up {
+        assert!(
+            live.contains(id.as_str()),
+            "{id} should still be in history"
+        );
+    }
+
+    // Reading the archive must not have written anything beside it.
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
 }

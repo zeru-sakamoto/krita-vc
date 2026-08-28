@@ -581,8 +581,11 @@ from it (`repo::store_dir_for`), so no signature changed when tracking went per-
 | `commit_layers(path, commitId, file)` | The per-layer before/after PNG rasters for one `.kra` in a commit — the heavy part, fetched on demand after `commit_diff`. |
 | `working_diff(path, file)` | Working-tree file vs its last commit, same shape as `commit_diff` (composite + metadata, rasters lazy). |
 | `working_layers(path, file)` | The lazy per-layer rasters for a working-tree `.kra`; the working-diff counterpart to `commit_layers`. |
-| `export_repository_zip(path, dest)` | Zip one document (the `.kra` **plus** its store, rebased under `.kvc/<slug>/` so the archive mirrors the on-disk shape) to `dest`, plus a `MANIFEST.json` (document, branch, tip, timestamp, app version); reopens the archive and verifies it (entry count, manifest readable) before reporting success. Manual backup — see [Backup & recovery](#backup--recovery). |
-| `export_repositories_zip(paths, destDir)` | Zip every artwork in `paths` into `destDir`, one `<name>-<date>.zip` each. Returns the paths that failed rather than aborting the batch on one bad store. |
+| `export_repositories_zip(paths, dest)` | Zip the documents in `paths` — each `.kra` **plus** its store — into **one** archive at `dest`: `MANIFEST.json` plus one `<dir>/` per artwork holding `<name>.kra` + `.kvc/<slug>/`, i.e. N copies of the on-disk shape. Skips the regenerable `cache/`, `trash/`, lock sidecars and temp files. Reopens the archive and verifies it (entry count, manifest readable) before reporting success, and returns the artwork paths that failed rather than aborting the batch on one bad store. Manual backup — see [Backup & recovery](#backup--recovery). |
+| `read_backup_manifest(archive)` | What's inside a backup archive. Cheap and read-only, so the restore UI can list it before writing anything. |
+| `plan_restore(archive, fallbackDir)` | Where each artwork in an archive would land (original folder if it still exists, else a subfolder of `fallbackDir`) and what's already sitting there. A proposal — nothing is written. |
+| `compare_restore_versions(archive, dir, destPath)` | Both sides of a restore clash: the versions inside one artwork in the archive, and the versions already tracked at the destination. Newest first, each scoped to its own branch tip (the `list_commits` default scope, so the counts mean the same thing). Read-only — the archive's `commits.log` is parsed straight out of the zip, nothing extracted. |
+| `import_repository_zip(archive, items)` | Restore the chosen artworks. Each one's **history** goes wherever *this* machine keeps it — `store_dir_for` is recomputed rather than copied out of the archive. Extraction is guarded by `safe_join` and `read_entry_capped`; every restored store is gated on `check_repository`. |
 
 ## Backup & recovery
 
@@ -603,20 +606,44 @@ the two ways a repository can be lost:
 - **Total loss outside the app's control** — the art folder deleted via `rm -rf` or
   Shift+Delete, disk failure, an external tool corrupting `.kvc/` — isn't something the app can
   intervene in after the fact. The only protection is a backup made *before* it happens: the
-  zip-icon action in the activity bar (`export_repository_zip`) zips the artwork **and its
-  store** to a path the user picks via a native Save dialog — the `.kra` plus its full version
-  history, ready to move to an external drive or the user's own cloud storage. **"Back up all
-  artworks…"** in the switcher menu (`export_repositories_zip`) does the same for every tracked
-  artwork into one chosen destination folder. An unverified backup isn't a backup: the finished
+  zip-icon action in the activity bar opens a **multi-select** of tracked artworks (all
+  pre-ticked — more backup is the safer default for a safety feature) and writes them into
+  **one** archive at a path the user picks via a native Save dialog: each `.kra` plus its full
+  version history, ready to move to an external drive or the user's own cloud storage. The
+  regenerable raster `cache/` is skipped, which is the largest disposable chunk an archive would
+  otherwise carry. An unverified backup isn't a backup: the finished
   archive carries a `MANIFEST.json` (document, branch, tip commit, timestamp, app version) and
-  `Repo::export_zip` reopens it and checks the entry count and manifest readability before
+  `Repo::export_zip_multi` reopens it and checks the entry count and manifest readability before
   reporting success, rather than trusting `zw.finish()` alone. Settings → Storage shows a
   "last backed up N days ago" hint (`Repository.lastBackupAt`, persisted client-side) so a stale
-  backup doesn't go unnoticed. Recovery is just extraction: the archive holds `<name>.kra` at the
-  top level with its store under `.kvc/<slug>/`, exactly the on-disk shape, so unzipping it into
-  any folder and pointing the picker at the `.kra` reopens it fully tracked — no dedicated
-  "restore" command. That holds even when the store had been relocated to a custom root, since
-  `export_zip` rebases it back into the default layout.
+  backup doesn't go unnoticed.
+
+  **Recovery is "Restore from a backup…"** in the artwork switcher (and pointed at from the
+  welcome screen, which is where a reinstall lands you). `Repo::plan_restore` resolves each
+  artwork to a destination — its original folder if that still exists, else a subfolder of one
+  you pick — and flags anything already sitting there so the row defaults to Skip. When what's
+  already there is a **tracked artwork**, the row also offers **Compare versions**
+  (`compare_restore_versions`): two text-only columns, backup on the left and this computer on the
+  right, each listing `Version N` + message + age newest-first, with the versions unique to one
+  side tagged. Replace deletes the on-disk history, and until this existed nothing told the artist
+  whether the backup was ahead of it or behind — "I have 5 versions, the backup has 8" is the whole
+  question. Deliberately text only: per-version imagery would mean a `run_heavy` `commit_diff`
+  each. Then
+  `Repo::import_zip` extracts it and, crucially, **recomputes where the history goes via
+  `store_dir_for` on the importing machine** rather than copying the `.kvc/<slug>/` path out of
+  the archive. With a store root configured in Settings → Storage, the tracking folders land
+  under it and no `.kvc/` is created beside the artwork at all; with none, they land beside it.
+  Both directions are pinned by `import_follows_this_machines_store_root_in_both_directions`.
+
+  Plain extraction still works — each `<dir>/` in the archive is the single-document on-disk
+  shape — but only when the importing machine has *no* custom store root. With one set, an
+  extracted `.kvc/` is a folder `store_dir_for` never looks at, so the artwork reads as untracked
+  and the app offers to start tracking it, minting an empty store beside intact history. That is
+  the failure the restore command exists to close, and the reason to prefer it.
+
+  Restore never renames an artwork: the filename is baked into `doc.json`, `index.json` keys,
+  chain shard filenames, `Commit.files[].path` and every `kra:{relpath}:…` stream key. So a name
+  clash is resolved by folder or by Replace/Skip, never by renaming.
 
 ## Frontend integration
 
@@ -628,8 +655,9 @@ The frontend uses [`inTauri()`](../src/lib/tauri.ts) to detect the desktop shell
   changed**, read off `useWorkingDiff`'s existing per-layer `change` rather than any new command;
   [`useCommits`](../src/lib/repoData.ts) calls `list_commits` and maps `BackendCommit` → the
   frontend `Commit` shape; [`useBranches`](../src/lib/repoData.ts) calls `list_branches`;
-  [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, backup
-  (`export_repository_zip`/`export_repositories_zip`), the native file/save picker
+  [`repository.tsx`](../src/lib/repository.tsx) drives `init`/`is`/`delete`, backup and restore
+  (`export_repositories_zip`/`read_backup_manifest`/`plan_restore`/`import_repository_zip`),
+  the native file/save picker
   (`tauri-plugin-dialog`, filtered to `.kra`), and the mutating actions (rollback/undo,
   `discardChanges`, branch create/switch/merge/delete).
 - **In a plain browser** (`npm run dev`, no backend) — the hooks return empty results and

@@ -194,7 +194,7 @@ fn zip_err(e: zip::result::ZipError) -> KvcError {
 
 /// Reopen a just-written zip and confirm it's actually readable before the caller reports
 /// success: every entry landed, and — if one was written — `MANIFEST.json` is present and
-/// parses. A backup nobody can verify isn't a backup. Split out from [`Repo::export_zip`] so the
+/// parses. A backup nobody can verify isn't a backup. Split out from [`Repo::export_zip_multi`] so the
 /// verification itself is directly unit-testable against a hand-built bad archive.
 fn verify_zip(dest: &Path, expected_entries: usize, expect_manifest: bool) -> Result<()> {
     let readback = std::fs::File::open(dest).map_err(|e| io_at(dest, e))?;
@@ -213,6 +213,281 @@ fn verify_zip(dest: &Path, expected_entries: usize, expect_manifest: bool) -> Re
             .map_err(|e| KvcError::CorruptZip(format!("unreadable backup manifest: {e}")))?;
     }
     Ok(())
+}
+
+/// Where one artwork in a backup would land, and what's already there. Purely a proposal —
+/// nothing is written until the caller turns rows it kept into [`ImportItem`]s.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePlan {
+    pub dir: String,
+    pub relpath: String,
+    pub original_dir: String,
+    /// The folder it was backed up from still exists, so it can go straight back.
+    pub original_dir_exists: bool,
+    /// Where it will actually go: the original folder if that still exists, else a subfolder of
+    /// the fallback the user picked.
+    pub dest_dir: String,
+    pub dest_path: String,
+    /// A file is already there — restoring overwrites it.
+    pub occupied: bool,
+    /// …and it's already a tracked artwork, so its history would be replaced too.
+    pub tracked: bool,
+}
+
+/// One version, stripped to what a side-by-side comparison shows. Deliberately not a whole
+/// [`Commit`]: the compare view lists version number, message and date, and `files` would drag
+/// every content hash of every version across the IPC boundary for nothing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionRow {
+    pub id: String,
+    pub message: String,
+    pub timestamp: String,
+    pub author: String,
+    pub branch: String,
+}
+
+impl From<&Commit> for VersionRow {
+    fn from(c: &Commit) -> Self {
+        VersionRow {
+            id: c.id.clone(),
+            message: c.message.clone(),
+            timestamp: c.timestamp.clone(),
+            author: c.author.clone(),
+            branch: c.branch.clone(),
+        }
+    }
+}
+
+impl Repo {
+    /// Resolve every artwork in an archive to a destination. Kept in Rust rather than joining
+    /// paths in the UI: this is a filesystem question (does the original folder still exist? is
+    /// something already sitting there?) and platform path joining is not the frontend's job.
+    pub fn plan_restore(archive: &Path, fallback_dir: Option<&Path>) -> Result<Vec<RestorePlan>> {
+        let manifest = Self::read_backup_manifest(archive)?;
+        Ok(manifest
+            .entries
+            .iter()
+            .map(|e| {
+                let original = Path::new(&e.original_dir);
+                let original_dir_exists = !e.original_dir.is_empty() && original.is_dir();
+                // One subfolder per artwork under the fallback, named by the archive's own
+                // folder — the slug is unique per document, so two artworks that share a
+                // filename can't collide the way a flat restore would let them.
+                let dest_dir = if original_dir_exists {
+                    original.to_path_buf()
+                } else {
+                    fallback_dir.map(|f| f.join(&e.dir)).unwrap_or_default()
+                };
+                let dest_path = safe_join(&dest_dir, &e.relpath).unwrap_or_default();
+                RestorePlan {
+                    dir: e.dir.clone(),
+                    relpath: e.relpath.clone(),
+                    original_dir: e.original_dir.clone(),
+                    original_dir_exists,
+                    dest_dir: dest_dir.to_string_lossy().into_owned(),
+                    dest_path: dest_path.to_string_lossy().into_owned(),
+                    occupied: dest_path.is_file(),
+                    tracked: Repo::is_repo(&dest_path),
+                }
+            })
+            .collect())
+    }
+}
+
+/// Store files not worth carrying into a backup. `cache/` regenerates on demand and is budgeted
+/// at [`Config::cache_max_bytes`] (256 MB by default) *per store*, so it's easily the largest
+/// disposable chunk; `trash/` is already-deleted history serving out its retention window; the
+/// rest is transient process state a restored store must not inherit.
+fn skip_in_backup(rel: &str) -> bool {
+    rel.starts_with("cache/")
+        || rel.starts_with("trash/")
+        || rel.starts_with("kvc.lock")
+        || rel.ends_with(".tmp")
+        || rel.ends_with(".kvctmp")
+}
+
+/// Write one artwork (document + store) into an open backup archive under `dir/`.
+fn zip_one_document(
+    zw: &mut ZipWriter<std::fs::File>,
+    opts: SimpleFileOptions,
+    kra_path: &Path,
+    dir: &str,
+    entry_count: &mut usize,
+) -> Result<BackupEntry> {
+    if !Repo::is_repo(kra_path) {
+        return Err(KvcError::NotARepo(kra_path.to_path_buf()));
+    }
+    let store = store_dir_for(kra_path);
+    let relpath = doc_relpath(kra_path)?;
+
+    // The document itself.
+    zw.start_file(format!("{dir}/{relpath}"), opts)
+        .map_err(zip_err)?;
+    zw.write_all(&std::fs::read(kra_path).map_err(|e| io_at(kra_path, e))?)?;
+    *entry_count += 1;
+
+    // Its store, rebased under `<dir>/.kvc/<slug>/` so the layout survives extraction even when
+    // the store currently lives under a custom root somewhere else entirely.
+    let slug = store
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "store".into());
+    for entry in walkdir::WalkDir::new(&store) {
+        let entry = entry.map_err(walk_err)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // Zip entry names are `/`-separated regardless of platform.
+        let rel = entry
+            .path()
+            .strip_prefix(&store)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if skip_in_backup(&rel) {
+            continue;
+        }
+        zw.start_file(format!("{dir}/{KVC_DIR}/{slug}/{rel}"), opts)
+            .map_err(zip_err)?;
+        let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
+        zw.write_all(&bytes)?;
+        *entry_count += 1;
+    }
+
+    // Best-effort branch state: a document whose branches will not load still gets backed up and
+    // still gets a manifest entry, because the entry is what makes it importable later.
+    let (branch, tip_commit) = Repo::open_light(kra_path)
+        .ok()
+        .map(|r| {
+            (
+                r.branches.current.clone(),
+                r.branches.tip().unwrap_or("").to_string(),
+            )
+        })
+        .unwrap_or_default();
+    Ok(BackupEntry {
+        dir: dir.to_string(),
+        relpath,
+        original_dir: doc_root(kra_path).to_string_lossy().into_owned(),
+        branch,
+        tip_commit,
+    })
+}
+
+fn failed_import(dir: &str, path: &str, store: &str, error: String) -> ImportResult {
+    ImportResult {
+        dir: dir.to_string(),
+        path: path.to_string(),
+        name: Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        store: store.to_string(),
+        problems: Vec::new(),
+        error: Some(error),
+    }
+}
+
+/// Restore one artwork out of an open archive. See [`Repo::import_zip`] for why the store's
+/// location is recomputed here rather than taken from the archive.
+fn import_one(
+    za: &mut zip::ZipArchive<std::fs::File>,
+    entry: &BackupEntry,
+    dest_dir: &Path,
+) -> Result<ImportResult> {
+    // `safe_join` is the zip-slip guard: entry names are untrusted, and every write below is
+    // rooted through it.
+    let dest = safe_join(dest_dir, &entry.relpath)?;
+    let prefix = format!("{}/{KVC_DIR}/", entry.dir);
+
+    // The artwork first, so a failure reading the archive has not destroyed anything yet.
+    let bytes = {
+        let f = za
+            .by_name(&format!("{}/{}", entry.dir, entry.relpath))
+            .map_err(zip_err)?;
+        read_entry_capped(f)?
+    };
+    std::fs::create_dir_all(dest_dir).map_err(|e| io_at(dest_dir, e))?;
+    write_file_atomic(&dest, &bytes)?;
+
+    // Where *this machine* keeps history — never the path baked into the archive.
+    let store = store_dir_for(&dest);
+    // Replacing: send the old store to the Recycle Bin rather than blend it with the incoming
+    // one. This unavoidably leaves a window where the old history is gone and the new store is
+    // partial — that is what Replace means, and `Repo::delete` keeps the old one recoverable.
+    if Repo::is_repo(&dest) {
+        let _ = Repo::delete(&dest);
+    }
+    if store.exists() {
+        std::fs::remove_dir_all(&store).map_err(|e| io_at(&store, e))?;
+    }
+    if let Some(container) = store.parent() {
+        std::fs::create_dir_all(container).map_err(|e| io_at(container, e))?;
+        // Only the default in-folder container gets hidden + a README; a user-chosen store root
+        // is a folder they picked themselves and expect to see. Mirrors `Repo::init`.
+        if custom_store_root().is_none() {
+            dress_container(container);
+        }
+    }
+    std::fs::create_dir_all(&store).map_err(|e| io_at(&store, e))?;
+    let _lock = RepoLock::acquire(&dest, "restoring a backup")?;
+
+    for i in 0..za.len() {
+        let mut f = za.by_index(i).map_err(zip_err)?;
+        if f.is_dir() {
+            continue;
+        }
+        let name = f.name().to_string();
+        let Some(after) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // `<slug>/<rel>` — the archive's slug is payload, `rel` is what we keep.
+        let Some((_slug, rel)) = after.split_once('/') else {
+            continue;
+        };
+        if rel.is_empty() || skip_in_backup(rel) {
+            continue;
+        }
+        let out = safe_join(&store, rel)?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        }
+        let bytes = read_entry_capped(&mut f)?;
+        // Plain writes, not `write_atomic`: nothing here is live until the whole store has
+        // landed, and a crash mid-import leaves a partial store the check below refuses. Paying
+        // an fsync per object would make restoring a large history needlessly slow.
+        std::fs::write(&out, &bytes).map_err(|e| io_at(&out, e))?;
+    }
+
+    // By construction these match, since nothing renames. A hand-edited archive could disagree,
+    // and a mismatch means every later scan and commit targets a file that is not there.
+    let meta = read_doc_meta(&store)?;
+    if meta.relpath != entry.relpath {
+        return Err(KvcError::BadIndex(format!(
+            "backup is inconsistent: its history is for {:?}, but the archive holds {:?}",
+            meta.relpath, entry.relpath
+        )));
+    }
+
+    // Reuse the read-only integrity check rather than inventing an import-specific one: it
+    // already covers dangling tips, undecodable log lines, broken chains, missing objects and
+    // unreadable packs. Findings are reported, not fatal — a partly-good store beats none.
+    let mut repo = Repo::open(&dest)?;
+    let report = crate::check::check_repository(&mut repo, false)?;
+    Ok(ImportResult {
+        dir: entry.dir.clone(),
+        path: dest.to_string_lossy().into_owned(),
+        name: entry.relpath.clone(),
+        store: store.to_string_lossy().into_owned(),
+        problems: report
+            .problems
+            .iter()
+            .map(|p| format!("{}: {}", p.kind, p.detail))
+            .collect(),
+        error: None,
+    })
 }
 
 pub fn objects_dir(store: &Path) -> PathBuf {
@@ -933,16 +1208,66 @@ pub struct Repo {
     pub verify_reads: bool,
 }
 
-/// Written into a backup zip as `MANIFEST.json` (see [`Repo::export_zip`]) so a recovered
-/// archive is self-describing without needing the app to inspect it.
+/// Written into a backup zip as `MANIFEST.json` (see [`Repo::export_zip_multi`]) so a recovered
+/// archive is self-describing — and so [`Repo::import_zip`] knows what's inside without having
+/// to infer it from entry names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupManifest {
-    repo_name: String,
-    branch: String,
-    tip_commit: String,
-    timestamp: String,
-    app_version: String,
+pub struct BackupManifest {
+    /// 2 = one folder per artwork under `entries`. v1 (a single artwork at the archive root, no
+    /// `entries`) was never read by anything but `verify_zip`, so there is no v1 import path;
+    /// the field exists so a future reader can tell, not so this one can branch.
+    pub version: u32,
+    pub timestamp: String,
+    pub app_version: String,
+    pub entries: Vec<BackupEntry>,
+}
+
+/// One artwork inside a backup archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEntry {
+    /// Folder inside the archive holding this artwork and its `.kvc/`.
+    pub dir: String,
+    /// The document's filename. Baked into `doc.json`, `index.json` keys, chain shard names and
+    /// every stream key, so import can never rename it — see [`Repo::import_zip`].
+    pub relpath: String,
+    /// Absolute directory the artwork lived in when backed up. A *hint* restore offers as the
+    /// default destination; nothing inside the store depends on it.
+    pub original_dir: String,
+    /// Best-effort — a document whose branch state won't load still gets backed up, and still
+    /// gets an entry, because the entry is what makes it importable.
+    pub branch: String,
+    pub tip_commit: String,
+}
+
+/// One artwork the caller chose to restore, and where to put it. Artworks the user skipped
+/// simply aren't in the list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItem {
+    /// Matches a [`BackupEntry::dir`] in the archive's manifest.
+    pub dir: String,
+    /// Folder to write the artwork into. Its **history** does not necessarily go beside it —
+    /// see [`Repo::import_zip`].
+    pub dest_dir: String,
+}
+
+/// What one restored artwork ended up as.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResult {
+    pub dir: String,
+    /// Absolute path of the restored `.kra`.
+    pub path: String,
+    pub name: String,
+    /// Where this machine decided the history goes — beside the artwork, or under the custom
+    /// store root. Surfaced so the UI can show it rather than leaving the user to guess.
+    pub store: String,
+    /// Findings from the post-import integrity check, `"kind: detail"` each. Non-fatal.
+    pub problems: Vec<String>,
+    /// Set when this artwork failed outright; `path`/`store` are then best-effort.
+    pub error: Option<String>,
 }
 
 impl Repo {
@@ -1029,75 +1354,189 @@ impl Repo {
         Ok(trashed)
     }
 
-    /// Zip one document (the `.kra` **plus** its store) to `dest` — a manual, on-demand backup
-    /// for the user to move to their own cloud storage or an external drive. It's the only thing
-    /// that helps against loss the app can't intervene in (the folder deleted outside the app,
-    /// disk failure, external corruption). Carries a `MANIFEST.json` entry (document name,
-    /// branch, tip commit, timestamp, app version) so a recovered zip is self-describing, and
-    /// the finished archive is reopened and checked (entry count + manifest readability) before
-    /// reporting success — an unverified backup is not actually a backup.
+    /// Zip the given documents — each `.kra` **plus** its store — into one archive at `dest`: a
+    /// manual, on-demand backup for the user to move to their own cloud storage or an external
+    /// drive. It's the only thing that helps against loss the app can't intervene in (the folder
+    /// deleted outside the app, disk failure, external corruption).
     ///
-    /// The archive holds `<name>.kra` at the top level and the store under `.kvc/<slug>/`, i.e.
-    /// exactly the on-disk shape — extract it into any folder and the document is tracked there.
-    pub fn export_zip(kra_path: &Path, dest: &Path) -> Result<()> {
-        if !Self::is_repo(kra_path) {
-            return Err(KvcError::NotARepo(kra_path.to_path_buf()));
-        }
-        let store = store_dir_for(kra_path);
-        let relpath = doc_relpath(kra_path)?;
-        // Best-effort: a document whose branch state can't be loaded still gets backed up, just
-        // without the manifest — the zip itself is the thing that must never silently fail.
-        let manifest = Self::open_light(kra_path).ok().map(|r| BackupManifest {
-            repo_name: relpath.clone(),
-            branch: r.branches.current.clone(),
-            tip_commit: r.branches.tip().unwrap_or("").to_string(),
-            timestamp: now_iso(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-        });
-
+    /// Layout, one folder per artwork:
+    ///
+    /// ```text
+    /// MANIFEST.json
+    /// <dir>/<name>.kra
+    /// <dir>/.kvc/<slug>/…
+    /// ```
+    ///
+    /// Each `<dir>/` is exactly the single-document on-disk shape, so plain extraction still
+    /// works — unzip and any one subfolder is a tracked document. Prefer [`Repo::import_zip`]
+    /// anyway: only it re-derives where *this machine* keeps history.
+    ///
+    /// Independent artworks, so one failing (permission denied, store gone) collects into the
+    /// returned list instead of aborting the rest. The finished archive is reopened and checked
+    /// (entry count + manifest readability) before success is reported — an unverified backup is
+    /// not actually a backup.
+    pub fn export_zip_multi(kra_paths: &[PathBuf], dest: &Path) -> Result<Vec<String>> {
         let file = std::fs::File::create(dest).map_err(|e| io_at(dest, e))?;
         let mut zw = ZipWriter::new(file);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         let mut entry_count = 0usize;
+        let (mut entries, mut failed) = (Vec::new(), Vec::new());
+        let mut seen = HashSet::new();
 
-        // The document itself, at the archive root.
-        zw.start_file(relpath.clone(), opts).map_err(zip_err)?;
-        zw.write_all(&std::fs::read(kra_path).map_err(|e| io_at(kra_path, e))?)?;
-        entry_count += 1;
-
-        // Its store, rebased under `.kvc/<slug>/` so the layout survives extraction even when
-        // the store currently lives under a custom root somewhere else entirely.
-        let slug = store
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "store".into());
-        for entry in walkdir::WalkDir::new(&store) {
-            let entry = entry.map_err(walk_err)?;
-            if !entry.file_type().is_file() {
-                continue;
+        for kra_path in kra_paths {
+            // The salted slug is unique per document by construction (it hashes the parent dir
+            // too), so two same-named paintings from different folders can't collide and no
+            // dedup bookkeeping is needed.
+            let salt = kra_path
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let dir = store_slug(kra_path, &salt);
+            if !seen.insert(dir.clone()) {
+                continue; // the same document listed twice
             }
-            // Zip entry names are `/`-separated regardless of platform.
-            let rel = entry
-                .path()
-                .strip_prefix(&store)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            zw.start_file(format!("{KVC_DIR}/{slug}/{rel}"), opts)
-                .map_err(zip_err)?;
-            let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
-            zw.write_all(&bytes)?;
-            entry_count += 1;
+            match zip_one_document(&mut zw, opts, kra_path, &dir, &mut entry_count) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => failed.push(kra_path.to_string_lossy().into_owned()),
+            }
         }
-        if let Some(manifest) = &manifest {
-            let bytes =
-                serde_json::to_vec(manifest).map_err(|e| KvcError::BadIndex(e.to_string()))?;
-            zw.start_file("MANIFEST.json", opts).map_err(zip_err)?;
-            zw.write_all(&bytes)?;
-            entry_count += 1;
+
+        if entries.is_empty() {
+            // Never leave a zip on disk that claims to be a backup of nothing.
+            drop(zw);
+            let _ = std::fs::remove_file(dest);
+            return Err(KvcError::Io(std::io::Error::other(
+                "nothing could be backed up",
+            )));
         }
+
+        let manifest = BackupManifest {
+            version: 2,
+            timestamp: now_iso(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            entries,
+        };
+        let bytes = serde_json::to_vec(&manifest).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+        zw.start_file("MANIFEST.json", opts).map_err(zip_err)?;
+        zw.write_all(&bytes)?;
+        entry_count += 1;
         zw.finish().map_err(zip_err)?;
-        verify_zip(dest, entry_count, manifest.is_some())
+        verify_zip(dest, entry_count, true)?;
+        Ok(failed)
+    }
+
+    /// Read just the `MANIFEST.json` out of a backup archive — what's in it, and where each
+    /// artwork came from. Cheap and read-only, so the restore UI can list an archive's contents
+    /// and check destinations before committing to anything.
+    pub fn read_backup_manifest(archive: &Path) -> Result<BackupManifest> {
+        let file = std::fs::File::open(archive).map_err(|e| io_at(archive, e))?;
+        let mut za = zip::ZipArchive::new(file).map_err(zip_err)?;
+        let mf = za.by_name("MANIFEST.json").map_err(zip_err)?;
+        let bytes = read_entry_capped(mf)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| KvcError::CorruptZip(format!("unreadable backup manifest: {e}")))
+    }
+
+    /// The versions inside one artwork in a backup archive, **newest first** — read straight out
+    /// of the zip, nothing extracted.
+    ///
+    /// This is what lets restore answer the only question a clash actually poses: is the backup
+    /// ahead of the history already on this machine, or behind it? Replace deletes the on-disk
+    /// history, so the artist needs to see both lists before choosing.
+    ///
+    /// Scoped to the archived branch tip via [`crate::commit::ancestors`], matching
+    /// `list_commits`' default scope so the two sides of the comparison are counted the same way.
+    pub fn backup_versions(archive: &Path, dir: &str) -> Result<Vec<VersionRow>> {
+        let manifest = Self::read_backup_manifest(archive)?;
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.dir == dir)
+            .ok_or_else(|| KvcError::CorruptZip(format!("{dir} is not in this backup")))?;
+
+        let file = std::fs::File::open(archive).map_err(|e| io_at(archive, e))?;
+        let mut za = zip::ZipArchive::new(file).map_err(zip_err)?;
+        // `<dir>/.kvc/<slug>/commits.log` — the slug is payload (same strip as `import_one`), so
+        // find the log by shape rather than by reconstructing this machine's slug.
+        let prefix = format!("{dir}/{KVC_DIR}/");
+        let idx = (0..za.len()).find(|&i| {
+            za.by_index(i)
+                .ok()
+                .map(|f| f.name().to_string())
+                .and_then(|n| n.strip_prefix(&prefix).map(str::to_string))
+                .and_then(|after| {
+                    after
+                        .split_once('/')
+                        .map(|(_slug, rel)| rel == "commits.log")
+                })
+                .unwrap_or(false)
+        });
+        let Some(idx) = idx else {
+            return Ok(Vec::new()); // an artwork backed up before its first commit
+        };
+        let bytes = read_entry_capped(za.by_index(idx).map_err(zip_err)?)?;
+        let (commits, _torn) = parse_commit_log(&bytes);
+
+        // `tip_commit` is best-effort at export time (a document whose branches wouldn't load
+        // still gets backed up); with no tip there is nothing to walk, so show the whole log.
+        let rows: Vec<&Commit> = if entry.tip_commit.is_empty() {
+            commits.iter().collect()
+        } else {
+            let reach = crate::commit::ancestors(&commits, &entry.tip_commit);
+            commits.iter().filter(|c| reach.contains(&c.id)).collect()
+        };
+        Ok(rows.into_iter().rev().map(VersionRow::from).collect())
+    }
+
+    /// Restore artworks out of a backup archive. Failures are per-artwork (reported in the
+    /// result) rather than fatal, for the same reason export collects them: these are
+    /// independent documents.
+    ///
+    /// **The archive's `.kvc/<slug>/` path is payload, not a destination.** Import extracts the
+    /// `.kra`, then asks *this machine* where that document's history belongs via
+    /// [`store_dir_for`] — so a backup made on a machine with no custom store root restores onto
+    /// one that has a store root by putting the history under that root (and creating no `.kvc/`
+    /// beside the artwork at all), and vice versa. That isn't a preference this flow offers: it
+    /// is the app-global setting, and matching what `Repo::init` would have done is mandatory —
+    /// history written anywhere else is history every later `open`/`is_repo`/scan/commit and the
+    /// `kvc` CLI would look straight past.
+    ///
+    /// Artworks are never renamed on the way in: the filename is baked into `doc.json`,
+    /// `index.json` keys, chain shard filenames, `Commit.files[].path` and every
+    /// `kra:{relpath}:…` stream key.
+    // ponytail: so a name clash is Replace-or-skip only. Renaming needs a relpath rewrite across
+    // all five of those; add it if artists actually hit the clash.
+    pub fn import_zip(archive: &Path, items: &[ImportItem]) -> Result<Vec<ImportResult>> {
+        let manifest = Self::read_backup_manifest(archive)?;
+        let file = std::fs::File::open(archive).map_err(|e| io_at(archive, e))?;
+        let mut za = zip::ZipArchive::new(file).map_err(zip_err)?;
+        let mut out = Vec::new();
+        for item in items {
+            let Some(entry) = manifest.entries.iter().find(|e| e.dir == item.dir) else {
+                out.push(failed_import(
+                    &item.dir,
+                    "",
+                    "",
+                    "not in this backup".to_string(),
+                ));
+                continue;
+            };
+            let dest_dir = Path::new(&item.dest_dir);
+            match import_one(&mut za, entry, dest_dir) {
+                Ok(r) => out.push(r),
+                Err(e) => {
+                    let path = safe_join(dest_dir, &entry.relpath).unwrap_or_default();
+                    let store = store_dir_for(&path);
+                    out.push(failed_import(
+                        &entry.dir,
+                        &path.to_string_lossy(),
+                        &store.to_string_lossy(),
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Resolve a document to `(working-tree root, store dir)`, or say precisely why not.
@@ -1425,6 +1864,27 @@ fn commit_lines(commits: &[Commit]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Parse an append-only `commits.log` body: `(commits, torn tail)`. Split out from
+/// [`read_commits`] so the same rules apply to a log read straight out of a backup archive
+/// ([`Repo::backup_versions`]), which has no store on disk to open.
+fn parse_commit_log(bytes: &[u8]) -> (Vec<Commit>, bool) {
+    let mut commits = Vec::new();
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Commit>(line) {
+            Ok(c) => commits.push(c),
+            Err(_) => {
+                // Torn tail from a crash mid-append — an orphan record, drop it. Flag a
+                // rewrite so the partial line is scrubbed rather than appended onto.
+                return (commits, true);
+            }
+        }
+    }
+    (commits, false)
+}
+
 /// Load the commit history: `(commits, lines persisted in the log, migrate-from-legacy)`.
 /// Prefers `commits.log` (JSON-lines). A torn trailing line — a crash mid-append — is dropped
 /// silently: `branches.json` is written after the log, so a torn record is never a branch tip.
@@ -1434,22 +1894,7 @@ fn read_commits(kvc: &Path) -> Result<(Vec<Commit>, usize, bool)> {
     let log = kvc.join("commits.log");
     if log.is_file() {
         let bytes = std::fs::read(&log).map_err(|e| io_at(&log, e))?;
-        let mut commits = Vec::new();
-        let mut torn = false;
-        for line in bytes.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_slice::<Commit>(line) {
-                Ok(c) => commits.push(c),
-                Err(_) => {
-                    // Torn tail from a crash mid-append — an orphan record, drop it. Flag a
-                    // rewrite so the partial line is scrubbed rather than appended onto.
-                    torn = true;
-                    break;
-                }
-            }
-        }
+        let (commits, torn) = parse_commit_log(&bytes);
         let n = commits.len();
         Ok((commits, n, torn))
     } else {
@@ -1630,11 +2075,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backup.zip");
         let manifest = serde_json::to_vec(&BackupManifest {
-            repo_name: "r".into(),
-            branch: "main".into(),
-            tip_commit: String::new(),
+            version: 2,
             timestamp: now_iso(),
             app_version: "1.1.0".into(),
+            entries: vec![BackupEntry {
+                dir: "art-abc123".into(),
+                relpath: "art.kra".into(),
+                original_dir: "/somewhere".into(),
+                branch: "main".into(),
+                tip_commit: String::new(),
+            }],
         })
         .unwrap();
         write_test_zip(&path, &[("a.gpl", b"data"), ("MANIFEST.json", &manifest)]);

@@ -104,7 +104,9 @@ precisely to report it and keep walking). It takes no lock and writes nothing.
 | **Switch rewrites only what differs.** Files whose committed content hash matches are never read, reconstructed, or rewritten — less IO means a smaller window in which a crash can damage anything. | `commit.rs` — `materialize_tree` |
 | **Staging is explicit, and partial staging is confirmed.** Committing with nothing staged, or with a partial selection, raises a confirm modal before anything is captured. | `ChangesPanel.tsx` |
 | **Discard is behind a confirm.** With the plugin's auto-save, discard is the only thing between the artist and losing saved-but-uncommitted work (the reopen takes the undo history with it). | `krita-plugin/`, `ChangesPanel.tsx` |
-| **One-click, verified backup.** `export_repository_zip` zips one artwork (the `.kra` + its store) from the activity bar, with a toast reporting where it landed. The finished archive carries a `MANIFEST.json` (document, branch, tip commit, timestamp, app version) and is reopened and checked — entry count, manifest readability — before success is reported, so a truncated or otherwise bad backup is never reported as good. Settings → Storage shows a "last backed up N days ago" hint so a stale backup doesn't go unnoticed. | `repo.rs` — `Repo::export_zip`, `verify_zip`; `commands.rs`, `ActivityBar.tsx`, `SettingsModal.tsx` |
+| **Verified backup, any number of artworks, one archive.** The activity-bar zip button opens a picker; `export_zip_multi` writes the chosen artworks — each `.kra` plus its store — into a single zip, one folder per artwork. The `cache/` raster cache, `trash/`, lock sidecars and temp leftovers are skipped: all regenerable or transient, and the cache alone is budgeted at 256 MB *per store*. The archive carries a versioned `MANIFEST.json` (per artwork: folder, document, original directory, branch, tip commit) and is reopened and checked — entry count, manifest readability — before success is reported, so a truncated or otherwise bad backup is never reported as good. An archive that ended up holding nothing is deleted rather than left looking like a backup. Settings → Storage shows a "last backed up N days ago" hint so a stale backup doesn't go unnoticed. | `repo.rs` — `Repo::export_zip_multi`, `verify_zip`, `skip_in_backup`; `BackupModal.tsx`, `SettingsModal.tsx` |
+| **Restore re-derives where history goes.** `import_zip` treats the archive's `.kvc/<slug>/` path as payload: it extracts the `.kra`, then asks *this* machine where that document's history belongs via `store_dir_for`. With a custom store root set, the tracking folders land under it and no `.kvc/` is created beside the artwork — plain extraction would drop one the app never looks at, and the artwork would read as untracked. Entry names are joined through `safe_join` (zip-slip) and inflated through `read_entry_capped` (decompression bomb); replacing sends the old store to the Recycle Bin; and every restored store is gated on a full `check_repository` pass before the artwork is added back to the list. | `repo.rs` — `Repo::import_zip`, `import_one`, `Repo::plan_restore`; `check.rs`; `RestoreModal.tsx` |
+| **A clash defaults to Skip, and Replace can be checked first.** A destination that already holds a file starts unticked, because Replace overwrites the artwork *and* deletes its history. When what's there is an already-tracked artwork, the row offers **Compare versions**: `Repo::backup_versions` reads the archive's `commits.log` straight out of the zip and lists it beside the history already on disk, both scoped to their own branch tip so the counts mean the same thing. Without it the artist cannot tell whether the backup is ahead of what they have or behind it — "5 here, 8 in the backup" is the whole decision, and Replace is not reversible except through the Recycle Bin. | `repo.rs` — `Repo::backup_versions`, `parse_commit_log`; `commands.rs` — `compare_restore_versions`; `RestoreCompareModal.tsx` |
 
 ## 6. Stash ordering invariants
 
@@ -197,8 +199,17 @@ shape the Krita plugin parses. Plus, for the measures above:
   trick as `corrupt_object_is_refused_on_restore_but_not_on_the_diff_path`, this time proving
   `scrub` catches what presence-only `check` can't, stays off by default, and doesn't abort on the
   first bad version.
-- `export_zip_round_trips_into_a_reopenable_repo` — extended to assert `MANIFEST.json`'s fields;
-  `verify_zip_rejects_entry_count_mismatch` / `verify_zip_rejects_missing_manifest` unit-test the
+- `export_multi_round_trips_two_documents`, `import_without_a_custom_root_lands_beside_the_artwork`,
+  `import_replaces_an_existing_artwork_in_place`, `backup_skips_the_raster_cache`,
+  `import_rejects_zip_slip` — the archive round-trips two artworks with their history intact, the
+  disposable cache never ships, replacing restores the backup's history over newer work, and an
+  archive whose entry names escape the destination writes nothing outside it.
+- `import_follows_this_machines_store_root_in_both_directions` (`backup_store_root.rs`) — the
+  regression the restore path exists to close. Its own test *binary*: the custom store root is
+  process-global state, so a test that sets it would move every concurrently-running test's store.
+  It also redirects the app-data dir to a tempdir, so the suite never touches the developer's real
+  setting.
+- `verify_zip_rejects_entry_count_mismatch` / `verify_zip_rejects_missing_manifest` unit-test the
   reopen-and-check step directly against a hand-built bad archive.
 - `generation_bumps_on_every_branches_write` — every `branches.json` write path bumps it;
   `read_consistent_retries_when_a_write_lands_mid_read` /

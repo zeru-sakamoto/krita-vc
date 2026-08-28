@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  Archive,
+  ArrowCounterClockwise,
   CaretDown,
   Minus,
   PaintBrush,
@@ -10,10 +10,12 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as pickArchive } from "@tauri-apps/plugin-dialog";
 import { Menu, type MenuItem } from "../ui/Menu";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Radio } from "../ui/Radio";
+import { RestoreModal } from "./RestoreModal";
 import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
@@ -26,19 +28,21 @@ import type { Repository } from "../../types";
  * (DESIGN.md → Layout & App Shell → Top bar)
  */
 export function TopBar() {
-  const { repositories, current, currentId, setCurrent, browseRepository, backupAllRepositories } =
-    useRepository();
+  const { repositories, current, currentId, setCurrent, browseRepository } = useRepository();
   const { customTitleBar } = useWindowChrome();
   const [modal, setModal] = useState<
-    | { kind: "remove"; repo: Repository }
-    | { kind: "backup-all-result"; total: number; failed: string[] }
-    | null
+    { kind: "remove"; repo: Repository } | { kind: "restore"; archive: string } | null
   >(null);
 
-  const backupAll = async () => {
-    const failed = await backupAllRepositories();
-    if (failed === null) return; // canceled, or nothing to back up
-    setModal({ kind: "backup-all-result", total: repositories.length, failed });
+  // Restoring is how someone gets their artworks back after a reinstall or a lost drive, so it
+  // sits next to "Track an artwork…" rather than buried in Settings.
+  const restore = async () => {
+    if (!inTauri()) return;
+    const picked = await pickArchive({
+      title: "Choose a backup to restore",
+      filters: [{ name: "Backup archive", extensions: ["zip"] }],
+    });
+    if (typeof picked === "string") setModal({ kind: "restore", archive: picked });
   };
   const showWindowControls = customTitleBar && inTauri();
 
@@ -74,11 +78,11 @@ export function TopBar() {
       onSelect: browseRepository,
     },
     {
-      id: "backup-all-repositories",
-      label: "Back up all artworks…",
-      icon: <Archive size={15} weight="regular" />,
+      id: "restore-backup",
+      label: "Restore from a backup…",
+      icon: <ArrowCounterClockwise size={15} weight="regular" />,
       separator: true,
-      onSelect: backupAll,
+      onSelect: restore,
     },
   ];
 
@@ -102,46 +106,10 @@ export function TopBar() {
       {modal?.kind === "remove" && (
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
-      {modal?.kind === "backup-all-result" && (
-        <BackupAllResultModal
-          total={modal.total}
-          failed={modal.failed}
-          onClose={() => setModal(null)}
-        />
+      {modal?.kind === "restore" && (
+        <RestoreModal archive={modal.archive} onClose={() => setModal(null)} />
       )}
     </header>
-  );
-}
-
-function BackupAllResultModal({
-  total,
-  failed,
-  onClose,
-}: {
-  total: number;
-  failed: string[];
-  onClose: () => void;
-}) {
-  const succeeded = total - failed.length;
-  return (
-    <Modal
-      title="Backup complete"
-      onClose={onClose}
-      footer={<Button onClick={onClose}>Close</Button>}
-    >
-      <p className="text-[13px] text-text">
-        {succeeded} of {total} artwork{total === 1 ? "" : "s"} backed up.
-      </p>
-      {failed.length > 0 && (
-        <ul className="mt-2 flex flex-col gap-1 font-mono text-[12px] text-danger">
-          {failed.map((path) => (
-            <li key={path} className="truncate">
-              {path}
-            </li>
-          ))}
-        </ul>
-      )}
-    </Modal>
   );
 }
 

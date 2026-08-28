@@ -57,8 +57,8 @@ how the map itself is one instance shared across both places.
 
 | Zone | Component | Responsibility |
 |------|-----------|----------------|
-| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Artwork switcher (one `.kra` the user chose to track — see [per-document-tracking.md](per-document-tracking.md)); local-only — no remote affordances. Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
-| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `map` \| `history` \| `branches` \| `performance`). `history`/`branches` are filtered out unless [Legacy version history](#version-map) is on. The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **Legacy version history** toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
+| Top bar | [`TopBar`](../src/components/shell/TopBar.tsx) | Artwork switcher (one `.kra` the user chose to track — see [per-document-tracking.md](per-document-tracking.md)); local-only — no remote affordances. Its menu also holds **"Restore from a backup…"** ([`RestoreModal`](../src/components/shell/RestoreModal.tsx) — see [Backup & restore](#backup--restore)). Also doubles as the **custom title bar** — see [Custom title bar](#custom-title-bar). |
+| Activity bar | [`ActivityBar`](../src/components/shell/ActivityBar.tsx) | Icon strip; emits the active view (`changes` \| `map` \| `history` \| `branches` \| `performance`). `history`/`branches` are filtered out unless [Legacy version history](#version-map) is on. A zip button above the gear opens [`BackupModal`](../src/components/shell/BackupModal.tsx) — see [Backup & restore](#backup--restore). The gear opens the [`SettingsModal`](../src/components/shell/SettingsModal.tsx) — Artist-view toggle, a **custom title bar** toggle (see [Custom title bar](#custom-title-bar)), a **Legacy version history** toggle, a **theme selector** (see [Theme selector](#theme-selector)), author name, the **set-aside shelf** (every stash with its origin branch + age, per-row remove and remove-all — see [Stashes](#stashes--setting-work-aside)), and (per repo) preview cache size, compact-storage toggle, a **low-memory diffs** toggle (`lowMemoryDiff` — decodes working-file diff entries one at a time instead of all at once), and "Clean up storage…" (`CleanupModal`: dry-run preview on open, then a confirmed `cleanup_repository` pass, which also reclaims dropped-stash storage). |
 | Sidebar | [`Sidebar`](../src/components/shell/Sidebar.tsx) | Resizable; its content **switches on the active view** (see below). Absent on the Map tab. |
 | Version Map | [`VersionMapPanel`](../src/components/vcs/VersionMapPanel.tsx) | The default view — see [Version Map](#version-map). Replaces Main Panel + Inspector on the Map tab, and Main Panel + Inspector on Performance when Legacy is off. |
 | Main panel | [`MainPanel`](../src/components/MainPanel.tsx) → [`DiffView`](../src/components/vcs/DiffView.tsx) | Renders **one selected file** of the current commit/working diff (art-diff canvas height is drag-resizable), or an empty state. Which file is chosen by the Inspector's file list (`selectedFile`/`onSelectFile`, lifted to `RepoShell`); a multi-file commit no longer stacks every file's diff at once. |
@@ -494,6 +494,55 @@ comes from `useStashes` in [`repoData.ts`](../src/lib/repoData.ts) (`list_stashe
 mutations (`createStash`, `popStash`, `dropStash`, `dropAllStashes`) live on the repository
 context alongside the other write actions.
 
+## Backup & restore
+
+Two entry points, deliberately far apart — backup is a thing you do to everything, restore is a
+thing you do to the app.
+
+**Backup** is a zip-icon `IconButton` in [`ActivityBar`](../src/components/shell/ActivityBar.tsx),
+directly above the Settings gear, opening
+[`BackupModal`](../src/components/shell/BackupModal.tsx): a multi-select of every tracked artwork,
+**all pre-ticked** (more backup is the safer default for a safety feature), written to **one**
+archive via `backupRepositories` → `export_repositories_zip`. The modal stays open and reports the
+destination plus any artworks that failed — the export collects per-artwork failures instead of
+aborting the batch, so "6 of 7 backed up" has to be sayable. Deliberately *not* in Settings — it is
+an action, not a preference.
+
+**Restore** is "Restore from a backup…" in the `TopBar` switcher menu, and is also pointed at from
+the welcome screen, since a reinstall lands you there with no artworks at all. It opens
+[`RestoreModal`](../src/components/shell/RestoreModal.tsx), which is a per-artwork checklist:
+`plan_restore` resolves each row to a destination in Rust (original folder if it still exists, else
+a subfolder of one you pick) and the modal states **where history will go** — beside the artwork,
+or under the Settings → Storage root — before anything is written, because with a store root set
+that is not where extraction would have put it. A row whose destination is **occupied** starts
+unticked: Skip is the safe default, because Replace overwrites the artwork *and* deletes its
+history.
+
+**`RestoreCompareModal` is what makes Replace a decision rather than a coin flip.** A row occupied
+by an *already-tracked* artwork gets a "Compare versions" link opening
+[`RestoreCompareModal`](../src/components/shell/RestoreCompareModal.tsx) — one
+`compare_restore_versions` call, then two text columns (backup on the left, this computer on the
+right) of `Version N` + message + age, newest first, with the versions unique to one side tagged
+and a "the backup has 8, this computer has 5" summary above them. Nothing else in the UI answered
+that, and it is the whole question. Details worth keeping:
+
+- **Text only, on purpose.** Per-version imagery would mean a `commit_diff` each — `run_heavy`,
+  uncached — and counts plus messages already answer "which history is further along?".
+- **Each column is numbered within itself**, the same positional `total - i` as `versionNumbers`
+  in [`friendly.ts`](../src/lib/friendly.ts). So the two columns line up only when one history is a
+  superset of the other — which is the case this dialog exists for, and is exactly why a
+  mismatch is legible as "the backup is 3 ahead" rather than as noise.
+- Its footer buttons (**Keep mine** / **Use the backup**) write nothing but the row's existing
+  tick in `RestoreModal` — no second selection model.
+- It renders as a **sibling** of `RestoreModal`, not a child: `Modal` has no portal, the same
+  reason `CleanupModal` and the set-aside confirms are siblings of `SettingsModal`.
+
+Both sides of the comparison are scoped to their own branch tip — the same scope `list_commits`
+uses by default — so the two counts mean the same thing. See
+[version-control.md](version-control.md#backup--recovery) for the backend half, and
+[data-integrity.md](data-integrity.md) for why import re-derives the store location instead of
+trusting the archive's.
+
 ## Diff viewer
 
 `DiffView` shows **one top-level entry at a time** — `selectedPath` (from the Inspector's file
@@ -690,10 +739,12 @@ automatically.
 
 ```
 AppShell (→ WelcomeShell with no repository, else RepoShell)
-├─ TopBar ─ Menu (repository switcher)
-├─ ActivityBar ─ SettingsModal (gear) ─┬─ CleanupModal ("Clean up storage…")
-│                                       ├─ CheckModal ("Check for problems…", opt-in full scrub)
-│                                       └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
+├─ TopBar ─ Menu (repository switcher) ─ RestoreModal ("Restore from a backup…")
+│                                          └─ RestoreCompareModal (sibling — "Compare versions" on a tracked clash)
+├─ ActivityBar ─┬─ BackupModal (zip button — multi-select of tracked artworks → one archive)
+│               └─ SettingsModal (gear) ─┬─ CleanupModal ("Clean up storage…")
+│                                        ├─ CheckModal ("Check for problems…", opt-in full scrub)
+│                                        └─ set-aside shelf ─ DropStashModal / DropAllStashesModal
 ├─ Sidebar ─ DockerPanel ─┬─ history*  → Menu (branch switcher) + CommitGraph ─ CommitGraphRail + CommitCard (+ tip BranchBadge)
 │  (absent on "map")      ├─ changes   → ChangesPanel ─ FileStatusChip
 │                         ├─ branches* → BranchesPanel ─ BranchBadge + useBranchActions (dialogs)
@@ -733,7 +784,8 @@ The whole tree is wrapped in `ToastProvider` → `RepositoryProvider` → `Theme
 `ArtistModeProvider` → `LegacyHistoryProvider` → `AuthorNameProvider` → `WindowChromeProvider` →
 `CpuBudgetProvider` → `TourProvider` (see [`App.tsx`](../src/App.tsx) for the exact nesting).
 `ToastProvider`/`CpuBudgetProvider` aren't part of the "six pieces of state" above — the toast
-queue (`src/lib/toast.tsx`) backs the backup-zip result notification in `ActivityBar`, and the CPU
+queue (`src/lib/toast.tsx`) backs the repository context's failure notices (couldn't start
+tracking, couldn't delete a history) and the right-click guard, and the CPU
 budget (`src/lib/cpuBudget.tsx`) is the Settings → Storage → "Background CPU use" knob, both
 app-global but orthogonal to `AppShell`'s own layout/view state.
 
