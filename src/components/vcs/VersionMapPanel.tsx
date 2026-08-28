@@ -679,16 +679,28 @@ function MinimapViewport({ nodes }: { nodes: Node[] }) {
     width: flowWidth / transform[2],
     height: flowHeight / transform[2],
   };
-  let x1 = view.x;
-  let y1 = view.y;
-  let x2 = view.x + view.width;
-  let y2 = view.y + view.height;
-  for (const n of nodes) {
-    x1 = Math.min(x1, n.position.x);
-    y1 = Math.min(y1, n.position.y);
-    x2 = Math.max(x2, n.position.x + (n.width ?? 0));
-    y2 = Math.max(y2, n.position.y + (n.height ?? 0));
-  }
+  // The node extent doesn't move when the viewport does, but this component re-renders on every
+  // frame of every pan and zoom (it has to — it draws the viewport rect). Memoizing on `nodes`
+  // keeps that per-frame cost O(1) instead of a full sweep of the map on each one.
+  const nodeBounds = useMemo(() => {
+    let x1 = Infinity;
+    let y1 = Infinity;
+    let x2 = -Infinity;
+    let y2 = -Infinity;
+    for (const n of nodes) {
+      x1 = Math.min(x1, n.position.x);
+      y1 = Math.min(y1, n.position.y);
+      x2 = Math.max(x2, n.position.x + (n.width ?? 0));
+      y2 = Math.max(y2, n.position.y + (n.height ?? 0));
+    }
+    return { x1, y1, x2, y2 };
+  }, [nodes]);
+  // Seeded from the viewport, so an empty map (bounds still ±Infinity) collapses to exactly the
+  // viewport, which is what the pre-memo loop did.
+  const x1 = Math.min(view.x, nodeBounds.x1);
+  const y1 = Math.min(view.y, nodeBounds.y1);
+  const x2 = Math.max(view.x + view.width, nodeBounds.x2);
+  const y2 = Math.max(view.y + view.height, nodeBounds.y2);
   const viewScale = Math.max((x2 - x1) / MINIMAP_W, (y2 - y1) / MINIMAP_H);
   const offset = MINIMAP_OFFSET_SCALE * viewScale;
   const boxW = viewScale * MINIMAP_W + offset * 2;

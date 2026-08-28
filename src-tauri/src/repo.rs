@@ -647,6 +647,22 @@ impl ChainStore {
         self.load(shard_of(key)).0.get(key).cloned()
     }
 
+    /// The object name for one `(key, hash)` pair, without cloning the key's chain.
+    ///
+    /// [`chain`] is the right shape when a caller wants the whole chain, and its clone is cheap
+    /// *per call*. This exists because the storage report doesn't: it resolves one object name
+    /// per **tile** per commit, and a real 110 MB painting holds ~45k tiles, so the per-call
+    /// clone is multiplied by (tiles x commits) and becomes the dominant cost of the whole
+    /// report. Same lookup, no allocation of the surrounding `Vec`.
+    pub fn object_name_of(&self, key: &str, hash: &str) -> Option<String> {
+        self.load(shard_of(key))
+            .0
+            .get(key)?
+            .iter()
+            .find(|v| v.hash == hash)
+            .map(|v| v.object_name())
+    }
+
     /// Append a version to `key`'s chain and mark its shard dirty.
     pub(crate) fn push(&self, key: String, version: Version) {
         let name = shard_of(&key).to_string();

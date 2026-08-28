@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FolderOpen, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { BusyOverlay } from "./BusyOverlay";
@@ -133,6 +133,11 @@ function RepoShell({ repo }: { repo: Repository }) {
   // `selectedId`/`selectedCommit` from History must not leak into the toolbar, canvas, or
   // Inspector once the user switches tabs. `showWorking` narrows further: only true once a
   // changed file is actually focused, which is when there's a real working-tree diff to fetch.
+  // Hoisted, not an inline arrow at the call sites below: `VersionMapPanel` folds this into a
+  // memoized node array, so a fresh identity each render hands React Flow a brand-new array of
+  // every node — on every AppShell render, which while the tree is dirty is the normal case.
+  const showChanges = useCallback(() => setActiveView("changes"), []);
+
   const inChanges = activeView === "changes";
   // The map owns the whole well: no sidebar, no inspector — the node carries the metadata.
   const inMap = activeView === "map";
@@ -199,7 +204,7 @@ function RepoShell({ repo }: { repo: Repository }) {
               // selected commit's in History. Undo/discard/set-aside all act on state this diff
               // reads, so they're blocked while it's still being computed too, not just mid-scan.
               diffLoading={diffLoading}
-              onShowChanges={() => setActiveView("changes")}
+              onShowChanges={showChanges}
             />
           )}
 
@@ -215,7 +220,7 @@ function RepoShell({ repo }: { repo: Repository }) {
               currentBranch={currentBranch}
               nonce={refreshNonce}
               dirty={workingItems.length > 0}
-              onShowChanges={() => setActiveView("changes")}
+              onShowChanges={showChanges}
             />
           </div>
 

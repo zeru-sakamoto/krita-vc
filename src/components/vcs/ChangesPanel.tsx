@@ -123,8 +123,16 @@ export function ChangesPanel({
   items: WorkingChange[];
   error: string | null;
 }) {
-  const { current, saving, scanning, setSaving, setBusyMessage, refresh, discardChanges } =
-    useRepository();
+  const {
+    current,
+    saving,
+    scanning,
+    setSaving,
+    setBusyMessage,
+    refresh,
+    discardChanges,
+    refreshNonce,
+  } = useRepository();
   const { authorName } = useAuthorName();
   const [message, setMessage] = useState("");
   const [commitError, setCommitError] = useState<string | null>(null);
@@ -147,7 +155,10 @@ export function ChangesPanel({
   // lingers (this component stays mounted across switches) and misleadingly reads as live.
   useEffect(() => setCommitError(null), [path, currentBranch.name]);
 
-  const { entries, loading } = useWorkingDiff(path ?? "", docPath);
+  // `refreshNonce` matters: without it this panel keeps painting the pre-commit diff while
+  // `AppShell`'s copy refetches. Both callers land on one backend call anyway — `useWorkingDiff`
+  // dedupes concurrent requests for the same path|file|nonce.
+  const { entries, loading } = useWorkingDiff(path ?? "", docPath, refreshNonce);
   const rows = useMemo(() => layerRows(entries), [entries]);
   // Either kind of "checking" leaves the diff this button reverts in flux.
   const checking = scanning || loading;

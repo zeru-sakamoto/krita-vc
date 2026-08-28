@@ -44,6 +44,9 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
 - [**Performance report**](performance-report.md) — the **Performance** tab: client-side operation
   timing (localStorage) and the storage saved vs. full-copy-per-version metric, and how each is
   measured.
+- [**Performance audit**](performance-audit.md) — measured speed and storage on **real** Krita
+  documents: the commit/reconstruct/rollback baseline, the ~2.9x store-vs-naive ratio, the
+  settled tile-delta decision, what was fixed, and what was measured and deliberately left alone.
 
 ## See also
 

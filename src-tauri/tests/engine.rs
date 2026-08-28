@@ -554,6 +554,35 @@ fn scan_reports_only_the_tracked_document() {
     );
 }
 
+/// `keep_bytes` retention is budgeted (`scan::RETAIN_BUDGET`), and the direction of that guard
+/// is not otherwise observable: invert it and commits still succeed, because
+/// `commit::store_change` falls back to re-reading the file. They would just silently re-read
+/// every ordinary document — the exact cost retention exists to avoid. So assert the ordinary
+/// case actually keeps its buffer.
+#[test]
+fn scan_keeps_bytes_for_documents_under_the_retain_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_doc(root);
+    let r = repo::Repo::open(&tracked_doc(root)).unwrap();
+
+    std::fs::write(tracked_doc(root), kra_bytes(4)).unwrap();
+    let changes = scan::scan_detailed(&r, true).unwrap();
+    let doc = changes.iter().find(|c| c.rel == "art.kra").unwrap();
+    assert!(
+        (doc.size as u64) < scan::RETAIN_BUDGET,
+        "fixture must be under budget for this to test the retaining branch"
+    );
+    assert!(
+        doc.bytes.is_some(),
+        "an under-budget document must hand its buffer to the commit path"
+    );
+
+    // And `keep_bytes: false` never retains, budget or not.
+    let changes = scan::scan_detailed(&r, false).unwrap();
+    assert!(changes.iter().all(|c| c.bytes.is_none()));
+}
+
 #[test]
 fn scan_status_and_lockfile_ignore() {
     let dir = tempfile::tempdir().unwrap();

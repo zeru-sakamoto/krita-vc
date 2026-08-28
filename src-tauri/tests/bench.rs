@@ -654,3 +654,271 @@ fn cpu_budget_sweep() {
     // Leave the process on the shipping default rather than whatever ran last.
     krita_vc_lib::cpu::set_budget(krita_vc_lib::cpu::DEFAULT_BUDGET);
 }
+
+// --- real-art corpus ---------------------------------------------------------------------
+
+/// Where the real-art corpus lives, overridable with `KVC_BENCH_CORPUS`. Every `*.kra` in it is
+/// a real Krita document. A `foo.kra~` sibling is Krita's backup of `foo.kra` — a genuine
+/// *earlier save of the same painting*, which makes the pair a real incremental edit rather
+/// than a synthesized one. That matters: synthetic random tiles can't produce a realistic dedup
+/// rate, and dedup is the whole storage story.
+const DEFAULT_CORPUS: &str = r"D:\Storage\Krita Test Folder\performance-testing";
+
+/// Corpus documents, smallest first so a run degrades gracefully if the big one is slow.
+fn corpus_files() -> Vec<std::path::PathBuf> {
+    let dir = std::env::var("KVC_BENCH_CORPUS").unwrap_or_else(|_| DEFAULT_CORPUS.to_string());
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        // Extension match, not `scan::is_supported` — that deliberately rejects `*.kra~`, and
+        // here the backups are wanted (as revision 1), just under a `.kra` name once copied.
+        .filter(|p| p.extension().is_some_and(|e| e == "kra"))
+        .collect();
+    out.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+    out
+}
+
+/// The committed content hash of `rel` at `id`.
+fn content_hash(r: &repo::Repo, id: &str, rel: &str) -> Option<String> {
+    r.commits
+        .iter()
+        .find(|c| c.id == id)?
+        .files
+        .iter()
+        .find(|f| f.path == rel)?
+        .content
+        .clone()
+}
+
+/// End-to-end baseline on **real** Krita documents, which is the only way the <10s targets and
+/// the storage ratios mean anything — the synthetic fixture above is deliberately incompressible
+/// and, at 7500 tiles, roughly 6x smaller than a real 110 MB painting.
+///
+/// Per document: commit revision 1 (the `.kra~` backup when present), then commit revision 2
+/// (the current file) as a **real** edit, then measure the read paths and the store.
+#[test]
+#[ignore = "benchmark — needs a real-art corpus; run in release mode with --nocapture"]
+fn corpus_baseline() {
+    let files = corpus_files();
+    if files.is_empty() {
+        println!("no corpus found — set KVC_BENCH_CORPUS=<dir of real .kra files>");
+        return;
+    }
+    for src in &files {
+        let name = src.file_name().unwrap().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let work = root.join(&name);
+
+        let backup = src.with_extension("kra~");
+        let rev1 = if backup.exists() { &backup } else { src };
+        std::fs::copy(rev1, &work).unwrap();
+
+        println!("\n=== {name} ===");
+        println!(
+            "revision 1:          {:>8.1} MB  ({})",
+            mb(std::fs::metadata(&work).unwrap().len()),
+            if backup.exists() {
+                "from .kra~ backup"
+            } else {
+                "no backup — same file"
+            }
+        );
+
+        repo::Repo::init(&work).unwrap();
+        let mut r = repo::Repo::open(&work).unwrap();
+
+        let t = Instant::now();
+        let c0 = commit::commit_snapshot(&mut r, "revision 1", "bench").unwrap();
+        println!("commit rev1:         {:>8.2?}", t.elapsed());
+        let (after_first, _) = dir_size(&store_of(&work));
+
+        // Revision 2 — the real edit, only when the backup gave us a distinct earlier state.
+        let mut c1 = None;
+        if backup.exists() {
+            std::fs::copy(src, &work).unwrap();
+            println!(
+                "revision 2:          {:>8.1} MB",
+                mb(std::fs::metadata(&work).unwrap().len())
+            );
+            let t = Instant::now();
+            let c = commit::commit_snapshot(&mut r, "revision 2", "bench").unwrap();
+            println!("commit rev2 (real):  {:>8.2?}", t.elapsed());
+            c1 = Some(c.id.clone());
+        }
+
+        // --- read paths --------------------------------------------------------------------
+        drop(r);
+        let t = Instant::now();
+        let mut r = repo::Repo::open(&work).unwrap();
+        println!("Repo::open:          {:>8.2?}", t.elapsed());
+
+        let t = Instant::now();
+        let changes = krita_vc_lib::scan::scan(&r).unwrap();
+        println!(
+            "clean scan:          {:>8.2?}  ({} changes)",
+            t.elapsed(),
+            changes.len()
+        );
+
+        let tip = c1.clone().unwrap_or_else(|| c0.id.clone());
+        if let Some(h) = content_hash(&r, &tip, &name) {
+            let t = Instant::now();
+            let m = kra::load_manifest(&r, &name, &h).unwrap();
+            println!(
+                "load manifest:       {:>8.2?}  ({} tiled entries)",
+                t.elapsed(),
+                m.tile_index().len()
+            );
+
+            let t = Instant::now();
+            let rebuilt = kra::reconstruct_kra(&r, &name, &h).unwrap();
+            println!(
+                "full reconstruct:    {:>8.2?}  ({:.1} MB)",
+                t.elapsed(),
+                mb(rebuilt.len() as u64)
+            );
+        }
+
+        // Rollback to revision 1 (only meaningful when there were two).
+        if c1.is_some() {
+            let t = Instant::now();
+            commit::rollback_to_commit(&mut r, &c0.id, "bench").unwrap();
+            println!("rollback to rev1:    {:>8.2?}", t.elapsed());
+        }
+
+        // --- storage -----------------------------------------------------------------------
+        let store = store_of(&work);
+        let (total, nfiles) = dir_size(&store);
+        let (objects, _) = dir_size(&store.join("objects"));
+        let (chains, _) = dir_size(&store.join("chains"));
+        let (cache, _) = dir_size(&store.join("cache"));
+        let src_bytes = std::fs::metadata(src).unwrap().len();
+        let naive = if backup.exists() {
+            src_bytes + std::fs::metadata(&backup).unwrap().len()
+        } else {
+            src_bytes
+        };
+        println!("store objects:       {:>8.1} MB", mb(objects));
+        println!("store chains:        {:>8.1} MB", mb(chains));
+        println!("store cache:         {:>8.1} MB", mb(cache));
+        println!(
+            "store TOTAL:         {:>8.1} MB  ({nfiles} files)",
+            mb(total)
+        );
+        println!(
+            "rev2 delta cost:     {:>8.1} MB  (store growth for the real edit)",
+            mb(total.saturating_sub(after_first))
+        );
+        println!(
+            "vs naive copies:     {:>8.1} MB  ->  {:.2}x  ({:.0}% saved)",
+            mb(naive),
+            naive as f64 / total.max(1) as f64,
+            (1.0 - total as f64 / naive.max(1) as f64) * 100.0
+        );
+    }
+}
+
+/// Cost of the Performance tab's storage report, and of the per-tile chain lookup underneath it.
+///
+/// `stored_bytes_by_commit` resolves an object name for **every referenced stream of every
+/// commit** — and `kra::referenced_streams` emits one entry per *tile*, not per layer. A real
+/// 110 MB painting holds ~45k tiles, so this is (tiles x commits) lookups; the audit's question
+/// was whether the `Vec<Version>` clone inside each one mattered. Times both variants over the
+/// real chains so the answer is a measurement rather than an argument.
+#[test]
+#[ignore = "benchmark — needs a real-art corpus; run in release mode with --nocapture"]
+fn storage_stats_cost() {
+    let files = corpus_files();
+    let Some(src) = files.iter().find(|p| p.to_string_lossy().contains("A4")) else {
+        println!("no A4 document in corpus — skipping");
+        return;
+    };
+    let name = src.file_name().unwrap().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join(&name);
+    let backup = src.with_extension("kra~");
+
+    std::fs::copy(if backup.exists() { &backup } else { src }, &work).unwrap();
+    repo::Repo::init(&work).unwrap();
+    let mut r = repo::Repo::open(&work).unwrap();
+    commit::commit_snapshot(&mut r, "revision 1", "bench").unwrap();
+    if backup.exists() {
+        std::fs::copy(src, &work).unwrap();
+        commit::commit_snapshot(&mut r, "revision 2", "bench").unwrap();
+    }
+    drop(r);
+    let r = repo::Repo::open(&work).unwrap();
+
+    // How many lookups the report actually performs, so the per-lookup cost is interpretable.
+    let mut streams = 0usize;
+    for c in &r.commits {
+        for f in &c.files {
+            let Some(content) = &f.content else { continue };
+            if f.is_kra {
+                if let Ok(m) = kra::load_manifest(&r, &f.path, content) {
+                    streams += kra::referenced_streams(&f.path, &m).len();
+                }
+            }
+        }
+    }
+    println!(
+        "commits: {}, referenced streams total: {streams}",
+        r.commits.len()
+    );
+
+    // --- the two lookup variants, over every (key, hash) the report resolves ----------------
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for c in &r.commits {
+        for f in &c.files {
+            let Some(content) = &f.content else { continue };
+            if f.is_kra {
+                if let Ok(m) = kra::load_manifest(&r, &f.path, content) {
+                    pairs.extend(kra::referenced_streams(&f.path, &m));
+                }
+            }
+        }
+    }
+
+    let t = Instant::now();
+    let mut hits = 0usize;
+    for (k, h) in &pairs {
+        // The pre-fix shape: clone the whole chain, then scan it.
+        if r.chains
+            .chain(k)
+            .and_then(|c| c.iter().find(|v| &v.hash == h).map(|v| v.object_name()))
+            .is_some()
+        {
+            hits += 1;
+        }
+    }
+    let old = t.elapsed();
+    println!("lookup via chain() clone:   {:>8.2?}  ({hits} hits)", old);
+
+    let t = Instant::now();
+    let mut hits2 = 0usize;
+    for (k, h) in &pairs {
+        if r.chains.object_name_of(k, h).is_some() {
+            hits2 += 1;
+        }
+    }
+    let new = t.elapsed();
+    println!("lookup via object_name_of:  {:>8.2?}  ({hits2} hits)", new);
+    assert_eq!(hits, hits2, "the two lookups must agree");
+    println!(
+        "speedup:                    {:>8.2}x",
+        old.as_secs_f64() / new.as_secs_f64().max(1e-9)
+    );
+
+    // --- the whole report, as the Performance tab calls it -----------------------------------
+    let t = Instant::now();
+    let stats = krita_vc_lib::commands::compute_storage_stats(&r);
+    println!(
+        "compute_storage_stats:      {:>8.2?}  ({} versions, {:.1} MB stored)",
+        t.elapsed(),
+        stats.per_version.len(),
+        mb(stats.actual_bytes)
+    );
+}

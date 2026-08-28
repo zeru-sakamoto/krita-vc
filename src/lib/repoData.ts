@@ -282,6 +282,17 @@ const workingDiffCache = new Map<string, DiffEntry[]>();
 const WORKING_DIFF_CACHE_MAX = 20;
 
 /**
+ * In-flight `working_diff` calls keyed by `path|file|nonce`, so two components asking for the
+ * same working diff at the same moment share one backend call instead of racing.
+ *
+ * This is not a micro-optimization: `working_diff` is `run_heavy`, and there are only **two**
+ * heavy permits process-wide (`cpu::HEAVY_PERMITS`). `AppShell` and `ChangesPanel` are both
+ * mounted in the Changes view and both want this exact diff, so the un-deduped version spent
+ * the entire heavy budget on one answer — starving any diff or raster the user asked for next.
+ */
+const workingDiffInflight = new Map<string, Promise<DiffEntry[]>>();
+
+/**
  * The visual diff for a single working-tree file (working copy vs its last committed version)
  * via `working_diff`. Empty when `file` is null or in a plain browser (no backend).
  * `nonce` forces a refetch after a rescan/commit.
@@ -298,7 +309,20 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
     const key = `${path}|${file}`;
     const stale = workingDiffCache.get(key);
     setResult({ entries: stale ?? [], error: null, loading: true });
-    timed(path, "diff", invoke<DiffEntry[]>("working_diff", { path, file }))
+    // Share one backend call across concurrent callers (see `workingDiffInflight`). Keyed with
+    // `nonce` so a refetch after a commit/rescan is never served by the previous generation's
+    // in-flight promise.
+    const reqKey = `${key}|${nonce}`;
+    let request = workingDiffInflight.get(reqKey);
+    if (!request) {
+      request = timed(path, "diff", invoke<DiffEntry[]>("working_diff", { path, file }));
+      workingDiffInflight.set(reqKey, request);
+      // `then(clear, clear)` rather than `finally` — finally's derived promise would surface an
+      // unhandled rejection when the request fails, since only the callers below catch it.
+      const clear = () => workingDiffInflight.delete(reqKey);
+      request.then(clear, clear);
+    }
+    request
       .then((entries) => {
         workingDiffCache.set(key, entries);
         while (workingDiffCache.size > WORKING_DIFF_CACHE_MAX) {

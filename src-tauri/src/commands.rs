@@ -417,11 +417,9 @@ fn object_size_map(repo: &Repo) -> std::collections::HashMap<String, u64> {
 
 /// The object name a `(stream key, content hash)` pair resolves to, via its chain.
 fn object_of(repo: &Repo, key: &str, hash: &str) -> Option<String> {
-    repo.chains
-        .chain(key)?
-        .iter()
-        .find(|v| v.hash == hash)
-        .map(|v| v.object_name())
+    // `object_name_of`, not `chain`: this runs once per tile per commit, and cloning the chain
+    // here made the storage report scale with (tiles x commits x chain length) allocations.
+    repo.chains.object_name_of(key, hash)
 }
 
 /// Attribute each stored object's bytes to the **first** commit (oldest-first) that references it,

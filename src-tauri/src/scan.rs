@@ -9,6 +9,13 @@
 use crate::error::{io_at, Result};
 use crate::repo::{hash_bytes, Repo};
 
+/// Ceiling on what a scan hands back through `keep_bytes`. Retaining the buffer saves the commit
+/// path a second full read of the document, which is the right trade for ordinary art; past this
+/// it stops being one, because the commit then holds the whole archive *plus* the entry chunk
+/// and the prepared objects it is building. Over-budget documents fall back to the re-read in
+/// [`crate::commit::store_change`] — that fallback has always been there for exactly this.
+pub const RETAIN_BUDGET: u64 = 512 << 20; // 512 MB
+
 /// One working-tree change with everything the scan already computed for it, so the commit
 /// path can reuse the hash/size/mtime instead of re-reading and re-hashing the file (a second
 /// full read + blake3 pass over a big `.kra` was pure duplication).
@@ -93,13 +100,16 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
             Some(tf) if tf.hash != hash => "M",
             Some(_) => continue,
         };
+        // Budget on what was actually read, not the pre-read `size` — the file may have grown
+        // between the stat and the read, and it is the buffer in hand that costs the RAM.
+        let retain = keep_bytes && bytes.len() as u64 <= RETAIN_BUDGET;
         out.push(ScanChange {
             rel,
             status: status.into(),
             hash,
             size,
             mtime,
-            bytes: keep_bytes.then_some(bytes),
+            bytes: retain.then_some(bytes),
         });
     }
     Ok(out)
