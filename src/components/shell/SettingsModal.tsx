@@ -18,6 +18,7 @@ import { Checkbox } from "../ui/Checkbox";
 import { Radio } from "../ui/Radio";
 import { IconButton } from "../ui/IconButton";
 import { Menu, Select } from "../ui/Menu";
+import { Slider } from "../ui/Slider";
 import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
@@ -32,7 +33,7 @@ import { useLegacyHistory } from "../../lib/legacyHistory";
 import { CPU_BUDGETS, useCpuBudget } from "../../lib/cpuBudget";
 import type { Repository, Stash } from "../../types";
 
-type SettingsCategory = "appearance" | "stash" | "performance" | "storage";
+type SettingsCategory = "appearance" | "performance" | "storage" | "stash";
 
 const CACHE_PRESETS_MB = [128, 256, 512, 1024, 2048];
 
@@ -289,13 +290,14 @@ function CpuBudgetRow() {
         <Cpu size={13} />
         Background CPU use
       </span>
-      <Select
+      <Slider
         value={budget}
         onChange={setBudget}
         options={CPU_BUDGETS.map((b) => ({ value: b.percent, label: b.label }))}
+        ariaLabel="Background CPU use"
       />
-      <span className="mt-1 block text-[11px] text-text-muted">
-        {hint}. Applies to every repository.
+      <span className="mt-1.5 block text-[11px] text-text-muted">
+        {hint} Applies to every repository.
       </span>
     </div>
   );
@@ -403,9 +405,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   const categories: { id: SettingsCategory; label: string }[] = [
     { id: "appearance", label: "Appearance" },
-    { id: "stash", label: artistMode ? "Set-Aside" : "Stashes" },
     { id: "performance", label: "Performance" },
     { id: "storage", label: "Storage" },
+    { id: "stash", label: artistMode ? "Set-Aside" : "Stashes" },
   ];
 
   return (
@@ -453,16 +455,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 }}
               />
             )}
-            {category === "stash" &&
-              (current ? (
-                <StashSettings
-                  stashes={stashes}
-                  onConfirmDrop={setConfirmDrop}
-                  onConfirmDropAll={() => setShowDropAll(true)}
-                />
-              ) : (
-                <NoRepoFallback />
-              ))}
             {category === "performance" && (
               <>
                 <CpuBudgetRow />
@@ -488,6 +480,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 )}
               </>
             )}
+            {category === "stash" &&
+              (current ? (
+                <StashSettings
+                  stashes={stashes}
+                  onConfirmDrop={setConfirmDrop}
+                  onConfirmDropAll={() => setShowDropAll(true)}
+                />
+              ) : (
+                <NoRepoFallback />
+              ))}
           </div>
         </div>
       </Modal>

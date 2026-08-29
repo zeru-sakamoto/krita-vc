@@ -14,9 +14,21 @@ import { inTauri } from "./tauri";
 const STORAGE_KEY = "krita-vc:cpu-budget";
 
 export const CPU_BUDGETS = [
-  { percent: 50, label: "Gentle", hint: "Keeps Krita and your browser snappy while versions save" },
-  { percent: 75, label: "Balanced", hint: "Recommended — fast, still leaves room for other apps" },
-  { percent: 100, label: "Full speed", hint: "Uses the whole machine; other apps may stutter" },
+  {
+    percent: 50,
+    label: "Gentle",
+    hint: "Uses at most half your processor, so Krita stays responsive while versions save in the background.",
+  },
+  {
+    percent: 75,
+    label: "Balanced",
+    hint: "Recommended. Uses most of your processor but leaves some free for Krita and other apps.",
+  },
+  {
+    percent: 100,
+    label: "Full speed",
+    hint: "Uses your whole processor. Versions save fastest, but Krita and other apps may lag while it runs.",
+  },
 ] as const;
 
 const DEFAULT_BUDGET = 75;
@@ -45,11 +57,18 @@ export function CpuBudgetProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // ignore (e.g. private mode) — state still works for the session
     }
+    if (!inTauri()) return;
+    // Debounced, because `set_cpu_budget` is far from free: cpu::set_budget spawns a whole new
+    // rayon pool (one OS thread per budgeted core, each doing a SetThreadPriority call) while
+    // holding the pool's write lock. Firing that per intermediate value — every step of a slider
+    // drag — stalls the app long enough that the WebView drops the Settings modal's
+    // backdrop-filter for a frame, which reads as the whole screen dimming as you drag.
     // Rust applies its own default until this lands, so a slow first paint just means the
     // very first operation may run at the default budget rather than the saved one.
-    if (inTauri()) {
+    const t = setTimeout(() => {
       invoke("set_cpu_budget", { percent: budget }).catch(() => {});
-    }
+    }, 250);
+    return () => clearTimeout(t);
   }, [budget]);
 
   const set = useCallback((percent: number) => setBudget(percent), []);

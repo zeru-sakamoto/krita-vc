@@ -81,8 +81,13 @@ fn read_consistent<T>(doc: &Path, f: impl Fn() -> Result<T>) -> Result<T> {
 /// frontend persists it and pushes it here on startup and on change.
 #[tauri::command]
 pub async fn set_cpu_budget(percent: u8) -> std::result::Result<(), String> {
-    crate::cpu::set_budget(percent);
-    Ok(())
+    // Off the async runtime's worker: set_budget spawns one OS thread per budgeted core and
+    // holds the pool's write lock while it does. Run inline, that blocking stretch stalls the
+    // webview long enough to drop the Settings modal's backdrop-filter for a frame — a visible
+    // full-screen dim every time the CPU-budget control changes.
+    tauri::async_runtime::spawn_blocking(move || crate::cpu::set_budget(percent))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // --- kvcimg raster delivery ---------------------------------------------------------------
