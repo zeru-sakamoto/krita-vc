@@ -132,18 +132,18 @@ export function useBranchActions({
             artistMode ? `Bring ${mergeTarget} into ${currentBranch}?` : `Merge ${mergeTarget}?`
           }
           onClose={() => (saving ? undefined : setMergeTarget(null))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setMergeTarget(null)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="primary" onClick={onMerge} disabled={saving}>
                 {saving ? "Merging…" : artistMode ? "Bring it in" : "Merge"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             Everything from <span className="text-text">{mergeTarget}</span> comes into{" "}
             <span className="text-text">{currentBranch}</span>. If the same artwork changed in both,
             the version from {mergeTarget} wins and the file is flagged for review.
@@ -155,18 +155,18 @@ export function useBranchActions({
         <Modal
           title={artistMode ? `Remove ${deleteTarget}?` : `Delete ${deleteTarget}?`}
           onClose={() => (saving ? undefined : setDeleteTarget(null))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setDeleteTarget(null)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="destructive" onClick={onDelete} disabled={saving}>
                 {saving ? "Removing…" : artistMode ? "Remove" : "Delete"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             The versions saved on it stay in your history. Only the label goes away.
           </p>
         </Modal>

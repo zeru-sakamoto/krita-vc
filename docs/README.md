@@ -58,5 +58,4 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   your documents for you, since the engine only ever sees the disk), built on the headless `kvc`
   CLI (`src-tauri/src/bin/kvc.rs`) that reuses this engine with no Tauri dependency.
 - [`../DESIGN.md`](../DESIGN.md) — the visual + interaction spec the UI is built against.
-- [`../REDESIGN.md`](../REDESIGN.md) — the screen-by-screen redesign tracker (status + scope).
 - [`../CLAUDE.md`](../CLAUDE.md) — repo guidance, commands, and Tauri architecture.

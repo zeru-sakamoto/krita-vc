@@ -37,14 +37,14 @@ export const CommitCard = memo(function CommitCard({
       aria-pressed={selected}
       className={[
         "block w-full py-2.5 px-3 text-left",
-        "transition-colors duration-100 ease-out",
+        "transition-colors duration-(--dur-instant) ease-(--ease-out)",
         selected ? "row-selected" : "hover:bg-state-hover",
       ].join(" ")}
     >
       <div className="flex items-baseline justify-between gap-2">
         <span
           className={[
-            "shrink-0 text-[12px] text-text-muted",
+            "shrink-0 text-dense text-text-muted",
             artistMode ? "font-medium" : "font-mono",
           ].join(" ")}
         >
@@ -54,11 +54,11 @@ export const CommitCard = memo(function CommitCard({
           {tips?.map((b) => (
             <BranchBadge key={b.name} branch={b} />
           ))}
-          <span className="shrink-0 text-[11px] text-text-muted">{rel}</span>
+          <span className="shrink-0 text-caption text-text-muted">{rel}</span>
         </span>
       </div>
-      <p className="mt-1 line-clamp-2 text-[13px] leading-snug text-text">{commit.message}</p>
-      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-text-muted">
+      <p className="mt-1 line-clamp-2 text-body leading-snug text-text">{commit.message}</p>
+      <div className="mt-1.5 flex items-center gap-1.5 text-caption text-text-muted">
         <span className="truncate">{commit.author}</span>
         <span aria-hidden>·</span>
         <span>

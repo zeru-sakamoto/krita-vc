@@ -43,10 +43,17 @@
   --color-info: #2d6ea8;
   --color-info-fg: #56b4e9;
 
-  /* Version Map grid background. Derived from each theme's own --color-bg rather than a
-     literal per-theme value, so it auto-adapts: dark themes land near-black (barely visible,
-     "very dark" per design), light themes override below to keep the old --color-border look. */
-  --color-grid: color-mix(in srgb, var(--color-bg) 75%, black);
+  /* Version Map grid background. Derived from each theme's own --color-bg/--color-text-muted
+     rather than a literal per-theme value, so it auto-adapts: dark themes land barely-visible
+     near the bg, light themes override below to keep the old --color-border look. Mixed toward
+     --color-text-muted, not black — true-black's --color-bg is literally #000, and mixing a
+     color toward black can never get darker than black, so the grid rendered exactly equal to
+     the background (invisible) on that theme. --color-border (the elevation ladder's very next
+     step) was tried first and was still too close to a near-#000 bg to read; --color-text-muted
+     is deliberately designed to be legibly distinct from its theme's bg at a glance, so blending
+     a slice of it in guarantees a real, perceptible-but-subtle delta on every dark theme
+     regardless of how dark that theme's bg already is. */
+  --color-grid: color-mix(in srgb, var(--color-bg) 88%, var(--color-text-muted));
 
   /* Diff colors */
   --color-diff-add: #1e3a2f;
@@ -57,6 +64,32 @@
   /* Typefaces */
   --font-ui: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", monospace;
+
+  /* Type scale — six steps, generating `text-title` ... `text-micro`.
+     Derived from what the app measurably uses, not from an aspirational table:
+     every step here replaces an existing arbitrary `text-[Npx]` 1:1, so adopting
+     them is a zero-visual-change edit. Without @theme entries there was nothing
+     for ~250 call sites to conform to, which is exactly how the scale drifted.
+     Weights are documented in DESIGN.md and are NOT carried by these tokens —
+     a font-size utility that silently set weight would be unusable for the
+     heading/subheading pair, which share a size and differ only in weight.
+     No `--text-mono`: mono content is 12px and already selected by `font-mono`,
+     so it is `text-dense font-mono` — a separate size token would be a second
+     way to say the same thing, and the two would drift apart. */
+  --text-title: 20px;
+  --text-title--line-height: 1.3;
+  --text-heading: 15px;
+  --text-heading--line-height: 1.3;
+  --text-body: 13px;
+  --text-body--line-height: 1.5;
+  /* 12px is the app's single most-used size (95 sites) and had no entry in the
+     spec's table at all — that omission is the origin of the drift. */
+  --text-dense: 12px;
+  --text-dense--line-height: 1.5;
+  --text-caption: 11px;
+  --text-caption--line-height: 1.4;
+  --text-micro: 10px;
+  --text-micro--line-height: 1.4;
 
   /* Border radius — bento, balanced density */
   --radius-button: 8px;
@@ -235,17 +268,21 @@ html[data-theme="true-black"] {
   --shadow-tint: rgba(0, 0, 0, 0.8);
 }
 
-html[data-theme="charcoal-light"] {
+/* Gallery — a standalone warm-paper light palette (formerly "charcoal-light", which just
+   inverted Charcoal's own tokens and read as a dark theme run backwards). Bg is a genuine warm
+   linen tone rather than nearly-white, cards step up from it, and the accent is its own clay
+   terracotta rather than Charcoal's orange lightened — nothing here is derived from Charcoal. */
+html[data-theme="gallery"] {
   color-scheme: light;
-  --color-bg: #f4f1ea;
-  --color-surface: #ffffff;
-  --color-surface-2: #eae4d9;
-  --color-surface-3: #ddd6c8;
-  --color-border: #d6cfc0;
-  --color-accent: #a8511a;
-  --color-text: #221f1b;
-  --color-text-muted: #6b6157;
-  --color-danger: #b23a22;
+  --color-bg: #efe7d8;
+  --color-surface: #fffcf6;
+  --color-surface-2: #f5eee0;
+  --color-surface-3: #ebe1cd;
+  --color-border: #ddd0b4;
+  --color-accent: #b1531f;
+  --color-text: #2a2016;
+  --color-text-muted: #7c6f57;
+  --color-danger: #b13a2c;
   --color-success: #d8f0dd;
   --color-success-fg: #1f7a3a;
   --color-warning: #f6ecc9;
@@ -258,25 +295,38 @@ html[data-theme="charcoal-light"] {
   --color-diff-del-fg: #b3261e;
   --color-state-hover: rgba(0, 0, 0, 0.05);
   --color-state-active: rgba(0, 0, 0, 0.08);
-  --edge-light: rgba(255, 255, 255, 0.9);
-  --shadow-tint: rgba(90, 74, 54, 0.16);
+  /* On light, elevation is carried by the shadow alone. The hairline top
+     highlight is a dark-mode device: a white line on a #ffffff card is
+     physically meaningless, and flipping it dark would draw a stray hairline
+     across the TOP of every raised card (--edge-light is the top inset on
+     --shadow-raised), which reads as a broken border, not as depth. So it is
+     neutralised here and --shadow-tint does all the work — roughly 2.5x the
+     old alpha, without which the three bento cards and the well composite into
+     one flat linen sheet. Same value also restores the pressed/inset states,
+     which were equally invisible. */
+  --edge-light: transparent;
+  --shadow-tint: rgba(94, 74, 42, 0.42);
   --scrim: rgba(0, 0, 0, 0.35);
-  /* See studio-light note — diff overlays tuned for dark. */
+  /* See Overcast's note — diff overlays tuned for dark. */
   /* "Very dark" grid only applies to dark themes — light keeps the old dot-grid look. */
   --color-grid: var(--color-border);
 }
 
-html[data-theme="studio-light"] {
+/* Overcast — a standalone cool daylight-gray light palette (formerly "studio-light", whose text
+   color and accent were literally Krita Blue's dark bg/accent lifted verbatim — the tell that it
+   was never designed as its own theme). Bg is a soft overcast gray, and the accent is a muted
+   steel blue distinct from Krita Blue's brighter, more saturated hue. */
+html[data-theme="overcast"] {
   color-scheme: light;
-  --color-bg: #f5f6fa;
+  --color-bg: #eceef2;
   --color-surface: #ffffff;
-  --color-surface-2: #eceef4;
-  --color-surface-3: #e2e5ee;
-  --color-border: #d4d7e2;
-  --color-accent: #2e86de;
-  --color-text: #1e1e24;
-  --color-text-muted: #5a5e6b;
-  --color-danger: #c8322f;
+  --color-surface-2: #e3e6ed;
+  --color-surface-3: #d7dbe5;
+  --color-border: #cdd2df;
+  --color-accent: #3d6fa5;
+  --color-text: #23262f;
+  --color-text-muted: #5b6274;
+  --color-danger: #c23b3b;
   --color-success: #d8f0dd;
   --color-success-fg: #1f7a3a;
   --color-warning: #f6ecc9;
@@ -289,8 +339,13 @@ html[data-theme="studio-light"] {
   --color-diff-del-fg: #b3261e;
   --color-state-hover: rgba(0, 0, 0, 0.05);
   --color-state-active: rgba(0, 0, 0, 0.08);
-  --edge-light: rgba(255, 255, 255, 0.9);
-  --shadow-tint: rgba(40, 48, 70, 0.14);
+  /* See Gallery. This theme is the worst case — its well->card contrast
+     is 1.08, the lowest in the set — so the shadow is the ONLY separation
+     between a card and the well. The tint is a cool slate to match the
+     palette; it is a darker base color than Gallery's brown, so it
+     needs slightly less alpha for the same read. */
+  --edge-light: transparent;
+  --shadow-tint: rgba(36, 44, 64, 0.38);
   --scrim: rgba(0, 0, 0, 0.35);
   /* diff-viewer changed-pixel mask/hatch overlays were tuned for
      dark; functional here but not re-tuned. Refine if it reads poorly. */

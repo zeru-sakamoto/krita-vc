@@ -83,18 +83,18 @@ export function SetAsideModal({
     <Modal
       title={artistMode ? "Set your work aside" : "Stash changes"}
       onClose={() => (saving ? undefined : onClose())}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose} disabled={saving}>
+          <Button onClick={close} disabled={saving}>
             Cancel
           </Button>
           <Button variant="primary" onClick={submit} disabled={saving}>
             {saving ? "Setting aside…" : artistMode ? "Set aside" : "Stash"}
           </Button>
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {artistMode ? (
           <>
             This tucks away {scopeText[scope]} and puts those files back the way they were at your
@@ -107,6 +107,9 @@ export function SetAsideModal({
           </>
         )}
       </p>
+      {/* Focus: the sanctioned `.inset-well` exception — see the same note in `BranchDialogs`.
+          `focus-visible:` plus a surface step (the non-color co-indicator); `!outline-none` is
+          needed because the global `:focus-visible` rule is unlayered. */}
       <input
         type="text"
         value={label}
@@ -116,14 +119,14 @@ export function SetAsideModal({
         }}
         placeholder={artistMode ? "What's this? (optional)" : "message (optional)"}
         autoFocus
-        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-body text-text placeholder:text-text-muted focus-visible:border-accent focus-visible:bg-surface-2 !outline-none"
       />
       {count != null && (
-        <p className="mt-2 text-[11px] text-text-muted">
+        <p className="mt-2 text-caption text-text-muted">
           {count} {count === 1 ? "file" : "files"}
         </p>
       )}
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+      {error && <p className="mt-3 text-dense text-danger">{error}</p>}
     </Modal>
   );
 }
@@ -144,13 +147,13 @@ export function PickStashModal({
     <Modal
       title={artistMode ? "Bring back work you set aside" : "Pop a stash"}
       onClose={() => (saving ? undefined : onClose())}
-      footer={
-        <Button onClick={onClose} disabled={saving}>
+      footer={(close) => (
+        <Button onClick={close} disabled={saving}>
           Cancel
         </Button>
-      }
+      )}
     >
-      <p className="mb-3 text-[13px] leading-relaxed text-text-muted">
+      <p className="mb-3 text-body leading-relaxed text-text-muted">
         {artistMode
           ? "Choose what to bring back. Its files return as unsaved work, and it leaves the shelf."
           : "Restores the stash's files into the working tree and drops it from the list."}
@@ -162,10 +165,10 @@ export function PickStashModal({
               type="button"
               disabled={saving}
               onClick={() => onPick(s.id)}
-              className="flex w-full flex-col items-start gap-0.5 rounded-button px-2 py-1.5 text-left transition-colors hover:bg-state-hover disabled:cursor-not-allowed disabled:opacity-40"
+              className="flex w-full flex-col items-start gap-0.5 rounded-button px-2 py-1.5 text-left transition-colors duration-(--dur-instant) ease-(--ease-out) hover:bg-state-hover disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <span className="truncate text-[13px] text-text">{stashTitle(s)}</span>
-              <span className="truncate text-[11px] text-text-muted">{stashSummary(s)}</span>
+              <span className="truncate text-body text-text">{stashTitle(s)}</span>
+              <span className="truncate text-caption text-text-muted">{stashSummary(s)}</span>
             </button>
           </li>
         ))}
@@ -194,9 +197,9 @@ export function StashConflictModal({
     <Modal
       title={artistMode ? "Can't bring this back yet" : "Stash conflict"}
       onClose={onClose}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={close}>Cancel</Button>
           {onShowChanges && (
             <Button
               variant="primary"
@@ -209,9 +212,9 @@ export function StashConflictModal({
             </Button>
           )}
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {artistMode ? (
           <>
             You've changed <span className="text-text">{files}</span> since setting this aside.

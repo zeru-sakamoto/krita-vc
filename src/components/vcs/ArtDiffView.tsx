@@ -9,8 +9,11 @@ import {
 } from "@phosphor-icons/react";
 import type { ArtDiff, ChangeRegion, DiffState, PaletteDiff } from "../../types";
 import { IconButton } from "../ui/IconButton";
+import { Switch } from "../ui/Switch";
 import { Tooltip } from "../ui/Tooltip";
+import { PanelHeader } from "../shell/DockerPanel";
 import { FileStatusChip } from "./FileStatusChip";
+import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
 import { useZoomPan } from "../../lib/useZoomPan";
@@ -49,7 +52,7 @@ const Pane = memo(function Pane({
 }) {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-6 shrink-0 items-center border-b border-border bg-surface px-2 text-[11px] font-medium uppercase text-text-muted">
+      <div className="flex h-6 shrink-0 items-center border-b border-border bg-surface px-2 text-caption font-medium uppercase text-text-muted">
         {label}
       </div>
       {/* Wheel handler lives on this pane's own element (not the shared split-view container)
@@ -212,15 +215,15 @@ export function ArtDiffView({
         <FileStatusChip status={diff.status} />
         <span
           className={[
-            "selectable text-[12px] text-text",
+            "selectable text-dense text-text",
             artistMode ? "font-medium" : "font-mono",
           ].join(" ")}
         >
           {artistMode ? assetName(diff.path) : diff.path}
         </span>
         {layersLoading && (
-          <span className="ml-auto flex items-center gap-1 text-[11px] text-text-muted">
-            <CircleNotchIcon size={12} className="animate-spin" />
+          <span className="ml-auto flex items-center gap-1 text-caption text-text-muted">
+            <CircleNotchIcon size={ICON.inline} className="animate-spin" />
             Loading layers…
           </span>
         )}
@@ -242,76 +245,71 @@ export function ArtDiffView({
           ) : (
             /* ── Art canvas pane ── */
             <>
-              {/* Diff toolbar */}
-              <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border bg-surface-2 px-1">
-                <IconButton
-                  icon={Columns}
-                  label="Side-by-side"
-                  size={18}
-                  active={viewMode === "split"}
-                  onClick={() => switchView("split")}
-                />
-                <IconButton
-                  icon={ArrowsLeftRight}
-                  label="Swipe slider"
-                  size={18}
-                  active={viewMode === "slider"}
-                  onClick={() => switchView("slider")}
-                />
-                <span className="mx-1 h-4 w-px bg-text-muted/40" />
-                <IconButton
-                  icon={ArrowsIn}
-                  label="Reset zoom"
-                  size={18}
-                  disabled={zoom.scale === 1}
-                  onClick={zoom.reset}
-                />
-                <span className="text-[11px] tabular-nums text-text-muted w-9 text-center">
-                  {Math.round(zoom.scale * 100)}%
-                </span>
-                <span className="mx-1 h-4 w-px bg-text-muted/40" />
-                <Tooltip label={highlightOn ? "Hide change highlight" : "Show change highlight"}>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={highlightOn}
-                    onClick={() => setHighlightOn((v) => !v)}
-                    className="tactile flex h-8 items-center gap-1.5 rounded-button bg-surface-2 px-2 text-[12px] text-text-muted hover:bg-surface-3 hover:text-text"
-                  >
-                    Show Diff
-                    <span
-                      aria-hidden
-                      className={[
-                        "inset-well relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200",
-                        highlightOn ? "bg-accent" : "bg-surface-3",
-                      ].join(" ")}
-                    >
-                      <span
-                        className={[
-                          "raised absolute left-0.5 top-1/2 size-3 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
-                          highlightOn ? "translate-x-3" : "translate-x-0",
-                        ].join(" ")}
-                      />
+              {/* Diff toolbar. `PanelHeader` alone, no `DockerPanel`: this bar has no card
+                  around it — it sits directly in the `bg-bg` canvas column — but it is the same
+                  40px docker title bar as every card header, so it uses the same definition
+                  rather than a sixth hand-rolled copy. Its own `gap-1` container keeps the 4px
+                  control spacing the header's `gap-2` would otherwise widen. */}
+              <PanelHeader
+                pad="tight"
+                leading={
+                  <div className="flex items-center gap-1">
+                    <IconButton
+                      icon={Columns}
+                      label="Side-by-side"
+                      active={viewMode === "split"}
+                      onClick={() => switchView("split")}
+                    />
+                    <IconButton
+                      icon={ArrowsLeftRight}
+                      label="Swipe slider"
+                      active={viewMode === "slider"}
+                      onClick={() => switchView("slider")}
+                    />
+                    <span className="mx-1 h-4 w-px bg-text-muted/40" />
+                    <IconButton
+                      icon={ArrowsIn}
+                      label="Reset zoom"
+                      disabled={zoom.scale === 1}
+                      onClick={zoom.reset}
+                    />
+                    <span className="w-9 text-center text-caption tabular-nums text-text-muted">
+                      {Math.round(zoom.scale * 100)}%
                     </span>
-                  </button>
-                </Tooltip>
-                <IconButton
-                  icon={Sparkle}
-                  label="Highlight: changed pixels"
-                  size={18}
-                  active={highlightOn && highlightMode === "pixels"}
-                  disabled={!highlightOn}
-                  onClick={() => setHighlightMode("pixels")}
-                />
-                <IconButton
-                  icon={BoundingBox}
-                  label="Highlight: region boxes"
-                  size={18}
-                  active={highlightOn && highlightMode === "box"}
-                  disabled={!highlightOn}
-                  onClick={() => setHighlightMode("box")}
-                />
-              </div>
+                    <span className="mx-1 h-4 w-px bg-text-muted/40" />
+                    <Tooltip
+                      label={highlightOn ? "Hide change highlight" : "Show change highlight"}
+                    >
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={highlightOn}
+                        onClick={() => setHighlightOn((v) => !v)}
+                        className="tactile flex h-8 items-center gap-1.5 rounded-button bg-surface-2 px-2 text-dense text-text-muted hover:bg-surface-3 hover:text-text"
+                      >
+                        Show Diff
+                        {/* `asIndicator`: this button owns the click and the ARIA, and a button
+                            cannot nest inside a button. */}
+                        <Switch asIndicator size="sm" active={highlightOn} />
+                      </button>
+                    </Tooltip>
+                    <IconButton
+                      icon={Sparkle}
+                      label="Highlight: changed pixels"
+                      active={highlightOn && highlightMode === "pixels"}
+                      disabled={!highlightOn}
+                      onClick={() => setHighlightMode("pixels")}
+                    />
+                    <IconButton
+                      icon={BoundingBox}
+                      label="Highlight: region boxes"
+                      active={highlightOn && highlightMode === "box"}
+                      disabled={!highlightOn}
+                      onClick={() => setHighlightMode("box")}
+                    />
+                  </div>
+                }
+              />
 
               {/* Canvas — overflow-hidden, never auto: the SVG scales to fit its pane, so
                   scrolling could only ever crop the artwork. Wheel zooms toward the cursor;
@@ -365,7 +363,7 @@ export function ArtDiffView({
                 {/* The selected layer's raster is still streaming in. */}
                 {pendingIds.has(selectedId) && (
                   <div className="absolute inset-0 grid place-items-center bg-bg/40">
-                    <CircleNotchIcon size={24} className="animate-spin text-accent" />
+                    <CircleNotchIcon size={ICON.toolbar} className="animate-spin text-accent" />
                   </div>
                 )}
               </div>

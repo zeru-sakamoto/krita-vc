@@ -62,12 +62,12 @@ function opLabel(op: PerfOp, artistMode: boolean): string {
 }
 
 const Empty = ({ children }: { children: React.ReactNode }) => (
-  <p className="px-3 py-2 text-[12px] text-text-muted">{children}</p>
+  <p className="px-3 py-2 text-dense text-text-muted">{children}</p>
 );
 
 /** One placeholder block: an inset glow that pulses in and out, in place of loaded text. */
 function GlowBlock({ className }: { className: string }) {
-  return <div className={`animate-skeleton-glow rounded bg-surface-3 ${className}`} />;
+  return <div className={`animate-skeleton-glow rounded-badge bg-surface-3 ${className}`} />;
 }
 
 /** Summary card content while `repo_storage_stats` is in flight. */
@@ -105,8 +105,8 @@ const VERSION_SKELETON_COUNT = 3;
 function Stat({ label, value }: { label: string; value?: number }) {
   return (
     <div className="flex items-baseline justify-between gap-2">
-      <span className="text-[11px] text-text-muted">{label}</span>
-      <span className="text-[11px] tabular-nums text-text">
+      <span className="text-caption text-text-muted">{label}</span>
+      <span className="text-caption tabular-nums text-text">
         {value != null ? formatMs(value) : "—"}
       </span>
     </div>
@@ -130,25 +130,25 @@ function VersionCard({
   return (
     <div className="raised rounded-panel bg-surface-2 p-2.5">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-[12px] font-medium text-text">Version {row.version}</span>
+        <span className="text-dense font-medium text-text">Version {row.version}</span>
         {hasData && (
-          <span className="rounded-badge bg-accent/12 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+          <span className="rounded-badge bg-accent/12 px-1.5 py-0.5 text-micro font-medium text-accent">
             {pct}% saved
           </span>
         )}
       </div>
       {row.message && (
         <Tooltip label={row.message}>
-          <div className="mt-0.5 truncate text-[11px] text-text-muted">{row.message}</div>
+          <div className="mt-0.5 truncate text-caption text-text-muted">{row.message}</div>
         </Tooltip>
       )}
       {hasData ? (
-        <div className="mt-1.5 text-[11px] text-text-muted">
+        <div className="mt-1.5 text-caption text-text-muted">
           <span className="tabular-nums text-text">{formatBytes(row.storedBytes)}</span> stored ·{" "}
           <span className="tabular-nums">{formatBytes(row.originalBytes)}</span> full copy
         </div>
       ) : (
-        <div className="mt-1.5 text-[11px] text-text-muted">
+        <div className="mt-1.5 text-caption text-text-muted">
           Size not measured for this version.
         </div>
       )}
@@ -197,32 +197,32 @@ export function PerformancePanel() {
         className="raised m-3 mb-2 shrink-0 rounded-panel bg-surface-2 p-3"
         data-tour-id="performance-stats"
       >
-        <div className="text-[11px] uppercase tracking-wide text-text-muted">
+        <div className="text-body font-medium text-text">
           {artistMode ? "Storage saved" : "Storage saved vs full copies"}
         </div>
         {loading ? (
           <SummarySkeleton />
         ) : !stats ? (
-          <div className="mt-1 text-[12px] text-text-muted">
+          <div className="mt-1 text-dense text-text-muted">
             {path ? "No versions yet." : "Storage report unavailable in browser preview."}
           </div>
         ) : hasSavings ? (
           <>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-[22px] font-semibold text-accent">
+              <span className="text-title font-semibold text-accent">
                 {formatBytes(stats.savedBytes)}
               </span>
-              <span className="text-[12px] text-text-muted">saved ({savedPct}%)</span>
+              <span className="text-dense text-text-muted">saved ({savedPct}%)</span>
             </div>
-            <div className="mt-1 text-[11px] text-text-muted">
+            <div className="mt-1 text-caption text-text-muted">
               {formatBytes(stats.actualBytes)} stored vs {formatBytes(stats.naiveBytes)} for a full
               copy of every {artistMode ? "version" : "commit"}
             </div>
           </>
         ) : (
           <div className="mt-1">
-            <div className="text-[13px] text-text">{formatBytes(stats.actualBytes)} stored</div>
-            <div className="mt-1 text-[11px] leading-relaxed text-text-muted">
+            <div className="text-body text-text">{formatBytes(stats.actualBytes)} stored</div>
+            <div className="mt-1 text-caption leading-relaxed text-text-muted">
               Savings show up once you record a few new {artistMode ? "versions" : "commits"} —
               versions saved before this report existed aren’t measured.
             </div>
@@ -235,21 +235,21 @@ export function PerformancePanel() {
             const s = summary.get(op);
             return (
               <div key={op} className="flex items-baseline justify-between">
-                <span className="text-[12px] text-text-muted">{opLabel(op, artistMode)}</span>
-                <span className="text-[12px] tabular-nums text-text">
+                <span className="text-dense text-text-muted">{opLabel(op, artistMode)}</span>
+                <span className="text-dense tabular-nums text-text">
                   {s ? formatMs(s.avgMs) : "—"}
                 </span>
               </div>
             );
           })}
         </div>
-        <div className="mt-2 text-[10px] text-text-muted">
+        <div className="mt-2 text-micro text-text-muted">
           Average time · measured on this device
         </div>
       </div>
 
       {/* Per-version cards — the only scroll region */}
-      <h3 className="flex h-8 shrink-0 items-center px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
+      <h3 className="flex h-8 shrink-0 items-center px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
         Per version
       </h3>
       <div className="min-h-0 flex-1 overflow-auto px-3 pb-2">
@@ -271,14 +271,14 @@ export function PerformancePanel() {
             ))}
           </div>
         ) : (
-          <p className="py-2 text-[12px] text-text-muted">
+          <p className="py-2 text-dense text-text-muted">
             {stats ? "No versions recorded yet." : "Unavailable in browser preview."}
           </p>
         )}
       </div>
 
       {/* Recent operations — pinned, capped at 5 rows */}
-      <h3 className="flex h-8 shrink-0 items-center border-t border-border px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
+      <h3 className="flex h-8 shrink-0 items-center border-t border-border px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
         Recent operations
       </h3>
       <div className="shrink-0">
@@ -287,12 +287,12 @@ export function PerformancePanel() {
             {recent.map((s, i) => (
               <li
                 key={`${s.ts}-${i}`}
-                className="flex items-center justify-between border-t border-border/50 px-3 py-1 text-[12px]"
+                className="flex items-center justify-between border-t border-border/50 px-3 py-1 text-dense"
               >
                 <span className="text-text">{opLabel(s.op, artistMode)}</span>
                 <span className="flex items-baseline gap-2">
                   <span className="tabular-nums text-text">{formatMs(s.ms)}</span>
-                  <span className="w-14 text-right text-[11px] text-text-muted">
+                  <span className="w-14 text-right text-caption text-text-muted">
                     {relativeTime(new Date(s.ts).toISOString())}
                   </span>
                 </span>

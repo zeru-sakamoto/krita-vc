@@ -77,18 +77,18 @@ export function CreateBranchModal({
             : "Create a branch"
       }
       onClose={() => (saving ? undefined : onClose())}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose} disabled={saving}>
+          <Button onClick={close} disabled={saving}>
             Cancel
           </Button>
           <Button variant="primary" onClick={submit} disabled={saving || !name.trim()}>
             {saving ? "Creating…" : "Create"}
           </Button>
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {commit
           ? artistMode
             ? `Your artwork goes back to ${version ? versionLabel(version) : "that version"} and the new line starts there. Everything after it stays safe on the line you're on now.`
@@ -97,6 +97,11 @@ export function CreateBranchModal({
             ? "Try an idea without touching your current work. New versions you save will live on this line until you bring them back together."
             : "The new branch starts at the chosen base branch's latest commit; new commits land on it until you switch back."}
       </p>
+      {/* Focus: the sanctioned `.inset-well` exception (DESIGN.md § Focus Ring Spec) — accent on
+          the field's own edge instead of the global ring, which would sit 2px outside a carved-in
+          edge and read as a halo. `!outline-none` is load-bearing: the global `:focus-visible`
+          rule is unlayered and beats Tailwind's utilities layer. `focus-visible:` (not `focus:`)
+          keeps it off mouse clicks, and the surface step is the required non-color co-indicator. */}
       <input
         type="text"
         value={name}
@@ -106,12 +111,12 @@ export function CreateBranchModal({
         }}
         placeholder={artistMode ? "e.g. new-hair-color" : "branch name"}
         autoFocus
-        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
+        className="mt-3 w-full inset-well rounded-button border border-border bg-bg px-2.5 py-1.5 text-body text-text placeholder:text-text-muted focus-visible:border-accent focus-visible:bg-surface-2 !outline-none"
       />
       {/* A base branch and a starting commit are mutually exclusive backend-side. */}
       {!commit && branches.length > 1 && (
         <div className="mt-3">
-          <span className="mb-1 block text-[12px] text-text-muted">
+          <span className="mb-1 block text-dense text-text-muted">
             {artistMode ? "Start from" : "Base branch"}
           </span>
           <Select
@@ -127,7 +132,7 @@ export function CreateBranchModal({
           />
         </div>
       )}
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+      {error && <p className="mt-3 text-dense text-danger">{error}</p>}
     </Modal>
   );
 }
@@ -150,9 +155,9 @@ export function SaveFirstModal({
     <Modal
       title="Unsaved changes"
       onClose={onClose}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={close}>Cancel</Button>
           {onSetAside && (
             <Button onClick={onSetAside}>{artistMode ? "Set it aside" : "Stash it"}</Button>
           )}
@@ -168,9 +173,9 @@ export function SaveFirstModal({
             </Button>
           )}
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {artistMode
           ? "You have work that isn't saved as a version yet. Save it first so nothing gets lost — or set it aside and pick it up later."
           : "The working tree has uncommitted changes. Commit, stash, or undo them before switching branches."}

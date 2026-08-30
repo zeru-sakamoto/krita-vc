@@ -2,6 +2,7 @@ import { memo, useMemo } from "react";
 import { CircleNotchIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
 import { compositeSvg } from "../../lib/svgArt";
+import { ICON } from "../../lib/iconSize";
 import { paletteName } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
 import { FileStatusChip } from "./FileStatusChip";
@@ -54,7 +55,8 @@ function Row({ selected, onClick, children }: RowProps) {
       type="button"
       onClick={onClick}
       className={[
-        "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
+        "flex w-full items-center gap-2 px-2 py-1.5 text-left",
+        "transition-colors duration-(--dur-instant) ease-(--ease-out)",
         selected ? "row-selected" : "hover:bg-state-hover",
       ].join(" ")}
     >
@@ -67,7 +69,7 @@ function Row({ selected, onClick, children }: RowProps) {
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-6 shrink-0 items-center border-b border-border bg-surface-2 px-2">
-      <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
+      <span className="text-caption font-medium uppercase tracking-wide text-text-muted">
         {children}
       </span>
     </div>
@@ -104,14 +106,14 @@ const LayerRow = memo(function LayerRow({
     <Row selected={selected} onClick={() => onSelect(layer.id)}>
       {pending ? (
         <div className="grid h-7 w-9 shrink-0 place-items-center rounded-badge border border-border bg-surface-2">
-          <CircleNotchIcon size={12} className="animate-spin text-text-muted" />
+          <CircleNotchIcon size={ICON.inline} className="animate-spin text-text-muted" />
         </div>
       ) : (
         <Thumb svg={svg} />
       )}
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-[12px] text-text">{layer.name}</span>
-        <span className="truncate font-mono text-[10px] text-text-muted">
+        <span className="truncate text-dense text-text">{layer.name}</span>
+        <span className="truncate font-mono text-micro text-text-muted">
           {layer.opacity}% · {layer.blendMode}
         </span>
       </span>
@@ -188,7 +190,7 @@ export const LayerStackPanel = memo(function LayerStackPanel({
         {/* Composite */}
         <Row selected={selectedId === COMPOSITE_ID} onClick={() => onSelect(COMPOSITE_ID)}>
           <Thumb svg={compositeThumb} />
-          <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-text">
+          <span className="min-w-0 flex-1 truncate text-dense font-medium text-text">
             Composite
           </span>
         </Row>
@@ -213,10 +215,10 @@ export const LayerStackPanel = memo(function LayerStackPanel({
             <Row selected={selectedId === PALETTE_ID} onClick={() => onSelect(PALETTE_ID)}>
               <PaletteThumb swatches={palette.swatches} />
               <span className="flex min-w-0 flex-1 flex-col">
-                <span className="truncate text-[12px] text-text">
+                <span className="truncate text-dense text-text">
                   {artistMode ? paletteName(palette.path) : palette.path}
                 </span>
-                <span className="truncate font-mono text-[10px] text-text-muted">
+                <span className="truncate font-mono text-micro text-text-muted">
                   {palette.swatches.length} swatches
                 </span>
               </span>

@@ -1,4 +1,5 @@
 import { CircleNotch } from "@phosphor-icons/react";
+import { ICON } from "../../lib/iconSize";
 import { useRepository } from "../../lib/repository";
 
 /**
@@ -18,8 +19,8 @@ export function BusyOverlay() {
       className="scrim fixed inset-0 z-(--z-blocking) grid place-items-center"
     >
       <div className="flex flex-col items-center gap-3 text-text">
-        <CircleNotch size={28} className="animate-spin text-accent" />
-        <p className="text-[13px]">{busyMessage}</p>
+        <CircleNotch size={ICON.display} className="animate-spin text-accent" />
+        <p className="text-body">{busyMessage}</p>
       </div>
     </div>
   );

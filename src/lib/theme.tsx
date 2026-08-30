@@ -12,9 +12,9 @@ import { createContext, useContext, useEffect, useState } from "react";
 
 export type ThemeId =
   | "charcoal"
-  | "charcoal-light"
+  | "gallery"
   | "krita-blue"
-  | "studio-light"
+  | "overcast"
   | "electric-cyan"
   | "sunset-coral"
   | "tokyo-night"
@@ -30,8 +30,9 @@ export const THEMES: { id: ThemeId; label: string; bg: string; accent: string }[
   { id: "sunset-coral", label: "Sunset Coral", bg: "#201e22", accent: "#ff6b6b" },
   { id: "tokyo-night", label: "Tokyo Night", bg: "#1a1b26", accent: "#7aa2f7" },
   { id: "true-black", label: "True Black", bg: "#000000", accent: "#8b5cf6" },
-  { id: "charcoal-light", label: "Charcoal Light", bg: "#f4f1ea", accent: "#a8511a" },
-  { id: "studio-light", label: "Studio Light", bg: "#f5f6fa", accent: "#2e86de" },
+  // Standalone light palettes, not inverted dark ones — see global.css's Gallery/Overcast notes.
+  { id: "gallery", label: "Gallery", bg: "#efe7d8", accent: "#b1531f" },
+  { id: "overcast", label: "Overcast", bg: "#eceef2", accent: "#3d6fa5" },
 ];
 
 const STORAGE_KEY = "krita-vc:theme";

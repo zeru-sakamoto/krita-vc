@@ -6,23 +6,23 @@
 
 ---
 
-## Redesign in progress
+## Status
 
-A screen-by-screen UI/UX redesign is underway, tracked in [`REDESIGN.md`](REDESIGN.md).
-
-**The foundation pass has landed.** The app-wide style — framed bento layout, tactile elevation,
-and purposeful glass — is described throughout this document and is now the locked system. Every
-screen redesign must *share* it rather than vary from it; a screen that drifts from this file is
-the bug, not the exception.
+This document is the single source of truth for the app's design system. The app-wide style —
+framed bento layout, tactile elevation, and purposeful glass — is described throughout this
+document and is the locked system. Any UI change must *share* it rather than vary from it; a
+screen that drifts from this file is the bug, not the exception.
 
 - **Locked / out of scope:** the **Color Palette** section below and the theme system (see its
   note) — colors do not change.
-- **Settled by the foundation pass:** Border Radius, Shadow & Elevation, Glass, Interaction
-  States, Layout & App Shell, and the button / slider / status-bar patterns. Amend them here first
-  if a screen genuinely needs something different — never override locally.
-- **Still open per screen:** the interiors of the individual panels (changes list, history graph,
-  diff viewer, layer stack, palette diff, performance tab, dialog bodies), plus Typography,
-  Spacing, Motion and Icon System if a screen turns up a real need.
+- **Settled:** Border Radius, Shadow & Elevation, Glass, Interaction States, Layout & App Shell,
+  the button / slider / status-bar patterns, and the Type Scale and Icon System — closed sets
+  backed by tokens (`--text-*` in `@theme`, `ICON` in [`src/lib/iconSize.ts`](src/lib/iconSize.ts)).
+  Amend this file first if a screen genuinely needs something different — never override locally.
+  A value outside a closed set is a bug, not a judgment call.
+- **Still open:** the interiors of the individual panels (changes list, history graph, diff
+  viewer, layer stack, palette diff, performance tab, dialog bodies), plus Spacing and Motion if a
+  screen turns up a real need.
 
 ---
 
@@ -95,8 +95,8 @@ this file later.
 selectable color themes, each overriding the base tokens via `html[data-theme="…"]` in
 `src/styles/global.css` (stamped by `src/lib/theme.tsx`): `charcoal` (default, shown above),
 `krita-blue`, `electric-cyan`, `sunset-coral`, `tokyo-night`, `true-black` (all dark), plus
-`charcoal-light` and `studio-light` (light — flip `color-scheme` and also override the status/diff
-colors below). None of the 8 themes change as part of this redesign.
+`gallery` and `overcast` (light — flip `color-scheme` and also override the status/diff colors
+below; standalone palettes, not the base tokens inverted — see global.css's notes on each).
 
 ### Interaction Overlays
 
@@ -136,16 +136,39 @@ Composited on top of any surface using `background` + overlay stacking:
 
 ### Type Scale
 
-| Level        | Size     | Weight  | Font       | Color          | Line Height | Usage                             |
-|--------------|----------|---------|------------|----------------|-------------|-----------------------------------|
-| `title`      | `20px`   | `600`   | UI         | `--text`       | `1.3`       | Window/page title                 |
-| `heading`    | `15px`   | `600`   | UI         | `--text`       | `1.3`       | Section headers, panel titles     |
-| `subheading` | `13px`   | `500`   | UI         | `--text`       | `1.4`       | Subsection labels                 |
-| `body`       | `13px`   | `400`   | UI         | `--text`       | `1.5`       | Default readable content          |
-| `caption`    | `11px`   | `400`   | UI         | `--text-muted` | `1.5`       | Timestamps, metadata, hints       |
-| `label`      | `11px`   | `500`   | UI         | `--text-muted` | `1.4`       | Form labels, input prefixes       |
-| `mono`       | `12px`   | `400`   | Monospace  | `--text`       | `1.6`       | Paths, hashes, diffs, layer names |
-| `mono-muted` | `12px`   | `400`   | Monospace  | `--text-muted` | `1.6`       | Unchanged diff lines, context     |
+Six steps, defined as `--text-*` entries in `global.css`'s `@theme` and therefore available as
+Tailwind utilities. **Use the utility, never `text-[Npx]`.** An arbitrary size is by definition
+off-scale — there is a token for every size the app is allowed to use, and if none of the six fits,
+the answer is a different step, not a seventh.
+
+| Level     | Utility        | Size   | Weight | Line Height | Color          | Usage                                  |
+|-----------|----------------|--------|--------|-------------|----------------|----------------------------------------|
+| `title`   | `text-title`   | `20px` | `600`  | `1.3`       | `--text`       | Window/page title, welcome headline    |
+| `heading` | `text-heading` | `15px` | `600`  | `1.3`       | `--text`       | Section headers, panel + modal titles  |
+| `body`    | `text-body`    | `13px` | `400`  | `1.5`       | `--text`       | Default readable content, button labels |
+| `dense`   | `text-dense`   | `12px` | `400`  | `1.5`       | `--text`       | Dense rows, mono content, chips, tables |
+| `caption` | `text-caption` | `11px` | `400`  | `1.4`       | `--text-muted` | Timestamps, metadata, hints, card labels |
+| `micro`   | `text-micro`   | `10px` | `400`  | `1.4`       | `--text-muted` | Counts, tick labels, overlay annotations |
+
+**`dense` (12px) is the load-bearing addition.** It is the app's single most-used size, and this
+table previously assigned 12px only to *mono* — so every one of the ~95 non-mono 12px sites had no
+step to name itself with. That omission is the reason the scale drifted to nine sizes; a scale with
+a hole in the middle of its most-used range does not get followed, it gets worked around.
+
+**Weight and family are separate axes, and the tokens deliberately do not carry them.** `heading`
+and `subheading` share a size in most systems and differ only in weight; a font-size utility that
+silently set weight could not express that. So:
+
+| Role         | Composition                                  | Usage                             |
+|--------------|----------------------------------------------|-----------------------------------|
+| `subheading` | `text-body font-medium`                      | In-card section labels            |
+| `label`      | `text-caption font-medium uppercase`         | Card headers, form labels         |
+| `mono`       | `text-dense font-mono`                       | Paths, hashes, diffs, layer names |
+| `mono-muted` | `text-dense font-mono text-text-muted`       | Unchanged diff lines, context     |
+
+There is **no `--text-mono` token**: mono content is 12px and `font-mono` already selects it, so a
+size token of its own would be a second way to say the same thing — and two ways to say it is how
+they drift apart.
 
 ---
 
@@ -220,6 +243,16 @@ carries one of them, and never try to cancel one with `disabled:shadow-none` (ha
 Only `--edge-light`, `--shadow-tint` and `--scrim` are mode-dependent; the two light themes and
 True Black override them, everything else derives.
 
+**On light themes the model drops to two cues, not three.** The hairline top highlight is a
+dark-mode device — a white line on a `#ffffff` card is physically meaningless — and it cannot simply
+be inverted, because `--edge-light` is the *top* inset on `--shadow-raised`: a dark hairline there
+draws what reads as a broken top border, not as depth. So the light themes set
+`--edge-light: transparent` and carry elevation on the lightness step plus a **substantially
+stronger** `--shadow-tint`, roughly 2.5× the alpha the dark themes need. This inverts the
+dark-theme instinct and is correct: on a light ground an object is legible by the shadow it casts,
+not by the edge it catches. Under-tinting here is not a subtle miss — it collapses the three bento
+cards and the well into one flat sheet, which is the entire direction gone.
+
 ---
 
 ## Glass
@@ -269,9 +302,12 @@ Specific to the commit/layer diff view:
 
 ```css
 --ease-out:     cubic-bezier(0.23, 1, 0.32, 1);    /* UI interactions, enter animations */
---ease-in-out:  cubic-bezier(0.77, 0, 0.175, 1);   /* on-screen element movement */
---ease-drawer:  cubic-bezier(0.32, 0.72, 0, 1);    /* panel slide-in */
+--ease-in-out:  cubic-bezier(0.77, 0, 0.175, 1);   /* on-screen element movement — reserved, see ‡ */
+--ease-drawer:  cubic-bezier(0.32, 0.72, 0, 1);    /* panel slide-in — reserved, see ‡ */
 ```
+
+`--ease-out` is the working curve; the other two are reserved for interactions the app does not yet
+have (marked ‡ in the timing table below).
 
 Never use `ease-in` on UI elements — it starts slow and makes the interface feel unresponsive.
 
@@ -288,12 +324,43 @@ Never use `ease-in` on UI elements — it starts slow and makes the interface fe
 
 | Element           | Duration       | Easing       | Transform                      |
 |-------------------|----------------|--------------|--------------------------------|
-| Button `:active`  | `--dur-instant`| `--ease-out` | `scale(0.97)`                  |
+| Button `:active`  | `--dur-instant`| `--ease-out` | `translateY(1px)` — it sinks, it doesn't shrink |
 | Tooltip open      | `--dur-fast`   | `--ease-out` | `scale(0.97)` + `opacity: 0→1` |
 | Dropdown / menu   | `--dur-normal` | `--ease-out` | `scale(0.95)` + `opacity: 0→1` |
-| Panel slide-in    | `280ms`        | `--ease-drawer` | `translateX(-100%)→0`       |
 | Modal open        | `--dur-slow`   | `--ease-out` | `scale(0.97)` + `opacity: 0→1` |
-| Diff row expand   | `--dur-normal` | `--ease-in-out` | height + `opacity: 0→1`    |
+| **Any of the three closing** | `--dur-fast` | `--ease-out` | reverse of its open |
+| *Panel slide-in* ‡ | `280ms`       | `--ease-drawer` | `translateX(-100%)→0`       |
+| *Diff row expand* ‡ | `--dur-normal` | `--ease-in-out` | height + `opacity: 0→1`   |
+
+Button `:active` is `translateY`, not `scale`, and the two tables agree on this. A tactile control
+sinks into its housing; scaling it down instead reads as the button retreating from the cursor,
+which is the opposite of contact. See § Interaction States.
+
+**Floating surfaces animate away, not just in**, and every dismissal path gets it — Escape, a
+backdrop or outside click, and a footer's Cancel/Close. One exit duration (`--dur-fast`) for all
+three surfaces regardless of how long they took to arrive: an element appearing is information and
+can afford the time, an element leaving is cleanup, and a slow exit reads as lag on a tool used this
+often. The easing stays `--ease-out` — `--ease-in` remains banned even on the way out, per
+§ Easing Curves.
+
+Mechanically this needs the surface to outlive its own open state. `Menu` and `Tooltip` own that
+state and use `useExitTransition` (`src/lib/useExitTransition.ts`), which keeps them mounted for the
+exit and then drops them. `Modal` cannot: it is mounted by its parent (`{show && <Modal/>}`), so it
+inverts the problem and holds `onClose` back until the transition has run. That is why `Modal`'s
+`footer` takes a render prop — `footer={(close) => …}` — and why a dismiss button must call that
+`close` rather than the parent's own `onClose`, which would unmount instantly and skip the exit. An
+action that *completes* (Delete, Merge, Restore) still unmounts immediately and is meant to: the
+dialog is finished, not dismissed.
+
+While exiting, a surface is still in the DOM. It must be `pointer-events-none` so it cannot swallow
+a click aimed at what is behind it.
+
+‡ **Aspirational — no shipped surface uses these two rows**, and `--ease-drawer` / `--ease-in-out`
+are consequently defined in `global.css` and referenced nowhere. They are kept because both
+interactions are plausible additions and the curves should be decided once rather than improvised at
+the moment one is needed. Treat them as reserved, not as describing current behaviour: don't cite
+either row as precedent, and if a panel slide-in or a row expand actually lands, that is the moment
+to confirm the curve is right rather than inherit it unexamined.
 
 ### Principles
 
@@ -332,6 +399,27 @@ Full 8-state system required for every interactive element.
 
 > Never animate the focus ring appearance — it must appear instantly on focus.
 
+**The one sanctioned exception: `.inset-well` text fields.** A carved-in field already casts its
+own inset shadow at its edge; a 2px ring sitting 2px *outside* that edge lands in the gap and reads
+as a halo bolted onto the field rather than as focus on it. These fields therefore suppress the
+global outline and take an `--accent` border instead — the border sits exactly where the field's own
+edge is, which is where focus belongs.
+
+Two requirements, both non-negotiable, because this exception gives up the system's default
+guarantees and has to buy them back:
+
+1. **`focus-visible:`, never `focus:`.** `focus:` also fires on mouse click, which is precisely what
+   the focus-visible convention exists to prevent — a field that lights up every time it is clicked
+   trains the user to ignore the signal, and by the time keyboard focus genuinely needs to be found
+   the indicator means nothing.
+2. **A non-color co-indicator.** § Accessibility: *"Never use color as the sole indicator of
+   state."* A border that changes only in hue fails for the same reason a red/green status dot does.
+   Pair it with a width, weight, or background step so the state survives being seen in grayscale.
+
+This applies **only** to text inputs inside `.inset-well`. Every other interactive element — buttons,
+icon chips, toggles, menu items, sliders — takes the global ring unmodified. `!outline-none` on
+anything else is a bug.
+
 ---
 
 ## Z-index Scale
@@ -355,11 +443,28 @@ Never use arbitrary z-index values. Reference these tokens for every layered ele
 | Setting       | Value                     |
 |---------------|---------------------------|
 | Library       | `@phosphor-icons/react`   |
-| Size — dense  | `16px`                    |
-| Size — default | `20px`                   |
-| Size — toolbar | `24px`                   |
+| Sizes         | `ICON` in [`src/lib/iconSize.ts`](src/lib/iconSize.ts) — the five values below |
 | Weight        | `regular` (default); `bold` for warning/error semantic icons only |
 | Color         | Always inherit from surrounding text token — never hardcoded      |
+
+| Step             | Size   | Usage                                              |
+|------------------|--------|----------------------------------------------------|
+| `ICON.inline`    | `12px` | Inside a chip, badge, or a line of text            |
+| `ICON.dense`     | `14px` | Dense rows: layer lists, status bar, menu items    |
+| `ICON.default`   | `16px` | Standard control icon — `IconButton`'s default     |
+| `ICON.toolbar`   | `24px` | Toolbar / activity bar                             |
+| `ICON.display`   | `32px` | Empty-state and error art only, **never a control** |
+
+**The scale lives in TypeScript, not in `@theme`, because Phosphor takes its size as a React prop.**
+A number passed to a component is invisible to the stylesheet, so this is the only token in the
+system that cannot be a CSS variable — and importing `ICON` is what makes it enforceable. A literal
+`size={n}` at a call site is off-scale by definition.
+
+This replaces an earlier `16 / 20 / 24` claim that the interface had already rejected: the app had
+drifted to nine distinct sizes, and `20` appeared at no explicit call site at all — it survived only
+as a default that 16 of 20 `IconButton` uses overrode. `14` and `13` were the two most common. The
+spec was corrected to the density the UI actually needs rather than 90 icons being edited up to a
+size that had never been used deliberately.
 
 Use one icon family per project. Do not mix Phosphor with Lucide or any other set.
 
@@ -424,6 +529,15 @@ Desktop-only application. No mobile breakpoints. **Minimum window size:** 900 ×
 dropdown menu of local repositories plus an "Add repository…" action. Local-only: no fetch/push/sync
 affordances. Menu surface: `--surface-2`, 1px `--border`, `panel` radius, `--shadow-float`; the
 active repo row shows a check in `--accent`. Closes on outside-click or Escape.
+
+**Settings dialog (activity-bar gear):** a modal with **four** left-hand category tabs — Appearance,
+Performance, Storage, Set-Aside. The tab list is **static**: it renders the same four regardless of
+whether an artwork is selected, and a tab whose settings need one shows a fallback message rather
+than disappearing. A tab set that resizes as you switch repositories moves the other tabs under the
+cursor, which is worse than a tab that is briefly empty.
+
+Every tab shares one row anatomy — a section label, then its control — so the dialog reads as one
+surface rather than four. Field width is set by the field's own content, not by the tab it sits in.
 
 ### Docker / Panel System
 
@@ -543,7 +657,8 @@ Two distinct button types. Both are tactile; they differ in whether they carry a
 | disabled | `--surface-2`   | none (lies flat), 40% opacity | —     |
 
 - Hit target: 32×32px minimum
-- Icon: 20px centered
+- Icon: `ICON.default` (16px) centered — `IconButton`'s default. Denser rows pass `ICON.dense`; the
+  activity rail passes `ICON.toolbar`. See § Icon System.
 - No text label by default (tooltip on hover provides context)
 - Checked state is carried by **depth first, color second** — the chip stays held down and the icon
   goes accent. Never a filled accent background; that spends the accent on chrome.
@@ -567,20 +682,70 @@ Borderless — the elevation defines the edge.
 - Default: `--surface-3` background, raised
 - Hover: `--danger` at 15% opacity background, `--danger` text
 
+### Toggle / Switch
+
+| Element | Off | On |
+|---|---|---|
+| Track | `--surface-3`, `--shadow-well` (carved in) | **unchanged — still `--surface-3`, still recessed** |
+| Thumb | `--surface` or `--text-muted`, `--shadow-raised`, resting at the left | `--accent`, `--shadow-raised`, slid to the right |
+| Travel | — | `--dur-normal` / `--ease-out`, `transform` only |
+
+**Never fill the track with the accent.** The track is the *housing*; the thumb is the part that
+moves and therefore the part that carries state. Filling the housing spends the accent on chrome —
+§ Notes, *"Depth before color"* — and it does so at the worst possible scale: a settings list is a
+column of toggles, so an accent-filled track turns every preference the user happens to have enabled
+into a saturated pill competing with the one action on the screen that should be dominant. In the
+diff viewer it made a "Show Diff" switch the loudest element in a view whose subject is the artwork.
+
+The track stays recessed in both states because the housing does not move. Depth here says *"this is
+a slot"*, not *"this is on"* — that is the thumb's job, and the thumb's position states it without
+any color at all, which is what keeps the control legible in grayscale (§ Accessibility, *"Never use
+color as the sole indicator of state"*).
+
+One `Switch` primitive, one set of measurements. Three hand-rolled copies at three different sizes
+is three thumb animations to keep in sync and three chances for them to disagree.
+
 ### Slider / Range Control
 
-Used for numeric properties — opacity, threshold, offset. Common in creative tool panels.
+Two kinds, and they are not interchangeable. What separates them is whether the value is a *number
+the user is dialling in* or *one of a short list of named options* — a continuous slider with three
+stops is a radio group wearing a costume, and a discrete slider showing a raw number tells the user
+nothing about what the number means.
+
+**Continuous slider** — numeric properties: opacity, threshold, offset. Common in creative tool
+panels.
 
 | Element | Value |
 |---|---|
 | Track height | 4px |
 | Track background | `--surface-3` + `--shadow-well` (carved in) |
-| Fill color | `--accent` |
+| Fill color | `--accent` on the travelled portion |
 | Thumb size | 12px circle |
 | Thumb fill | `--accent`, `--shadow-raised` (sits proud of the track) |
 | Thumb border | 2px `--bg` (for contrast against fill) |
-| Label position | Left: property name (`label` scale, 11px); right: current value (mono 11px) |
+| Label position | Left: property name (`label` role, 11px); right: current value (mono 11px) |
 | Keyboard behavior | Arrow keys: ±1 unit; Shift+Arrow: ±10 units |
+
+**Discrete slider** — a drag-to-pick option list with labelled stops (Settings → Performance's
+"Background CPU use": Gentle / Balanced / Full speed). The drag-target sibling of `Select`, chosen
+over one when the options are *ordered* and the ordering is the point.
+
+| Element | Value |
+|---|---|
+| Track height | 6px |
+| Track background | `--surface-3` + `--shadow-well` (carved in) |
+| Fill color | **`--accent` on the travelled portion — required** |
+| Thumb size | 16px circle |
+| Thumb fill | `--accent`, `--shadow-raised` |
+| Labels | One per stop, `caption` scale, equal-width columns so each label centres on its own tick; current option in `--text`, the rest `--text-muted` |
+| Keyboard behavior | Arrow keys: ±1 stop; Home/End: first/last |
+
+The larger 6px track and 16px thumb are deliberate and are the one place this control departs from
+the continuous spec above: it is dragged directly rather than nudged, and its stops are coarse, so
+it needs a real hit target. **The accent fill is not optional.** Without it the thumb's position is
+the only encoding of the value, which forces the user to measure a dot against a bare track — a
+filled track states "how far along" pre-attentively, which is the entire reason a slider is used
+here instead of a dropdown.
 
 ### Status Bar
 

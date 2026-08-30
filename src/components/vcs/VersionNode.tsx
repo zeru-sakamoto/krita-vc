@@ -13,6 +13,7 @@ import {
   versionLabel,
 } from "../../lib/friendly";
 import { wrapSvg } from "../../lib/svgArt";
+import { ICON } from "../../lib/iconSize";
 import { Tooltip } from "../ui/Tooltip";
 
 /** Node column width — React Flow lays out with it, so the panel imports it too. */
@@ -148,7 +149,10 @@ export const VersionNode = memo(function VersionNode({
             // (`pointer-events-auto`) or every click falls through to the pane and pans instead.
             // `nopan` then stops that pane pan-drag from starting on this button in the first place.
             "nopan pointer-events-auto raised block w-full overflow-hidden rounded-panel bg-surface-2",
-            "transition-[box-shadow,transform] duration-100 ease-out",
+            // `translate`, not `transform`: Tailwind v4 compiles `-translate-y-0.5` to the
+            // standalone `translate` CSS property, so transitioning `transform` here animated
+            // nothing and the hover lift snapped. Verified in the built CSS. Don't change it back.
+            "transition-[box-shadow,translate] duration-(--dur-instant) ease-(--ease-out)",
             "hover:-translate-y-0.5 active:translate-y-0",
             selected ? "ring-1 ring-accent" : "",
           ].join(" ")}
@@ -167,7 +171,7 @@ export const VersionNode = memo(function VersionNode({
             <div className="h-full w-full animate-pulse bg-surface-3" />
           ) : (
             <div className="grid h-full w-full place-items-center bg-surface-2">
-              <KindIcon size={28} className="text-text-muted" />
+              <KindIcon size={ICON.display} className="text-text-muted" />
             </div>
           )}
         </button>
@@ -189,7 +193,7 @@ export const VersionNode = memo(function VersionNode({
           <div className="w-full text-center">
             <p
               className={[
-                "text-[11px] text-text-muted",
+                "text-caption text-text-muted",
                 artistMode ? "font-medium" : "font-mono",
               ].join(" ")}
             >
@@ -199,7 +203,7 @@ export const VersionNode = memo(function VersionNode({
               </span>
               {rel}
             </p>
-            <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-text">
+            <p className="mt-0.5 line-clamp-2 text-dense leading-snug text-text">
               {commit.message}
             </p>
             {/* Two lanes can both read "Version 5" — versions are counted along each line's own
@@ -207,7 +211,7 @@ export const VersionNode = memo(function VersionNode({
             {(branch || tipOf.length > 0) && (
               <div className="mt-1 flex flex-wrap justify-center gap-1">
                 {branch && tipOf.length === 0 && (
-                  <span className="text-[10px] text-text-muted">{branch}</span>
+                  <span className="text-micro text-text-muted">{branch}</span>
                 )}
                 {tipOf.map((name) => (
                   <Tooltip
@@ -215,7 +219,7 @@ export const VersionNode = memo(function VersionNode({
                     label={artistMode ? `Newest version on "${name}"` : `Branch tip: ${name}`}
                   >
                     <span
-                      className="rounded-badge border px-1.5 py-px text-[10px] leading-tight"
+                      className="rounded-badge border px-1.5 py-px text-micro leading-tight"
                       style={{
                         color: laneColor,
                         borderColor: `color-mix(in srgb, ${laneColor} 45%, transparent)`,
@@ -241,21 +245,25 @@ export const VersionNode = memo(function VersionNode({
                     key={l.id}
                     label={`${l.name} — ${layerTypeLabel(l.layerType ?? "")}, ${layerChangeLabel(l.change)}`}
                   >
-                    <span className="raised flex min-w-0 items-center gap-1 rounded-badge bg-surface-2 px-1.5 py-1 text-[11px] leading-none">
-                      <TypeIcon size={12} className="shrink-0 text-text-muted" />
+                    <span className="raised flex min-w-0 items-center gap-1 rounded-badge bg-surface-2 px-1.5 py-1 text-caption leading-none">
+                      <TypeIcon size={ICON.inline} className="shrink-0 text-text-muted" />
                       <span className="min-w-0 flex-1 truncate text-text">{l.name}</span>
-                      <GlyphIcon size={11} weight="bold" className={`shrink-0 ${glyph.color}`} />
+                      <GlyphIcon
+                        size={ICON.inline}
+                        weight="bold"
+                        className={`shrink-0 ${glyph.color}`}
+                      />
                     </span>
                   </Tooltip>
                 );
               })}
               {overflow > 0 && (
-                <span className="flex items-center justify-center rounded-badge px-1.5 py-1 text-[11px] leading-none text-text-muted">
+                <span className="flex items-center justify-center rounded-badge px-1.5 py-1 text-caption leading-none text-text-muted">
                   +{overflow} more
                 </span>
               )}
               {extraFiles > 0 && (
-                <span className="flex items-center justify-center rounded-badge px-1.5 py-1 text-[11px] leading-none text-text-muted">
+                <span className="flex items-center justify-center rounded-badge px-1.5 py-1 text-caption leading-none text-text-muted">
                   +{extraFiles} file{extraFiles === 1 ? "" : "s"}
                 </span>
               )}
@@ -322,13 +330,14 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
           // No `raised`: a shadow would make an empty frame read as a real, present thing.
           className={[
             "nopan pointer-events-auto block w-full overflow-hidden rounded-panel border-2 border-dashed bg-bg",
-            "transition-transform duration-100 ease-out",
+            // `translate`, not `transform` — see the same note on VersionNode's thumbnail above.
+            "transition-[translate] duration-(--dur-instant) ease-(--ease-out)",
             picking ? "" : "hover:-translate-y-0.5 active:translate-y-0",
           ].join(" ")}
           style={{ height: THUMB_H, borderColor: dashed }}
         >
           <div className="grid h-full w-full place-items-center">
-            <Plus size={28} className="text-text-muted" />
+            <Plus size={ICON.display} className="text-text-muted" />
           </div>
         </button>
       </Tooltip>
@@ -348,7 +357,7 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
           <div className="w-full text-center">
             <p
               className={[
-                "text-[11px] text-text-muted",
+                "text-caption text-text-muted",
                 artistMode ? "font-medium" : "font-mono",
               ].join(" ")}
             >
@@ -361,7 +370,7 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
             <div className="mt-1 flex flex-wrap justify-center gap-1">
               <Tooltip label={artistMode ? `Would be saved on "${branch}"` : `Branch: ${branch}`}>
                 <span
-                  className="rounded-badge border border-dashed px-1.5 py-px text-[10px] leading-tight"
+                  className="rounded-badge border border-dashed px-1.5 py-px text-micro leading-tight"
                   style={{ color: laneColor, borderColor: dashed }}
                 >
                   {branch}
@@ -371,7 +380,7 @@ export const PreviewNode = memo(function PreviewNode({ data }: { data: PreviewNo
           </div>
 
           <div className="mt-2 flex w-full justify-center">
-            <span className="rounded-badge border border-dashed border-border px-2 py-1 text-[11px] leading-none text-text-muted">
+            <span className="rounded-badge border border-dashed border-border px-2 py-1 text-caption leading-none text-text-muted">
               Unsaved changes
             </span>
           </div>

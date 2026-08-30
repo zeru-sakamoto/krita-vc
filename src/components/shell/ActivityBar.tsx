@@ -9,6 +9,7 @@ import {
   MapTrifold,
 } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
+import { ICON } from "../../lib/iconSize";
 import { SettingsModal } from "./SettingsModal";
 import { BackupModal } from "./BackupModal";
 import { useRepository } from "../../lib/repository";
@@ -50,7 +51,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
             key={view}
             icon={icon}
             label={label}
-            size={24}
+            size={ICON.toolbar}
             active={active === view}
             onClick={() => onChange(view)}
             tourId={view}
@@ -61,7 +62,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
         <IconButton
           icon={FileZip}
           label="Back up artworks…"
-          size={24}
+          size={ICON.toolbar}
           disabled={repositories.length === 0 || !!busyMessage}
           onClick={() => setBackupOpen(true)}
           tourId="backup"
@@ -69,7 +70,7 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
         <IconButton
           icon={GearSix}
           label="Settings"
-          size={24}
+          size={ICON.toolbar}
           onClick={() => setSettingsOpen(true)}
           tourId="settings"
         />

@@ -20,6 +20,22 @@ production builds.
   (`bg-bg`, `bg-surface-2`, `text-text-muted`, `text-accent`, `rounded-panel`, `font-mono`, …).
 - Non-utility tokens (easing curves, durations, z-index scale) live in `:root` and are referenced
   as `z-(--z-sticky)`, `duration-(--dur-normal)`, etc.
+- **Type scale** — six `@theme` steps generating `text-title` (20) · `text-heading` (15) ·
+  `text-body` (13) · `text-dense` (12) · `text-caption` (11) · `text-micro` (10). There is no
+  separate mono size token: mono content is `text-dense font-mono`. An arbitrary `text-[Npx]`
+  anywhere is a bug — the whole app was migrated off them.
+- **Icon scale** — Phosphor takes its size as a React prop, not CSS, so this one scale cannot live
+  in `@theme`. It lives in [`src/lib/iconSize.ts`](../src/lib/iconSize.ts) as `ICON`: `inline` 12 ·
+  `dense` 14 · `default` 16 · `toolbar` 24 · `display` 32 (empty-state art only, never a control).
+  A literal `size={N}` on an icon is a bug.
+- **Motion is always explicit.** Every `transition-*` carries a `duration-(--dur-*)` and an
+  `ease-(--ease-out)`; a bare `transition-colors` silently inherits Tailwind's own 150ms
+  `cubic-bezier(0.4, 0, 0.2, 1)`, which is not one of the app's curves.
+  **Transition the property Tailwind actually emits**: v4 compiles `translate-*`, `scale-*` and
+  `rotate-*` to the standalone `translate` / `scale` / `rotate` CSS properties, *not* `transform`,
+  so `transition-transform` on an element moved by `translate-x-*` animates nothing and the element
+  snaps. Reserve `transition-transform` for elements that write an explicit `transform:` string
+  (`Slider`'s thumb, `ArtCanvas`'s zoom wrapper). This fails silently — there is no warning.
 - Fonts (Inter, JetBrains Mono) are self-hosted via `@fontsource` for offline use.
 - **Color themes** — the `@theme` block's `--color-*` values are Charcoal (the default, no
   override needed); every other theme is an `html[data-theme="…"] { --color-* : … }` block further
@@ -78,10 +94,21 @@ human-readable label before the call and clears it in a `finally`. Renders nothi
 element (`fixed inset-0`, so it still visually covers all four zones); it renders nothing when the
 tour isn't active. See [Application tour](#application-tour).
 
-[`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable panel container (24px title
-bar + scroll area) used by the Sidebar and Inspector. Its header's `actions` slot lays out icons
-with a small `gap-1` so adjacent buttons (e.g. Changes' rescan + panel-options) don't sit flush
-against each other — every panel gets this for free rather than each header spacing its own icons.
+[`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable bento card (40px title bar
++ scroll area) used by the Sidebar and Inspector. Its header's `actions` slot lays out icons with a
+small `gap-1` so adjacent buttons (e.g. Changes' rescan + panel-options) don't sit flush against
+each other — every panel gets this for free rather than each header spacing its own icons.
+
+The header is also exported on its own as **`PanelHeader`** (`title` · `leading` · `meta` ·
+`actions` · `pad`), because five other places had hand-rolled a copy of the same
+`h-10 border-b bg-surface-2` bar and had already drifted apart on padding: `AppShell`'s main card,
+`Inspector`, the Version Map's header and its drilldown, and `ArtDiffView`'s diff toolbar. The last
+of those has no card around it at all — it sits in a `bg-bg` column — which is why the header is
+exported separately rather than every caller being forced through the full `<section>` wrapper.
+`title` is deliberately a `string`: it carries the reserved uppercase-caption treatment, so richer
+content routes to `leading`/`meta` by type rather than by convention. **That caption style belongs
+to the card-header level only** — in-card section headings use the `subheading` step
+(`text-body font-medium`), which is what keeps the two readable as different levels.
 
 ## State ownership
 
@@ -622,8 +649,9 @@ The capabilities needed to drive this from the frontend
 
 ## Theme selector
 
-Eight color themes — five dark (`charcoal` default, `krita-blue`, `electric-cyan`, `sunset-coral`,
-`tokyo-night`, `true-black`) and two light (`charcoal-light`, `studio-light`) — are picked from a
+Eight color themes — six dark (`charcoal` default, `krita-blue`, `electric-cyan`, `sunset-coral`,
+`tokyo-night`, `true-black`) and two light (`gallery`, `overcast`), each a standalone palette
+rather than an inverted dark one — are picked from a
 `Menu` in the Settings modal (gear in the activity bar), each option rendered as a `ThemeChip`
 (background swatch + accent dot). Themes are **pure CSS palettes**, not component variants:
 
@@ -789,8 +817,12 @@ tracking, couldn't delete a history) and the right-click guard, and the CPU
 budget (`src/lib/cpuBudget.tsx`) is the Settings → Storage → "Background CPU use" knob, both
 app-global but orthogonal to `AppShell`'s own layout/view state.
 
-Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (tactile icon chip),
-[`Button`](../src/components/ui/Button.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
+Shared primitives: [`IconButton`](../src/components/ui/IconButton.tsx) (tactile icon chip,
+`ICON.default` unless told otherwise), [`Button`](../src/components/ui/Button.tsx)
+(`default` / `primary` / `destructive` / `ghost`, `sm` / `md` — **the only two button types**; a
+hand-rolled button is a bug, the app had nine treatments before they were folded back in),
+[`Switch`](../src/components/ui/Switch.tsx), [`Slider`](../src/components/ui/Slider.tsx),
+[`Modal`](../src/components/ui/Modal.tsx), [`Menu`](../src/components/ui/Menu.tsx) (dropdown:
 outside-click + Esc to close), [`FileStatusChip`](../src/components/vcs/FileStatusChip.tsx),
 [`BranchBadge`](../src/components/vcs/BranchBadge.tsx),
 [`Tooltip`](../src/components/ui/Tooltip.tsx) — the app's only hover/focus tooltip, replacing every
@@ -808,6 +840,29 @@ and `TourOverlay`'s "Skip" button keeps native `title=` since it sits inside the
 overlay, whose `--z-tour` layer sits *above* `--z-tooltip` by design — a portaled Tooltip there
 would render invisibly behind the dimming bands.
 
+**Floating surfaces animate away, not just in.** `Tooltip`, `Menu` and `Modal` all fade + scale out
+at `--dur-fast`/`--ease-out` on every dismissal path, and while exiting they are
+`pointer-events-none` so a surface mid-fade can't swallow a click meant for what's behind it.
+`Menu` and `Tooltip` own their open state and use
+[`useExitTransition`](../src/lib/useExitTransition.ts), which keeps them mounted for the exit and
+then drops them.
+
+`Modal` can't: it is mounted by its parent (`{show && <Modal/>}`), so it inverts the problem and
+holds `onClose` back until the transition has run. Two consequences worth knowing:
+
+- Its `footer` takes a **render prop** — `footer={(close) => …}` — and a dismiss button must call
+  that `close`, not the parent's own `onClose`, which would unmount instantly and skip the exit.
+  (An action that *completes* — Delete, Merge, Restore — still unmounts immediately, as it should:
+  the dialog is finished, not dismissed.)
+- The unmount is driven by **`transitionend`, not a timer**. A timer was tried and does not work:
+  on a large dialog the re-render plus the repaint of the nested `backdrop-filter` chain
+  (`.scrim`'s blur under the panel's own) delays the transition's *start* by ~85ms, so a timer set
+  to the exit duration fires mid-fade and `transitioncancel`s it, which reads as the dialog
+  snapping out. A fallback timer survives only for the case where the transition is suppressed
+  entirely and `transitionend` never fires. That same nested backdrop chain is why the dialog's
+  fade resolves in ~3 steps where `Menu`'s is smooth; `will-change` on either layer was measured
+  and does not help.
+
 Cross-cutting libs: [`src/lib/artistMode.tsx`](../src/lib/artistMode.tsx) (the toggle context),
 [`src/lib/legacyHistory.tsx`](../src/lib/legacyHistory.tsx) (the Legacy version history toggle
 context — see [Version Map](#version-map)),
@@ -817,6 +872,9 @@ create/switch/merge/delete),
 [`src/lib/repoData.ts`](../src/lib/repoData.ts) (data hooks: commits, branches, diffs, layers,
 stashes),
 [`src/lib/useResize.ts`](../src/lib/useResize.ts) (shared drag-resize hook),
+[`src/lib/useExitTransition.ts`](../src/lib/useExitTransition.ts) (keeps a floating surface mounted
+for its exit transition; also exports `EXIT_MS`),
+[`src/lib/iconSize.ts`](../src/lib/iconSize.ts) (the `ICON` scale — see [Styling](#styling)),
 [`src/lib/graph.ts`](../src/lib/graph.ts) (history-graph lane layout + `branchColorMap` — the
 *legacy* History graph; the Version Map's own lane palette is a separate, smaller one local to
 `VersionMapPanel.tsx`, see [Version Map](#version-map)),

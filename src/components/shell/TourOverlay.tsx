@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Button } from "../ui/Button";
 import { useTour } from "../../lib/tour";
 import type { ActivityView } from "./ActivityBar";
 
@@ -176,29 +177,23 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
         style={calloutStyle}
         className="glass fixed w-72 rounded-panel p-3 shadow-(--shadow-float)"
       >
-        <h2 className="text-[13px] font-medium text-text">{step.title}</h2>
-        <p className="mt-1 text-[12px] leading-relaxed text-text-muted">{step.body}</p>
+        <h2 className="text-body font-medium text-text">{step.title}</h2>
+        <p className="mt-1 text-dense leading-relaxed text-text-muted">{step.body}</p>
         <div className="mt-3 flex items-center justify-between">
-          <span className="text-[11px] text-text-muted">
+          <span className="text-caption text-text-muted">
             Step {stepIndex + 1} of {totalSteps}
           </span>
+          {/* The app's two sanctioned button types, at the dense `sm` metric the callout
+              already used. `ghost` for Back so the pair doesn't read as two equals. */}
           <div className="flex gap-1.5">
             {stepIndex > 0 && (
-              <button
-                type="button"
-                onClick={goBack}
-                className="rounded-button px-2 py-1 text-[12px] text-text-muted hover:bg-state-hover hover:text-text"
-              >
+              <Button variant="ghost" size="sm" onClick={goBack}>
                 Back
-              </button>
+              </Button>
             )}
-            <button
-              type="button"
-              onClick={goNext}
-              className="tactile rounded-button bg-accent px-2.5 py-1 text-[12px] font-medium text-bg hover:brightness-110"
-            >
+            <Button variant="primary" size="sm" onClick={goNext}>
               {stepIndex + 1 >= totalSteps ? "Done" : "Next"}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -232,7 +227,7 @@ function HoldToSkip({ onSkip }: { onSkip: () => void }) {
       // own full-screen overlay (`--z-tour`, above `--z-tooltip` in the z-scale on purpose), so
       // a portaled Tooltip would render underneath the dimming bands and never be seen.
       title="Press and hold to skip the tour"
-      className="glass fixed bottom-4 right-4 flex items-center gap-1.5 rounded-button px-2.5 py-1.5 text-[12px] text-text-muted hover:text-text"
+      className="glass fixed bottom-4 right-4 flex items-center gap-1.5 rounded-button px-2.5 py-1.5 text-dense text-text-muted transition-colors duration-(--dur-fast) ease-(--ease-out) hover:text-text"
     >
       <svg width="20" height="20" viewBox="0 0 20 20" className="-rotate-90">
         <circle
@@ -254,9 +249,11 @@ function HoldToSkip({ onSkip }: { onSkip: () => void }) {
           strokeDasharray={RING_CIRC}
           strokeDashoffset={holding ? 0 : RING_CIRC}
           style={{
+            // Filling is linear on purpose — it is a progress readout, not an ease.
+            // The release snaps back on the scale's fast step / the app's one curve.
             transition: holding
               ? `stroke-dashoffset ${HOLD_MS}ms linear`
-              : "stroke-dashoffset 150ms ease-out",
+              : "stroke-dashoffset var(--dur-fast) var(--ease-out)",
           }}
         />
       </svg>

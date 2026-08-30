@@ -7,6 +7,7 @@ import {
   type ReactElement,
 } from "react";
 import { createPortal } from "react-dom";
+import { useExitTransition } from "../../lib/useExitTransition";
 
 const SHOW_DELAY_MS = 400;
 const GAP = 6;
@@ -30,7 +31,9 @@ interface TooltipProps {
  */
 export function Tooltip({ label, children, disabled }: TooltipProps) {
   const [open, setOpen] = useState(false);
-  const [visible, setVisible] = useState(false);
+  // Enter and exit. `mounted` outlives `open` by the exit duration so the tooltip fades
+  // away instead of blinking out.
+  const { mounted, visible } = useExitTransition(open);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const anchorRef = useRef<HTMLElement | null>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -44,8 +47,9 @@ export function Tooltip({ label, children, disabled }: TooltipProps) {
   const hide = () => {
     clearTimeout(showTimer.current);
     setOpen(false);
-    setVisible(false);
-    setPos(null);
+    // `pos` is deliberately NOT cleared here — the tooltip stays mounted for the exit
+    // duration, and dropping its position mid-exit would fling it to the -9999 offscreen
+    // fallback instead of fading in place.
   };
   useEffect(() => () => clearTimeout(showTimer.current), []);
 
@@ -60,10 +64,6 @@ export function Tooltip({ label, children, disabled }: TooltipProps) {
       window.innerWidth - tip.width - 8
     );
     setPos({ top, left });
-    // Next frame so the opacity/scale transition below has a "from" state to animate out of,
-    // rather than committing the visible state in the same layout pass and skipping it.
-    const raf = requestAnimationFrame(() => setVisible(true));
-    return () => cancelAnimationFrame(raf);
   }, [open, label]);
 
   // Native DOM elements only (button/span/div) — none carry an existing ref at their
@@ -93,7 +93,7 @@ export function Tooltip({ label, children, disabled }: TooltipProps) {
   return (
     <>
       {child}
-      {open &&
+      {mounted &&
         createPortal(
           <div
             ref={popoverRef}
@@ -106,8 +106,8 @@ export function Tooltip({ label, children, disabled }: TooltipProps) {
             }}
             className={[
               "pointer-events-none z-(--z-tooltip) max-w-[280px] whitespace-normal break-words",
-              "rounded-badge bg-surface-3 px-2 py-1 text-xs text-text shadow-(--shadow-float)",
-              "transition-[opacity,transform] duration-(--dur-fast) ease-(--ease-out)",
+              "rounded-badge bg-surface-3 px-2 py-1 text-dense text-text shadow-(--shadow-float)",
+              "transition-[opacity,scale] duration-(--dur-fast) ease-(--ease-out)",
               visible ? "scale-100 opacity-100" : "scale-[0.97] opacity-0",
             ].join(" ")}
           >

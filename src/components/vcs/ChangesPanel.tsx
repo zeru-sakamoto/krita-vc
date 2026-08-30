@@ -10,6 +10,7 @@ import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWorkingDiff } from "../../lib/repoData";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
+import { ICON } from "../../lib/iconSize";
 import { layerTypeIcon } from "../../lib/friendly";
 import { inTauri } from "../../lib/tauri";
 import { timed } from "../../lib/perf";
@@ -97,12 +98,12 @@ function LayerRowItem({ row }: { row: LayerRow }) {
   return (
     <li className="flex items-center gap-2 px-3 py-1">
       <FileStatusChip status={CHANGE_STATUS[row.change] ?? "M"} />
-      <Icon size={14} weight="regular" className="shrink-0 text-text-muted" />
+      <Icon size={ICON.dense} weight="regular" className="shrink-0 text-text-muted" />
       <Tooltip label={row.name}>
-        <span className="min-w-0 flex-1 truncate text-[12px] text-text">{row.name}</span>
+        <span className="min-w-0 flex-1 truncate text-dense text-text">{row.name}</span>
       </Tooltip>
       {row.nested > 0 && (
-        <span className="shrink-0 text-[10px] text-text-muted">+{row.nested} inside</span>
+        <span className="shrink-0 text-micro text-text-muted">+{row.nested} inside</span>
       )}
     </li>
   );
@@ -202,7 +203,7 @@ export function ChangesPanel({
 
   if (error && items.length === 0) {
     return (
-      <p className="px-3 py-2 text-[12px] text-text-muted">Couldn’t check this artwork: {error}</p>
+      <p className="px-3 py-2 text-dense text-text-muted">Couldn’t check this artwork: {error}</p>
     );
   }
 
@@ -210,14 +211,14 @@ export function ChangesPanel({
     <div className="flex flex-col">
       <div
         data-tour-id="changes-branch"
-        className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-3 text-[11px] text-text-muted"
+        className="flex h-8 shrink-0 items-center gap-1.5 border-b border-border px-3 text-caption text-text-muted"
       >
         Saving to
         <BranchBadge branch={currentBranch} />
       </div>
 
       <div data-tour-id="changes-unstaged">
-        <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
+        <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
           <span className="flex items-center gap-2">
             Since your last version
             {rows.length > 0 && <span className="text-text-muted/70">{rows.length}</span>}
@@ -230,9 +231,9 @@ export function ChangesPanel({
                 type="button"
                 onClick={() => setConfirmDiscard(true)}
                 disabled={saving || checking}
-                className="flex items-center gap-1 rounded-button px-1 py-0.5 text-[10px] normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                className="flex items-center gap-1 rounded-button px-1 py-0.5 text-micro normal-case tracking-normal text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
               >
-                <ArrowCounterClockwise size={11} />
+                <ArrowCounterClockwise size={ICON.inline} />
                 Undo all
               </button>
             </Tooltip>
@@ -240,16 +241,16 @@ export function ChangesPanel({
         </h3>
 
         {!changed ? (
-          <p className="px-3 pb-2 text-[12px] text-text-muted">
+          <p className="px-3 pb-2 text-dense text-text-muted">
             No changes yet — this artwork matches its latest version.
           </p>
         ) : changed.status === "D" ? (
-          <p className="px-3 pb-2 text-[12px] text-text-muted">
+          <p className="px-3 pb-2 text-dense text-text-muted">
             This artwork is missing from its folder. Undo to bring the latest version back.
           </p>
         ) : loading ? (
-          <p className="flex items-center gap-1.5 px-3 pb-2 text-[12px] text-text-muted">
-            <CircleNotch size={12} className="animate-spin" />
+          <p className="flex items-center gap-1.5 px-3 pb-2 text-dense text-text-muted">
+            <CircleNotch size={ICON.inline} className="animate-spin" />
             Looking at what changed…
           </p>
         ) : rows.length > 0 ? (
@@ -259,7 +260,7 @@ export function ChangesPanel({
             ))}
           </ul>
         ) : (
-          <p className="px-3 pb-2 text-[12px] text-text-muted">
+          <p className="px-3 pb-2 text-dense text-text-muted">
             {changed.status === "U"
               ? "First version — the whole artwork will be saved."
               : "Changed outside the layer stack (canvas size, animation, or document settings)."}
@@ -269,25 +270,30 @@ export function ChangesPanel({
 
       {inTauri() && (
         <div className="mt-1 flex flex-col gap-2 border-t border-border p-3">
+          {/* Focus: the sanctioned `.inset-well` exception (DESIGN.md § Focus Ring Spec) — the
+              global ring's 2px offset lands in the gap outside a carved-in field and reads as a
+              halo, so the accent moves onto the field's own edge. `!outline-none` is genuinely
+              needed: the global `:focus-visible` rule is unlayered and beats Tailwind's utilities
+              layer. `focus-visible:` (not `focus:`) so it doesn't fire on mouse click, and the
+              surface step is the non-color co-indicator the exception is required to carry. */}
           <textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             placeholder="Describe this version…"
             rows={2}
             data-tour-id="commit-message"
-            className="resize-none inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[12px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
+            className="resize-none inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-dense text-text placeholder:text-text-muted focus-visible:border-accent focus-visible:bg-surface-2 !outline-none"
           />
-          {commitError && <p className="text-[11px] text-danger">{commitError}</p>}
-          <button
-            type="button"
+          {commitError && <p className="text-caption text-danger">{commitError}</p>}
+          <Button
+            variant="primary"
             onClick={doCommit}
             disabled={!message.trim() || !changed || saving}
             data-tour-id="commit-button"
-            className="flex items-center justify-center gap-1.5 rounded-button bg-accent/15 px-2 py-1.5 text-[12px] font-medium text-accent transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {saving && <CircleNotch size={13} className="animate-spin" />}
+            {saving && <CircleNotch size={ICON.inline} className="animate-spin" />}
             {saving ? "Saving version…" : "Save this version"}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -295,24 +301,24 @@ export function ChangesPanel({
         <Modal
           title="Undo everything since the last version?"
           onClose={() => (saving ? undefined : setConfirmDiscard(false))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setConfirmDiscard(false)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="destructive" onClick={discardAll} disabled={saving}>
                 {saving ? "Undoing…" : "Undo changes"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             This permanently reverts{" "}
             <span className="font-medium text-text">{current?.name ?? "this artwork"}</span> to its
             latest saved version. Everything painted since is lost — including Krita’s undo history
             for it.
           </p>
-          {discardError && <p className="mt-3 text-[12px] text-danger">{discardError}</p>}
+          {discardError && <p className="mt-3 text-dense text-danger">{discardError}</p>}
         </Modal>
       )}
     </div>

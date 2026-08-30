@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowCounterClockwise, ShieldCheck } from "@phosphor-icons/react";
+import { ICON } from "../../lib/iconSize";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { relativeTime } from "../../lib/format";
@@ -74,16 +75,16 @@ export function RestoreCompareModal({
       title={`Compare versions — ${name}`}
       onClose={onClose}
       maxWidthClassName="max-w-3xl"
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={close}>Cancel</Button>
           <Button
             onClick={() => {
               onKeep();
               onClose();
             }}
           >
-            <ShieldCheck size={14} />
+            <ShieldCheck size={ICON.dense} />
             Keep mine
           </Button>
           <Button
@@ -93,23 +94,23 @@ export function RestoreCompareModal({
               onClose();
             }}
           >
-            <ArrowCounterClockwise size={14} />
+            <ArrowCounterClockwise size={ICON.dense} />
             Use the backup
           </Button>
         </>
-      }
+      )}
     >
-      {error && <p className="text-[12px] text-danger">{error}</p>}
-      {!data && !error && <p className="text-[12px] text-text-muted">Reading versions…</p>}
+      {error && <p className="text-dense text-danger">{error}</p>}
+      {!data && !error && <p className="text-dense text-text-muted">Reading versions…</p>}
 
       {data && (
         <>
           {/* The actual answer, before any scrolling: which side is further along. */}
-          <p className="text-[13px] text-text">
+          <p className="text-body text-text">
             The backup has {data.backup.length} version{data.backup.length === 1 ? "" : "s"}. This
             computer has {data.current.length}.
           </p>
-          <p className="mt-1 text-[12px] text-text-muted">
+          <p className="mt-1 text-dense text-text-muted">
             {onlyInBackup === 0 && onlyHere === 0
               ? "Both sides hold the same versions."
               : [
@@ -154,26 +155,29 @@ function VersionColumn({
 }) {
   return (
     <div className="min-w-0">
-      <h3 className="mb-1.5 text-[12px] font-medium text-text-muted">
+      <h3 className="mb-1.5 text-body font-medium text-text">
         {heading} · {rows.length}
       </h3>
       {rows.length === 0 ? (
-        <p className="text-[12px] text-text-muted">No versions saved yet.</p>
+        <p className="text-dense text-text-muted">No versions saved yet.</p>
       ) : (
         <ul className="max-h-72 overflow-auto">
           {rows.map((v, i) => {
             const only = !otherIds.has(v.id);
             return (
-              <li key={v.id} className="rounded-button px-2 py-1.5 hover:bg-state-hover">
+              <li
+                key={v.id}
+                className="rounded-button px-2 py-1.5 transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover"
+              >
                 <span className="flex items-baseline gap-2">
                   {/* Numbered per side — same positional formula as `versionNumbers`. The two
                       columns therefore only line up when one history is a superset of the
                       other, which is exactly the case this dialog exists for. */}
-                  <span className="text-[13px] text-text">{versionLabel(rows.length - i)}</span>
-                  <span className="text-[11px] text-text-muted">{relativeTime(v.timestamp)}</span>
-                  {only && <span className="text-[11px] text-warning-fg">{onlyLabel}</span>}
+                  <span className="text-body text-text">{versionLabel(rows.length - i)}</span>
+                  <span className="text-caption text-text-muted">{relativeTime(v.timestamp)}</span>
+                  {only && <span className="text-caption text-warning-fg">{onlyLabel}</span>}
                 </span>
-                <span className="block truncate text-[12px] text-text-muted">
+                <span className="block truncate text-dense text-text-muted">
                   {v.message || "No description"}
                 </span>
               </li>

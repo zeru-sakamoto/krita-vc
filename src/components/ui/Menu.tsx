@@ -1,6 +1,8 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useExitTransition } from "../../lib/useExitTransition";
 import { CaretDown } from "@phosphor-icons/react";
+import { ICON } from "../../lib/iconSize";
 
 export interface MenuItem {
   id: string;
@@ -69,9 +71,16 @@ export function Menu({
     right?: number;
     width: number;
   } | null>(null);
+  // Enter AND exit (DESIGN.md § Per-Interaction Timing: dropdown = --dur-normal,
+  // scale(0.95) + opacity; exit one step quicker). `mounted` outlives `open` by the exit
+  // duration so the popover animates away instead of vanishing, and `pos` is deliberately
+  // never cleared so the outgoing popover keeps animating where it stood.
+  const { mounted, visible } = useExitTransition(open);
 
   useLayoutEffect(() => {
     if (!open || !rootRef.current) return;
+    // Measured off the *trigger*, before the popover's scale() exists — so the enter
+    // transform can never feed back into the position it's animating out of.
     const rect = rootRef.current.getBoundingClientRect();
     setPos(
       align === "right"
@@ -125,8 +134,8 @@ export function Menu({
           setInternalOpen(false);
         }}
         className={[
-          "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
-          "transition-colors hover:bg-state-hover",
+          "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left text-body",
+          "transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover",
           "disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent",
           item.selected ? "text-accent" : "text-text",
         ].join(" ")}
@@ -144,12 +153,12 @@ export function Menu({
         >
           <span className="truncate">{item.label}</span>
           {item.detail && (
-            <span className="truncate font-mono text-[10px] text-text-muted">{item.detail}</span>
+            <span className="truncate font-mono text-micro text-text-muted">{item.detail}</span>
           )}
         </span>
       </button>
       {item.action && (
-        <span className="absolute right-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <span className="absolute right-1.5 opacity-0 transition-opacity duration-(--dur-fast) ease-(--ease-out) group-hover:opacity-100">
           {item.action}
         </span>
       )}
@@ -170,7 +179,7 @@ export function Menu({
         {trigger(open)}
       </button>
 
-      {open &&
+      {mounted &&
         pos &&
         createPortal(
           <div
@@ -182,8 +191,22 @@ export function Menu({
               top: pos.top,
               left: pos.left,
               right: pos.right,
+              // DESIGN.md § Principles: popovers scale from their trigger origin, not
+              // from their own center. The popover hangs off whichever trigger edge
+              // `align` picked, so that edge is the origin.
+              transformOrigin: align === "right" ? "top right" : "top left",
             }}
-            className="glass fixed z-(--z-modal) overflow-hidden rounded-panel shadow-(--shadow-float)"
+            className={[
+              "glass fixed z-(--z-modal) overflow-hidden rounded-panel shadow-(--shadow-float)",
+              "transition-[opacity,scale] ease-(--ease-out)",
+              // Exit is quicker than enter and must finish inside EXIT_MS, else the
+              // unmount cuts the fade off partway. While exiting the popover is still
+              // mounted, so it's also made inert — it must not swallow a click aimed at
+              // whatever is behind it.
+              visible
+                ? "duration-(--dur-normal) scale-100 opacity-100"
+                : "pointer-events-none duration-(--dur-fast) scale-95 opacity-0",
+            ].join(" ")}
           >
             <div className="max-h-72 overflow-auto py-1">{items.map(renderItem)}</div>
             {footer && footer.length > 0 && (
@@ -226,13 +249,13 @@ export function Select<T extends string | number>({
       trigger={(open) => (
         <span
           className={[
-            "inset-well flex w-full items-center justify-between gap-2 rounded-button border bg-bg px-2 py-1.5 text-left text-[13px] text-text",
+            "inset-well flex w-full items-center justify-between gap-2 rounded-button border bg-bg px-2 py-1.5 text-left text-body text-text",
             disabled ? "opacity-50" : "",
             open ? "border-accent" : "border-border",
           ].join(" ")}
         >
           <span className="min-w-0 flex-1 truncate">{cur?.label ?? ""}</span>
-          <CaretDown size={12} weight="bold" className="shrink-0 text-text-muted" />
+          <CaretDown size={ICON.inline} weight="bold" className="shrink-0 text-text-muted" />
         </span>
       )}
     />

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { FolderOpen, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { BusyOverlay } from "./BusyOverlay";
+import { PanelHeader } from "./DockerPanel";
 import { Sidebar } from "./Sidebar";
 import { Inspector } from "./Inspector";
 import { StatusBar } from "./StatusBar";
@@ -10,6 +11,7 @@ import { TourOverlay } from "./TourOverlay";
 import { MainPanel } from "../MainPanel";
 import { VersionMapPanel } from "../vcs/VersionMapPanel";
 import { IconButton } from "../ui/IconButton";
+import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
 import { useLegacyHistory } from "../../lib/legacyHistory";
@@ -56,15 +58,15 @@ function WelcomeShell() {
           status bar here, so the margin supplies all three missing edges. */}
       <div className="mx-2 mb-2 grid min-h-0 flex-1 place-items-center rounded-well bg-bg p-2">
         <div className="raised flex max-w-sm flex-col items-center gap-3 rounded-panel bg-surface px-8 py-10 text-center">
-          <FolderOpen size={40} className="text-text-muted" />
-          <h1 className="text-[15px] font-medium">No artwork yet</h1>
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <FolderOpen size={ICON.display} className="text-text-muted" />
+          <h1 className="text-heading font-medium">No artwork yet</h1>
+          <p className="text-body leading-relaxed text-text-muted">
             Use the switcher in the top-left corner to pick a Krita artwork to track. Its version
             history will appear here.
           </p>
           {/* The other half of an empty list is "I already had artworks" — after a reinstall or
               a lost drive, this screen is exactly where that person lands. */}
-          <p className="text-[12px] leading-relaxed text-text-muted">
+          <p className="text-dense leading-relaxed text-text-muted">
             Got a backup? The same menu has{" "}
             <span className="text-text">Restore from a backup…</span>
           </p>
@@ -244,52 +246,57 @@ function RepoShell({ repo }: { repo: Repository }) {
           {!showMap && (
             <>
               <div className="raised flex min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
-                {/* Card header — commit context (left) + inspector toggle (right).
-                Matches DockerPanel's header so every card reads the same. */}
-                <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-                  {inChanges ? (
-                    showWorking ? (
+                {/* Card header — commit context in the `meta` slot, inspector toggle in
+                    `actions`. No `title`: this card is named by what it is showing, not by a
+                    fixed caption, so the whole bar is content. */}
+                <PanelHeader
+                  meta={
+                    inChanges ? (
+                      showWorking ? (
+                        <>
+                          <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-caption text-text-muted">
+                            Unsaved changes
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-body text-text">
+                            {artistMode ? assetName(focusedFile) : focusedFile}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="text-body text-text-muted">No changes to show</span>
+                      )
+                    ) : selectedCommit ? (
                       <>
-                        <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
-                          Unsaved changes
+                        <span
+                          className={[
+                            "text-dense text-text-muted",
+                            artistMode ? "font-medium" : "font-mono",
+                          ].join(" ")}
+                        >
+                          {artistMode ? versionLabel(selectedVersion) : selectedCommit.hash}
                         </span>
-                        <span className="min-w-0 flex-1 truncate text-[13px] text-text">
-                          {artistMode ? assetName(focusedFile) : focusedFile}
+                        <span className="min-w-0 flex-1 truncate text-body text-text">
+                          {selectedCommit.message}
                         </span>
                       </>
                     ) : (
-                      <span className="flex-1 text-[13px] text-text-muted">No changes to show</span>
+                      <span className="text-body text-text-muted">
+                        {artistMode ? "No version selected" : "No commit selected"}
+                      </span>
                     )
-                  ) : selectedCommit ? (
-                    <>
-                      <span
-                        className={[
-                          "text-[12px] text-text-muted",
-                          artistMode ? "font-medium" : "font-mono",
-                        ].join(" ")}
-                      >
-                        {artistMode ? versionLabel(selectedVersion) : selectedCommit.hash}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-[13px] text-text">
-                        {selectedCommit.message}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="flex-1 text-[13px] text-text-muted">
-                      {artistMode ? "No version selected" : "No commit selected"}
-                    </span>
-                  )}
-                  {!inspectorOpen && (
-                    <IconButton
-                      icon={SidebarSimple}
-                      label="Show inspector"
-                      size={18}
-                      onClick={() => setInspectorOpen(true)}
-                      tourId="inspector"
-                      iconClassName="-scale-x-100"
-                    />
-                  )}
-                </div>
+                  }
+                  actions={
+                    !inspectorOpen && (
+                      <IconButton
+                        icon={SidebarSimple}
+                        label="Show inspector"
+                        size={ICON.default}
+                        onClick={() => setInspectorOpen(true)}
+                        tourId="inspector"
+                        iconClassName="-scale-x-100"
+                      />
+                    )
+                  }
+                />
 
                 <MainPanel
                   diff={diff}

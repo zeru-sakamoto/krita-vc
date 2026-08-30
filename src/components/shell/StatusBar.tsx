@@ -1,4 +1,5 @@
 import { GitBranch } from "@phosphor-icons/react";
+import { ICON } from "../../lib/iconSize";
 import { assetName } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
@@ -26,7 +27,7 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
   const { artistMode } = useArtistMode();
   const { saving } = useRepository();
   return (
-    <footer className="relative flex h-6 shrink-0 items-center justify-between bg-surface px-3 text-[11px] text-text-muted">
+    <footer className="relative flex h-6 shrink-0 items-center justify-between bg-surface px-3 text-caption text-text-muted">
       {/* Indeterminate save progress — only while a commit is being written */}
       {saving && (
         <div
@@ -56,7 +57,12 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
         {!inTauri() && (
           <>
             <Tooltip label="No backend in the browser. Run the desktop app to work with real repositories.">
-              <span className="rounded-badge bg-warning/20 px-1.5 py-px font-medium uppercase tracking-wide text-warning-fg">
+              {/* The border, not the fill, is what makes this read as a chip on the two light
+                  themes: there `--warning` is already a pale #f6ecc9, so a 20% wash of it over a
+                  cream page is invisible and the badge degraded to bare text. `--warning-fg` is
+                  the one warning token defined to contrast with its own theme's background, so
+                  the outline holds in all eight. */}
+              <span className="rounded-badge border border-warning-fg/40 bg-warning/20 px-1.5 py-px font-medium uppercase tracking-wide text-warning-fg">
                 Browser preview
               </span>
             </Tooltip>
@@ -64,7 +70,7 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
           </>
         )}
         <span className="flex items-center gap-1">
-          <GitBranch size={12} />
+          <GitBranch size={ICON.inline} />
           {branch}
         </span>
         <Separator />

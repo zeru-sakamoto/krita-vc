@@ -120,10 +120,10 @@ export const CompareSlider = memo(function CompareSlider({
       </div>
 
       {/* State labels */}
-      <span className="pointer-events-none absolute left-2 top-2 rounded-badge bg-bg/70 px-1.5 py-0.5 text-[11px] font-medium uppercase text-text-muted">
+      <span className="pointer-events-none absolute left-2 top-2 rounded-badge bg-bg/70 px-1.5 py-0.5 text-caption font-medium uppercase text-text-muted">
         Before
       </span>
-      <span className="pointer-events-none absolute right-2 top-2 rounded-badge bg-bg/70 px-1.5 py-0.5 text-[11px] font-medium uppercase text-text-muted">
+      <span className="pointer-events-none absolute right-2 top-2 rounded-badge bg-bg/70 px-1.5 py-0.5 text-caption font-medium uppercase text-text-muted">
         After
       </span>
 
@@ -145,7 +145,7 @@ export const CompareSlider = memo(function CompareSlider({
         className="absolute top-0 z-(--z-sticky) h-full w-1 -translate-x-1/2 cursor-col-resize bg-accent"
         style={{ left: `${pos}%` }}
       >
-        <span className="absolute top-1/2 left-1/2 grid h-6 w-6 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border-2 border-bg bg-accent text-[10px] text-bg">
+        <span className="absolute top-1/2 left-1/2 grid h-6 w-6 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border-2 border-bg bg-accent text-micro text-bg">
           ⇆
         </span>
       </div>

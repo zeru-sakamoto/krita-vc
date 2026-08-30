@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { FileZip } from "@phosphor-icons/react";
+import { ICON } from "../../lib/iconSize";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Checkbox } from "../ui/Checkbox";
@@ -45,16 +46,16 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
       <Modal
         title="Backup complete"
         onClose={onClose}
-        footer={<Button onClick={onClose}>Close</Button>}
+        footer={(close) => <Button onClick={close}>Close</Button>}
       >
-        <p className="text-[13px] text-text">
+        <p className="text-body text-text">
           {succeeded} of {selected.length} artwork{selected.length === 1 ? "" : "s"} backed up.
         </p>
-        <p className="mt-1 break-all text-[12px] text-text-muted">Saved to {result.dest}</p>
+        <p className="mt-1 break-all text-dense text-text-muted">Saved to {result.dest}</p>
         {result.failed.length > 0 && (
           <>
-            <p className="mt-3 text-[12px] text-text-muted">These couldn’t be backed up:</p>
-            <ul className="mt-1 flex flex-col gap-1 font-mono text-[12px] text-danger">
+            <p className="mt-3 text-dense text-text-muted">These couldn’t be backed up:</p>
+            <ul className="mt-1 flex flex-col gap-1 font-mono text-dense text-danger">
               {result.failed.map((path) => (
                 <li key={path} className="truncate">
                   {path}
@@ -72,33 +73,33 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
     <Modal
       title="Back up artworks"
       onClose={onClose}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose} disabled={busy}>
+          <Button onClick={close} disabled={busy}>
             Cancel
           </Button>
           <Button variant="primary" disabled={busy || selected.length === 0} onClick={run}>
-            <FileZip size={14} />
+            <FileZip size={ICON.dense} />
             {busy
               ? "Backing up…"
               : `Back up ${selected.length} artwork${selected.length === 1 ? "" : "s"}…`}
           </Button>
         </>
-      }
+      )}
     >
-      <p className="text-[13px] text-text-muted">
+      <p className="text-body text-text-muted">
         Everything you pick goes into one zip file — each artwork with its full version history.
         There’s no cloud sync, so this is the only copy that survives a lost drive.
       </p>
 
       {repositories.length === 0 ? (
-        <p className="mt-3 text-[12px] text-text-muted">
+        <p className="mt-3 text-dense text-text-muted">
           You aren’t tracking any artworks yet, so there’s nothing to back up.
         </p>
       ) : (
         <>
           <div className="mt-3 flex items-center justify-between">
-            <span className="text-[11px] uppercase tracking-wide text-text-muted">Artworks</span>
+            <span className="text-body font-medium text-text">Artworks</span>
             <button
               type="button"
               disabled={busy}
@@ -107,7 +108,7 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
                   selected.length === repositories.length ? [] : repositories.map((r) => r.id)
                 )
               }
-              className="rounded-button px-1.5 py-0.5 text-[12px] text-text-muted hover:bg-state-hover hover:text-text disabled:opacity-40"
+              className="rounded-button px-1.5 py-0.5 text-dense text-text-muted transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover hover:text-text disabled:opacity-40"
             >
               {selected.length === repositories.length ? "Select none" : "Select all"}
             </button>
@@ -115,7 +116,7 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
           <ul className="-mx-1 mt-1 max-h-64 overflow-auto">
             {repositories.map((repo) => (
               <li key={repo.id}>
-                <label className="flex cursor-pointer items-start gap-2 rounded-button px-2 py-1.5 hover:bg-state-hover">
+                <label className="flex cursor-pointer items-start gap-2 rounded-button px-2 py-1.5 transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover">
                   <Checkbox
                     checked={selected.includes(repo.id)}
                     disabled={busy}
@@ -123,8 +124,8 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
                     className="mt-0.5"
                   />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] text-text">{repo.name}</span>
-                    <span className="block truncate text-[11px] text-text-muted">
+                    <span className="block truncate text-body text-text">{repo.name}</span>
+                    <span className="block truncate text-caption text-text-muted">
                       {backupAgeLabel(repo.lastBackupAt)}
                     </span>
                   </span>
@@ -135,7 +136,7 @@ export function BackupModal({ onClose }: { onClose: () => void }) {
         </>
       )}
 
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+      {error && <p className="mt-3 text-dense text-danger">{error}</p>}
     </Modal>
   );
 }

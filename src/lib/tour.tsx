@@ -53,8 +53,8 @@ const withVersions = (c: TourConditions) => c.hasVersions;
 export const TOUR_STEPS: TourStep[] = [
   {
     tourId: "repo-switcher",
-    title: "Your repositories",
-    body: "Switch between local repositories here, or create/open another one.",
+    title: "Your artworks",
+    body: "Switch between the artworks you're tracking, or track/restore another one — this opens a searchable list.",
   },
   {
     tourId: "changes",

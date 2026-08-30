@@ -1,6 +1,7 @@
 import { CircleNotchIcon, FilesIcon, WarningIcon } from "@phosphor-icons/react";
 import { DiffView } from "./vcs/DiffView";
 import type { DiffEntry } from "../types";
+import { ICON } from "../lib/iconSize";
 
 interface MainPanelProps {
   diff: DiffEntry[];
@@ -68,19 +69,19 @@ export function MainPanel({
       <div className="grid flex-1 place-items-center text-text-muted">
         {loading ? (
           <div className="flex flex-col items-center gap-2">
-            <CircleNotchIcon size={28} className="animate-spin text-accent" />
-            <p className="text-[13px]">Analyzing changes…</p>
+            <CircleNotchIcon size={ICON.display} className="animate-spin text-accent" />
+            <p className="text-body">Analyzing changes…</p>
           </div>
         ) : error ? (
           <div className="flex max-w-sm flex-col items-center gap-2 px-4 text-center">
-            <WarningIcon size={32} weight="regular" className="text-danger" />
-            <p className="text-[13px]">Couldn’t build this diff.</p>
-            <p className="text-[12px] text-text-muted/80">{error}</p>
+            <WarningIcon size={ICON.display} weight="regular" className="text-danger" />
+            <p className="text-body">Couldn’t build this diff.</p>
+            <p className="text-dense text-text-muted/80">{error}</p>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-2">
-            <FilesIcon size={32} weight="regular" />
-            <p className="text-[13px]">{emptyHint ?? "Select a commit to view its diff."}</p>
+            <FilesIcon size={ICON.display} weight="regular" />
+            <p className="text-body">{emptyHint ?? "Select a commit to view its diff."}</p>
           </div>
         )}
       </div>

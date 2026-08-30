@@ -4,6 +4,7 @@ import { BranchBadge } from "./BranchBadge";
 import { IconButton } from "../ui/IconButton";
 import { Tooltip } from "../ui/Tooltip";
 import { useBranchActions } from "./useBranchActions";
+import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 
 /**
@@ -28,7 +29,7 @@ export function BranchesPanel({
   return (
     <div className="flex flex-col">
       <div>
-        <h3 className="flex h-8 shrink-0 items-center px-3 text-[11px] font-medium uppercase tracking-wide text-text-muted">
+        <h3 className="flex h-8 shrink-0 items-center px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
           Local
         </h3>
         <ul className="flex flex-col">
@@ -44,25 +45,26 @@ export function BranchesPanel({
                   onClick={() => actions.switchTo(b.name)}
                   disabled={saving}
                   className={[
-                    "flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors",
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-left",
+                    "transition-colors duration-(--dur-instant) ease-(--ease-out)",
                     active ? "row-selected" : "hover:bg-state-hover",
                   ].join(" ")}
                 >
                   <BranchBadge branch={b} />
                   {active && (
                     <Tooltip label={artistMode ? "You're working here" : "Current branch"}>
-                      <Check size={13} className="ml-auto text-accent" />
+                      <Check size={ICON.inline} className="ml-auto text-accent" />
                     </Tooltip>
                   )}
                 </button>
                 {!active && (
-                  <span className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+                  <span className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity duration-(--dur-fast) ease-(--ease-out) focus-within:opacity-100 group-hover:opacity-100">
                     <IconButton
                       icon={GitMerge}
                       label={
                         artistMode ? `Bring ${b.name} into ${current}` : `Merge into ${current}`
                       }
-                      size={14}
+                      size={ICON.dense}
                       disabled={saving || !b.tip}
                       onClick={() => actions.askMerge(b.name)}
                     />
@@ -70,7 +72,7 @@ export function BranchesPanel({
                       <IconButton
                         icon={Trash}
                         label={artistMode ? "Remove this version line" : "Delete branch"}
-                        size={14}
+                        size={ICON.dense}
                         disabled={saving}
                         onClick={() => actions.askDelete(b.name)}
                       />
@@ -88,13 +90,13 @@ export function BranchesPanel({
         onClick={() => actions.askCreate()}
         disabled={saving}
         data-tour-id="branches-new"
-        className="mx-3 mt-2 flex items-center gap-1.5 rounded-button px-1 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text"
+        className="mx-3 mt-2 flex items-center gap-1.5 rounded-button px-1 py-1 text-dense text-text-muted transition-colors duration-(--dur-instant) ease-(--ease-out) hover:bg-state-hover hover:text-text"
       >
-        <Plus size={13} />
+        <Plus size={ICON.inline} />
         {artistMode ? "New version line" : "New branch"}
       </button>
 
-      {actions.error && <p className="px-3 pt-2 text-[12px] text-danger">{actions.error}</p>}
+      {actions.error && <p className="px-3 pt-2 text-dense text-danger">{actions.error}</p>}
 
       {actions.dialogs}
     </div>

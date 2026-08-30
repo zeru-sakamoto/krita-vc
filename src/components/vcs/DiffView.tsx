@@ -7,6 +7,7 @@ import { LayerStackPanel, PALETTE_ID } from "./LayerStackPanel";
 import { useArtistMode } from "../../lib/artistMode";
 import { assetKind, assetName, paletteName, statusVerb } from "../../lib/friendly";
 import { useState } from "react";
+import { ICON } from "../../lib/iconSize";
 
 /** Per-line background/foreground per DESIGN.md → Diff Colors. */
 function lineClasses(kind: DiffLine["kind"]): string {
@@ -24,7 +25,7 @@ function lineClasses(kind: DiffLine["kind"]): string {
 
 function gutter(n?: number) {
   return (
-    <span className="w-10 shrink-0 select-none pr-2 text-right text-[11px] text-text-muted/70">
+    <span className="w-10 shrink-0 select-none pr-2 text-right text-caption text-text-muted/70">
       {n ?? ""}
     </span>
   );
@@ -36,11 +37,11 @@ function DiffFileBlock({ file }: { file: TextDiff }) {
       {/* File path header */}
       <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-y border-border bg-surface px-3 py-1.5">
         <FileStatusChip status={file.status} />
-        <span className="selectable font-mono text-[12px] text-text">{file.path}</span>
+        <span className="selectable font-mono text-dense text-text">{file.path}</span>
       </div>
 
       {/* Diff lines */}
-      <div className="font-mono text-[12px] leading-[1.6]">
+      <div className="font-mono text-dense leading-[1.6]">
         {file.lines.map((line, i) => {
           const isHunk = line.kind === "hunk";
           return (
@@ -71,7 +72,7 @@ function GenericSummary({ file }: { file: TextDiff }) {
   const detail = parts.length > 0 ? ` — ${parts.join(", ")}` : "";
   const verb = file.status === "A" ? "created" : file.status === "D" ? "removed" : "updated";
   return (
-    <p className="px-3 py-2 text-[13px] text-text-muted">
+    <p className="px-3 py-2 text-body text-text-muted">
       {`${kind.charAt(0).toUpperCase()}${kind.slice(1)} ${verb}${detail}.`}
     </p>
   );
@@ -85,10 +86,10 @@ function FriendlyFileDiff({ file }: { file: TextDiff }) {
     <div className="border-b border-border">
       {/* Friendly header */}
       <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-y border-border bg-surface px-3 py-2">
-        <Icon size={16} className="shrink-0 text-text-muted" />
-        <span className="text-[13px] font-medium text-text">{assetName(file.path)}</span>
-        <span className="text-[12px] text-text-muted">{kind.label}</span>
-        <span className="ml-auto rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+        <Icon size={ICON.default} className="shrink-0 text-text-muted" />
+        <span className="text-body font-medium text-text">{assetName(file.path)}</span>
+        <span className="text-dense text-text-muted">{kind.label}</span>
+        <span className="ml-auto rounded-badge bg-surface-3 px-1.5 py-0.5 text-caption text-text-muted">
           {statusVerb(file.status)}
         </span>
       </div>
@@ -120,8 +121,8 @@ function StandalonePaletteDiff({ palette }: { palette: PaletteDiff }) {
       {/* Header */}
       <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-y border-border bg-surface px-3 py-1.5">
         <FileStatusChip status={palette.status} />
-        <PaletteIcon size={14} className="shrink-0 text-text-muted" />
-        <span className="selectable text-[12px] font-medium text-text">
+        <PaletteIcon size={ICON.dense} className="shrink-0 text-text-muted" />
+        <span className="selectable text-dense font-medium text-text">
           {artistMode ? paletteName(palette.path) : palette.path}
         </span>
       </div>

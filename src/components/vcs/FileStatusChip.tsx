@@ -8,6 +8,7 @@ import {
   type Icon,
 } from "@phosphor-icons/react";
 import type { FileStatus } from "../../types";
+import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { Tooltip } from "../ui/Tooltip";
 
@@ -35,11 +36,11 @@ export function FileStatusChip({ status }: { status: FileStatus }) {
       <Tooltip label={label}>
         <span
           className={[
-            "inline-flex items-center gap-1 text-[11px] font-medium leading-none",
+            "inline-flex items-center gap-1 text-caption font-medium leading-none",
             color,
           ].join(" ")}
         >
-          <Icon size={12} weight="bold" />
+          <Icon size={ICON.inline} weight="bold" />
           {label}
         </span>
       </Tooltip>
@@ -48,7 +49,7 @@ export function FileStatusChip({ status }: { status: FileStatus }) {
 
   return (
     <Tooltip label={label}>
-      <span className={["font-mono text-[11px] font-medium leading-none", color].join(" ")}>
+      <span className={["font-mono text-caption font-medium leading-none", color].join(" ")}>
         {status}
       </span>
     </Tooltip>

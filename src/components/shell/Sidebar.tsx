@@ -31,6 +31,7 @@ import {
   isStashConflictError,
   type StashScope,
 } from "../vcs/StashDialogs";
+import { ICON } from "../../lib/iconSize";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
 import { useStashes } from "../../lib/repoData";
@@ -193,7 +194,7 @@ export function Sidebar({
             // "staged files" row would have been a second button doing the same thing.
             id: "stash-all",
             label: artistMode ? "Set this aside" : "Stash changes",
-            icon: <StashIcon size={14} />,
+            icon: <StashIcon size={ICON.dense} />,
             separator: true,
             tourId: "panel-option-stash-all",
             // Needs a commit to revert back to, same guard as undo.
@@ -207,7 +208,7 @@ export function Sidebar({
     {
       id: "stash-pop-latest",
       label: artistMode ? "Bring back latest" : "Pop latest stash",
-      icon: <UnstashIcon size={14} />,
+      icon: <UnstashIcon size={ICON.dense} />,
       detail:
         stashes.length === 0
           ? undefined
@@ -222,7 +223,7 @@ export function Sidebar({
     {
       id: "stash-pick",
       label: artistMode ? "Bring back…" : "Pop stash…",
-      icon: <ListBullets size={14} />,
+      icon: <ListBullets size={ICON.dense} />,
       tourId: "panel-option-stash-pick",
       disabled: stashes.length === 0 || saving,
       onSelect: () => setPickStash(true),
@@ -247,11 +248,11 @@ export function Sidebar({
               "grid h-8 w-8 place-items-center rounded-button text-text-muted",
               checking
                 ? "cursor-not-allowed opacity-40"
-                : "transition-colors hover:bg-state-hover hover:text-text",
-              open ? "bg-white/5 text-text" : "",
+                : "transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover hover:text-text",
+              open ? "bg-state-hover text-text" : "",
             ].join(" ")}
           >
-            <DotsThreeVertical size={16} />
+            <DotsThreeVertical size={ICON.default} />
           </span>
         </Tooltip>
       )}
@@ -259,7 +260,7 @@ export function Sidebar({
         {
           id: "undo",
           label: artistMode ? "Undo the last version" : "Undo the last commit",
-          icon: <ArrowUUpLeft size={14} />,
+          icon: <ArrowUUpLeft size={ICON.dense} />,
           tourId: "panel-option-undo",
           disabled: commits.length === 0 || saving,
           onSelect: () => {
@@ -272,7 +273,7 @@ export function Sidebar({
               {
                 id: "discard-all",
                 label: "Discard current changes",
-                icon: <ArrowCounterClockwise size={14} />,
+                icon: <ArrowCounterClockwise size={ICON.dense} />,
                 tourId: "panel-option-discard-all",
                 disabled: changedPaths.length === 0 || saving,
                 onSelect: () => {
@@ -300,7 +301,7 @@ export function Sidebar({
               <IconButton
                 icon={ArrowsClockwise}
                 label="Rescan for changes"
-                size={16}
+                size={ICON.default}
                 spinning={scanning}
                 disabled={scanning}
                 onClick={refresh}
@@ -324,14 +325,14 @@ export function Sidebar({
                   // whole span would stack both tooltips when hovering the badge itself.
                   <span
                     data-tour-id="history-branch"
-                    className="flex items-center gap-1.5 rounded-button px-1 py-0.5 hover:bg-state-hover"
+                    className="flex items-center gap-1.5 rounded-button px-1 py-0.5 transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover"
                   >
                     <BranchBadge branch={currentBranch} />
                     <Tooltip
                       label={artistMode ? "Choose which version line to view" : "Switch branch"}
                     >
                       <span className="flex items-center">
-                        <CaretDown size={12} className="text-text-muted" />
+                        <CaretDown size={ICON.inline} className="text-text-muted" />
                       </span>
                     </Tooltip>
                   </span>
@@ -346,18 +347,18 @@ export function Sidebar({
                   {
                     id: "new-branch",
                     label: artistMode ? "New version line…" : "New branch…",
-                    icon: <Plus size={13} />,
+                    icon: <Plus size={ICON.inline} />,
                     onSelect: () => branchActions.askCreate(),
                   },
                 ]}
               />
-              <span className="text-[11px] text-text-muted">
+              <span className="text-caption text-text-muted">
                 {commits.length} {artistMode ? "versions" : "commits"}
               </span>
             </div>
 
             {branchActions.error && (
-              <p className="px-3 pt-2 text-[12px] text-danger">{branchActions.error}</p>
+              <p className="px-3 pt-2 text-dense text-danger">{branchActions.error}</p>
             )}
 
             <div data-tour-id="history-versions">
@@ -397,7 +398,7 @@ export function Sidebar({
         onPointerUp={onPointerUp}
         className={`group absolute -right-2 top-0 z-(--z-panel) flex h-full w-2 items-center justify-center ${cursorClass}`}
       >
-        <div className="h-10 w-0.5 rounded-full bg-transparent transition-colors group-hover:bg-accent" />
+        <div className="h-10 w-0.5 rounded-full bg-transparent transition-colors duration-(--dur-fast) ease-(--ease-out) group-hover:bg-accent" />
       </div>
 
       {branchActions.dialogs}
@@ -432,23 +433,23 @@ export function Sidebar({
         <Modal
           title={artistMode ? "Undo the last version?" : "Undo the last commit?"}
           onClose={() => (saving ? undefined : setConfirmUndo(false))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setConfirmUndo(false)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="primary" onClick={onUndo} disabled={saving}>
                 {saving ? "Undoing…" : "Undo"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             This removes the most recent {artistMode ? "version" : "commit"} from history. Your
             files are left exactly as they are — the changes reappear as unsaved work, ready to
             re-save.
           </p>
-          {undoError && <p className="mt-3 text-[12px] text-danger">{undoError}</p>}
+          {undoError && <p className="mt-3 text-dense text-danger">{undoError}</p>}
         </Modal>
       )}
 
@@ -456,22 +457,22 @@ export function Sidebar({
         <Modal
           title="Discard current changes?"
           onClose={() => (saving ? undefined : setConfirmDiscardAll(false))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setConfirmDiscardAll(false)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="destructive" onClick={onDiscardAll} disabled={saving}>
                 {saving ? "Discarding…" : "Discard"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             This permanently reverts this artwork to its latest saved version. Everything painted
             since is lost — including Krita's undo history for it.
           </p>
-          {discardAllError && <p className="mt-3 text-[12px] text-danger">{discardAllError}</p>}
+          {discardAllError && <p className="mt-3 text-dense text-danger">{discardAllError}</p>}
         </Modal>
       )}
     </div>

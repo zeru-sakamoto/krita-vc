@@ -26,6 +26,7 @@ import {
   Trash,
 } from "@phosphor-icons/react";
 import { MainPanel } from "../MainPanel";
+import { PanelHeader } from "../shell/DockerPanel";
 import { Inspector } from "../shell/Inspector";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
@@ -46,6 +47,7 @@ import { useCommitDiff, useCommits } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
 import { assetName, versionLabel } from "../../lib/friendly";
+import { ICON } from "../../lib/iconSize";
 import { bendFraction, buildVersionMap } from "../../lib/versionMap";
 import type { Branch, Commit } from "../../types";
 
@@ -397,65 +399,70 @@ function VersionMap({
 
   return (
     <section className="raised flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-3 pr-1">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">
-          {artistMode ? "Version map" : `Version map · ${currentBranch.name}`}
-        </span>
-        <span className="flex-1 text-[11px] text-text-muted">
-          {drawn.length} {artistMode ? "versions" : "commits"}
-          {showAll && layout.laneCount > 1 && (
-            <>
-              {" · "}
-              {layout.laneCount} {artistMode ? "lines" : "branches"}
-            </>
-          )}
-        </span>
-        {drawn.length > 0 && (
-          <>
-            {otherBranches > 0 && (
+      <PanelHeader
+        title={artistMode ? "Version map" : `Version map · ${currentBranch.name}`}
+        meta={
+          <span className="text-caption text-text-muted">
+            {drawn.length} {artistMode ? "versions" : "commits"}
+            {showAll && layout.laneCount > 1 && (
               <>
-                {/* Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
-                    every other map target is a plain `data-tour-id` too. */}
-                <span data-tour-id="map-all-lines" className="flex items-center">
-                  <Switch
-                    active={showAll}
-                    icon={GitBranch}
-                    text={artistMode ? "All lines" : "All branches"}
-                    label={
-                      artistMode
-                        ? showAll
-                          ? "Show only the line you're on"
-                          : `Show all version lines (${otherBranches} other)`
-                        : showAll
-                          ? "Show only the current branch"
-                          : `Show all branches (${otherBranches} other)`
-                    }
-                    onClick={toggleShowAll}
-                  />
-                </span>
-                <span className="mx-1 h-4 w-px bg-text-muted/40" />
+                {" · "}
+                {layout.laneCount} {artistMode ? "lines" : "branches"}
               </>
             )}
-            {/* One spotlight for all three: consecutive holes over adjacent 16px buttons read as
-                padding, not as teaching. `gap-2` reproduces what the header was giving them. */}
-            <span data-tour-id="map-view-controls" className="flex items-center gap-2">
-              <ZoomReadout />
-              <IconButton
-                icon={ArrowsOut}
-                label="Fit all versions"
-                size={16}
-                onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
-              />
-              <IconButton
-                icon={CaretLineRight}
-                label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
-                size={16}
-                onClick={jumpToLatest}
-              />
-            </span>
-          </>
-        )}
-      </header>
+          </span>
+        }
+        actions={
+          drawn.length > 0 ? (
+            // Its own `gap-2` container: PanelHeader's `actions` slot spaces at `gap-1`, and this
+            // row's switch + divider + readout + chips need the wider rhythm the header gave them.
+            <div className="flex items-center gap-2">
+              {otherBranches > 0 && (
+                <>
+                  {/* Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
+                      every other map target is a plain `data-tour-id` too. */}
+                  <span data-tour-id="map-all-lines" className="flex items-center">
+                    {/* `sm`: this is a toolbar row beside 32x32 icon chips, which is exactly what
+                        the small track was sized for — `md` is the settings-list metric. */}
+                    <Switch
+                      active={showAll}
+                      size="sm"
+                      icon={GitBranch}
+                      text={artistMode ? "All lines" : "All branches"}
+                      label={
+                        artistMode
+                          ? showAll
+                            ? "Show only the line you're on"
+                            : `Show all version lines (${otherBranches} other)`
+                          : showAll
+                            ? "Show only the current branch"
+                            : `Show all branches (${otherBranches} other)`
+                      }
+                      onClick={toggleShowAll}
+                    />
+                  </span>
+                  <span className="mx-1 h-4 w-px bg-text-muted/40" />
+                </>
+              )}
+              {/* One spotlight for all three: consecutive holes over adjacent 16px buttons read as
+                  padding, not as teaching. `gap-2` reproduces what the header was giving them. */}
+              <span data-tour-id="map-view-controls" className="flex items-center gap-2">
+                <ZoomReadout />
+                <IconButton
+                  icon={ArrowsOut}
+                  label="Fit all versions"
+                  onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
+                />
+                <IconButton
+                  icon={CaretLineRight}
+                  label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
+                  onClick={jumpToLatest}
+                />
+              </span>
+            </div>
+          ) : undefined
+        }
+      />
 
       {drawn.length === 0 ? (
         <div className="grid flex-1 place-items-center">
@@ -463,8 +470,8 @@ function VersionMap({
             data-tour-id="map-empty"
             className="flex max-w-xs flex-col items-center gap-2 px-4 text-center text-text-muted"
           >
-            <MapTrifold size={32} />
-            <p className="text-[13px]">
+            <MapTrifold size={ICON.display} />
+            <p className="text-body">
               {artistMode
                 ? "No versions yet — save your first version from the Changes tab."
                 : "No commits yet — make one from the Changes tab."}
@@ -590,7 +597,7 @@ function MapActionBar({
       <div className="raised flex items-center gap-1 rounded-panel border border-border bg-surface-2 p-1">
         {picking ? (
           <>
-            <span className="px-2 text-[12px] text-text">
+            <span className="px-2 text-dense text-text">
               {artistMode
                 ? "Click the version to start the new line from"
                 : "Click the commit to branch from"}
@@ -609,14 +616,14 @@ function MapActionBar({
                   <span
                     data-tour-id="map-branch"
                     className={[
-                      "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text",
+                      "flex items-center gap-1.5 rounded-button px-2 py-1 text-dense text-text",
                       "hover:bg-state-hover",
                       open ? "bg-state-active" : "",
                     ].join(" ")}
                   >
-                    <GitBranch size={13} className="text-text-muted" />
+                    <GitBranch size={ICON.inline} className="text-text-muted" />
                     <span className="max-w-40 truncate">{currentBranch.name}</span>
-                    <CaretDown size={12} className="text-text-muted" />
+                    <CaretDown size={ICON.inline} className="text-text-muted" />
                   </span>
                 </Tooltip>
               )}
@@ -637,7 +644,7 @@ function MapActionBar({
                             ? `Bring ${b.name} into ${currentBranch.name}`
                             : `Merge into ${currentBranch.name}`
                         }
-                        size={14}
+                        size={ICON.dense}
                         disabled={saving || !b.tip}
                         onClick={() => actions.askMerge(b.name)}
                       />
@@ -646,7 +653,7 @@ function MapActionBar({
                         <IconButton
                           icon={Trash}
                           label={artistMode ? "Remove this version line" : "Delete branch"}
-                          size={14}
+                          size={ICON.dense}
                           disabled={saving}
                           onClick={() => actions.askDelete(b.name)}
                         />
@@ -658,7 +665,7 @@ function MapActionBar({
                 {
                   id: "new-branch",
                   label: artistMode ? "New version line…" : "New branch…",
-                  icon: <Plus size={13} />,
+                  icon: <Plus size={ICON.inline} />,
                   tourId: "map-branch-new",
                   disabled: saving,
                   onSelect: () => actions.askCreate(),
@@ -678,16 +685,16 @@ function MapActionBar({
                 onClick={onStartPicking}
                 disabled={saving}
                 data-tour-id="map-pick"
-                className="flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:opacity-40"
+                className="flex items-center gap-1.5 rounded-button px-2 py-1 text-dense text-text-muted transition-colors duration-(--dur-instant) ease-(--ease-out) hover:bg-state-hover hover:text-text disabled:opacity-40"
               >
-                <GitBranch size={13} />
+                <GitBranch size={ICON.inline} />
                 {artistMode ? "Start a line here…" : "Branch from a commit…"}
               </button>
             </Tooltip>
           </>
         )}
       </div>
-      {actions.error && <p className="mt-1 max-w-xs text-[12px] text-danger">{actions.error}</p>}
+      {actions.error && <p className="mt-1 max-w-xs text-dense text-danger">{actions.error}</p>}
     </Panel>
   );
 }
@@ -832,7 +839,7 @@ function ZoomReadout() {
       <button
         type="button"
         onClick={() => void zoomTo(1, { duration: 200 })}
-        className="rounded-button px-1.5 py-0.5 font-mono text-[11px] text-text-muted transition-colors hover:bg-state-hover hover:text-text"
+        className="rounded-button px-1.5 py-0.5 font-mono text-caption text-text-muted transition-colors duration-(--dur-instant) ease-(--ease-out) hover:bg-state-hover hover:text-text"
       >
         {Math.round(zoom * 100)}%
       </button>
@@ -879,52 +886,60 @@ function CommitDrilldown({
   return (
     <div className="flex min-h-0 min-w-0 flex-1 gap-2">
       <section className="raised flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-panel bg-surface">
-        <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2 pl-1 pr-1">
-          <IconButton icon={ArrowLeft} label="Back to the version map" size={16} onClick={onBack} />
-          <span
-            className={[
-              "shrink-0 text-[12px] text-text-muted",
-              artistMode ? "font-medium" : "font-mono",
-            ].join(" ")}
-          >
-            {artistMode ? versionLabel(version) : commit.hash}
-          </span>
-          <span className="min-w-0 flex-1 truncate text-[13px] text-text">{commit.message}</span>
-          {files.length > 1 && (
-            <Menu
-              align="right"
-              trigger={(open) => (
-                <Tooltip label="Choose which file to view">
-                  <span
-                    className={[
-                      "flex items-center gap-1.5 rounded-button px-2 py-1 text-[12px] text-text-muted",
-                      "hover:bg-state-hover hover:text-text",
-                      open ? "bg-state-active text-text" : "",
-                    ].join(" ")}
-                  >
-                    {active ? (artistMode ? assetName(active) : active) : "Files"}
-                    <CaretDown size={12} />
-                  </span>
-                </Tooltip>
+        <PanelHeader
+          pad="tight"
+          leading={<IconButton icon={ArrowLeft} label="Back to the version map" onClick={onBack} />}
+          meta={
+            <>
+              <span
+                className={[
+                  "shrink-0 text-dense text-text-muted",
+                  artistMode ? "font-medium" : "font-mono",
+                ].join(" ")}
+              >
+                {artistMode ? versionLabel(version) : commit.hash}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-body text-text">{commit.message}</span>
+            </>
+          }
+          actions={
+            <>
+              {files.length > 1 && (
+                <Menu
+                  align="right"
+                  trigger={(open) => (
+                    <Tooltip label="Choose which file to view">
+                      <span
+                        className={[
+                          "flex items-center gap-1.5 rounded-button px-2 py-1 text-dense text-text-muted",
+                          "hover:bg-state-hover hover:text-text",
+                          open ? "bg-state-active text-text" : "",
+                        ].join(" ")}
+                      >
+                        {active ? (artistMode ? assetName(active) : active) : "Files"}
+                        <CaretDown size={ICON.inline} />
+                      </span>
+                    </Tooltip>
+                  )}
+                  items={files.map((f) => ({
+                    id: f,
+                    label: artistMode ? assetName(f) : f,
+                    selected: f === active,
+                    onSelect: () => setSelectedFile(f),
+                  }))}
+                />
               )}
-              items={files.map((f) => ({
-                id: f,
-                label: artistMode ? assetName(f) : f,
-                selected: f === active,
-                onSelect: () => setSelectedFile(f),
-              }))}
-            />
-          )}
-          {!inspectorOpen && (
-            <IconButton
-              icon={SidebarSimple}
-              label="Show inspector"
-              size={18}
-              onClick={() => setInspectorOpen(true)}
-              iconClassName="-scale-x-100"
-            />
-          )}
-        </header>
+              {!inspectorOpen && (
+                <IconButton
+                  icon={SidebarSimple}
+                  label="Show inspector"
+                  onClick={() => setInspectorOpen(true)}
+                  iconClassName="-scale-x-100"
+                />
+              )}
+            </>
+          }
+        />
         <MainPanel
           diff={entries}
           error={error}

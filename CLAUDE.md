@@ -324,9 +324,16 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   `isStoreUnreachableError` matches the backend's stable `"history isn't reachable"` prefix, the
   one error that must never be answered with "start tracking?". In a plain browser there is no
   picker and these actions are no-ops.
-- **UI primitives** (`src/components/ui/`): `Button.tsx`, `IconButton.tsx` (flat Krita-style, no
-  background until hover), `Menu.tsx` (dropdown with outside-click + Esc to close). Shared across
-  shell and VCS components.
+- **UI primitives** (`src/components/ui/`): `Button.tsx` (`default`/`primary`/`destructive`/`ghost`,
+  `sm`/`md`), `IconButton.tsx` (raised tactile chip that sinks on press — *not* the old flat
+  no-chrome-until-hover button; see DESIGN.md → Krita Design Influence for why that was reversed),
+  `Switch.tsx`, `Slider.tsx`, `Modal.tsx`, `Menu.tsx` (dropdown with outside-click + Esc to close),
+  `Tooltip.tsx`, `Checkbox.tsx`, `Radio.tsx`. Shared across shell and VCS components — **these are
+  the only button and toggle types**; a hand-rolled one is a bug. `Tooltip`/`Menu`/`Modal` animate
+  both in and out (`src/lib/useExitTransition.ts`; `Modal` unmounts on `transitionend`, and its
+  `footer` is a render prop so a Cancel animates like an Escape). Type sizes come from the six
+  `text-*` tokens and icon sizes from `ICON` (`src/lib/iconSize.ts`) — an arbitrary `text-[Npx]` or
+  a literal `size={N}` is a bug.
 - **VCS components** (`src/components/vcs/`): commit cards, the git-style history graph
   (`CommitGraph` + `CommitGraphRail`, lane layout from `lib/graph.ts`; lane colors are a deliberate
   functional exception to the single-accent rule), branch badge, file-status chip, the sidebar

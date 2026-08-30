@@ -30,8 +30,12 @@ const CHANGE_BADGE: Record<SwatchChange, string | null> = {
   unchanged: null,
 };
 
+// `text-white` at the three call sites below is a deliberate untokenized literal: these labels
+// sit on a *user-supplied swatch color*, not on a theme surface, so no `--text` token can be
+// guaranteed to read against them. The black text-shadow baked in here is what carries legibility;
+// white is simply the highest-contrast partner for it. Don't "tokenize" it into a theme color.
 const HEX_BASE =
-  "cursor-pointer font-mono text-[11px] leading-none transition-colors duration-200 [text-shadow:0_0_4px_rgba(0,0,0,1),0_0_2px_rgba(0,0,0,1)]";
+  "cursor-pointer font-mono text-caption leading-none transition-colors duration-(--dur-normal) ease-(--ease-out) [text-shadow:0_0_4px_rgba(0,0,0,1),0_0_2px_rgba(0,0,0,1)]";
 
 function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
   const { name, before, after, change } = swatch;
@@ -115,7 +119,7 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
           {badge && (
             <span
               className={[
-                "pointer-events-none absolute bottom-0.5 right-0.5 rounded-badge px-1 py-px text-[9px] font-semibold uppercase leading-none",
+                "pointer-events-none absolute bottom-0.5 right-0.5 rounded-badge px-1 py-px text-micro font-semibold uppercase leading-none",
                 change === "added"
                   ? "bg-diff-add text-diff-add-fg"
                   : "bg-diff-del text-diff-del-fg",
@@ -129,7 +133,7 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
         {/* Name */}
         <span
           className={[
-            "truncate text-center font-mono text-[10px] leading-tight",
+            "truncate text-center font-mono text-micro leading-tight",
             change === "removed" ? "text-text-muted line-through" : "text-text-muted",
           ].join(" ")}
         >
@@ -143,8 +147,8 @@ function SwatchCell({ swatch }: { swatch: PaletteSwatch }) {
 /** Legend entry */
 function LegendItem({ color, label }: { color: string; label: string }) {
   return (
-    <span className="flex items-center gap-1 text-[11px] text-text-muted">
-      <span className={["h-2.5 w-2.5 rounded-sm border", color].join(" ")} />
+    <span className="flex items-center gap-1 text-caption text-text-muted">
+      <span className={["h-2.5 w-2.5 rounded-badge border", color].join(" ")} />
       {label}
     </span>
   );

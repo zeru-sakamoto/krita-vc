@@ -1,5 +1,6 @@
 import { Check } from "@phosphor-icons/react";
 import type { InputHTMLAttributes } from "react";
+import { ICON } from "../../lib/iconSize";
 
 interface CheckboxProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "size"> {
   checked: boolean;
@@ -30,7 +31,7 @@ export function Checkbox({ checked, disabled, className = "", ...rest }: Checkbo
         className="absolute inset-0 size-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
         {...rest}
       />
-      {checked && <Check size={11} weight="bold" className="text-accent" aria-hidden />}
+      {checked && <Check size={ICON.inline} weight="bold" className="text-accent" aria-hidden />}
     </span>
   );
 }

@@ -7,8 +7,10 @@ import {
   FolderOpen,
   Gauge,
   HardDrive,
+  PaintBrush,
   ShieldCheck,
   Trash,
+  User as UserIcon,
 } from "@phosphor-icons/react";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -19,6 +21,8 @@ import { Radio } from "../ui/Radio";
 import { IconButton } from "../ui/IconButton";
 import { Menu, Select } from "../ui/Menu";
 import { Slider } from "../ui/Slider";
+import { Switch } from "../ui/Switch";
+import { ICON } from "../../lib/iconSize";
 import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
@@ -59,26 +63,17 @@ function ToggleRow({
       className="flex w-full flex-col gap-0.5 rounded-button py-1.5 text-left"
     >
       <span className="flex w-full items-start justify-between gap-3">
-        <span className="flex min-w-0 items-center gap-2 text-[13px] text-text">
+        <span className="flex min-w-0 items-center gap-2 text-body text-text">
           {icon && <span className="shrink-0 text-text-muted">{icon}</span>}
           {label}
         </span>
-        <span
-          aria-hidden
-          className={[
-            "inset-well relative h-5 w-9 shrink-0 rounded-full transition-colors duration-200",
-            active ? "bg-accent" : "bg-surface-3",
-          ].join(" ")}
-        >
-          <span
-            className={[
-              "raised absolute left-0.5 top-1/2 size-4 -translate-y-1/2 rounded-full bg-text transition-transform duration-200 ease-out",
-              active ? "translate-x-4" : "translate-x-0",
-            ].join(" ")}
-          />
-        </span>
+        {/* The row itself is the `<button role="switch">` and owns the click and ARIA, so the
+            track+thumb comes in as `asIndicator` — a button can't nest inside a button, which
+            is why this used to be a hand-rolled copy of `Switch`'s markup (with an accent-filled
+            track, which DESIGN.md § Toggle / Switch rules out). */}
+        <Switch asIndicator active={active} />
       </span>
-      {detail && <span className="block text-[11px] text-text-muted">{detail}</span>}
+      {detail && <span className="block text-caption text-text-muted">{detail}</span>}
     </button>
   );
 }
@@ -97,7 +92,7 @@ function ThemeChip({ bg, accent }: { bg: string; accent: string }) {
 }
 
 function NoRepoFallback() {
-  return <p className="text-[12px] text-text-muted">Open an artwork to see these settings.</p>;
+  return <p className="text-dense text-text-muted">Open an artwork to see these settings.</p>;
 }
 
 /**
@@ -141,12 +136,12 @@ function StoreRootRow() {
 
   return (
     <div className="mb-3">
-      <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
-        <FolderOpen size={13} />
+      <span className="mb-1 flex items-center gap-1.5 text-dense text-text-muted">
+        <FolderOpen size={ICON.inline} />
         Where version history is kept
       </span>
       <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 truncate inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-text">
+        <span className="min-w-0 flex-1 truncate inset-well rounded-button border border-border bg-bg px-2 py-1.5 font-mono text-dense text-text">
           {root ?? <span className="font-sans text-text-muted">Beside each artwork</span>}
         </span>
         <Button onClick={choose} disabled={busy || !inTauri()}>
@@ -158,7 +153,7 @@ function StoreRootRow() {
           </Button>
         )}
       </div>
-      <span className="mt-1 block text-[11px] text-text-muted">
+      <span className="mt-1 block text-caption text-text-muted">
         By default each artwork's history lives in a hidden folder beside it, so it travels with
         your files and stays on the same drive. Changing this only affects artworks you start
         tracking from now on — existing history isn't moved.
@@ -213,19 +208,31 @@ function AppearanceSettings({
         onToggle={toggleLegacyHistory}
       />
       <label className="mt-2 block">
-        <span className="mb-1 block text-[12px] text-text-muted">Your name</span>
+        {/* Leading icon per section label — the row anatomy the Storage and Performance tabs
+            already use. One dialog, one grammar. */}
+        <span className="mb-1 flex items-center gap-1.5 text-dense text-text-muted">
+          <UserIcon size={ICON.inline} />
+          Your name
+        </span>
         <input
           value={authorName}
           onChange={(e) => setAuthorName(e.target.value)}
           placeholder="You"
-          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-[13px] text-text placeholder:text-text-muted focus:border-accent !outline-none"
+          // `!outline-none` stays: global.css's `:focus-visible` outline is unlayered CSS and beats
+          // Tailwind's utilities layer, so plain `outline-none` would lose to it. The accent border
+          // is the sanctioned .inset-well substitute (DESIGN.md § Focus Ring Spec), paired with a
+          // background step so the state survives being seen in grayscale.
+          className="w-full inset-well rounded-button border border-border bg-bg px-2 py-1.5 text-body text-text placeholder:text-text-muted transition-[color,background-color,border-color] duration-(--dur-fast) ease-(--ease-out) focus-visible:border-accent focus-visible:bg-surface !outline-none"
         />
-        <span className="mt-1 block text-[11px] text-text-muted">
+        <span className="mt-1 block text-caption text-text-muted">
           Shown as the author of new versions.
         </span>
       </label>
       <div className="mt-3">
-        <span className="mb-1 block text-[12px] text-text-muted">Theme</span>
+        <span className="mb-1 flex items-center gap-1.5 text-dense text-text-muted">
+          <PaintBrush size={ICON.inline} />
+          Theme
+        </span>
         <Menu
           minWidth={200}
           items={THEMES.map((t) => ({
@@ -240,13 +247,14 @@ function AppearanceSettings({
             return (
               <span
                 className={[
-                  "tactile flex min-w-50 items-center gap-2 rounded-button border bg-surface-3 px-2 py-1.5 text-[13px] text-text",
+                  "tactile flex min-w-50 items-center gap-2 rounded-button border bg-surface-3 px-2 py-1.5 text-body text-text",
+                  "transition-[border-color,background-color] duration-(--dur-fast) ease-(--ease-out)",
                   open ? "border-accent" : "border-border",
                 ].join(" ")}
               >
                 <ThemeChip bg={cur.bg} accent={cur.accent} />
                 <span className="min-w-0 flex-1 truncate text-left">{cur.label}</span>
-                <CaretDown size={12} weight="bold" className="shrink-0 text-text-muted" />
+                <CaretDown size={ICON.inline} weight="bold" className="shrink-0 text-text-muted" />
               </span>
             );
           }}
@@ -286,8 +294,8 @@ function CpuBudgetRow() {
   const hint = CPU_BUDGETS.find((b) => b.percent === budget)?.hint ?? "";
   return (
     <div className="mb-3">
-      <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
-        <Cpu size={13} />
+      <span className="mb-1 flex items-center gap-1.5 text-dense text-text-muted">
+        <Cpu size={ICON.inline} />
         Background CPU use
       </span>
       <Slider
@@ -296,7 +304,7 @@ function CpuBudgetRow() {
         options={CPU_BUDGETS.map((b) => ({ value: b.percent, label: b.label }))}
         ariaLabel="Background CPU use"
       />
-      <span className="mt-1.5 block text-[11px] text-text-muted">
+      <span className="mt-1.5 block text-caption text-text-muted">
         {hint} Applies to every repository.
       </span>
     </div>
@@ -312,7 +320,7 @@ function PerformanceSettings({
 }) {
   return (
     <ToggleRow
-      icon={<Gauge size={15} />}
+      icon={<Gauge size={ICON.dense} />}
       label="Low-memory diffs"
       detail="Loads each layer of a working-file preview one at a time instead of all at
         once. Uses noticeably less memory on large files, in exchange for a little extra
@@ -338,8 +346,8 @@ function StorageSettings({
   return (
     <>
       <div className="mb-3">
-        <span className="mb-1 flex items-center gap-1.5 text-[12px] text-text-muted">
-          <HardDrive size={13} />
+        <span className="mb-1 flex items-center gap-1.5 text-dense text-text-muted">
+          <HardDrive size={ICON.inline} />
           Preview cache size
         </span>
         <Select
@@ -351,14 +359,14 @@ function StorageSettings({
             label: mb >= 1024 ? `${mb / 1024} GB` : `${mb} MB`,
           }))}
         />
-        <span className="mt-1 block text-[11px] text-text-muted">
+        <span className="mt-1 block text-caption text-text-muted">
           How much space diff previews may use on disk. Oldest previews are cleared first once you
           go over — they regenerate automatically when needed again.
         </span>
       </div>
 
       <ToggleRow
-        icon={<Archive size={15} />}
+        icon={<Archive size={ICON.dense} />}
         label="Compact storage for heavily-revised art"
         detail="Shrinks version history for files with many small edits by 2–10x, at the
           cost of a little extra time on each save and restore. Safe to turn on or off at
@@ -371,15 +379,15 @@ function StorageSettings({
 
       <div className="mt-3 flex flex-wrap gap-2">
         <Button onClick={onShowCleanup}>
-          <Broom size={14} />
+          <Broom size={ICON.dense} />
           Clean up storage…
         </Button>
         <Button onClick={onShowCheck}>
-          <ShieldCheck size={14} />
+          <ShieldCheck size={ICON.dense} />
           Check for problems…
         </Button>
       </div>
-      <span className="mt-2 block text-[11px] text-text-muted">
+      <span className="mt-2 block text-caption text-text-muted">
         {backupAgeLabel(current?.lastBackupAt)} There's no cloud sync — a backup is the only copy
         that survives your disk failing.
       </span>
@@ -415,7 +423,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       <Modal
         title="Settings"
         onClose={onClose}
-        footer={<Button onClick={onClose}>Done</Button>}
+        footer={(close) => <Button onClick={close}>Done</Button>}
         maxWidthClassName="max-w-2xl"
       >
         <div className="flex gap-5">
@@ -426,7 +434,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 type="button"
                 onClick={() => setCategory(c.id)}
                 className={[
-                  "rounded-button px-2.5 py-1.5 text-left text-[13px] transition-colors",
+                  "rounded-button px-2.5 py-1.5 text-left text-body transition-colors duration-(--dur-fast) ease-(--ease-out)",
                   category === c.id
                     ? "row-selected text-text"
                     : "text-text-muted hover:bg-state-hover hover:text-text",
@@ -521,7 +529,7 @@ function StashShelf({
 
   if (stashes.length === 0) {
     return (
-      <p className="text-[12px] text-text-muted">
+      <p className="text-dense text-text-muted">
         {artistMode
           ? "Nothing set aside. Use the ⋮ menu in Changes to tuck work away and pick it up later."
           : "No stashes. Use the ⋮ menu in the Changes panel to stash your working tree."}
@@ -535,16 +543,16 @@ function StashShelf({
         {stashes.map((s) => (
           <li key={s.id} className="group flex items-center gap-2 rounded-button py-1.5">
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[13px] text-text">{stashTitle(s)}</span>
-              <span className="mt-0.5 block truncate text-[11px] text-text-muted">
+              <span className="block truncate text-body text-text">{stashTitle(s)}</span>
+              <span className="mt-0.5 block truncate text-caption text-text-muted">
                 {stashSummary(s)}
               </span>
             </span>
-            <span className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100">
+            <span className="shrink-0 opacity-0 transition-opacity duration-(--dur-fast) ease-(--ease-out) group-hover:opacity-100">
               <IconButton
                 icon={Trash}
                 label={artistMode ? "Remove this set-aside work" : "Drop this stash"}
-                size={16}
+                size={ICON.default}
                 disabled={saving}
                 onClick={() => onConfirmDrop(s)}
               />
@@ -553,7 +561,7 @@ function StashShelf({
         ))}
       </ul>
       <Button variant="destructive" className="mt-3" disabled={saving} onClick={onConfirmDropAll}>
-        <Trash size={14} />
+        <Trash size={ICON.dense} />
         {artistMode ? "Remove all" : "Drop all stashes"}
       </Button>
     </>
@@ -579,18 +587,18 @@ function DropStashModal({ stash, onClose }: { stash: Stash; onClose: () => void 
     <Modal
       title={artistMode ? "Remove this work for good?" : "Drop this stash?"}
       onClose={() => (saving ? undefined : onClose())}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose} disabled={saving}>
+          <Button onClick={close} disabled={saving}>
             Cancel
           </Button>
           <Button variant="destructive" onClick={onDrop} disabled={saving}>
             {saving ? "Removing…" : "Remove"}
           </Button>
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {artistMode ? (
           <>
             <span className="text-text">{stashTitle(stash)}</span> will be gone for good — this
@@ -604,7 +612,7 @@ function DropStashModal({ stash, onClose }: { stash: Stash; onClose: () => void 
           </>
         )}
       </p>
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+      {error && <p className="mt-3 text-dense text-danger">{error}</p>}
     </Modal>
   );
 }
@@ -630,18 +638,18 @@ function DropAllStashesModal({ onClose }: { onClose: () => void }) {
     <Modal
       title={artistMode ? "Empty the shelf?" : "Drop all stashes?"}
       onClose={() => (saving ? undefined : onClose())}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose} disabled={saving}>
+          <Button onClick={close} disabled={saving}>
             Cancel
           </Button>
           <Button variant="destructive" onClick={onDropAll} disabled={saving}>
             {saving ? "Removing…" : "Remove all"}
           </Button>
         </>
-      }
+      )}
     >
-      <p className="text-[13px] leading-relaxed text-text-muted">
+      <p className="text-body leading-relaxed text-text-muted">
         {artistMode ? (
           <>
             All {count} {count === 1 ? "piece" : "pieces"} of set-aside work will be gone for good,
@@ -655,7 +663,7 @@ function DropAllStashesModal({ onClose }: { onClose: () => void }) {
           </>
         )}
       </p>
-      {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+      {error && <p className="mt-3 text-dense text-danger">{error}</p>}
     </Modal>
   );
 }
@@ -764,20 +772,21 @@ function CheckModal({ onClose }: { onClose: () => void }) {
     <Modal
       title="Check for problems"
       onClose={() => (phase === "running" ? undefined : onClose())}
-      footer={
+      footer={(close) =>
         phase === "confirm" ? (
           <>
-            <Button onClick={onClose}>Cancel</Button>
+            <Button onClick={close}>Cancel</Button>
             <Button variant="primary" disabled={scopeCount === 0} onClick={run}>
               Run check
             </Button>
           </>
         ) : phase === "running" ? (
+          // Cancels the running check, not the dialog — deliberately not `close`.
           <Button disabled={cancelling} onClick={cancel}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </Button>
         ) : (
-          <Button variant="primary" onClick={onClose}>
+          <Button variant="primary" onClick={close}>
             Done
           </Button>
         )
@@ -785,12 +794,12 @@ function CheckModal({ onClose }: { onClose: () => void }) {
     >
       {phase === "confirm" && (
         <>
-          <p className="mb-2 text-[13px] text-text">
+          <p className="mb-2 text-body text-text">
             Looks over every version in your history and confirms the stored data behind it is still
             there. Nothing is changed or removed.
           </p>
           <fieldset className="mt-2 flex flex-col gap-2">
-            <label className="flex items-start gap-2 text-[13px] text-text">
+            <label className="flex items-start gap-2 text-body text-text">
               <Radio
                 name="check-scope"
                 checked={scope === "current"}
@@ -800,7 +809,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
               />
               <span>Current repo{current ? ` (${current.name})` : ""}</span>
             </label>
-            <label className="flex items-start gap-2 text-[13px] text-text">
+            <label className="flex items-start gap-2 text-body text-text">
               <Radio
                 name="check-scope"
                 checked={scope === "all"}
@@ -810,7 +819,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
               />
               <span>All repos ({repositories.length})</span>
             </label>
-            <label className="flex items-start gap-2 text-[13px] text-text">
+            <label className="flex items-start gap-2 text-body text-text">
               <Radio
                 name="check-scope"
                 checked={scope === "neverChecked"}
@@ -821,7 +830,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
               <span>Repos never checked before ({neverChecked.length})</span>
             </label>
           </fieldset>
-          <label className="mt-3 flex items-start gap-2 text-[13px] text-text">
+          <label className="mt-3 flex items-start gap-2 text-body text-text">
             <Checkbox
               checked={scrub}
               onChange={(e) => setScrub(e.target.checked)}
@@ -829,7 +838,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
             />
             <span>
               Also read back every version (slower)
-              <span className="block text-[11px] text-text-muted">
+              <span className="block text-caption text-text-muted">
                 Re-hashes every version's stored content, not just its index.
               </span>
             </span>
@@ -838,7 +847,7 @@ function CheckModal({ onClose }: { onClose: () => void }) {
       )}
 
       {phase === "running" && (
-        <p className="text-[12px] text-text-muted">
+        <p className="text-dense text-text-muted">
           {batch
             ? `Checking ${currentRepo?.name ?? "…"} (${index + 1} of ${queue.length})…`
             : "Checking…"}
@@ -850,15 +859,15 @@ function CheckModal({ onClose }: { onClose: () => void }) {
           {results.map(({ repo, report, error }, ri) => (
             <li key={ri}>
               {batch && (
-                <p className="mb-1 text-[12px] font-medium text-text">
+                <p className="mb-1 text-dense font-medium text-text">
                   {error || (report && report.problems.length > 0)
                     ? repo.name
                     : `✓ ${repo.name} — all clear`}
                 </p>
               )}
-              {error && <p className="text-[12px] text-danger">{error}</p>}
+              {error && <p className="text-dense text-danger">{error}</p>}
               {!error && report && report.problems.length === 0 && !batch && (
-                <p className="text-[13px] text-text">
+                <p className="text-body text-text">
                   All clear — {report.commitsChecked} version
                   {report.commitsChecked === 1 ? "" : "s"} and {report.objectsChecked} stored piece
                   {report.objectsChecked === 1 ? "" : "s"} checked out fine
@@ -871,10 +880,10 @@ function CheckModal({ onClose }: { onClose: () => void }) {
                 <ul className="space-y-1.5">
                   {report.problems.map((p, i) => (
                     <li key={i} className="rounded-button bg-surface-2 px-2 py-1.5">
-                      <span className="block text-[12px] text-text">
+                      <span className="block text-dense text-text">
                         {PROBLEM_LABEL[p.kind] ?? p.kind}
                       </span>
-                      <span className="block break-all text-[11px] text-text-muted">
+                      <span className="block break-all text-caption text-text-muted">
                         {p.detail}
                       </span>
                     </li>
@@ -889,13 +898,13 @@ function CheckModal({ onClose }: { onClose: () => void }) {
       {phase === "done" && (
         <>
           {results.some((r) => (r.report?.problems.length ?? 0) > 0) && (
-            <p className="mt-2 text-[12px] text-text-muted">
+            <p className="mt-2 text-dense text-text-muted">
               Your current artwork on disk is untouched — restore from a backup if any version won't
               open.
             </p>
           )}
           {cancelledEarly && (
-            <p className="mt-2 text-[12px] text-text-muted">
+            <p className="mt-2 text-dense text-text-muted">
               Cancelled after checking {results.length} of {queue.length} repos.
             </p>
           )}
@@ -951,25 +960,25 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
     <Modal
       title="Clean up storage"
       onClose={onClose}
-      footer={
+      footer={(close) => (
         <>
-          <Button onClick={onClose}>{result ? "Done" : "Cancel"}</Button>
+          <Button onClick={close}>{result ? "Done" : "Cancel"}</Button>
           {!result && (
             <Button variant="primary" disabled={busy || preview == null || nothing} onClick={clean}>
               {busy ? "Cleaning…" : "Clean up"}
             </Button>
           )}
         </>
-      }
+      )}
     >
-      <p className="mb-2 text-[13px] text-text">
+      <p className="mb-2 text-body text-text">
         Frees space held by versions no longer part of any history — leftovers from undone saves and
         deleted branches. Your current artwork and every version you can still see are never
         touched.
       </p>
-      {error && <p className="text-[12px] text-danger">{error}</p>}
+      {error && <p className="text-dense text-danger">{error}</p>}
       {!error && result ? (
-        <p className="text-[13px] text-text">
+        <p className="text-body text-text">
           Freed <span className="font-medium">{formatBytes(totalOf(result))}</span>
           {result.cacheBytesReclaimed > 0 && (
             <span className="text-text-muted">
@@ -981,12 +990,12 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
           .
         </p>
       ) : !error && preview == null ? (
-        <p className="text-[12px] text-text-muted">Checking what can be cleaned…</p>
+        <p className="text-dense text-text-muted">Checking what can be cleaned…</p>
       ) : !error && nothing ? (
-        <p className="text-[12px] text-text-muted">Nothing to clean up — storage is tidy.</p>
+        <p className="text-dense text-text-muted">Nothing to clean up — storage is tidy.</p>
       ) : (
         !error && (
-          <p className="text-[13px] text-text">
+          <p className="text-body text-text">
             About <span className="font-medium">{formatBytes(totalOf(preview!))}</span> can be freed
             {preview!.cacheBytesReclaimed > 0 && (
               <span className="text-text-muted">

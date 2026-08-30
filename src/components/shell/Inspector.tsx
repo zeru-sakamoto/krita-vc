@@ -6,6 +6,7 @@ import {
   SidebarSimple,
 } from "@phosphor-icons/react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { PanelHeader } from "./DockerPanel";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
@@ -14,6 +15,7 @@ import { FileStatusChip } from "../vcs/FileStatusChip";
 import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
 import type { ArtDiff, ArtLayer, Commit, DiffEntry, FileChange, PaletteDiff } from "../../types";
 import { fullTimestamp } from "../../lib/format";
+import { ICON } from "../../lib/iconSize";
 import {
   assetName,
   layerChangeLabel,
@@ -50,8 +52,8 @@ interface InspectorProps {
 function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-[64px_1fr] items-baseline gap-2 px-3 py-1.5">
-      <span className="text-[11px] font-medium uppercase text-text-muted">{label}</span>
-      <span className="selectable text-[13px] text-text">{children}</span>
+      <span className="text-caption font-medium uppercase text-text-muted">{label}</span>
+      <span className="selectable text-body text-text">{children}</span>
     </div>
   );
 }
@@ -61,7 +63,7 @@ function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null 
   if (layer) {
     return (
       <div className="border-t border-border px-3 py-2">
-        <h3 className="mb-1.5 text-[11px] font-medium uppercase text-text-muted">Selected layer</h3>
+        <h3 className="mb-1.5 text-body font-medium text-text">Selected layer</h3>
         <div className="flex flex-col">
           <MetaRow label="Name">{layer.name}</MetaRow>
           {layer.layerType && <MetaRow label="Type">{layerTypeLabel(layer.layerType)}</MetaRow>}
@@ -81,7 +83,7 @@ function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null 
   const changed = art.layers.filter((l) => l.change !== "unchanged").length;
   return (
     <div className="border-t border-border px-3 py-2">
-      <h3 className="mb-1.5 text-[11px] font-medium uppercase text-text-muted">Composite</h3>
+      <h3 className="mb-1.5 text-body font-medium text-text">Composite</h3>
       <div className="flex flex-col">
         <MetaRow label="Size">
           {art.width} × {art.height}
@@ -169,22 +171,23 @@ export function Inspector({
 
   return (
     <div className="raised flex h-full w-70 shrink-0 flex-col overflow-hidden rounded-panel bg-surface">
-      {/* Header row — h-10/pl-3 pr-1, matches DockerPanel and the main panel card header so
-          every top panel button sits at the same height and edge inset. */}
-      <div className="flex h-10 shrink-0 items-center border-b border-border bg-surface-2 pl-3 pr-1">
-        <span className="flex-1 text-[11px] font-medium uppercase tracking-wide text-text-muted">
-          {working ? "Changes" : artistMode ? "Version" : "Commit"}
-        </span>
-        <IconButton
-          icon={SidebarSimple}
-          label="Hide inspector"
-          active
-          size={18}
-          onClick={onHide}
-          tourId="inspector"
-          iconClassName="-scale-x-100"
-        />
-      </div>
+      {/* Not "Changes" in the working case: the Sidebar card next to this one is already
+          titled that, and two adjacent cards sharing a name tells the user nothing about
+          which is which. This card holds the details of whatever the well is showing. */}
+      <PanelHeader
+        title={working ? "Details" : artistMode ? "Version" : "Commit"}
+        actions={
+          <IconButton
+            icon={SidebarSimple}
+            label="Hide inspector"
+            active
+            size={ICON.default}
+            onClick={onHide}
+            tourId="inspector"
+            iconClassName="-scale-x-100"
+          />
+        }
+      />
       {/* Scrollable content */}
       <div className="min-h-0 flex-1 overflow-auto bg-surface">
         {working ? (
@@ -192,7 +195,7 @@ export function Inspector({
             <div className="flex flex-col">
               <div className="border-b border-border py-1">
                 <MetaRow label="Status">
-                  <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-[11px] text-text-muted">
+                  <span className="rounded-badge bg-surface-3 px-1.5 py-0.5 text-caption text-text-muted">
                     Unsaved changes
                   </span>
                 </MetaRow>
@@ -213,9 +216,9 @@ export function Inspector({
                           aria-label="Go to file"
                           disabled={!inTauri()}
                           onClick={() => void revealItemInDir(current.path)}
-                          className="shrink-0 rounded-button p-0.5 text-text-muted transition-colors hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                          className="shrink-0 rounded-button p-0.5 text-text-muted transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                         >
-                          <FolderOpen size={13} />
+                          <FolderOpen size={ICON.inline} />
                         </button>
                       </Tooltip>
                     )}
@@ -228,12 +231,12 @@ export function Inspector({
               )}
             </div>
           ) : (
-            <div className="grid h-full place-items-center px-6 text-center text-[12px] text-text-muted">
+            <div className="grid h-full place-items-center px-6 text-center text-dense text-text-muted">
               No changes to show.
             </div>
           )
         ) : !commit ? (
-          <div className="grid h-full place-items-center px-6 text-center text-[12px] text-text-muted">
+          <div className="grid h-full place-items-center px-6 text-center text-dense text-text-muted">
             Select a commit to inspect its details.
           </div>
         ) : (
@@ -243,23 +246,23 @@ export function Inspector({
                 <MetaRow label="Version">{versionLabel(version)}</MetaRow>
               ) : (
                 <MetaRow label="Hash">
-                  <span className="font-mono text-[12px]">{commit.hash}</span>
+                  <span className="font-mono text-dense">{commit.hash}</span>
                 </MetaRow>
               )}
               <MetaRow label="Author">{commit.author}</MetaRow>
               <MetaRow label="Date">
-                <span className="text-[12px] text-text-muted">
+                <span className="text-dense text-text-muted">
                   {fullTimestamp(commit.timestamp)}
                 </span>
               </MetaRow>
             </div>
 
             <div className="border-b border-border px-3 py-2.5">
-              <p className="selectable text-[13px] leading-relaxed text-text">{commit.message}</p>
+              <p className="selectable text-body leading-relaxed text-text">{commit.message}</p>
             </div>
 
             <div className="px-3 py-2">
-              <h3 className="mb-1.5 text-[11px] font-medium uppercase text-text-muted">
+              <h3 className="mb-1.5 text-body font-medium text-text">
                 Changed files ({commit.changes.length})
               </h3>
               <ul className="flex flex-col">
@@ -269,14 +272,14 @@ export function Inspector({
                       type="button"
                       onClick={() => onSelectFile(c.path, undefined)}
                       className={[
-                        "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
+                        "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors duration-(--dur-fast) ease-(--ease-out)",
                         selectedFile === c.path ? "row-selected" : "hover:bg-state-hover",
                       ].join(" ")}
                     >
                       <FileStatusChip status={c.status} />
                       <span
                         className={[
-                          "selectable truncate text-[12px] text-text",
+                          "selectable truncate text-dense text-text",
                           artistMode ? "" : "font-mono",
                         ].join(" ")}
                       >
@@ -288,14 +291,14 @@ export function Inspector({
                         type="button"
                         onClick={() => onSelectFile(c.path, PALETTE_ID)}
                         className={[
-                          "ml-4 flex items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
+                          "ml-4 flex items-center gap-2 rounded-button px-2 py-1 text-left transition-colors duration-(--dur-fast) ease-(--ease-out)",
                           focus?.path === c.path && focus?.id === PALETTE_ID
                             ? "row-selected"
                             : "hover:bg-state-hover",
                         ].join(" ")}
                       >
-                        <PaletteIcon size={12} className="shrink-0 text-text-muted" />
-                        <span className="selectable truncate text-[11px] text-text-muted">
+                        <PaletteIcon size={ICON.inline} className="shrink-0 text-text-muted" />
+                        <span className="selectable truncate text-caption text-text-muted">
                           {artistMode ? paletteName(embeddedPalette.path) : embeddedPalette.path}
                         </span>
                       </button>
@@ -306,7 +309,7 @@ export function Inspector({
 
               {paletteChanges.length > 0 && (
                 <>
-                  <h3 className="mb-1.5 mt-2 text-[11px] font-medium uppercase text-text-muted">
+                  <h3 className="mb-1.5 mt-2 text-body font-medium text-text">
                     Palettes ({paletteChanges.length})
                   </h3>
                   <ul className="flex flex-col">
@@ -316,15 +319,15 @@ export function Inspector({
                           type="button"
                           onClick={() => onSelectFile(c.path, undefined)}
                           className={[
-                            "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors",
+                            "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors duration-(--dur-fast) ease-(--ease-out)",
                             selectedFile === c.path ? "row-selected" : "hover:bg-state-hover",
                           ].join(" ")}
                         >
                           <FileStatusChip status={c.status} />
-                          <PaletteIcon size={13} className="shrink-0 text-text-muted" />
+                          <PaletteIcon size={ICON.inline} className="shrink-0 text-text-muted" />
                           <span
                             className={[
-                              "selectable truncate text-[12px] text-text",
+                              "selectable truncate text-dense text-text",
                               artistMode ? "" : "font-mono",
                             ].join(" ")}
                           >
@@ -357,7 +360,7 @@ export function Inspector({
               setConfirmRestore(true);
             }}
           >
-            <ArrowCounterClockwise size={14} />
+            <ArrowCounterClockwise size={ICON.dense} />
             {artistMode ? "Restore this version" : "Roll back to this commit"}
           </Button>
         </div>
@@ -367,23 +370,23 @@ export function Inspector({
         <Modal
           title={artistMode ? `Restore ${restoreLabel}?` : `Roll back to ${restoreLabel}?`}
           onClose={() => (saving ? undefined : setConfirmRestore(false))}
-          footer={
+          footer={(close) => (
             <>
-              <Button onClick={() => setConfirmRestore(false)} disabled={saving}>
+              <Button onClick={close} disabled={saving}>
                 Cancel
               </Button>
               <Button variant="primary" onClick={onRestore} disabled={saving}>
                 {saving ? "Restoring…" : artistMode ? "Restore this version" : "Roll back"}
               </Button>
             </>
-          }
+          )}
         >
-          <p className="text-[13px] leading-relaxed text-text-muted">
+          <p className="text-body leading-relaxed text-text-muted">
             {isTip
               ? "This discards any unsaved changes and restores your last saved version. No new version is recorded."
               : "This puts that version back on disk and saves the result as a new version. Nothing in your history is lost — you can always come back."}
           </p>
-          {error && <p className="mt-3 text-[12px] text-danger">{error}</p>}
+          {error && <p className="mt-3 text-dense text-danger">{error}</p>}
         </Modal>
       )}
     </div>

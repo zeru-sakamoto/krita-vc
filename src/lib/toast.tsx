@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useRef, useState } from "react";
 import { CheckCircle, WarningCircle, X } from "@phosphor-icons/react";
+import { ICON } from "./iconSize";
 
 type ToastVariant = "success" | "error";
 interface ToastState {
@@ -36,12 +37,12 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
       {toast && (
         <div
           role="status"
-          className="glass fixed bottom-4 right-4 z-(--z-toast) flex max-w-sm items-start gap-2 rounded-panel px-3 py-2.5 text-[13px] text-text shadow-(--shadow-float)"
+          className="glass fixed bottom-4 right-4 z-(--z-toast) flex max-w-sm items-start gap-2 rounded-panel px-3 py-2.5 text-body text-text shadow-(--shadow-float)"
         >
           {toast.variant === "error" ? (
-            <WarningCircle size={16} className="mt-0.5 shrink-0 text-danger" />
+            <WarningCircle size={ICON.default} className="mt-0.5 shrink-0 text-danger" />
           ) : (
-            <CheckCircle size={16} className="mt-0.5 shrink-0 text-success-fg" />
+            <CheckCircle size={ICON.default} className="mt-0.5 shrink-0 text-success-fg" />
           )}
           <span className="min-w-0 flex-1 break-words">{toast.message}</span>
           <button
@@ -50,7 +51,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             onClick={() => setToast(null)}
             className="shrink-0 text-text-muted hover:text-text"
           >
-            <X size={14} />
+            <X size={ICON.dense} />
           </button>
         </div>
       )}

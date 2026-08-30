@@ -137,6 +137,25 @@ export function Slider<T extends string | number>({
           }
         }}
       >
+        {/* Accent fill on the travelled portion (DESIGN.md § Slider, Discrete). Scaled, never
+            sized: a `width: N%` fill would reintroduce the exact bug the thumb comment below
+            describes — width is a layout property, and invalidating layout inside the nested
+            backdrop chain each drag frame is what dims the whole screen. A full-width bar
+            scaled from its left edge stays on the compositor with the thumb.
+            The scale factor is the same `ratio`, and the bar's unscaled width is the track's,
+            so its right edge lands exactly on the thumb's centre at every stop: 0 at the first
+            (scaleX(0) paints nothing — no stray nub at the left edge) and the full track width
+            at the last, which is where translate3d puts the thumb's centre. */}
+        <span
+          aria-hidden
+          className="absolute inset-0 rounded-full bg-accent"
+          style={{
+            transform: `scaleX(${ratio})`,
+            transformOrigin: "left",
+            transition: dragRatio === null ? "transform var(--dur-fast) var(--ease-out)" : "none",
+            willChange: "transform",
+          }}
+        />
         {/* Positioned with `transform`, never `left`. `left` is a layout property, and this
             thumb lives inside the modal's `.glass` panel — a backdrop-filter over the
             `.scrim`'s own backdrop-filter. Invalidating layout in there each drag frame makes
@@ -148,7 +167,7 @@ export function Slider<T extends string | number>({
           className="raised absolute left-0 top-1/2 size-4 rounded-full bg-accent"
           style={{
             transform: `translate3d(${ratio * trackWidth}px, -50%, 0) translateX(-50%)`,
-            transition: dragRatio === null ? "transform 150ms ease-out" : "none",
+            transition: dragRatio === null ? "transform var(--dur-fast) var(--ease-out)" : "none",
             willChange: "transform",
           }}
         />
@@ -158,7 +177,7 @@ export function Slider<T extends string | number>({
           neighbors rather than on the container's true midpoint, so it drifts off the dot's
           50% position. A flex-1 column per label keeps each one's own center aligned with its
           tick (0%, 50%, ..., 100%), matching how the thumb is positioned above. */}
-      <div className="mt-1 flex text-[11px]">
+      <div className="mt-1 flex text-caption">
         {options.map((o, i) => (
           <button
             key={String(o.value)}
@@ -166,7 +185,7 @@ export function Slider<T extends string | number>({
             disabled={disabled}
             onClick={() => setIndex(i)}
             className={[
-              "flex-1 rounded px-1 disabled:cursor-not-allowed",
+              "flex-1 rounded-badge px-1 disabled:cursor-not-allowed",
               i === 0
                 ? "-ml-1 text-left"
                 : i === options.length - 1
