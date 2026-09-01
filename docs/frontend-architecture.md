@@ -94,6 +94,16 @@ human-readable label before the call and clears it in a `finally`. Renders nothi
 element (`fixed inset-0`, so it still visually covers all four zones); it renders nothing when the
 tour isn't active. See [Application tour](#application-tour).
 
+`RepoShell` also listens for the DOM `window` `"focus"` event (a plain `addEventListener`, no
+Tauri capability needed) and calls the repository context's `refresh()` — the same bump used by
+the "Rescan for changes" button — so alt-tabbing back from Krita after a save reflects here without
+a manual click. DOM `window` focus tracks the OS window regaining focus, not in-page element focus,
+so clicking between panels inside the app doesn't refire it. Throttled to
+`FOCUS_REFRESH_THROTTLE_MS` (30s, `AppShell.tsx`) — the scan itself is cheap (one `stat`), so the
+throttle exists to avoid spinner churn on a rapid save-and-alt-tab-back loop, not backend cost —
+and skipped outright while `scanning` is already true (read via a ref, so the listener itself is
+created once and never goes stale).
+
 [`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable bento card (40px title bar
 + scroll area) used by the Sidebar and Inspector. Its header's `actions` slot lays out icons with a
 small `gap-1` so adjacent buttons (e.g. Changes' rescan + panel-options) don't sit flush against
@@ -160,9 +170,15 @@ refresh button. All six providers are mounted in [`App.tsx`](../src/App.tsx).
 
 Local, self-contained UI state stays in the leaf components — e.g. the sidebar width
 (`Sidebar`), the art-diff canvas height (`ArtDiffView`), modal open/close state (`BranchesPanel`,
-`Sidebar`), and the diff view/compare/highlight controls (`ArtDiffView`). The working-tree items
-are the one exception: `useWorkingChanges` (below) is called in `Sidebar`, not `ChangesPanel`, and
-passed down as props, so the panel and the panel-options actions act on one scan.
+`Sidebar`), and the diff view/compare/highlight controls (`ArtDiffView`). Two data hooks are the
+exception, both called in `RepoShell` rather than the component that renders their result, and
+passed down as props: `useWorkingChanges` (`Sidebar`'s `ChangesPanel` and the Version Map both need
+the one dirty-tree scan, and `Sidebar` itself unmounts in Map view — a second call anywhere
+downstream would rescan on every view switch and race the one `scanning` flag) and
+`useStorageStats` (`PerformancePanel` mounts only while `activeView === "performance"` — `Sidebar`
+conditionally renders it on `view`, and unmounts entirely in Map view — so a `useStorageStats` call
+inside it would recompute `repo_storage_stats` on every open instead of once per `refreshNonce`
+bump; see [performance-report.md](performance-report.md)).
 Both drag-resizable dimensions use the shared [`useResize`](../src/lib/useResize.ts) hook
 (pointer-capture drag, clamped, persisted under a `krita-vc:` key).
 
@@ -233,8 +249,12 @@ history** is on; see [Version Map](#version-map) for what replaced them.
 - **`performance`** — [`PerformancePanel`](../src/components/vcs/PerformancePanel.tsx): the
   Performance report — a summary card (average operation times + total storage saved), a
   scrollable per-version card list (stored vs full-copy bytes + % saved + save/compare time), and a
-  pinned recent-operations log. Timing is client-side (localStorage); storage comes from the
-  `repo_storage_stats` backend command. See [performance-report.md](performance-report.md).
+  pinned recent-operations log. Timing is client-side (localStorage), recomputed from
+  `localStorage` on every mount (cheap). Storage comes from the `repo_storage_stats` backend
+  command via `useStorageStats`, hoisted into `RepoShell` and passed in as `stats`/`loading` props
+  — not called inside `PerformancePanel` itself, since the panel mounts/unmounts on every switch
+  to/from this view (see the hoisting note above). See
+  [performance-report.md](performance-report.md).
   Always visible (not legacy-gated), but what sits *beside* it in `AppShell` depends on the
   Legacy toggle — the Version Map when Legacy is off, Main Panel + Inspector when it's on. See
   [Version Map](#version-map).

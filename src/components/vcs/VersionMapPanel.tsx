@@ -15,6 +15,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import {
   ArrowLeft,
+  ArrowsClockwise,
   ArrowsOut,
   CaretDown,
   CaretLineRight,
@@ -44,6 +45,7 @@ import {
   type VersionNodeData,
 } from "./VersionNode";
 import { useCommitDiff, useCommits } from "../../lib/repoData";
+import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
 import { assetName, versionLabel } from "../../lib/friendly";
@@ -162,6 +164,7 @@ function VersionMap({
   onShowChanges,
 }: VersionMapPanelProps) {
   const { artistMode } = useArtistMode();
+  const { refresh, scanning } = useRepository();
   const [openId, setOpenId] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(() => localStorage.getItem(SHOW_ALL_KEY) === "1");
   // Pick-a-version mode: the action bar asked for a starting point, so the next node click
@@ -418,32 +421,37 @@ function VersionMap({
             // row's switch + divider + readout + chips need the wider rhythm the header gave them.
             <div className="flex items-center gap-2">
               {otherBranches > 0 && (
-                <>
-                  {/* Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
-                      every other map target is a plain `data-tour-id` too. */}
-                  <span data-tour-id="map-all-lines" className="flex items-center">
-                    {/* `sm`: this is a toolbar row beside 32x32 icon chips, which is exactly what
-                        the small track was sized for — `md` is the settings-list metric. */}
-                    <Switch
-                      active={showAll}
-                      size="sm"
-                      icon={GitBranch}
-                      text={artistMode ? "All lines" : "All branches"}
-                      label={
-                        artistMode
-                          ? showAll
-                            ? "Show only the line you're on"
-                            : `Show all version lines (${otherBranches} other)`
-                          : showAll
-                            ? "Show only the current branch"
-                            : `Show all branches (${otherBranches} other)`
-                      }
-                      onClick={toggleShowAll}
-                    />
-                  </span>
-                  <span className="mx-1 h-4 w-px bg-text-muted/40" />
-                </>
+                // Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
+                // every other map target is a plain `data-tour-id` too.
+                <span data-tour-id="map-all-lines" className="flex items-center">
+                  {/* `sm`: this is a toolbar row beside 32x32 icon chips, which is exactly what
+                      the small track was sized for — `md` is the settings-list metric. */}
+                  <Switch
+                    active={showAll}
+                    size="sm"
+                    icon={GitBranch}
+                    text={artistMode ? "All lines" : "All branches"}
+                    label={
+                      artistMode
+                        ? showAll
+                          ? "Show only the line you're on"
+                          : `Show all version lines (${otherBranches} other)`
+                        : showAll
+                          ? "Show only the current branch"
+                          : `Show all branches (${otherBranches} other)`
+                    }
+                    onClick={toggleShowAll}
+                  />
+                </span>
               )}
+              <IconButton
+                icon={ArrowsClockwise}
+                label="Rescan for changes"
+                spinning={scanning}
+                disabled={scanning}
+                onClick={refresh}
+              />
+              {otherBranches > 0 && <span className="mx-1 h-4 w-px bg-text-muted/40" />}
               {/* One spotlight for all three: consecutive holes over adjacent 16px buttons read as
                   padding, not as teaching. `gap-2` reproduces what the header was giving them. */}
               <span data-tour-id="map-view-controls" className="flex items-center gap-2">

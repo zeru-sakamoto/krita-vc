@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderOpen, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { BusyOverlay } from "./BusyOverlay";
@@ -20,12 +20,18 @@ import {
   useBranches,
   useCommits,
   useCommitDiff,
+  useStorageStats,
   useWorkingChanges,
   useWorkingDiff,
   type DiffResult,
 } from "../../lib/repoData";
 import { versionLabel, versionNumbers, assetName } from "../../lib/friendly";
 import type { Repository } from "../../types";
+
+// The scan itself is cheap (one `stat` call), so this throttles UI churn, not backend load —
+// long enough to absorb a rapid save-and-alt-tab-back loop while painting, short enough that
+// it's invisible on any real break (and "Rescan for changes" covers the gap either way).
+const FOCUS_REFRESH_THROTTLE_MS = 30_000;
 
 /**
  * Root application shell — owns layout + view state.
@@ -80,7 +86,7 @@ function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
   const { beginIfFirstTime, setConditions } = useTour();
   const { legacy } = useLegacyHistory();
-  const { refreshNonce, setScanning } = useRepository();
+  const { refreshNonce, refresh, scanning, setScanning } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
   const branches = useBranches(repo.path, refreshNonce);
   // One scan of the tracked artwork for the whole shell. Lifted out of `Sidebar` because the
@@ -92,6 +98,11 @@ function RepoShell({ repo }: { repo: Repository }) {
     refreshNonce,
     setScanning
   );
+  // Same reasoning as `workingItems` above: `PerformancePanel` mounts/unmounts every time the
+  // Performance view is switched to/away from (Sidebar conditionally renders it on `view`, and
+  // Sidebar itself unmounts in Map view), so a `useStorageStats` call inside it would recompute
+  // `repo_storage_stats` on every open. Hoisted here so it survives view switches.
+  const { stats: perfStats, loading: perfLoading } = useStorageStats(repo.path, refreshNonce);
   const [activeView, setActiveView] = useState<ActivityView>("map");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
@@ -107,6 +118,34 @@ function RepoShell({ repo }: { repo: Repository }) {
   useEffect(() => {
     beginIfFirstTime();
   }, []);
+
+  // Read the latest `scanning` without re-subscribing the focus listener below on every
+  // scan start/stop.
+  const scanningRef = useRef(scanning);
+  useEffect(() => {
+    scanningRef.current = scanning;
+  }, [scanning]);
+
+  // Alt-tabbing back from Krita after a save should reflect here without a manual click —
+  // this just triggers the same `refresh()` the "Rescan for changes" button uses. DOM
+  // `window` focus tracks the OS window regaining focus, not in-page element focus, so
+  // clicking between panels inside the app does not spuriously refire this. Skipped while
+  // a scan is already in flight (via a ref, not state, so the listener itself never goes
+  // stale) — `refresh()` during `scanning` isn't a race, just a discarded, wasted scan.
+  // Throttled (not debounced — the first focus of a burst should fire immediately), so
+  // frequent alt-tabbing back and forth while painting can't queue up redundant scans.
+  const lastRefreshRef = useRef(0);
+  useEffect(() => {
+    const onFocus = () => {
+      if (scanningRef.current) return;
+      const now = Date.now();
+      if (now - lastRefreshRef.current < FOCUS_REFRESH_THROTTLE_MS) return;
+      lastRefreshRef.current = now;
+      refresh();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refresh]);
 
   // Which tour steps have anything to point at. Reported live rather than read once at the start:
   // the tour fires on mount, while `useCommits`/`useBranches` are still in flight.
@@ -219,6 +258,8 @@ function RepoShell({ repo }: { repo: Repository }) {
               onFocusFile={setFocusedFile}
               workingItems={workingItems}
               workingError={workingError}
+              perfStats={perfStats}
+              perfLoading={perfLoading}
               // Whatever diff the well is currently showing — the working diff in Changes, the
               // selected commit's in History. Undo/discard/set-aside all act on state this diff
               // reads, so they're blocked while it's still being computed too, not just mid-scan.

@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useRepository } from "../../lib/repository";
 import { useArtistMode } from "../../lib/artistMode";
-import { useStorageStats, type VersionRow } from "../../lib/repoData";
+import type { StorageStats, VersionRow } from "../../lib/repoData";
 import {
   readTimings,
   summarizeTimings,
@@ -162,19 +162,26 @@ function VersionCard({
 
 /**
  * Performance report: how long operations take (measured client-side, from localStorage) and
- * how much disk the delta store saves versus a full copy of every file per version (from the
- * `repo_storage_stats` backend command). Self-contained — pulls its own repo context.
+ * how much disk the delta store saves versus a full copy of every file per version. `stats`/
+ * `loading` come from `AppShell`'s hoisted `useStorageStats` call, not fetched here — this view
+ * mounts/unmounts on every switch to/from Performance, and re-running `repo_storage_stats` on
+ * every open would recompute it for nothing.
  *
  * Layout owns its own height (DockerPanel `scroll={false}` for this view): the per-version cards
  * are the only scroll region, so the summary stays on top and Recent operations stays pinned to
  * the bottom no matter how many versions there are.
  */
-export function PerformancePanel() {
+export function PerformancePanel({
+  stats,
+  loading,
+}: {
+  stats: StorageStats | null;
+  loading: boolean;
+}) {
   const { current, refreshNonce } = useRepository();
   const { artistMode } = useArtistMode();
   const path = current?.path ?? "";
 
-  const { stats, loading } = useStorageStats(path, refreshNonce);
   const samples = useMemo(() => readTimings(path), [path, refreshNonce]);
   const summary = useMemo(() => summarizeTimings(samples), [samples]);
   const byCommit = useMemo(() => timingByCommit(samples), [samples]);

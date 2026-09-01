@@ -43,7 +43,10 @@ exists (so a fast-forward merge can't clobber a pre-existing version's real comm
 
 Because diffs don't bump `refreshNonce`, new diff samples surface the next time the panel mounts or
 after any mutation, rather than live. A version's Save/Compare time reads "—" until you've done that
-op in-app on this machine (e.g. a version you've never opened has no Compare time).
+op in-app on this machine (e.g. a version you've never opened has no Compare time). This
+mount-refresh is specific to samples (a cheap `localStorage` read, recomputed by `PerformancePanel`
+on every mount) — the storage-savings numbers below don't recompute on mount at all; see the
+`useStorageStats` hoisting note there.
 
 ## Storage savings — backend, forward-only
 
@@ -59,7 +62,11 @@ against the delta store's real footprint.
   commit's full tree with `commit::tree_at_commit` and sums `original_size` over every file — one
   `VersionRow` per commit. `naiveBytes` is the sum of those rows; `actualBytes` is a recursive
   byte-size walk of `.kvc/objects/` + `.kvc/chains/`; `savedBytes = naive − actual` (saturating).
-  Exposed as the `repo_storage_stats` Tauri command (`useStorageStats` in `repoData.ts`).
+  Exposed as the `repo_storage_stats` Tauri command (`useStorageStats` in `repoData.ts`), called
+  once in `RepoShell` (`AppShell.tsx`) and passed into `PerformancePanel` as props — not called
+  inside the panel itself, which mounts/unmounts on every switch to/from the Performance view and
+  would otherwise recompute the stats on every open. Refetches only on a real `refreshNonce` bump
+  (a write op, or the window-focus refresh — see [frontend-architecture.md](frontend-architecture.md)).
   `// ponytail:` the per-version tree re-fold is O(commits × files) — fine for hand-scale histories.
 - **Per-version stored bytes (`VersionRow.storedBytes`).** Each version also reports what it
   *added* to the store, by **first-reference attribution** (reuses the GC mark, so no commit-path

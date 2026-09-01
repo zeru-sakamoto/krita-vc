@@ -34,7 +34,7 @@ import {
 import { ICON } from "../../lib/iconSize";
 import { useResize } from "../../lib/useResize";
 import { useRepository } from "../../lib/repository";
-import { useStashes } from "../../lib/repoData";
+import { useStashes, type StorageStats } from "../../lib/repoData";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
 import type { Branch, Commit, WorkingChange } from "../../types";
@@ -74,6 +74,10 @@ interface SidebarProps {
    *  lives in `AppShell` rather than here. */
   workingItems: WorkingChange[];
   workingError: string | null;
+  /** Performance tab's `repo_storage_stats` result — hoisted to `AppShell` for the same reason
+   *  as `workingItems`: `PerformancePanel` mounts/unmounts on every switch to/from this view. */
+  perfStats: StorageStats | null;
+  perfLoading: boolean;
   /** Whether the diff currently in the well (working or commit) is still being computed. */
   diffLoading: boolean;
   /** Jump to the Changes view (used by the save-first prompt). */
@@ -96,6 +100,8 @@ export function Sidebar({
   onFocusFile,
   workingItems,
   workingError,
+  perfStats,
+  perfLoading,
   diffLoading,
   onShowChanges,
 }: SidebarProps) {
@@ -384,7 +390,7 @@ export function Sidebar({
 
         {view === "branches" && <BranchesPanel branches={branches} onShowChanges={onShowChanges} />}
 
-        {view === "performance" && <PerformancePanel />}
+        {view === "performance" && <PerformancePanel stats={perfStats} loading={perfLoading} />}
       </DockerPanel>
 
       {/* Resize handle — the bento gutter itself. Fills the 8px gap to the next
