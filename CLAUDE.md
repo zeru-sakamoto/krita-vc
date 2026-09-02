@@ -499,8 +499,16 @@ because timing is per-machine and belongs with the browser, not the repo).
   mask cached by both layer raster keys). `ArtDiffView` picks the overlay source from the selection
   and passes `diffImage`/`diffOutline`/`regions` as explicit props into `ArtCanvas`/`CompareSlider`
   (never read off `diff`), so a focused layer shows only its own change and unchanged/added/removed
-  layers show none. **Region boxes are normalized 0..1** of the viewBox (composite tile-bbox and
-  per-layer alike) — `boxOverlay` scales by width/height, so a region must not be pre-scaled to
+  layers show none. Which layers *are* `modified` is decided **per matched layer, never per archive
+  path**: layers pair by `commands::layer_id` (uuid, name when absent), and the tile comparison
+  looks the old side up under that matched layer's own `<image name>/layers/<filename>` — hence the
+  `pair` map (new entry path -> old entry path, `""` for no counterpart) that
+  `kra::diff_tile_indexes` takes. Krita renumbers `layerN` whenever the stack changes, so pairing
+  by path made every layer above an inserted one report `modified` with byte-identical tiles — in
+  the diff navigator *and* the Changes panel, whose rows roll up this same `change`. Same class of
+  bug `merge.rs` avoids by collecting data files filename-independently. **Region boxes are
+  normalized 0..1** of the viewBox (composite tile-bbox and per-layer alike) — `boxOverlay` scales
+  by width/height, so a region must not be pre-scaled to
   pixels or it overflows past the canvas' bottom-right. Palette files (`.gpl`, `.kpl`, `.aco`,
   `.ase`) have `kind: "palette"` and always render
   as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's

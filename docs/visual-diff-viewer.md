@@ -192,6 +192,23 @@ stages** so the panel appears immediately instead of blocking on every layer's r
      default "pixels" highlight; keyed off the composite so they need no layer stream.
    - **Change regions** — one normalized bounding box over the tiles that differ between the two
      commits (no pixel decode; just tile-hash comparison), feeding the coarse box-highlight overlay.
+   - **Per-layer `change`** (`added`/`removed`/`modified`/`unchanged`) — a layer is `modified` when
+     its curated metadata moved (`opacity`/`compositeop`/`name`) **or** its tiles differ. Both
+     halves are decided **per matched layer**, never per archive path: layers are paired by
+     `commands::layer_id` (uuid, name when there is none), and the tile comparison looks the old
+     side up under *that* layer's own `<image name>/layers/<filename>` — which is why
+     `kra::diff_tile_indexes` takes a `pair` map from new-side entry path to old-side entry path
+     (`""` for a layer with no counterpart, since no entry path is empty, so an added layer's
+     tiles all count as new and it still contributes to the union change region).
+
+     **This is load-bearing.** Krita renumbers `layerN` data files whenever the stack changes —
+     insert one layer and every layer above it shifts — so pairing by path made an untouched
+     layer diff against nothing and report `modified`: add a layer, and the whole stack above it
+     lit up as changed in both the diff navigator and the Changes panel (whose rows roll up this
+     same `change`). It is the same class of bug `merge.rs` already guards against by collecting
+     data files filename-independently, and the raster path in the same loop already got it right
+     (`before_r` reads the *matched* old layer's `filename` and its own side's image name). Any
+     replacement must keep identity and content pairing on the same key.
 2. **`commit_layers`** (or `working_layers`) is then fetched lazily by
    [`useArtLayers`](../src/lib/repoData.ts) and **streamed**: the command takes a Tauri
    `Channel<LayerDto>` and sends each layer the moment its rasters finish (rayon-parallel, so

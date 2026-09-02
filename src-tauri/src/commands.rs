@@ -1524,12 +1524,43 @@ pub fn art_diff_dto(
     // Borrow the new side's tile grid once — feeds both the change detection below and each
     // layer's painted-area bounds (kra::layer_bounds) in the loop.
     let new_index = new_src.tile_index_ref();
+    // Krita renumbers `layerN` data files whenever the stack changes (adding one layer shifts
+    // every layer above it), so an untouched layer's archive path differs between two versions.
+    // Pair each new-side layer entry with the path the *same* layer — matched by id, the way the
+    // loop below already matches metadata and rasters — had on the old side, so change detection
+    // compares tiles rather than filenames. "" for a layer with no counterpart: no entry path is
+    // empty, so its tiles all count as new (it's an added layer, and its area really did change).
+    let pair_paths: Vec<(String, String)> = match &old_meta {
+        Some(om) => new_meta
+            .layers
+            .iter()
+            .filter(|nl| !nl.filename.is_empty())
+            .map(|nl| {
+                let old_path = om
+                    .layers
+                    .iter()
+                    .find(|o| layer_id(o) == layer_id(nl))
+                    .filter(|o| !o.filename.is_empty())
+                    .map(|o| format!("{}/layers/{}", om.name, o.filename))
+                    .unwrap_or_default();
+                (
+                    format!("{}/layers/{}", new_meta.name, nl.filename),
+                    old_path,
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let entry_pairs: std::collections::HashMap<&str, &str> = pair_paths
+        .iter()
+        .map(|(n, o)| (n.as_str(), o.as_str()))
+        .collect();
     // One pass over borrowed tile indexes yields both the changed-layer set and the union
     // region — no per-tile hash clones, no duplicate map builds.
     let (changed_entries, changed_region) = old_manifest
         .as_ref()
         .map(|m| {
-            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_index, w, h);
+            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_index, &entry_pairs, w, h);
             (d.changed_paths, d.region)
         })
         .unwrap_or_default();

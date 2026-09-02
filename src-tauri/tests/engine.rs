@@ -4242,3 +4242,76 @@ fn backup_versions_reads_the_archived_history_without_extracting() {
     // Reading the archive must not have written anything beside it.
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
 }
+
+/// Krita renumbers `layerN` data files when a layer is added, so an untouched layer's archive
+/// path shifts between versions. Change detection must pair the two sides by the *matched* layer's
+/// own filename (and its own side's image name), not by the new side's path — pairing by path made
+/// every renumbered layer report "modified" even though its tiles were byte-identical.
+#[test]
+fn added_layer_does_not_mark_renumbered_layers_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_doc(root);
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+
+    let base_tile = solid_rgba_tile(10, 20, 30, 255);
+    let top_tile = solid_rgba_tile(40, 50, 60, 255);
+
+    let v1 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        (
+            "maindoc.xml",
+            maindoc_layers(&[("Base", "base", "layer1"), ("Top", "top", "layer2")]),
+        ),
+        ("img/layers/layer1", tiled(&[(0, 0, &base_tile)])),
+        ("img/layers/layer2", tiled(&[(0, 0, &top_tile)])),
+    ]);
+    // A new layer is inserted at the bottom; Krita renumbers, so Base/Top move to layer2/layer3
+    // with byte-identical tile data.
+    let v2 = pack_kra(&[
+        ("mimetype", b"application/x-krita".to_vec()),
+        (
+            "maindoc.xml",
+            maindoc_layers(&[
+                ("New", "new", "layer1"),
+                ("Base", "base", "layer2"),
+                ("Top", "top", "layer3"),
+            ]),
+        ),
+        (
+            "img/layers/layer1",
+            tiled(&[(0, 0, &solid_rgba_tile(90, 90, 90, 255))]),
+        ),
+        ("img/layers/layer2", tiled(&[(0, 0, &base_tile)])),
+        ("img/layers/layer3", tiled(&[(0, 0, &top_tile)])),
+    ]);
+
+    std::fs::write(root.join("art.kra"), &v1).unwrap();
+    let c1 = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    std::fs::write(root.join("art.kra"), &v2).unwrap();
+    let c2 = commit::commit_snapshot(&mut r, "v2", "t").unwrap();
+
+    let parent_tree = commit::tree_at_commit(&r.commits, &c1.id).unwrap();
+    let f = c2.files.iter().find(|f| f.path == "art.kra").unwrap();
+    let dto = commands::committed_art_dto(&r, f, parent_tree.get("art.kra"), false, None).unwrap();
+
+    let change = |name: &str| {
+        dto.layers
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("{name} layer present"))
+            .change
+            .clone()
+    };
+    assert_eq!(change("New"), "added");
+    assert_eq!(
+        change("Base"),
+        "unchanged",
+        "Base only moved layer1 -> layer2"
+    );
+    assert_eq!(
+        change("Top"),
+        "unchanged",
+        "Top only moved layer2 -> layer3"
+    );
+}

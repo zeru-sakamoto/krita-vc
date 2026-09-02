@@ -1384,6 +1384,7 @@ pub struct TileDiff {
 pub fn diff_tile_indexes(
     old: &TileIndexRef,
     new: &TileIndexRef,
+    pair: &std::collections::HashMap<&str, &str>,
     width: i64,
     height: i64,
 ) -> TileDiff {
@@ -1392,8 +1393,14 @@ pub fn diff_tile_indexes(
     let mut max = (i64::MIN, i64::MIN);
     let mut seen = false;
     for (path, (tw, th, tiles)) in new {
+        // Krita renumbers `layerN` data files whenever the stack changes, so the same layer's
+        // archive path differs between two versions. `pair` maps a new-side path to the one the
+        // *same layer* had on the old side ("" when it has no counterpart, which no entry path
+        // is); without it a renumbered-but-untouched layer diffs against nothing and reads as
+        // fully rewritten. Entries absent from `pair` keep their own path.
+        let old_path = pair.get(path).copied().unwrap_or(path);
         let old_tiles: std::collections::HashMap<(i64, i64), &str> = old
-            .get(path)
+            .get(old_path)
             .map(|(_, _, ts)| ts.iter().map(|(x, y, h)| ((*x, *y), *h)).collect())
             .unwrap_or_default();
         let mut entry_changed = tiles.len() != old_tiles.len();
@@ -1567,7 +1574,14 @@ impl KraManifest {
 /// The set of tiled layer-data entry paths whose tiles differ between two sides (added,
 /// removed, or hash-changed tiles). Thin wrapper over [`diff_tile_indexes`] for owned indexes.
 pub fn changed_entry_paths(old: &TileIndex, new: &TileIndex) -> std::collections::HashSet<String> {
-    diff_tile_indexes(&borrow_index(old), &borrow_index(new), 0, 0).changed_paths
+    diff_tile_indexes(
+        &borrow_index(old),
+        &borrow_index(new),
+        &Default::default(),
+        0,
+        0,
+    )
+    .changed_paths
 }
 
 /// One normalized (0..1) bounding box over the tiles that changed between two sides.
@@ -1578,7 +1592,14 @@ pub fn changed_region(
     width: i64,
     height: i64,
 ) -> Option<(f64, f64, f64, f64)> {
-    diff_tile_indexes(&borrow_index(old), &borrow_index(new), width, height).region
+    diff_tile_indexes(
+        &borrow_index(old),
+        &borrow_index(new),
+        &Default::default(),
+        width,
+        height,
+    )
+    .region
 }
 
 // --- working-tree .kra (in-memory, read-only diff path) --------------------------------
