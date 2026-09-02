@@ -152,18 +152,26 @@ error still names the artwork rather than an internal directory.
 | `krita-plugin/` | `find_repo` (walk up for `.kvc`) → `find_doc`; `in_repo` (folder prefix) → `is_tracked_document` (exact identity). |
 | Frontend | File picker instead of folder picker; "create repository" flow deleted; staging deleted; `ChangesPanel` shows changed **layers**. |
 
+## Done since
+
+- **Layer-level staging.** The Changes tab's rows are checkboxes now:
+  [`stage::stage_kra`](../src-tauri/src/stage.rs) synthesises a `.kra` holding the ticked layers
+  plus the committed form of every other one, and `commit_selected`'s new `layers` argument stores
+  it. It landed at the **top-level** grain this section predicted, reusing `merge.rs`'s zip/XML
+  helpers — but *not* `merge_layers` itself, whose splice turns out to be wrong for the job. A
+  merge folds layers **on top** with fresh uuids and ` [2]` names because it is adding a second
+  copy; staging **substitutes** a layer in place, so it must preserve the uuid (that is what makes
+  the next diff recognise it) and keep the committed `layerN` filename unless something actually
+  collides (a rename would re-store every reverted tile under fresh stream keys and lose dedup
+  against the history it just came from). The prediction was right about the grain and about
+  `layers_node`; it was wrong that the existing function was "already mostly it".
+  See [version-control.md](version-control.md#layer-subset-staging--saving-only-some-layers).
+
 ## Not done
 
-- **Layer-level staging.** The Changes tab lists changed layers read-only. Ticking them needs a
-  write path that synthesises a `.kra` holding only the selected layers, which
-  `merge::merge_layers` already mostly is — it folds selected **top-level** layers from one `.kra`
-  onto another with uuid-keyed matching, content comparison via `canon_entry`, name-clash
-  suffixing and data-file remapping. Top-level is the grain `merge.rs` natively speaks
-  (`layers_node` is the `<layers>` directly under `<IMAGE>`), and it keeps the unit whole: a group
-  either comes or it doesn't, so you can never emit XML referencing a data file you didn't copy.
-  Full recursion means partial groups, added/removed group rules, mask handling and ancestor
-  forcing — every one able to produce a `.kra` Krita won't open, discovered by the artist, in
-  their art, later.
+- **Recursive (inside-a-group) staging.** A group is still saved whole. Going finer means partial
+  groups, added/removed group rules, mask handling and ancestor forcing — every one able to
+  produce a `.kra` Krita won't open, discovered by the artist, in their art, later.
 - **Rename re-pointing.** Renaming a tracked `.kra` currently reads as untracked. `doc.json` holds
   what a content-hash re-point would need. The same gap is why restoring a backup never renames an
   artwork on the way in — the filename is baked into `doc.json`, `index.json` keys, chain shard

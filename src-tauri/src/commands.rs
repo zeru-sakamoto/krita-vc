@@ -573,18 +573,32 @@ pub async fn scan_repository(path: String) -> std::result::Result<Vec<WorkingCha
     .await
 }
 
+/// Save a version. `paths` restricts it to those relative paths (omitted = everything).
+///
+/// `layers` restricts it *within* the tracked `.kra` to the top-level layer ids the artist ticked
+/// in the Changes panel — the ids are `LayerDto.id`. Omitted/`null` saves the whole artwork, which
+/// is the default and the only thing the Krita plugin ever asks for. With a subset, the version
+/// stores a synthesized document (`stage::stage_kra`) and the unticked layers stay uncommitted, so
+/// the artwork is still dirty afterwards.
 #[tauri::command]
 pub async fn commit_snapshot(
     path: String,
     message: String,
     author: String,
     paths: Option<Vec<String>>,
+    layers: Option<Vec<String>>,
 ) -> std::result::Result<Commit, String> {
     run_heavy(move || {
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "committing")?;
         let mut repo = Repo::open(root)?;
-        commit::commit_selected(&mut repo, &message, &author, paths.as_deref())
+        commit::commit_selected(
+            &mut repo,
+            &message,
+            &author,
+            paths.as_deref(),
+            layers.as_deref(),
+        )
     })
     .await
 }
@@ -982,6 +996,12 @@ pub struct BoundsDto {
 #[serde(rename_all = "camelCase")]
 pub struct LayerDto {
     pub id: String,
+    /// The id of the **top-level** layer this one sits under — its own `id` when it already is
+    /// one. Krita's stack is a tree but this list is flat, so without it the Changes panel can
+    /// only guess which row a nested change belongs to. That guess was fine while the rows were
+    /// read-only; it is not fine now that a row is a checkbox deciding what gets saved, since
+    /// layer-subset staging acts on top-level layers only (`stage::stage_kra`).
+    pub top_level_id: String,
     pub name: String,
     pub opacity: i64,
     pub blend_mode: String,
@@ -1245,6 +1265,15 @@ fn layer_id(l: &LayerNode) -> String {
     }
 }
 
+/// The id of `l`'s top-level ancestor — `l`'s own when it already is one. `LayerNode::top` is an
+/// index rather than an id precisely so the "uuid, or name when there's no uuid" rule stays in
+/// [`layer_id`] alone; this is the one place that resolves it.
+fn top_level_id(meta: &kra::ImageMeta, l: &LayerNode) -> String {
+    l.top
+        .and_then(|t| meta.layers.get(t))
+        .map_or_else(|| layer_id(l), layer_id)
+}
+
 /// Composite (mergedimage.png) as a capped PNG data URL. The decode/resize/encode runs once per
 /// unique composite — the result is disk-cached in `.kvc/cache/` keyed by the entry's content
 /// hash, and on a hit `bytes` is never called (no reconstruct at all).
@@ -1277,6 +1306,91 @@ fn composite_data_url(
         )));
     }
     Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
+}
+
+/// The composite for a `.kra` version that carries no `mergedimage.png` of its own — stack its
+/// layers ourselves.
+///
+/// A **layer-subset version** (`stage::stage_kra`) drops Krita's composite deliberately, rather
+/// than ship a render showing layers the version doesn't contain. Without this, such a version
+/// would have a blank thumbnail on the Version Map, since `VersionNode` draws `afterImage` and
+/// `commit_diff` fetches no per-layer rasters.
+///
+/// Cached like every other raster and keyed by the version's content, so the rasterization below
+/// happens once per version. On a cold cache it costs one raster per paint layer — but those are
+/// the same content-addressed layer rasters `commit_layers` writes, so the diff viewer warms this
+/// and vice versa. Only committed versions get a key (a working file has no manifest); a working
+/// `.kra` without a composite falls through to the frontend's SVG layer stacker.
+///
+/// ponytail: holds every layer's capped PNG at once (~2 MB each) before compositing. Bounded by
+/// `run_heavy`'s two permits, and no worse than `commit_layers` streaming the same set. Composite
+/// incrementally if a pathological layer count ever shows up.
+fn stacked_composite_url(
+    repo: &Repo,
+    path: &str,
+    src: &kra::KraSource,
+    meta: &kra::ImageMeta,
+    tile_cache: &crate::delta::TileCache,
+) -> Result<Option<String>> {
+    let kra::KraSource::Committed(manifest) = src else {
+        return Ok(None);
+    };
+    let key = kra::stack_cache_key(&manifest.version_key());
+    let cache_dir = repo.cache_dir();
+    if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
+        return Ok(Some(crate::raster::raster_url(
+            &repo.store,
+            &cache_dir,
+            &key,
+            &png,
+        )));
+    }
+
+    let (w, h) = (meta.width, meta.height);
+    // Bottom→top: `parse_image_meta` preserves Krita's document order, which is top-first.
+    let mut rasters: Vec<(kra::LayerRaster, f32, String)> = Vec::new();
+    for (i, l) in meta.layers.iter().enumerate().rev() {
+        if l.filename.is_empty() {
+            continue; // a group contributes no pixels of its own, only its children's
+        }
+        // ponytail: folds in only the *top-level* ancestor's opacity and visibility, which is
+        // what `LayerNode::top` records. A group nested inside another group contributes its own
+        // opacity only when it is that top-level one. This renders a preview, so the gap is
+        // cosmetic; recording the full parent chain is the upgrade.
+        let group = match l.top {
+            Some(t) if t != i => meta.layers.get(t),
+            _ => None,
+        };
+        if !l.visible || group.is_some_and(|g| !g.visible) {
+            continue;
+        }
+        let opacity = (l.opacity as f32 / 255.0) * group.map_or(1.0, |g| g.opacity as f32 / 255.0);
+        if opacity <= 0.0 {
+            continue;
+        }
+        if let Some(r) = src.layer_raster(repo, path, &meta.name, &l.filename, w, h, tile_cache)? {
+            rasters.push((r, opacity, blend_mode(&l.blend)));
+        }
+    }
+
+    let stack: Vec<crate::raster::StackLayer> = rasters
+        .iter()
+        .map(|(r, o, b)| crate::raster::StackLayer {
+            png: &r.png,
+            opacity: *o,
+            blend: b,
+        })
+        .collect();
+    let Some(png) = crate::raster::composite_stack(&stack) else {
+        return Ok(None);
+    };
+    crate::raster::cache_write(&cache_dir, &key, &png);
+    Ok(Some(crate::raster::raster_url(
+        &repo.store,
+        &cache_dir,
+        &key,
+        &png,
+    )))
 }
 
 /// The changed-pixel highlight for a diff: the accent mask as a capped PNG URL, plus the SVG path
@@ -1476,6 +1590,7 @@ pub fn art_diff_dto(
             };
             let dto = LayerDto {
                 id: layer_id(nl),
+                top_level_id: top_level_id(&new_meta, nl),
                 name: nl.name.clone(),
                 opacity: to_percent(nl.opacity),
                 blend_mode: blend_mode(&nl.blend),
@@ -1523,6 +1638,7 @@ pub fn art_diff_dto(
                 };
                 let dto = LayerDto {
                     id: layer_id(ol),
+                    top_level_id: top_level_id(om, ol),
                     name: ol.name.clone(),
                     opacity: to_percent(ol.opacity),
                     blend_mode: blend_mode(&ol.blend),
@@ -1546,15 +1662,36 @@ pub fn art_diff_dto(
     }
     layers.reverse(); // Krita writes top-first; the UI stacks bottom→top.
 
-    let after_image = composite_data_url(repo, new_src.entry_hash("mergedimage.png"), || {
+    // A layer-subset version has no `mergedimage.png` (see `stage::stage_kra`), so fall back to
+    // compositing its layer stack ourselves rather than leave the Composite pane — and the
+    // Version Map's thumbnail — blank.
+    let after_image = match composite_data_url(repo, new_src.entry_hash("mergedimage.png"), || {
         new_src.entry_bytes(repo, path, "mergedimage.png")
-    })?
-    .map(&img);
+    })? {
+        Some(url) => Some(img(url)),
+        None => stacked_composite_url(repo, path, new_src, &new_meta, &tile_cache)?.map(&img),
+    };
     let before_image = match &old_manifest {
-        Some(m) => composite_data_url(repo, m.entry_hash("mergedimage.png"), || {
-            kra::entry_bytes(repo, path, m, "mergedimage.png")
-        })?
-        .map(&img),
+        Some(m) => {
+            match composite_data_url(repo, m.entry_hash("mergedimage.png"), || {
+                kra::entry_bytes(repo, path, m, "mergedimage.png")
+            })? {
+                Some(url) => Some(img(url)),
+                // Same fallback for the "before" side, so diffing *against* a partial version
+                // doesn't show an empty left pane.
+                None => match &old_meta {
+                    Some(om) => stacked_composite_url(
+                        repo,
+                        path,
+                        &kra::KraSource::Committed(m),
+                        om,
+                        &tile_cache,
+                    )?
+                    .map(&img),
+                    None => None,
+                },
+            }
+        }
         None => None,
     };
     // Changed-pixel highlight: diff the before/after composites. Rides on this first diff (no

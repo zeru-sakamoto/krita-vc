@@ -44,16 +44,25 @@ fn require<'a>(flags: &'a HashMap<String, String>, name: &str) -> Result<&'a str
         .ok_or_else(|| format!("missing required --{name}"))
 }
 
-/// The optional `--paths` subset (commit / discard / stash), as a JSON array of repo-relative
-/// paths. A JSON array rather than a comma list because `parse_flags` is a map (a repeated flag
-/// would overwrite) and paths may legitimately contain commas.
-fn paths_of(flags: &HashMap<String, String>) -> Result<Option<Vec<String>>, String> {
-    match flags.get("paths") {
+/// An optional subset flag, as a JSON array of strings. A JSON array rather than a comma list
+/// because `parse_flags` is a map (a repeated flag would overwrite) and the values — relative
+/// paths, Krita layer names — may legitimately contain commas.
+fn json_array_of(
+    flags: &HashMap<String, String>,
+    name: &str,
+    what: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match flags.get(name) {
         None => Ok(None),
         Some(raw) => serde_json::from_str(raw)
             .map(Some)
-            .map_err(|e| format!("bad --paths (expected a JSON array of relative paths): {e}")),
+            .map_err(|e| format!("bad --{name} (expected a JSON array of {what}): {e}")),
     }
+}
+
+/// The optional `--paths` subset (commit / discard / stash).
+fn paths_of(flags: &HashMap<String, String>) -> Result<Option<Vec<String>>, String> {
+    json_array_of(flags, "paths", "relative paths")
 }
 
 fn main() -> ExitCode {
@@ -159,12 +168,22 @@ fn run_commit(flags: &HashMap<String, String>) -> Result<String, String> {
     let message = require(flags, "message")?;
     let author = require(flags, "author")?;
     let only = paths_of(flags)?;
+    // `--layers` restricts the version to those top-level layer ids (uuid, or name when the layer
+    // carries none) — the desktop app's Changes-panel ticks. The Krita docker never passes it: it
+    // has no layer picker. Kept here so the CLI stays a complete surface over the engine.
+    let layers = json_array_of(flags, "layers", "layer ids")?;
     let root = Path::new(repo_path);
     let _lock = RepoLock::acquire(root, "committing").map_err(|e| e.to_string())?;
     let mut repo = Repo::open(root).map_err(|e| e.to_string())?;
-    // `only: None` is exactly commit_snapshot — it's a one-line delegate to this.
-    let c = commit::commit_selected(&mut repo, message, author, only.as_deref())
-        .map_err(|e| e.to_string())?;
+    // `only: None, layers: None` is exactly commit_snapshot — it's a one-line delegate to this.
+    let c = commit::commit_selected(
+        &mut repo,
+        message,
+        author,
+        only.as_deref(),
+        layers.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(json!({ "id": c.id, "message": c.message, "timestamp": c.timestamp }).to_string())
 }
 

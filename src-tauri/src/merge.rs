@@ -176,15 +176,8 @@ pub fn merge_layers(base: &[u8], incoming: &[u8], ancestor: Option<&[u8]>) -> Re
         return Err(fail("set-aside file has no changed layers to bring back"));
     }
 
-    // Splice the fragments in as the first children of base's <layers> (top of the stack). The
-    // first '>' after `<layers` closes its opening tag — Krita never puts '>' inside an
-    // attribute value, so this is unambiguous.
-    let lr = base_layers.range();
-    let insert_at = lr.start
-        + base_xml[lr.clone()]
-            .find('>')
-            .ok_or_else(|| fail("base <layers> tag is malformed"))?
-        + 1;
+    // Splice the fragments in as the first children of base's <layers> (top of the stack).
+    let insert_at = layers_insert_at(base_xml, base_layers, fail)?;
     let mut merged = String::with_capacity(
         base_xml.len() + fragments.iter().map(String::len).sum::<usize>() + fragments.len(),
     );
@@ -276,12 +269,12 @@ fn or_q(s: &str) -> &str {
     }
 }
 
-fn zip_err(e: zip::result::ZipError) -> KvcError {
+pub(crate) fn zip_err(e: zip::result::ZipError) -> KvcError {
     KvcError::CorruptZip(e.to_string())
 }
 
 /// mimetype stored first, everything else deflated — the shape Krita reads.
-fn opts(name: &str) -> SimpleFileOptions {
+pub(crate) fn opts(name: &str) -> SimpleFileOptions {
     let method = if name == "mimetype" {
         CompressionMethod::Stored
     } else {
@@ -290,42 +283,85 @@ fn opts(name: &str) -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(method)
 }
 
-fn attr(key: &str, value: &str) -> String {
+pub(crate) fn attr(key: &str, value: &str) -> String {
     format!("{key}=\"{value}\"")
 }
 
-fn read_entry(zip_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+/// The byte offset just past a `<layers …>` opening tag, i.e. where its first child begins.
+/// The first `'>'` after `<layers` closes it — Krita never puts `'>'` inside an attribute value.
+pub(crate) fn layers_insert_at(
+    xml: &str,
+    layers: roxmltree::Node,
+    fail: impl Fn(&str) -> KvcError,
+) -> Result<usize> {
+    let lr = layers.range();
+    Ok(lr.start
+        + xml[lr.clone()]
+            .find('>')
+            .ok_or_else(|| fail("<layers> tag is malformed"))?
+        + 1)
+}
+
+/// Read one archive entry's bytes. `missing` builds the error, so [`crate::stage`] can reuse this
+/// without reporting a staging problem as a set-aside merge failure.
+pub(crate) fn read_entry_with(
+    zip_bytes: &[u8],
+    name: &str,
+    missing: impl Fn(&str) -> KvcError,
+) -> Result<Vec<u8>> {
     let mut zip = ZipArchive::new(Cursor::new(zip_bytes)).map_err(zip_err)?;
     let mut f = zip
         .by_name(name)
-        .map_err(|_| fail(&format!("missing {name}")))?;
+        .map_err(|_| missing(&format!("missing {name}")))?;
     let buf = crate::repo::read_entry_capped(&mut f)?;
     Ok(buf)
 }
 
-fn image_node<'a>(doc: &'a roxmltree::Document<'a>) -> Result<roxmltree::Node<'a, 'a>> {
+fn read_entry(zip_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    read_entry_with(zip_bytes, name, fail)
+}
+
+/// The first `<IMAGE>` element. `fail` builds the error — see [`read_entry_with`].
+pub(crate) fn image_node_with<'a>(
+    doc: &'a roxmltree::Document<'a>,
+    fail: impl Fn(&str) -> KvcError,
+) -> Result<roxmltree::Node<'a, 'a>> {
     doc.descendants()
         .find(|n| n.has_tag_name("IMAGE"))
         .ok_or_else(|| fail("maindoc.xml has no <IMAGE>"))
 }
 
+fn image_node<'a>(doc: &'a roxmltree::Document<'a>) -> Result<roxmltree::Node<'a, 'a>> {
+    image_node_with(doc, fail)
+}
+
 /// The `<layers>` element that is a direct child of `<IMAGE>` — the document's top-level stack.
-fn layers_node<'a>(image: roxmltree::Node<'a, 'a>) -> Result<roxmltree::Node<'a, 'a>> {
+/// This is the grain both the set-aside merge and layer-subset staging speak: a group layer is
+/// one of these children, so it is always taken or left whole and the XML can never reference a
+/// data file that wasn't copied.
+pub(crate) fn layers_node_with<'a>(
+    image: roxmltree::Node<'a, 'a>,
+    fail: impl Fn(&str) -> KvcError,
+) -> Result<roxmltree::Node<'a, 'a>> {
     image
         .children()
         .find(|n| n.is_element() && n.has_tag_name("layers"))
         .ok_or_else(|| fail("maindoc.xml has no <layers>"))
 }
 
+fn layers_node<'a>(image: roxmltree::Node<'a, 'a>) -> Result<roxmltree::Node<'a, 'a>> {
+    layers_node_with(image, fail)
+}
+
 /// Every value of `attr` across `node` and its descendants (`descendants()` includes `node`).
-fn descendant_attr(node: roxmltree::Node, attr: &str) -> HashSet<String> {
+pub(crate) fn descendant_attr(node: roxmltree::Node, attr: &str) -> HashSet<String> {
     node.descendants()
         .filter_map(|n| n.attribute(attr).map(str::to_string))
         .collect()
 }
 
 /// Like [`descendant_attr`] but a de-duplicated list in document order (stable id remapping).
-fn subtree_attr(node: roxmltree::Node, attr: &str) -> Vec<String> {
+pub(crate) fn subtree_attr(node: roxmltree::Node, attr: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     node.descendants()
         .filter_map(|n| n.attribute(attr).map(str::to_string))
@@ -334,7 +370,7 @@ fn subtree_attr(node: roxmltree::Node, attr: &str) -> Vec<String> {
 }
 
 /// Filename components of every `<image>/layers/<name>...` entry in a `.kra` archive.
-fn archive_layer_files(kra: &[u8], image: &str) -> Result<HashSet<String>> {
+pub(crate) fn archive_layer_files(kra: &[u8], image: &str) -> Result<HashSet<String>> {
     let prefix = format!("{image}/layers/");
     let mut zip = ZipArchive::new(Cursor::new(kra)).map_err(zip_err)?;
     let mut out = HashSet::new();

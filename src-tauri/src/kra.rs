@@ -996,6 +996,16 @@ pub struct LayerNode {
     pub kind: String,
     /// The `layers/<filename>` data file; empty for group/non-paint layers.
     pub filename: String,
+    /// Index into the same flat `ImageMeta::layers` of the **top-level** layer this one sits
+    /// under — itself, when it already is one. `None` only for a malformed stack.
+    ///
+    /// `parse_image_meta` flattens every `<layer>` in the document, so a group's children arrive
+    /// as siblings of the group with no parent link. Two things need the real tree: layer-subset
+    /// staging, whose grain is the top-level layer (so the Changes panel must roll a nested change
+    /// up to the row that actually commits it, rather than guessing), and the composite fallback,
+    /// which has to apply a group's opacity to its children. An index rather than an id keeps the
+    /// "uuid, or name when there's no uuid" rule in one place (`commands::layer_id`).
+    pub top: Option<usize>,
 }
 
 /// Upper bound on a parsed canvas dimension. Canvas dims come from maindoc.xml unchecked and
@@ -1026,9 +1036,30 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
             "maindoc: canvas {width}x{height} exceeds the {MAX_CANVAS_DIM}px limit"
         )));
     }
-    let layers = doc
+    // The `<layers>` directly under `<IMAGE>` — the top-level stack. A group's children live in a
+    // nested `<layers>`, so walking up to this one is what identifies a node's top-level ancestor.
+    let stack = image
+        .children()
+        .find(|n| n.is_element() && n.has_tag_name("layers"));
+    let nodes: Vec<roxmltree::Node> = doc
         .descendants()
         .filter(|n| n.has_tag_name("layer"))
+        .collect();
+    // ponytail: linear scan per layer — O(layers²), and a Krita stack is tens of nodes. A node-id
+    // map is the upgrade if a document ever makes this show up.
+    let top_of = |n: roxmltree::Node| -> Option<usize> {
+        let stack = stack?;
+        let mut cur = n;
+        loop {
+            let parent = cur.parent()?;
+            if parent == stack {
+                return nodes.iter().position(|m| *m == cur);
+            }
+            cur = parent;
+        }
+    };
+    let layers = nodes
+        .iter()
         .map(|n| LayerNode {
             name: n.attribute("name").unwrap_or("").to_string(),
             uuid: n.attribute("uuid").unwrap_or("").to_string(),
@@ -1041,6 +1072,7 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
             visible: n.attribute("visible") != Some("0"),
             kind: n.attribute("nodetype").unwrap_or("").to_string(),
             filename: n.attribute("filename").unwrap_or("").to_string(),
+            top: top_of(*n),
         })
         .collect();
     Ok(ImageMeta {
@@ -1103,6 +1135,24 @@ fn raster_cache_key(
         h.update(format!("\0{x},{y},{hash}").as_bytes());
     }
     h.finalize().to_hex().to_string()
+}
+
+/// Cache key for the **composited stand-in** the app renders when a `.kra` version carries no
+/// `mergedimage.png` — see `commands::stacked_composite_url`. Keyed by
+/// [`KraManifest::version_key`], so it invalidates exactly when the picture would change and two
+/// identical stacks share one entry. Carries the same resolution-cap and filter tokens as every
+/// other cached raster.
+pub fn stack_cache_key(version_key: &str) -> String {
+    blake3::hash(
+        format!(
+            "stack\0{version_key}\0{}\0{}",
+            crate::raster::MAX_RASTER_DIM,
+            crate::raster::FILTER_VERSION
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 /// Cache key for a capped composite (mergedimage.png), from its content hash.
@@ -1401,6 +1451,37 @@ impl KraManifest {
             } if path == name => Some(pixels_hash.clone()),
             _ => None,
         })
+    }
+
+    /// A content address for this whole document version: every entry folded in, in manifest
+    /// order, by path plus whatever identifies its bytes (blob hash, composite pixel hash, or
+    /// each tile's position + content hash). Two versions that reconstruct to the same archive
+    /// share a key.
+    ///
+    /// Used to cache the **composited stand-in** for a version with no `mergedimage.png` of its
+    /// own — see `commands::stacked_composite_url`. Deliberately derived here rather than taking
+    /// the manifest's own stream hash, which would have to be threaded down through every
+    /// `art_diff_dto` call site.
+    pub fn version_key(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        for e in &self.entries {
+            h.update(b"\0");
+            h.update(e.path().as_bytes());
+            match e {
+                KraEntry::Raw { blob, .. } => {
+                    h.update(blob.as_bytes());
+                }
+                KraEntry::CompositePng { pixels_hash, .. } => {
+                    h.update(pixels_hash.as_bytes());
+                }
+                KraEntry::Tiled { tiles, .. } => {
+                    for t in tiles {
+                        h.update(format!("\0{},{},{}", t.x, t.y, t.hash).as_bytes());
+                    }
+                }
+            }
+        }
+        h.finalize().to_hex().to_string()
     }
 
     /// Paths of non-tiled (`Raw`) archive entries — the only entries an embedded palette can be.

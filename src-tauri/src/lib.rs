@@ -14,6 +14,7 @@ pub mod palette;
 pub mod raster;
 pub mod repo;
 pub mod scan;
+pub mod stage;
 pub mod stash;
 pub mod tiles;
 

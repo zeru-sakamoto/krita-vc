@@ -167,6 +167,21 @@ stages** so the panel appears immediately instead of blocking on every layer's r
      canvases dominated the IPC payload). The "Composite" navigator row prefers this over
      stacking layers; `ArtDiffView` swaps in a single composite "layer" when these are present, so
      the default view is correct the instant the diff loads.
+
+     A version saved from a **layer subset** has no `mergedimage.png` — Krita rendered the whole
+     stack and we can't redo it, so `stage::stage_kra` drops it rather than ship a preview showing
+     layers the version doesn't contain (see
+     [version-control.md](version-control.md#layer-subset-staging--saving-only-some-layers)).
+     For those, `commands::stacked_composite_url` composites the stack itself
+     (`raster::composite_stack`) and caches it under `kra::stack_cache_key` like any other raster,
+     so the Composite pane — and the Version Map node, which draws `afterImage` and fetches no
+     per-layer rasters — isn't blank. Both the before and after sides fall back this way. It
+     models source-over, per-layer opacity, `visible`, one level of group opacity and the five
+     blend modes `svgArt.ts::blendCss` maps; masks and filter/clone/vector layers render as plain
+     paint — the same ceiling the frontend's SVG stacker has always had, and acceptable precisely
+     because this is a cached preview rather than anything written into the artwork. Its inputs
+     are the ordinary per-layer rasters, so the diff viewer and this share cache entries in both
+     directions. Krita rewrites the real composite on the next save.
    - **Changed-pixel mask + outline** — `ArtDiff.diffImage` and `ArtDiff.diffOutline`: the
      before/after composites diffed pixel-for-pixel in Rust (`raster::diff_overlay`, threshold
      ~16/channel; each side is capped to `MAX_RASTER_DIM` right after decode so the compare never

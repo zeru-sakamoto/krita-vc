@@ -349,6 +349,7 @@ function RepoShell({ repo }: { repo: Repository }) {
                   working={showWorking}
                   nonce={refreshNonce}
                   onFocus={setFocus}
+                  onOpenInspector={() => setInspectorOpen(true)}
                   selectedFile={selectedFile}
                   focusId={selectedFocusId}
                 />

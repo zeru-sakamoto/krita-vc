@@ -985,7 +985,8 @@ fn undo_last_commit_keeps_working_tree() {
 }
 
 /// `commit_selected`'s path subset survives per-document tracking — the CLI still passes it, and
-/// layer-level staging will build on the same entry point.
+/// layer-level staging rides on the same entry point (its own `layers` argument; see
+/// `tests/staging.rs`).
 #[test]
 fn commit_selected_only_includes_named_paths() {
     let dir = tempfile::tempdir().unwrap();
@@ -994,8 +995,14 @@ fn commit_selected_only_includes_named_paths() {
     let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
 
     std::fs::write(tracked_doc(root), kra_bytes(10)).unwrap();
-    let c1 = commit::commit_selected(&mut r, "the document", "t", Some(&["art.kra".to_string()]))
-        .unwrap();
+    let c1 = commit::commit_selected(
+        &mut r,
+        "the document",
+        "t",
+        Some(&["art.kra".to_string()]),
+        None,
+    )
+    .unwrap();
     assert_eq!(c1.files.len(), 1);
     assert_eq!(c1.files[0].path, "art.kra");
     assert!(scan::scan(&r).unwrap().is_empty());
@@ -1003,7 +1010,13 @@ fn commit_selected_only_includes_named_paths() {
     // A selection that matches nothing dirty errors `Nothing` rather than committing everything.
     std::fs::write(tracked_doc(root), kra_bytes(11)).unwrap();
     assert!(matches!(
-        commit::commit_selected(&mut r, "nothing", "t", Some(&["missing.kra".to_string()])),
+        commit::commit_selected(
+            &mut r,
+            "nothing",
+            "t",
+            Some(&["missing.kra".to_string()]),
+            None
+        ),
         Err(KvcError::Nothing)
     ));
     assert!(

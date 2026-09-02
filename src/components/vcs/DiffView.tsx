@@ -154,6 +154,8 @@ interface DiffViewProps {
   nonce?: number;
   /** Forwarded to art views so the navigator selection reaches the Inspector. */
   onFocus?: (f: { path: string; id: string }) => void;
+  /** Forwarded to art views so a layer row's "View layer details" can reveal the Inspector. */
+  onOpenInspector?: () => void;
 }
 
 export function DiffView({
@@ -165,6 +167,7 @@ export function DiffView({
   working,
   nonce,
   onFocus,
+  onOpenInspector,
 }: DiffViewProps) {
   const { artistMode } = useArtistMode();
 
@@ -193,6 +196,7 @@ export function DiffView({
           working={working}
           nonce={nonce}
           onFocus={onFocus}
+          onOpenInspector={onOpenInspector}
         />
       </div>
     );

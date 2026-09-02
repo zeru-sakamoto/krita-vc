@@ -33,6 +33,16 @@ pub struct ScanChange {
     /// (`keep_bytes`) — saves the commit path a second full read of a big `.kra` (a page-cache
     /// miss is a whole extra HDD pass).
     pub bytes: Option<Vec<u8>>,
+    /// Set by [`crate::commit::commit_selected`] when `bytes`/`hash` were replaced with a
+    /// **synthesized** `.kra` holding only the layers the artist ticked — so the content being
+    /// committed is deliberately *not* what sits on disk.
+    ///
+    /// Load-bearing: it makes [`crate::commit::store_change`] record `size`/`mtime` as `0` in the
+    /// index. The fast path above skips a file whose size+mtime match the index, and the working
+    /// file's do — so recording them would make the very next scan report the artwork **clean**
+    /// and the unticked layers would silently vanish from the Changes panel. The `(0, 0)` guard is
+    /// the disarm, and zeroing only `mtime` is not enough. Costs one re-hash on the next scan.
+    pub partial: bool,
 }
 
 /// Returns `(relativePath, status)` pairs for the tracked document if it differs from the index.
@@ -76,6 +86,7 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
                         size: 0,
                         mtime: 0,
                         bytes: None,
+                        partial: false,
                     });
                 }
                 continue;
@@ -110,6 +121,7 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
             size,
             mtime,
             bytes: retain.then_some(bytes),
+            partial: false,
         });
     }
     Ok(out)

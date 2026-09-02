@@ -26,11 +26,14 @@ Developer documentation for the Krita VCS desktop app (Tauri 2 + React 19 + Type
   concurrency model (`RepoLock` + the CPU-budgeted pool), the two binaries that share one crate,
   and the third-party crates in use with their licenses.
 - [**File tracking & version control**](version-control.md) — the Rust backend's *feature*
-  behavior: the `.kvc/` store, the scanner, commits, branches (create/switch/merge), stashes
-  (setting work aside), delta-chain storage, the `.kra` tile engine, and the Tauri commands.
-- [**Per-document tracking**](per-document-tracking.md) — *design note, not implemented.* Moving
-  from one history per folder to one history per `.kra` document: the `Project`/`Document` split,
-  a shared object store with per-document history, migration, and the blast radius.
+  behavior: the `.kvc/` store, the scanner, commits (whole-artwork and
+  [layer-subset](version-control.md#layer-subset-staging--saving-only-some-layers)), branches
+  (create/switch/merge), stashes (setting work aside), delta-chain storage, the `.kra` tile
+  engine, and the Tauri commands.
+- [**Per-document tracking**](per-document-tracking.md) — *built (v2.0.0).* Moving from one
+  history per folder to one history per `.kra` document: why the shipped shape (one hidden
+  container, many self-contained stores) is not the `Project`/`Document` split with a shared
+  object store the original note specified, and the blast radius as built.
 - [**Data integrity**](data-integrity.md) — the measures the engine already applies to avoid
   losing an artist's work: the cross-process repo lock, a `branches.json` generation counter that
   lets user-facing reads detect a stale snapshot, atomic + fsynced writes and save ordering (plus

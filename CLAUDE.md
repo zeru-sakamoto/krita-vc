@@ -10,7 +10,7 @@ no fetch, no cloud sync. The UI exposes only local operations (commit history, l
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
-`gc`, `palette`, `stash`, `merge`; commands in `commands.rs`).
+`gc`, `palette`, `stash`, `merge`, `stage`; commands in `commands.rs`).
 
 **One `.kra` document = one history** (v2.0.0; see
 [`docs/per-document-tracking.md`](docs/per-document-tracking.md)). The unit the app versions is a
@@ -83,7 +83,36 @@ stack (nothing to fold). **Any other conflict** still
 hard-refuses the whole pop with `StashConflict` (prefix `"stash conflict"`, distinct from the
 `"unsaved changes"` one) — a non-`.kra` file or a stashed *deletion* onto edited work. No
 frontend/CLI change: a merged pop returns normally, so the existing "brought back" path applies.
-See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside). The `.kra` composite
+See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside).
+**Layer-subset staging** (`stage.rs`, `stage::stage_kra`) is how "save only these layers" works:
+the store versions whole documents, so a partial commit **synthesizes** one — the working file
+with every *unticked* top-level layer reverted to its committed form — and stores that. Reached
+via `commit_selected`'s `layers` arg (`commit_snapshot(path, message, author, paths, layers)`, and
+`kvc commit --layers '["<id>"]'`, a JSON array like `--paths`; the Krita docker never passes it).
+**Top-level only**, the grain `merge.rs` already speaks (`layers_node`), so a group goes whole and
+the XML can never reference a data file that wasn't copied. It reuses merge.rs's helpers but
+differs from `merge_layers` in two ways that are load-bearing: **uuids are never remapped** (a
+merge adds a second copy of a layer and must mint a fresh identity; staging *substitutes* the same
+layer, and the preserved uuid is what makes the next diff recognise it), and **committed `layerN`
+filenames are kept unless they actually collide** with a layer that survived — tile streams are
+keyed `kra:{rel}:tile:{image}/layers/{layerN}:…`, so renaming unconditionally would re-store every
+reverted tile under fresh keys and lose dedup against the history it just came from. Changes
+outside the layer stack always come from the working file. **Two traps, each with a test in
+`tests/staging.rs`.** The index must record `size`/`mtime` as **0** for a partial commit
+(`ScanChange::partial` → `store_change`): the committed content isn't what's on disk, so the
+artwork has to keep scanning dirty, and `scan_detailed`'s fast path skips a file whose size+mtime
+match the index — recording the working file's would make the next scan report it **clean** and
+the unticked layers would silently vanish. Its `(size, mtime) != (0, 0)` guard is the disarm, and
+zeroing only `mtime` is not enough. And `mergedimage.png`/`preview.png` are **dropped** from the
+synthesized archive rather than carried over, since they're Krita's renders of the whole stack and
+would show layers the version doesn't contain — right down to the artist's file manager once it's
+restored. Krita rewrites both on the next save; in the meantime `commands::stacked_composite_url`
+composites the stack itself (`raster::composite_stack`, keyed by `kra::KraManifest::version_key`,
+cached in the regenerable `cache/`) so the Version Map node isn't blank. That compositor models
+source-over, per-layer opacity, `visible`, one level of group opacity and the five blend modes
+`svgArt.ts` maps — the same ceiling the frontend's SVG stacker already had; masks and
+filter/clone/vector layers render as plain paint. It only ever produces a preview, never document
+data, which is why that gap is acceptable. The `.kra` composite
 (`mergedimage.png`) is stored as **content-addressed 256px pixel blocks**
 (`KraEntry::CompositePng`) instead of a full PNG per commit — the store's former dominant cost;
 restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
@@ -341,16 +370,24 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
   A store tracks one `.kra`, so a file list would always be one row and staging a subset of a
   one-file working tree means nothing; what the artist wants is what moved in the painting. The
   rows come from `useWorkingDiff`'s existing per-layer `change` — **no new backend command** —
-  rolled up so a changed group reads as one row with a "+N inside" count (the backend enumerates
-  layers via `.descendants()`, so children arrive as siblings of their group with no parent link;
-  the rollup is approximate for that reason and says so). The rows are **read-only**: layer-level
-  staging needs a write path that synthesizes a `.kra` holding only the ticked layers —
-  `merge::merge_layers` is most of it, and **top-level** is the grain it natively speaks
-  (`layers_node` is the `<layers>` directly under `<IMAGE>`), which also keeps the unit whole so
-  you can never emit XML referencing a data file you didn't copy. Until that exists a version
-  captures the whole artwork; checkboxes that don't bind would be worse than none.
-  `commit_snapshot`'s `paths` arg (`commit::commit_selected`) survives for the CLI and for that
-  future. While a commit is in flight the commit button spins and the `StatusBar` shows a progress
+  rolled up so a changed group reads as one row with a "+N inside" count. Each row is a
+  **checkbox**: ticking sends its id in `commit_snapshot`'s `layers` and the version saves only
+  those layers (`stage::stage_kra` — see the **Layer-subset staging** section below). Three things
+  hold it together. The rollup is **exact**, keyed on `LayerDto.topLevelId` (a group's children
+  arrive as siblings via `.descendants()`, so `kra::LayerNode.top` now records each layer's
+  top-level ancestor) — it used to guess by "changed layers following a changed group", which
+  over-counted with several groups and, worse, surfaced a changed layer inside an *unchanged*
+  group as its own row whose id nothing could act on; a checkbox has to name the layer that
+  actually gets committed. Rows list **top-first**, matching the diff navigator
+  (`LayerStackPanel`'s `[...diff.layers].reverse()`) rather than the backend's raw bottom-to-top
+  `.kra` stacking order — `layerRows` builds top ids in that raw order (first-seen per group) and
+  reverses the result once at the end, so the two panels never disagree about which layer is
+  "on top". Everything is **pre-ticked**, so doing nothing saves the whole artwork
+  exactly as before and the panel tracks what's been *un*ticked. And changes **outside** the layer
+  stack (canvas size, animation, document settings) always ride along — there's no row for them,
+  and the copy says so once a selection is partial. `commit_snapshot`'s `paths` arg
+  (`commit::commit_selected`) is unrelated and survives for the CLI.
+  While a commit is in flight the commit button spins and the `StatusBar` shows a progress
   bar, via the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
   branches with **real actions**: click to switch, hover-row merge/delete with confirm modals
   (the delete affordance is hidden on `main` — the backend also refuses it with `DeleteMain`), a

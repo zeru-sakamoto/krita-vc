@@ -5,6 +5,7 @@ import type { ArtLayer, Branch, DiffEntry, FileStatus, WorkingChange } from "../
 import { BranchBadge } from "./BranchBadge";
 import { FileStatusChip } from "./FileStatusChip";
 import { Button } from "../ui/Button";
+import { Checkbox } from "../ui/Checkbox";
 import { Modal } from "../ui/Modal";
 import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
@@ -17,19 +18,24 @@ import { timed } from "../../lib/perf";
 
 /**
  * Unsaved work on the tracked artwork, described as **which layers changed** rather than which
- * files are staged.
+ * files are staged — and which of them go into the next version.
  *
  * A store tracks exactly one `.kra`, so the file list this panel used to show would always be
- * one row — and staging a subset of a one-file working tree means nothing. What the artist
- * actually wants to know is what moved in the painting since the last version, which the diff
- * already computes: `working_diff` returns per-layer `change` on every art entry, so this needs
- * no new backend call.
+ * one row. What the artist actually wants to choose between is what moved in the painting, which
+ * the diff already computes: `working_diff` returns per-layer `change` on every art entry, so the
+ * rows need no backend call of their own.
  *
- * The rows are **read-only**. Choosing which layers go into a version is a real feature and a
- * separate one — it needs a write path that synthesizes a `.kra` holding only the ticked layers
- * (`merge::merge_layers` folds selected top-level layers onto a base, which is most of it). Until
- * that exists, a version captures the whole artwork, and pretending otherwise with checkboxes
- * that don't bind would be worse than showing none.
+ * Ticking one sends its id in `commit_snapshot`'s `layers`, and the backend synthesizes a `.kra`
+ * holding the ticked layers plus the committed form of every other one (`stage::stage_kra`). Three
+ * consequences worth keeping in mind here:
+ *
+ * - **Top-level only.** A group is saved whole, so a change inside one rolls up to the group's row
+ *   via `ArtLayer.topLevelId` — the row's id is what actually gets committed.
+ * - **Everything is ticked by default**, so doing nothing saves the whole artwork exactly as
+ *   before. The state tracked below is therefore what's been *un*ticked.
+ * - **Changes outside the layer stack always ride along** (canvas size, animation, document
+ *   settings) — there's no row to untick them with, and the copy says so once a selection is
+ *   partial.
  */
 
 /** A changed top-level layer, with the nested changes inside a group rolled up into it. */
@@ -51,60 +57,75 @@ const CHANGE_STATUS: Record<string, FileStatus> = {
 /**
  * Roll the diff's flat layer list up to top-level rows.
  *
- * The backend enumerates layers with `.descendants()`, so a group's children arrive as siblings
- * of the group with no parent link. Without one, the honest rollup is: show every changed layer,
- * and where a changed group is present, count the changed layers that follow it as nested. That
- * over-counts in a document with several groups — which is why the row says "and N more inside"
- * rather than claiming an exact tree.
+ * The backend enumerates layers with `.descendants()`, so a group's children arrive as siblings of
+ * the group — but each one carries `topLevelId`, the id of the top-level layer it sits under. That
+ * makes the rollup exact, which it has to be now that a row is a checkbox: a row's id is the layer
+ * the backend will actually commit, and an approximate grouping would save something other than
+ * what the artist ticked. It also catches a changed layer inside an *otherwise unchanged* group,
+ * which previously surfaced as its own top-level row that nothing could act on.
  */
 function layerRows(entries: DiffEntry[]): LayerRow[] {
-  const rows: LayerRow[] = [];
+  const byId = new Map<string, LayerRow>();
+  const order: string[] = [];
   for (const entry of entries) {
     if (entry.kind !== "art") continue;
-    let group: LayerRow | null = null;
     for (const layer of entry.layers) {
-      const isGroup = layer.layerType === "grouplayer";
-      if (layer.change === "unchanged") {
-        if (isGroup) group = null;
-        continue;
-      }
-      if (isGroup) {
-        group = {
-          id: layer.id,
-          name: layer.name,
-          change: layer.change,
-          layerType: layer.layerType,
+      if (layer.change === "unchanged") continue;
+      const top = layer.topLevelId ?? layer.id;
+      let row = byId.get(top);
+      if (!row) {
+        // Label the row with the top-level layer itself when it's in the list; a nested change
+        // inside an unchanged group is the only evidence of that group we'd otherwise have.
+        const owner = entry.layers.find((l) => l.id === top) ?? layer;
+        row = {
+          id: top,
+          name: owner.name,
+          // A group whose own record is unchanged still changed, if something inside it did.
+          change: owner.change === "unchanged" ? "modified" : owner.change,
+          layerType: owner.layerType,
           nested: 0,
         };
-        rows.push(group);
-      } else if (group) {
-        group.nested += 1;
-      } else {
-        rows.push({
-          id: layer.id,
-          name: layer.name,
-          change: layer.change,
-          layerType: layer.layerType,
-          nested: 0,
-        });
+        byId.set(top, row);
+        order.push(top);
       }
+      if (layer.id !== top) row.nested += 1;
     }
   }
-  return rows;
+  // Backend order is bottom-to-top (raw `.kra` stacking order); the diff navigator
+  // (`LayerStackPanel`) reverses it to show top-first, so match that here too.
+  return order.reverse().map((id) => byId.get(id) as LayerRow);
 }
 
-function LayerRowItem({ row }: { row: LayerRow }) {
+function LayerRowItem({
+  row,
+  checked,
+  disabled,
+  onToggle,
+}: {
+  row: LayerRow;
+  checked: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+}) {
   const Icon = layerTypeIcon(row.layerType ?? "");
   return (
-    <li className="flex items-center gap-2 px-3 py-1">
-      <FileStatusChip status={CHANGE_STATUS[row.change] ?? "M"} />
-      <Icon size={ICON.dense} weight="regular" className="shrink-0 text-text-muted" />
-      <Tooltip label={row.name}>
-        <span className="min-w-0 flex-1 truncate text-dense text-text">{row.name}</span>
-      </Tooltip>
-      {row.nested > 0 && (
-        <span className="shrink-0 text-micro text-text-muted">+{row.nested} inside</span>
-      )}
+    <li>
+      <label className="flex cursor-pointer items-center gap-2 px-3 py-1 hover:bg-state-hover">
+        <Checkbox
+          checked={checked}
+          disabled={disabled}
+          onChange={onToggle}
+          aria-label={`Include ${row.name} in this version`}
+        />
+        <FileStatusChip status={CHANGE_STATUS[row.change] ?? "M"} />
+        <Icon size={ICON.dense} weight="regular" className="shrink-0 text-text-muted" />
+        <Tooltip label={row.name}>
+          <span className="min-w-0 flex-1 truncate text-dense text-text">{row.name}</span>
+        </Tooltip>
+        {row.nested > 0 && (
+          <span className="shrink-0 text-micro text-text-muted">+{row.nested} inside</span>
+        )}
+      </label>
     </li>
   );
 }
@@ -139,6 +160,9 @@ export function ChangesPanel({
   const [commitError, setCommitError] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [discardError, setDiscardError] = useState<string | null>(null);
+  // What the artist has *un*ticked, not what they've ticked — so a layer that shows up in a later
+  // scan is included by default and "do nothing" keeps saving the whole artwork.
+  const [excluded, setExcluded] = useState<Set<string>>(() => new Set());
 
   const path = current?.path ?? null;
   const changed = items[0]?.change ?? null;
@@ -164,8 +188,25 @@ export function ChangesPanel({
   // Either kind of "checking" leaves the diff this button reverts in flux.
   const checking = scanning || loading;
 
+  // Ticks are only meaningful against the diff they were made on: a new scan, a different artwork
+  // or a branch switch all replace the rows underneath them.
+  useEffect(() => setExcluded(new Set()), [docPath, currentBranch.name, refreshNonce]);
+
+  const included = useMemo(() => rows.filter((r) => !excluded.has(r.id)), [rows, excluded]);
+  // A subset only exists once something is unticked *and* there are rows to untick. With no rows
+  // (a change outside the layer stack) there's nothing to choose, so it's a whole-artwork save.
+  const partial = rows.length > 0 && included.length < rows.length;
+  const nothingPicked = rows.length > 0 && included.length === 0;
+
+  const toggle = (id: string) =>
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+
   const doCommit = async () => {
-    if (!message.trim() || saving || !path) return;
+    if (!message.trim() || saving || !path || nothingPicked) return;
     setSaving(true);
     setBusyMessage("Saving this version — please wait…");
     setCommitError(null);
@@ -178,6 +219,8 @@ export function ChangesPanel({
           message: message.trim(),
           author: resolvedAuthor(authorName),
           paths: null,
+          // null is the whole artwork — the same call this made before layer picking existed.
+          layers: partial ? included.map((r) => r.id) : null,
         }),
         (c) => ({ commitId: c.id })
       );
@@ -221,7 +264,11 @@ export function ChangesPanel({
         <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
           <span className="flex items-center gap-2">
             Since your last version
-            {rows.length > 0 && <span className="text-text-muted/70">{rows.length}</span>}
+            {rows.length > 0 && (
+              <span className="text-text-muted/70">
+                {partial ? `${included.length}/${rows.length}` : rows.length}
+              </span>
+            )}
           </span>
           {changed && (
             <Tooltip
@@ -254,11 +301,37 @@ export function ChangesPanel({
             Looking at what changed…
           </p>
         ) : rows.length > 0 ? (
-          <ul className="flex flex-col pb-1">
-            {rows.map((row) => (
-              <LayerRowItem key={row.id} row={row} />
-            ))}
-          </ul>
+          <>
+            {rows.length > 1 && (
+              <div className="flex justify-end px-3 pb-1">
+                <button
+                  type="button"
+                  onClick={() => setExcluded(partial ? new Set() : new Set(rows.map((r) => r.id)))}
+                  disabled={saving || checking}
+                  className="rounded-button px-1 py-0.5 text-micro text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                >
+                  {partial ? "Choose all" : "Choose none"}
+                </button>
+              </div>
+            )}
+            <ul className="flex flex-col pb-1">
+              {rows.map((row) => (
+                <LayerRowItem
+                  key={row.id}
+                  row={row}
+                  checked={!excluded.has(row.id)}
+                  disabled={saving || checking}
+                  onToggle={() => toggle(row.id)}
+                />
+              ))}
+            </ul>
+            {partial && (
+              <p className="px-3 pb-2 text-micro leading-relaxed text-text-muted">
+                The layers you leave out stay unsaved, ready for a later version. Canvas size and
+                document settings are always included.
+              </p>
+            )}
+          </>
         ) : (
           <p className="px-3 pb-2 text-dense text-text-muted">
             {changed.status === "U"
@@ -288,11 +361,17 @@ export function ChangesPanel({
           <Button
             variant="primary"
             onClick={doCommit}
-            disabled={!message.trim() || !changed || saving}
+            disabled={!message.trim() || !changed || saving || nothingPicked}
             data-tour-id="commit-button"
           >
             {saving && <CircleNotch size={ICON.inline} className="animate-spin" />}
-            {saving ? "Saving version…" : "Save this version"}
+            {saving
+              ? "Saving version…"
+              : nothingPicked
+                ? "Choose at least one layer"
+                : partial
+                  ? `Save ${included.length} of ${rows.length} layers`
+                  : "Save this version"}
           </Button>
         </div>
       )}

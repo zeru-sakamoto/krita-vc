@@ -96,6 +96,8 @@ interface ArtDiffViewProps {
   nonce?: number;
   /** Reports the navigator selection up to the Inspector (which file + which layer/composite). */
   onFocus?: (f: { path: string; id: string }) => void;
+  /** Reveals the Inspector — used by a layer row's "View layer details" context menu item. */
+  onOpenInspector?: () => void;
 }
 
 export function ArtDiffView({
@@ -107,6 +109,7 @@ export function ArtDiffView({
   working,
   nonce,
   onFocus,
+  onOpenInspector,
 }: ArtDiffViewProps) {
   const { artistMode } = useArtistMode();
   const [selectedId, setSelectedId] = useState<string>(initialFocusId ?? COMPOSITE_ID);
@@ -235,6 +238,7 @@ export function ArtDiffView({
           palette={palette}
           selectedId={selectedId}
           onSelect={setSelectedId}
+          onOpenInspector={onOpenInspector}
           pendingIds={pendingIds}
         />
 

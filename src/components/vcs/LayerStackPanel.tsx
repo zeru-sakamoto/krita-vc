@@ -1,5 +1,6 @@
-import { memo, useMemo } from "react";
-import { CircleNotchIcon } from "@phosphor-icons/react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { CircleNotchIcon, InfoIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
 import { compositeSvg } from "../../lib/svgArt";
 import { ICON } from "../../lib/iconSize";
@@ -46,14 +47,16 @@ function PaletteThumb({ swatches }: { swatches: PaletteDiff["swatches"] }) {
 interface RowProps {
   selected: boolean;
   onClick: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
   children: React.ReactNode;
 }
 
-function Row({ selected, onClick, children }: RowProps) {
+function Row({ selected, onClick, onContextMenu, children }: RowProps) {
   return (
     <button
       type="button"
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={[
         "flex w-full items-center gap-2 px-2 py-1.5 text-left",
         "transition-colors duration-(--dur-instant) ease-(--ease-out)",
@@ -76,6 +79,66 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+interface LayerMenuState {
+  layerId: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Right-click popover for a navigator row (layer, composite, or palette), anchored at the
+ * cursor (not a trigger rect, so it doesn't reuse `Menu`). Closes on outside click, Escape,
+ * or scroll — same rules as `Menu`.
+ */
+function LayerContextMenu({
+  state,
+  onClose,
+  onViewDetails,
+}: {
+  state: LayerMenuState;
+  onClose: () => void;
+  onViewDetails: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      if (ref.current?.contains(e.target as Node)) return;
+      onClose();
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("scroll", onClose, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("scroll", onClose, true);
+    };
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      ref={ref}
+      role="menu"
+      style={{ top: state.y, left: state.x }}
+      className="glass fixed z-(--z-modal) min-w-44 overflow-hidden rounded-panel py-1 shadow-(--shadow-float)"
+    >
+      <button
+        type="button"
+        role="menuitem"
+        onClick={onViewDetails}
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-body text-text transition-colors duration-(--dur-fast) ease-(--ease-out) hover:bg-state-hover"
+      >
+        <InfoIcon size={ICON.inline} className="shrink-0 text-text-muted" />
+        View details
+      </button>
+    </div>,
+    document.body
+  );
+}
+
 /**
  * One layer row. Memoized because rebuilding the thumb's SVG re-serializes the layer's
  * raster markup (multi-MB on the base64 fallback) — with N layers and one parent render per
@@ -88,6 +151,7 @@ const LayerRow = memo(function LayerRow({
   selected,
   pending,
   onSelect,
+  onContextMenu,
 }: {
   layer: ArtLayer;
   width: number;
@@ -95,6 +159,7 @@ const LayerRow = memo(function LayerRow({
   selected: boolean;
   pending: boolean;
   onSelect: (id: string) => void;
+  onContextMenu: (id: string, e: React.MouseEvent) => void;
 }) {
   const state = layer.after != null ? "after" : "before";
   const status = CHANGE_STATUS[layer.change];
@@ -103,7 +168,11 @@ const LayerRow = memo(function LayerRow({
     [layer, state, width, height]
   );
   return (
-    <Row selected={selected} onClick={() => onSelect(layer.id)}>
+    <Row
+      selected={selected}
+      onClick={() => onSelect(layer.id)}
+      onContextMenu={(e) => onContextMenu(layer.id, e)}
+    >
       {pending ? (
         <div className="grid h-7 w-9 shrink-0 place-items-center rounded-badge border border-border bg-surface-2">
           <CircleNotchIcon size={ICON.inline} className="animate-spin text-text-muted" />
@@ -130,6 +199,8 @@ interface LayerStackPanelProps {
   onSelect: (id: string) => void;
   /** Layers whose rasters are still streaming in — their thumbs show a spinner. */
   pendingIds?: Set<string>;
+  /** Reveals the Inspector — used by a layer row's "View layer details" context menu item. */
+  onOpenInspector?: () => void;
 }
 
 /**
@@ -147,8 +218,15 @@ export const LayerStackPanel = memo(function LayerStackPanel({
   selectedId,
   onSelect,
   pendingIds,
+  onOpenInspector,
 }: LayerStackPanelProps) {
   const { artistMode } = useArtistMode();
+  const [menu, setMenu] = useState<LayerMenuState | null>(null);
+  // Stable identity so it doesn't defeat LayerRow's memo (see its own comment).
+  const handleLayerContextMenu = useCallback((id: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    setMenu({ layerId: id, x: e.clientX, y: e.clientY });
+  }, []);
   // Derive an overall palette change status: prefer M > A > D over unchanged swatches.
   const paletteStatus: FileStatus | null = palette ? (palette.status ?? null) : null;
 
@@ -188,7 +266,11 @@ export const LayerStackPanel = memo(function LayerStackPanel({
         <SectionLabel>Layers</SectionLabel>
 
         {/* Composite */}
-        <Row selected={selectedId === COMPOSITE_ID} onClick={() => onSelect(COMPOSITE_ID)}>
+        <Row
+          selected={selectedId === COMPOSITE_ID}
+          onClick={() => onSelect(COMPOSITE_ID)}
+          onContextMenu={(e) => handleLayerContextMenu(COMPOSITE_ID, e)}
+        >
           <Thumb svg={compositeThumb} />
           <span className="min-w-0 flex-1 truncate text-dense font-medium text-text">
             Composite
@@ -205,6 +287,7 @@ export const LayerStackPanel = memo(function LayerStackPanel({
             selected={selectedId === l.id}
             pending={pendingIds?.has(l.id) ?? false}
             onSelect={onSelect}
+            onContextMenu={handleLayerContextMenu}
           />
         ))}
 
@@ -212,7 +295,11 @@ export const LayerStackPanel = memo(function LayerStackPanel({
         {palette && (
           <>
             <SectionLabel>Color Palette</SectionLabel>
-            <Row selected={selectedId === PALETTE_ID} onClick={() => onSelect(PALETTE_ID)}>
+            <Row
+              selected={selectedId === PALETTE_ID}
+              onClick={() => onSelect(PALETTE_ID)}
+              onContextMenu={(e) => handleLayerContextMenu(PALETTE_ID, e)}
+            >
               <PaletteThumb swatches={palette.swatches} />
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate text-dense text-text">
@@ -227,6 +314,18 @@ export const LayerStackPanel = memo(function LayerStackPanel({
           </>
         )}
       </div>
+
+      {menu && (
+        <LayerContextMenu
+          state={menu}
+          onClose={() => setMenu(null)}
+          onViewDetails={() => {
+            onSelect(menu.layerId);
+            onOpenInspector?.();
+            setMenu(null);
+          }}
+        />
+      )}
     </div>
   );
 });

@@ -85,6 +85,13 @@ export interface ChangeRegion {
 
 export interface ArtLayer {
   id: string;
+  /**
+   * The id of the **top-level** layer this one sits under — its own `id` when it already is one.
+   * Krita's stack is a tree but this list is flat, so the Changes panel needs it to roll a nested
+   * change up to the row that actually saves it. Layer-subset staging acts on top-level layers
+   * only, so a checkbox binds to this, never to `id`.
+   */
+  topLevelId?: string;
   name: string;
   /** 0..100 */
   opacity: number;

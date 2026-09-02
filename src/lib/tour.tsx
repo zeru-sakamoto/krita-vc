@@ -77,7 +77,9 @@ export const TOUR_STEPS: TourStep[] = [
   {
     tourId: "changes-unstaged",
     title: "What changed",
-    body: "The layers you've painted, added or removed since your last saved version.",
+    body:
+      "The layers you've painted, added or removed since your last saved version. They're all " +
+      "ticked, so saving keeps the whole artwork — untick one to leave it out and save it later.",
     view: "changes",
   },
   {

@@ -41,14 +41,14 @@ files, where git's text-oriented delta model performs poorly.
   of a hash and a commit message. Click a version to open its full visual diff in place. The
   classic branch-aware **History graph** and **Branches** list are still there, one Settings
   toggle away ("Legacy version history"), for anyone who prefers them.
-- **Real local version control**: stage exactly the files you want (or commit everything, with a
-  confirm prompt if some changes aren't staged), and roll back / undo commits. Rolling back to the
-  version you're already on just discards unsaved changes in place (no new history entry); rolling
-  back to an older one records a new commit, linked back to it in the graph by a dashed connector.
-  Changed your mind mid-edit? Discard a single file's unsaved changes, or every unstaged file at
-  once, without touching what's staged.
-- **Set aside** (stash): park working-tree changes off to the side — staged files or everything —
-  and bring them back later, without leaving a version in your history. A switch or merge blocked
+- **Real local version control**: save a version of the whole artwork, or **tick just the layers
+  you want in it** — the ones you leave out stay unsaved, ready for a later version. Everything is
+  ticked by default, so saving everything stays one click. Plus roll back / undo. Rolling back to
+  the version you're already on just discards unsaved changes in place (no new history entry);
+  rolling back to an older one records a new commit, linked back to it in the graph by a dashed
+  connector. Changed your mind mid-edit? Discard everything since your last version in one go.
+- **Set aside** (stash): park working-tree changes off to the side and bring them back later,
+  without leaving a version in your history. A switch or merge blocked
   by unsaved changes offers setting them aside as a one-click way through, and a Settings-modal
   shelf lists every set-aside item with its origin branch and age.
 - **Branching & merging**: create, switch, merge (fast-forward or two-parent), and delete local

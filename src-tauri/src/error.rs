@@ -72,6 +72,13 @@ pub enum KvcError {
     #[error("couldn't merge set-aside work: {0}")]
     MergeFailed(String),
 
+    // Synthesizing the .kra for a layer-subset commit (`stage::stage_kra`) couldn't be done
+    // cleanly. Same contract as MergeFailed: nothing is written, so the working tree and the
+    // history are both untouched. Its own variant because the artist here picked layers to save
+    // and has never heard of a set-aside.
+    #[error("couldn't save just those layers: {0}")]
+    StageFailed(String),
+
     #[error("no such branch: {0}")]
     NoBranch(String),
 

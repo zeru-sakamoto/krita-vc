@@ -9,17 +9,25 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
-    commit_selected(repo, message, author, None)
+    commit_selected(repo, message, author, None, None)
 }
 
-/// Commit working-tree changes, optionally restricted to `only` (e.g. the frontend's "staged"
-/// paths) — files outside that set are left dirty, uncommitted. `None` commits everything,
-/// matching [`commit_snapshot`]. Errors `Nothing` if the selected set has no changes.
+/// Commit working-tree changes, optionally restricted to `only` (relative paths) — files outside
+/// that set are left dirty, uncommitted. `None` commits everything, matching [`commit_snapshot`].
+/// Errors `Nothing` if the selected set has no changes.
+///
+/// `layers` narrows the commit *within* the tracked `.kra`: it holds the **top-level** layer ids
+/// (see `stage::layer_key`) the artist ticked, and every other changed layer is reverted to its
+/// committed form in the version that gets stored. The working file on disk is never touched, so
+/// the unticked layers stay uncommitted and the artwork scans dirty afterwards — which is the
+/// whole point, and is why [`store_change`] must not record the on-disk size/mtime for one of
+/// these (see `scan::ScanChange::partial`).
 pub fn commit_selected(
     repo: &mut Repo,
     message: &str,
     author: &str,
     only: Option<&[String]>,
+    layers: Option<&[String]>,
 ) -> Result<Commit> {
     // `keep_bytes`: changed files hand their just-read buffers straight to the commit below
     // (budgeted — see `scan::RETAIN_BUDGET`), so a big .kra isn't read twice per commit.
@@ -35,13 +43,30 @@ pub fn commit_selected(
     // `commit_kra` and skip re-inflating unchanged zip entries.
     let prev_tree = current_tree(repo);
 
+    if let Some(sel) = layers {
+        stage_changes(repo, &mut changes, &prev_tree, sel)?;
+    }
+
     let needed: u64 = changes.iter().map(|c| c.size).sum();
     crate::diskspace::check_available(repo, needed)?;
 
     let mut files = Vec::new();
     for change in changes {
         let rel = change.rel.clone();
+        let partial = change.partial;
         let (record, tracked) = store_change(repo, change, &prev_tree)?;
+        // A layer-subset commit can synthesize a document that matches the one already committed
+        // — the artist ticked only layers that hadn't actually moved. Byte-comparing the two
+        // archives would be wrong (each is an independent rebuild, so the zip bytes differ even
+        // when the content is identical); the `.kra` manifest hash *is* content-derived, so an
+        // unchanged document dedups straight back to the previous commit's. Nothing was written
+        // to reach this point either — every stream deduped — and `repo.save()` hasn't run.
+        if partial
+            && record.content.is_some()
+            && prev_tree.get(&rel).and_then(|f| f.content.as_deref()) == record.content.as_deref()
+        {
+            continue;
+        }
         match tracked {
             Some(tf) => {
                 repo.index.files.insert(rel, tf);
@@ -51,6 +76,9 @@ pub fn commit_selected(
             }
         }
         files.push(record);
+    }
+    if files.is_empty() {
+        return Err(KvcError::Nothing);
     }
 
     let timestamp = crate::repo::now_iso();
@@ -78,6 +106,61 @@ pub fn commit_selected(
     Ok(commit)
 }
 
+/// Rewrite each `.kra` change so it carries the **synthesized** document holding only the ticked
+/// layers, instead of the bytes on disk. Everything downstream — `store_change`, `commit_kra`, the
+/// manifest, the index — then works on that synthesized document with no further special-casing.
+///
+/// Whether the staged document actually differs from what's already committed is *not* decided
+/// here — see the manifest-hash check in [`commit_selected`]. The two archives are independent
+/// rebuilds, so their bytes never match even when their content is identical.
+///
+/// Refuses a first version (`U`): there is no committed side to revert the unticked layers to, so
+/// "some of the layers" has no meaning yet.
+fn stage_changes(
+    repo: &Repo,
+    changes: &mut [scan::ScanChange],
+    prev_tree: &BTreeMap<String, CommittedFile>,
+    selected: &[String],
+) -> Result<()> {
+    let keep: HashSet<String> = selected.iter().cloned().collect();
+
+    for change in changes.iter_mut() {
+        let is_kra = change.rel.to_lowercase().ends_with(".kra");
+        if !is_kra || change.status == "D" {
+            continue;
+        }
+        if change.status == "U" {
+            return Err(KvcError::StageFailed(
+                "this is the first version of the artwork — save all of it once, then you can \
+                 choose layers"
+                    .into(),
+            ));
+        }
+        let Some(prev) = prev_tree.get(&change.rel).filter(|f| f.is_kra) else {
+            return Err(KvcError::StageFailed(
+                "no saved version to compare against — save the whole artwork once first".into(),
+            ));
+        };
+
+        // The committed side of the revert. This is a full `reconstruct_kra` on the commit path —
+        // the price of a partial commit; whole-artwork commits never reach here.
+        let (committed, _) = bytes_of(repo, prev)?;
+        let abs = safe_join(&repo.root, &change.rel)?;
+        let working = match change.bytes.take() {
+            Some(b) => b,
+            None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
+        };
+
+        let synth = crate::stage::stage_kra(&working, &committed, &keep)?;
+        drop(working);
+        change.size = synth.len() as u64;
+        change.hash = hash_bytes(&synth);
+        change.bytes = Some(synth);
+        change.partial = true;
+    }
+    Ok(())
+}
+
 /// Store one scanned change's content and describe it as a [`CommittedFile`], plus the
 /// [`TrackedFile`] the caller *may* record for it (`None` for a deletion, which un-tracks).
 ///
@@ -100,6 +183,7 @@ pub(crate) fn store_change(
         size,
         mtime,
         bytes,
+        partial,
     } = change;
     if status == "D" {
         return Ok((
@@ -137,11 +221,18 @@ pub(crate) fn store_change(
     };
     drop(bytes);
 
+    // On a partial (layer-subset) commit the committed content is *not* what's on disk, so the
+    // working file must keep scanning dirty. Zeroing size+mtime disarms `scan_detailed`'s fast
+    // path via its `(size, mtime) != (0, 0)` guard — recording the working file's own size/mtime
+    // would make the next scan skip it as unchanged and the unticked layers would disappear from
+    // the Changes panel. Zeroing only `mtime` is not enough: `size` is compared too, and both must
+    // fail the guard. Costs one re-hash on the next scan, which is nothing next to the reconstruct
+    // the partial commit already paid.
     let tracked = TrackedFile {
         hash: hash.clone(),
         is_kra,
-        size,
-        mtime,
+        size: if partial { 0 } else { size },
+        mtime: if partial { 0 } else { mtime },
     };
     let record = CommittedFile {
         path: rel,

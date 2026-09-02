@@ -10,6 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 /// A minimal but real `.kra` — the commit path parses one as a zip, so a document can't be
 /// arbitrary bytes.
 fn kra_bytes(tag: &str) -> Vec<u8> {
@@ -167,10 +169,8 @@ fn status_commit_roundtrip_and_lock() {
 }
 
 /// The staging + set-aside surface the Krita docker drives. Field names and the `--paths`
-/// The staging + set-aside surface the Krita docker drives. Field names and the `--paths`
 /// encoding are a contract with `krita-plugin/kritavc/kvc_client.py`, so assert the shapes.
-/// `--paths` now only ever names the one document, but the encoding is unchanged and layer-level
-/// staging will ride on the same flag.
+/// `--paths` now only ever names the one document, but the encoding is unchanged.
 #[test]
 fn staged_commit_stash_and_discard() {
     let dir = tempfile::tempdir().unwrap();
@@ -245,6 +245,59 @@ fn staged_commit_stash_and_discard() {
         krita_vc_lib::repo::Repo::open(&doc).unwrap().commits.len(),
         before
     );
+}
+
+/// `--layers` saves only the named top-level layers, the same JSON-array encoding as `--paths`.
+/// Nothing calls it today — the Krita docker has no layer picker — but the CLI stays a complete
+/// surface over the engine, so the flag is pinned here rather than left to rot untested.
+#[test]
+fn commit_with_a_layer_subset() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("art.kra");
+    std::fs::write(&doc, common::kra_layered(10, 10)).unwrap();
+    krita_vc_lib::repo::Repo::init(&doc).unwrap();
+
+    let (ok, _) = kvc(&doc, &["commit", "--message", "base", "--author", "Zeru"]);
+    assert!(ok);
+
+    // Edit both layers, then save only "lines".
+    std::fs::write(&doc, common::kra_layered(20, 20)).unwrap();
+    let (ok, committed) = kvc(
+        &doc,
+        &[
+            "commit",
+            "--message",
+            "just the lines",
+            "--author",
+            "Zeru",
+            "--layers",
+            r#"["lines"]"#,
+        ],
+    );
+    assert!(ok);
+    assert!(committed["id"].as_str().is_some());
+
+    // The unticked layer is still unsaved, so the document stays dirty — the same guarantee
+    // `tests/staging.rs` pins on the engine side, checked here through the real binary.
+    let (ok, status) = kvc(&doc, &["status"]);
+    assert!(ok);
+    assert_eq!(status["changes"].as_array().unwrap().len(), 1);
+
+    // A malformed value is rejected by the flag parser, not swallowed.
+    let (ok, err) = kvc(
+        &doc,
+        &[
+            "commit",
+            "--message",
+            "m",
+            "--author",
+            "Z",
+            "--layers",
+            "lines",
+        ],
+    );
+    assert!(!ok);
+    assert!(err["error"].as_str().unwrap().contains("--layers"));
 }
 
 /// A repo with problems is still a *successful* check run — `{"error":…}` means the check

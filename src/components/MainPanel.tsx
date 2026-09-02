@@ -18,6 +18,8 @@ interface MainPanelProps {
   nonce?: number;
   /** Forwarded to the diff viewer so the navigator selection reaches the Inspector. */
   onFocus?: (f: { path: string; id: string }) => void;
+  /** Forwarded to the diff viewer so a layer row's "View layer details" can reveal the Inspector. */
+  onOpenInspector?: () => void;
   /** Which file (among several in the current diff) to show — from the Inspector's file list. */
   selectedFile?: string | null;
   /** Navigator id to seed the selected file's view with, e.g. jump straight to its palette. */
@@ -39,6 +41,7 @@ export function MainPanel({
   working,
   nonce,
   onFocus,
+  onOpenInspector,
   selectedFile,
   focusId,
 }: MainPanelProps) {
@@ -57,6 +60,7 @@ export function MainPanel({
           working={working}
           nonce={nonce}
           onFocus={onFocus}
+          onOpenInspector={onOpenInspector}
           selectedPath={selectedFile}
           focusId={focusId}
         />

@@ -192,8 +192,15 @@ the index write and, if the byte size is unchanged too (`"v1"` → `"v2"`), size
 tell it apart from "untouched". So any working file whose mtime is `>=` the index file's mtime
 (`<store>/index.json`, statted once per scan) is treated as racy and re-hashed rather than
 trusted; a document committed in an earlier tick keeps the fast path. `commit_selected`'s optional
-`paths` filter survives — the CLI still passes it, and layer-level staging will build on the same
-entry point — but with one tracked document there is no longer a file subset for the UI to choose.
+`paths` filter survives — the CLI still passes it — but with one tracked document there is no
+longer a file subset for the UI to choose; picking *layers* is a separate argument, below.
+
+One consequence of that racy-clean rule is load-bearing for
+[layer-subset staging](#layer-subset-staging--saving-only-some-layers): a partial commit stores
+content that is deliberately **not** what sits on disk, so its index entry records `size`/`mtime`
+as `0`. Recording the working file's own would satisfy the fast path above and the next scan would
+report the artwork **clean**, silently losing the layers the artist chose *not* to save yet. The
+`(size, mtime) != (0, 0)` clause exists to be failed on purpose here.
 
 ## Committing — `commit_snapshot` / `commit_selected`
 
@@ -224,6 +231,69 @@ switch/merge/undo never rewrite chains at all. A batch of ≥32 distinct new obj
 as one pack file instead of one loose file each (see
 [performance.md](performance.md#state-file-writes) — per-file creates dominated large commits
 on Windows).
+
+### Layer-subset staging — saving only some layers
+
+The Changes panel's rows are the layers that changed, and each is a checkbox. Ticking a subset
+sends those ids as `commit_snapshot`'s `layers`, and the store — which versions whole documents —
+gets a `.kra` **synthesized** for the occasion ([`stage.rs`](../src-tauri/src/stage.rs),
+`stage::stage_kra`): the working file, with every *unticked* top-level layer reverted to the form
+it has in the committed version. The file on disk is never touched, so the layers left out stay
+uncommitted and the artwork scans dirty afterwards — a partial commit defers work, it never
+discards it.
+
+**Top-level only**, the same grain [`merge.rs`](../src-tauri/src/merge.rs) speaks (`layers_node` is
+the `<layers>` directly under `<IMAGE>`). A group is taken or left whole, which is what makes it
+impossible to emit XML referencing a data file that wasn't copied. Recursing would mean partial
+groups, added/removed group rules, mask handling and ancestor forcing — every one able to produce
+a `.kra` Krita won't open, discovered by the artist in their art, later.
+
+The three cases, all keyed by layer id (uuid, or name when a layer carries none — the same rule
+`commands::layer_id` uses, so a tick always matches):
+
+- **modified, unticked** → the committed `<layer>` subtree is spliced in its place and its data
+  files copied across.
+- **added, unticked** → dropped, subtree and data files together.
+- **deleted, unticked** → put back, positioned after whichever committed predecessor survives.
+  ("Don't save that deletion" is the only reading of leaving it unticked.)
+
+Everything outside the layer stack — canvas size, animation, document settings, embedded palettes
+— comes from the working file unconditionally. A version is "the document, minus some layers", and
+reverting `<IMAGE>` attributes and animation blocks is a separate surgery.
+
+It reuses merge.rs's zip/XML helpers but differs from `merge_layers` in two deliberate ways, both
+because a merge *adds a second copy* of a layer while staging *substitutes the same one*:
+
+- **uuids are never remapped.** The preserved uuid is exactly what makes the next diff recognise
+  the layer.
+- **Committed `layerN` filenames are kept** unless they collide with a layer that survived from
+  the working file. Tile streams are keyed `kra:{rel}:tile:{image}/layers/{layerN}:{x},{y}`, so
+  renaming unconditionally — which `merge_layers` does, correctly, for its own case — would
+  re-store every reverted layer's tiles under fresh keys and lose dedup against the very history
+  they came from. Krita does renumber `layerN` between saves, so the collision path is real and
+  tested; it just isn't the common case.
+
+`mergedimage.png` and `preview.png` are **dropped** from the synthesized archive. They are Krita's
+renders of the whole stack and we can't redo them, so carrying the working copies would ship a
+preview showing layers the version doesn't contain — visible in the artist's own file manager once
+that version is restored. Both are regenerable: Krita rewrites them on the next save, and in the
+meantime `commands::stacked_composite_url` composites the stack itself
+(`raster::composite_stack`, keyed by `KraManifest::version_key`, cached in the regenerable
+`cache/`) so the Version Map's node isn't blank. That compositor models source-over, per-layer
+opacity, `visible`, one level of group opacity and the five blend modes the frontend's `svgArt.ts`
+already maps; masks and filter/clone/vector layers render as plain paint. Same ceiling the SVG
+stacker always had — and since it only ever produces a preview, never document data, a gap there
+is cosmetic rather than something baked into the artwork.
+
+Refused rather than written (`KvcError::StageFailed`, its own variant so the message can talk
+about picking layers instead of set-aside work): a color-space change between the two versions
+(copied layer data would be in the wrong pixel format), a malformed `maindoc.xml`, and a **first**
+version — there's no committed side to revert the unticked layers to, so "some of the layers" has
+no meaning yet. Ticking only layers that didn't actually change is `Nothing`, not an empty commit.
+
+`kvc commit --layers '["<id>"]'` exposes the same thing, a JSON array like `--paths`. The Krita
+docker never passes it — it has no layer picker — but the CLI stays a complete surface over the
+engine. Tests: [`src-tauri/tests/staging.rs`](../src-tauri/tests/staging.rs).
 
 ### The first-parent-delta invariant
 
@@ -557,7 +627,7 @@ from it (`repo::store_dir_for`), so no signature changed when tracking went per-
 | `delete_repository(path)` | Delete the document's **store**, preferring the OS Recycle Bin, and take the container with it if it held nothing else. **Never touches the artwork.** Returns `true` if the Recycle Bin was used, `false` if it fell back to a permanent delete. |
 | `get_store_root()` / `set_store_root(path?)` | Where new stores are created; `null` = the default, beside each document. App-global (the `kvc` CLI reads the same file), and deliberately does **not** move existing stores. |
 | `scan_repository(path)` | Working-tree changes as `WorkingChange[]` — at most one, the tracked document. |
-| `commit_snapshot(path, message, author, paths?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths, omitted/`null` commits everything. Returns the `Commit`. |
+| `commit_snapshot(path, message, author, paths?, layers?)` | Commit working-tree changes; `paths` restricts the commit to those relative paths, omitted/`null` commits everything. `layers` restricts it *within* the tracked `.kra` to those **top-level** layer ids (`LayerDto.id`) — the version stores a synthesized document and the unticked layers stay uncommitted, so the artwork is still dirty afterwards. See [Layer-subset staging](#layer-subset-staging--saving-only-some-layers). Returns the `Commit`. |
 | `discard_changes(path, paths)` | Discard uncommitted changes, restoring them to the branch tip's committed content — no new commit. Empty `paths` discards everything dirty; otherwise only those relative paths. |
 | `list_commits(path, allBranches?)` | Commits **reachable from the current branch tip** (oldest-first topological; the frontend reverses for newest-first). Merged branches' commits appear; other branches' don't. `allBranches: true` (default false, so every existing caller is unchanged) unions the reachable set over *every* branch tip instead — the Version Map's "show all lines" mode. |
 | `list_branches(path)` | All local branches as `{ name, tip, current }`. |

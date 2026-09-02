@@ -211,12 +211,27 @@ history** is on; see [Version Map](#version-map) for what replaced them.
   used to show would always be one row, and staging a subset of a one-file working tree means
   nothing; what the artist wants to know is what moved in the painting. The rows come from
   `useWorkingDiff`'s existing per-layer `change` — **no new backend command** — rolled up so a
-  changed group reads as one row with an "+N inside" count rather than spilling its children
-  (the backend enumerates layers with `.descendants()`, so children arrive as siblings of their
-  group with no parent link; the rollup is honest about being approximate for that reason).
-  The rows are **read-only**: choosing which layers go into a version needs a write path that
-  synthesizes a `.kra` holding only the ticked ones, and checkboxes that don't bind would be
-  worse than none. "Undo all" in the section header, and "Discard current changes" in the
+  changed group reads as one row with an "+N inside" count rather than spilling its children.
+  Each row is a **checkbox**, and ticking a subset sends those ids as `commit_snapshot`'s `layers`
+  so the version holds only those layers
+  ([layer-subset staging](version-control.md#layer-subset-staging--saving-only-some-layers)).
+  Three details make that work:
+  - The rollup is **exact**, keyed on `ArtLayer.topLevelId`. The backend enumerates layers with
+    `.descendants()`, so children arrive as siblings of their group; the panel used to guess the
+    grouping from "changed layers following a changed group", which over-counted with several
+    groups and surfaced a changed layer inside an *unchanged* group as its own row. That was fine
+    while the rows were read-only. It is not fine when a row's id is what actually gets committed,
+    so `kra::LayerNode` now records each layer's top-level ancestor and `LayerDto` ships it.
+  - Everything is **pre-ticked**, and the state tracked is what's been *un*ticked — so a layer
+    appearing in a later scan is included by default and doing nothing saves the whole artwork
+    exactly as before (`layers: null`, the identical call this made before layer picking existed).
+    Ticks reset on artwork, branch or `refreshNonce` change, since all three replace the rows.
+  - Changes **outside** the layer stack (canvas size, animation, document settings) always ride
+    along; there's no row to untick them with, and a line of copy says so once the selection is
+    partial. The commit button counts the selection ("Save 3 of 7 layers") and refuses an empty
+    one.
+
+  "Undo all" in the section header, and "Discard current changes" in the
   sidebar's `…` menu, both revert the artwork via the repository context's `discardChanges`. Both
   that button and the whole `…` menu are disabled — dimmed, tooltip swapped to "Checking for
   changes…" — while `scanning` or the diff itself is still `loading`: undo/discard/set-aside all

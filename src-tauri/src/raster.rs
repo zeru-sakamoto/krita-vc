@@ -291,8 +291,9 @@ pub fn cap_rgba(rgba: &[u8], width: u32, height: u32) -> (std::borrow::Cow<'_, [
 
 /// Decode a PNG into a straight-alpha RGBA8 buffer + dimensions. Returns `None` for anything we
 /// don't handle (16-bit, palette, grayscale, malformed) — callers treat that as "skip", never
-/// an error. RGB is expanded to opaque RGBA. Shared by [`diff_mask_png`].
-fn decode_png_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+/// an error. RGB is expanded to opaque RGBA. Shared by [`diff_mask_png`] and
+/// [`composite_stack`].
+pub fn decode_png_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
     let mut reader = decoder.read_info().ok()?;
     let (w, h, color, depth) = {
@@ -647,6 +648,108 @@ pub fn bbox_from_mask_png(mask_png: &[u8]) -> Option<(f64, f64, f64, f64)> {
     let (w, h) = (w as usize, h as usize);
     let grid: Vec<bool> = (0..w * h).map(|i| rgba[i * 4 + 3] > 0).collect();
     bbox_from_grid(&grid, w, h)
+}
+
+/// One layer's contribution to [`composite_stack`], bottom-of-stack first.
+pub struct StackLayer<'a> {
+    /// The layer's capped raster, as produced by `kra::layer_raster` — already a full-canvas PNG
+    /// at the `MAX_RASTER_DIM` cap, so no alignment work is needed here.
+    pub png: &'a [u8],
+    /// 0..=1, with any enclosing group's opacity already folded in by the caller.
+    pub opacity: f32,
+    /// Krita's `compositeop`, normalized the way `commands::blend_mode` normalizes it.
+    pub blend: &'a str,
+}
+
+/// Composite a layer stack into one PNG — the app's own stand-in for `mergedimage.png`.
+///
+/// Used when a `.kra` carries no composite entry, which is the case for a **layer-subset commit**:
+/// `stage::stage_kra` drops Krita's `mergedimage.png` rather than ship a render of layers the
+/// version doesn't contain. The result is a *preview* written to the regenerable `cache/`, never
+/// into the artwork — Krita rewrites the real composite on the next save.
+///
+/// `layers` must be ordered **bottom→top** and pre-filtered (hidden layers, and children of a
+/// hidden group, dropped by the caller). Layers whose raster can't be decoded, or whose dimensions
+/// disagree with the first one that could, are skipped rather than failing the whole composite.
+/// `None` when nothing decodable was supplied.
+///
+/// ponytail: models source-over, per-layer opacity and the five blend modes the frontend's
+/// `svgArt.ts` already maps — the same ceiling the SVG stacker has today. Masks, filter/clone/
+/// vector/generator layers and Krita's other ~65 blend modes render as plain source-over paint.
+/// Since this only ever produces a preview, a gap here is cosmetic and local; the upgrade path is
+/// more arms in [`blend_channel`] plus applying transparency masks before the blend.
+pub fn composite_stack(layers: &[StackLayer]) -> Option<Vec<u8>> {
+    use rayon::prelude::*;
+
+    let mut acc: Vec<u8> = Vec::new();
+    let (mut w, mut h) = (0u32, 0u32);
+
+    for layer in layers {
+        let Some((src, sw, sh)) = decode_png_rgba(layer.png) else {
+            continue;
+        };
+        if acc.is_empty() {
+            w = sw;
+            h = sh;
+            acc = vec![0u8; (sw as usize) * (sh as usize) * 4];
+        } else if sw != w || sh != h {
+            continue;
+        }
+        let opacity = layer.opacity.clamp(0.0, 1.0);
+        if opacity <= 0.0 {
+            continue;
+        }
+        let blend = layer.blend;
+        // Rows are independent, and this runs on the CPU-budgeted pool like everything else.
+        acc.par_chunks_mut(4)
+            .zip(src.par_chunks(4))
+            .for_each(|(dst, s)| blend_pixel(dst, s, opacity, blend));
+    }
+
+    if acc.is_empty() {
+        return None;
+    }
+    rgba_to_png(&acc, w, h).ok()
+}
+
+/// W3C source-over with a separable blend function, in straight alpha.
+fn blend_pixel(dst: &mut [u8], src: &[u8], opacity: f32, blend: &str) {
+    let sa = (src[3] as f32 / 255.0) * opacity;
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[3] as f32 / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    for c in 0..3 {
+        let cs = src[c] as f32 / 255.0;
+        let cb = dst[c] as f32 / 255.0;
+        let mixed = blend_channel(cb, cs, blend);
+        // Cs against transparent backdrop stays Cs; against an opaque one it is fully blended.
+        let cs_eff = (1.0 - da) * cs + da * mixed;
+        let cr = (sa * cs_eff + (1.0 - sa) * da * cb) / out_a.max(f32::EPSILON);
+        dst[c] = (cr.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    dst[3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
+}
+
+/// The separable blend functions behind the five `compositeop` values the app models. Anything
+/// else falls through to `normal`, which is what `svgArt.ts::blendCss` already does.
+fn blend_channel(cb: f32, cs: f32, blend: &str) -> f32 {
+    match blend {
+        "multiply" => cb * cs,
+        "screen" => cb + cs - cb * cs,
+        // Overlay is hard-light with the operands swapped.
+        "overlay" => {
+            if cb <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        // Krita's "add" is linear dodge, not CSS's premultiplied plus-lighter.
+        "add" => (cb + cs).min(1.0),
+        _ => cs,
+    }
 }
 
 /// Encode an RGBA8 buffer as PNG bytes.
