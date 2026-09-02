@@ -142,14 +142,20 @@ fn stage_changes(
             ));
         };
 
-        // The committed side of the revert. This is a full `reconstruct_kra` on the commit path —
-        // the price of a partial commit; whole-artwork commits never reach here.
-        let (committed, _) = bytes_of(repo, prev)?;
         let abs = safe_join(&repo.root, &change.rel)?;
         let working = match change.bytes.take() {
             Some(b) => b,
             None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
         };
+        // The committed side of the revert — rebuilt from the store, but only the entries the
+        // staging will actually read (`maindoc.xml` plus the reverted layers' data files). This
+        // used to be a full `reconstruct_kra` of the whole document, which was the single largest
+        // cost of a partial commit and mostly thrown away. Whole-artwork commits never reach here.
+        let content = prev.content.as_deref().ok_or_else(|| {
+            KvcError::StageFailed("the saved version has no content to compare against".into())
+        })?;
+        let committed =
+            crate::stage::committed_subset(repo, &change.rel, content, &working, &keep)?;
 
         let synth = crate::stage::stage_kra(&working, &committed, &keep)?;
         drop(working);
@@ -222,17 +228,28 @@ pub(crate) fn store_change(
     drop(bytes);
 
     // On a partial (layer-subset) commit the committed content is *not* what's on disk, so the
-    // working file must keep scanning dirty. Zeroing size+mtime disarms `scan_detailed`'s fast
-    // path via its `(size, mtime) != (0, 0)` guard — recording the working file's own size/mtime
-    // would make the next scan skip it as unchanged and the unticked layers would disappear from
-    // the Changes panel. Zeroing only `mtime` is not enough: `size` is compared too, and both must
-    // fail the guard. Costs one re-hash on the next scan, which is nothing next to the reconstruct
-    // the partial commit already paid.
+    // working file must keep scanning dirty — but it must do so *cheaply*. The `partial` flag says
+    // so outright, which lets `scan_detailed` answer "modified" from a `stat`; the alternative
+    // (zeroing size+mtime to disarm its fast path) made every later scan re-read and re-hash the
+    // whole document, and `kvc status` is on the Krita docker's 1.5s poll.
+    //
+    // `hash` stays the *synthesized* hash, deliberately: if a scan does fall through to a full
+    // read (a same-tick rewrite trips the racy-clean guard), it must still come out "M".
+    // `size`/`mtime` are re-stat'ed rather than taken from the change, whose `size` was replaced
+    // with the synthesized archive's by `stage_changes`.
+    let (disk_size, disk_mtime) = if partial {
+        std::fs::metadata(&abs)
+            .map(|m| crate::repo::size_mtime(&m))
+            .unwrap_or((0, 0))
+    } else {
+        (size, mtime)
+    };
     let tracked = TrackedFile {
         hash: hash.clone(),
         is_kra,
-        size: if partial { 0 } else { size },
-        mtime: if partial { 0 } else { mtime },
+        size: disk_size,
+        mtime: disk_mtime,
+        partial,
     };
     let record = CommittedFile {
         path: rel,
@@ -333,19 +350,32 @@ pub fn current_tree(repo: &Repo) -> BTreeMap<String, CommittedFile> {
 /// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob),
 /// plus the blake3 of those bytes for the index. A generic blob's stream hash *is* blake3 of
 /// its exact bytes (write-time verified), so only a rebuilt `.kra` pays a hash pass.
-pub(crate) fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
+pub(crate) fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
     let content = f
         .content
         .as_deref()
         .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))?;
     if f.is_kra {
-        let bytes = kra::reconstruct_kra(repo, &f.path, content)?;
-        let hash = hash_bytes(&bytes);
-        Ok((bytes, hash))
+        kra::reconstruct_kra(repo, &f.path, content)
     } else {
-        let bytes = repo.reconstruct(&format!("file:{}", f.path), content)?;
-        Ok((bytes, content.to_string()))
+        repo.reconstruct(&format!("file:{}", f.path), content)
     }
+}
+
+/// [`bytes_of`] plus the file hash, for the callers that record one in the index.
+///
+/// Split out because the hash is a full blake3 pass over the rebuilt document — hundreds of MB on
+/// a real painting — and three of the five callers were throwing it away, the staging path on the
+/// commit hot loop among them.
+fn bytes_and_hash_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
+    let bytes = bytes_of(repo, f)?;
+    // A `.kra`'s stored `content` is its *manifest* hash, not the archive's, so it has to be
+    // hashed; a plain file's content hash already is the blake3 of these bytes.
+    let hash = match (f.is_kra, f.content.as_deref()) {
+        (false, Some(c)) => c.to_string(),
+        _ => hash_bytes(&bytes),
+    };
+    Ok((bytes, hash))
 }
 
 /// Reconstruct `target`'s bytes for one file, incrementally when possible: for a `.kra` whose
@@ -373,7 +403,7 @@ fn restore_bytes(
             }
         }
     }
-    bytes_of(repo, target)
+    bytes_and_hash_of(repo, target)
 }
 
 /// Make the working tree **and index** match `target`, rewriting only files whose committed
@@ -413,6 +443,7 @@ pub fn materialize_tree(
                 is_kra: f.is_kra,
                 size,
                 mtime,
+                partial: false,
             },
         );
     }
@@ -480,6 +511,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
                 is_kra: f.is_kra,
                 size,
                 mtime,
+                partial: false,
             },
         );
         files.push(CommittedFile {
@@ -593,7 +625,7 @@ pub fn discard_working_changes(
         let f = target
             .get(&change.rel)
             .ok_or_else(|| KvcError::NotTracked(change.rel.clone()))?;
-        let (bytes, hash) = bytes_of(repo, f)?;
+        let (bytes, hash) = bytes_and_hash_of(repo, f)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
@@ -608,6 +640,7 @@ pub fn discard_working_changes(
                 is_kra: f.is_kra,
                 size,
                 mtime,
+                partial: false,
             },
         );
     }
@@ -714,7 +747,7 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
         } else if !pf.is_kra {
             pf.content.clone().expect("restores keep content")
         } else {
-            bytes_of(repo, &pf)?.1
+            bytes_and_hash_of(repo, &pf)?.1
         };
         // size/mtime left 0: the working-tree file is untouched by a soft undo, so its real mtime
         // is unknown here — 0 never matches, forcing the next scan to re-hash (correct, conservative).
@@ -725,6 +758,7 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
                 is_kra: pf.is_kra,
                 size: 0,
                 mtime: 0,
+                partial: false,
             },
         );
     }

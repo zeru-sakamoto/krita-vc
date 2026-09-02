@@ -1348,30 +1348,45 @@ fn stacked_composite_url(
 
     let (w, h) = (meta.width, meta.height);
     // Bottom→top: `parse_image_meta` preserves Krita's document order, which is top-first.
-    let mut rasters: Vec<(kra::LayerRaster, f32, String)> = Vec::new();
-    for (i, l) in meta.layers.iter().enumerate().rev() {
-        if l.filename.is_empty() {
-            continue; // a group contributes no pixels of its own, only its children's
-        }
-        // ponytail: folds in only the *top-level* ancestor's opacity and visibility, which is
-        // what `LayerNode::top` records. A group nested inside another group contributes its own
-        // opacity only when it is that top-level one. This renders a preview, so the gap is
-        // cosmetic; recording the full parent chain is the upgrade.
-        let group = match l.top {
-            Some(t) if t != i => meta.layers.get(t),
-            _ => None,
-        };
-        if !l.visible || group.is_some_and(|g| !g.visible) {
-            continue;
-        }
-        let opacity = (l.opacity as f32 / 255.0) * group.map_or(1.0, |g| g.opacity as f32 / 255.0);
-        if opacity <= 0.0 {
-            continue;
-        }
-        if let Some(r) = src.layer_raster(repo, path, &meta.name, &l.filename, w, h, tile_cache)? {
-            rasters.push((r, opacity, blend_mode(&l.blend)));
-        }
-    }
+    // Choosing the contributing layers is cheap and needs `meta` by index, so it stays serial;
+    // fetching their rasters is not — each one replays that layer's tiles — and doing them one at
+    // a time was the only serial stretch on a path that is `par_iter` everywhere else. This runs
+    // for every layer-subset version, which by design carries no `mergedimage.png` of its own.
+    let plan: Vec<(&str, f32, String)> = meta
+        .layers
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| !l.filename.is_empty()) // a group has no pixels of its own
+        .filter_map(|(i, l)| {
+            // ponytail: folds in only the *top-level* ancestor's opacity and visibility, which is
+            // what `LayerNode::top` records. A group nested inside another group contributes its
+            // own opacity only when it is that top-level one. This renders a preview, so the gap
+            // is cosmetic; recording the full parent chain is the upgrade.
+            let group = match l.top {
+                Some(t) if t != i => meta.layers.get(t),
+                _ => None,
+            };
+            if !l.visible || group.is_some_and(|g| !g.visible) {
+                return None;
+            }
+            let opacity =
+                (l.opacity as f32 / 255.0) * group.map_or(1.0, |g| g.opacity as f32 / 255.0);
+            (opacity > 0.0).then(|| (l.filename.as_str(), opacity, blend_mode(&l.blend)))
+        })
+        .collect();
+
+    // rayon's `map` + `collect` preserves order, so the stack stays bottom→top.
+    let rasters: Vec<(kra::LayerRaster, f32, String)> = plan
+        .into_par_iter()
+        .map(|(filename, opacity, blend)| {
+            let r = src.layer_raster(repo, path, &meta.name, filename, w, h, tile_cache)?;
+            Ok(r.map(|r| (r, opacity, blend)))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let stack: Vec<crate::raster::StackLayer> = rasters
         .iter()

@@ -195,12 +195,17 @@ trusted; a document committed in an earlier tick keeps the fast path. `commit_se
 `paths` filter survives — the CLI still passes it — but with one tracked document there is no
 longer a file subset for the UI to choose; picking *layers* is a separate argument, below.
 
-One consequence of that racy-clean rule is load-bearing for
-[layer-subset staging](#layer-subset-staging--saving-only-some-layers): a partial commit stores
-content that is deliberately **not** what sits on disk, so its index entry records `size`/`mtime`
-as `0`. Recording the working file's own would satisfy the fast path above and the next scan would
-report the artwork **clean**, silently losing the layers the artist chose *not* to save yet. The
-`(size, mtime) != (0, 0)` clause exists to be failed on purpose here.
+[Layer-subset staging](#layer-subset-staging--saving-only-some-layers) has to get past that fast
+path without paying for it. A partial commit stores content that is deliberately **not** what sits
+on disk, so the artwork must keep reading as modified — but the working file's size and mtime
+*match* the index, which is exactly the "unchanged" signal. The index says so outright instead:
+`TrackedFile.partial`. On a size+mtime match a `partial` entry reports `"M"` from the `stat` alone,
+with no read and no hash (callers that want the bytes — the commit path — fall through and read as
+usual). The earlier design zeroed `size`/`mtime` to fail the fast path's `(size, mtime) != (0, 0)`
+clause; it was correct but made every later scan read and blake3 the whole document, and `kvc
+status` is on the Krita plugin's 1.5s poll. The recorded `hash` stays the *synthesized* one, so a
+scan that does fall through — a same-tick rewrite trips the racy-clean rule above — still comes out
+`"M"`.
 
 ## Committing — `commit_snapshot` / `commit_selected`
 
@@ -261,6 +266,19 @@ Everything outside the layer stack — canvas size, animation, document settings
 — comes from the working file unconditionally. A version is "the document, minus some layers", and
 reverting `<IMAGE>` attributes and animation blocks is a separate surgery.
 
+**The committed side is rebuilt in two passes, not one.** `stage::committed_subset` reconstructs
+`maindoc.xml` on its own, plans the output stack against it (`stage::plan_pieces`, the same
+function `stage_kra` uses, so the two can't disagree about which layers get reverted), and then
+reconstructs only the data files that plan names — typically one or two layers out of a stack.
+The first implementation called `commit::bytes_of`, i.e. a full `reconstruct_kra`: every tile of
+the whole document replayed through its delta chains plus a re-encode of `mergedimage.png` from
+its pixel blocks, nearly all of it discarded a moment later. It was the single largest cost of a
+partial commit; see [performance.md](performance.md#layer-subset-staging) for the numbers. The
+subset archive is deliberately not an openable `.kra` — it is an input to `stage_kra` and nothing
+else — and one consequence is that `stage_kra`'s `taken` collision set no longer sees committed
+data files belonging to layers that aren't being reverted. It doesn't need to: those can't appear
+in the output either.
+
 It reuses merge.rs's zip/XML helpers but differs from `merge_layers` in two deliberate ways, both
 because a merge *adds a second copy* of a layer while staging *substitutes the same one*:
 
@@ -271,7 +289,14 @@ because a merge *adds a second copy* of a layer while staging *substitutes the s
   renaming unconditionally — which `merge_layers` does, correctly, for its own case — would
   re-store every reverted layer's tiles under fresh keys and lose dedup against the very history
   they came from. Krita does renumber `layerN` between saves, so the collision path is real and
-  tested; it just isn't the common case.
+  tested; it just isn't the common case. Keeping the names also buys the *entry*-level
+  short-circuit: a reverted layer comes back byte-identical, so `commit_kra`'s crc32+size check
+  matches the previous manifest and the entry is reused verbatim without ever being inflated.
+
+The synthesized archive is written **deflate level 1** (`stage::out_opts`), not the zip crate's
+default level 6 that `merge::opts` supplies. It is never written to disk — `commit_kra` re-opens
+it immediately, and crc32+size are computed over uncompressed bytes, so the level cannot affect
+what is stored. Level 6 over a whole document's already-LZF'd tiles was pure discarded work.
 
 `mergedimage.png` and `preview.png` are **dropped** from the synthesized archive. They are Krita's
 renders of the whole stack and we can't redo them, so carrying the working copies would ship a

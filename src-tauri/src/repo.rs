@@ -758,6 +758,14 @@ pub struct TrackedFile {
     pub size: u64,
     #[serde(default)]
     pub mtime: u64,
+    /// The committed content is a **layer subset** of what's on disk (`stage::stage_kra`), so the
+    /// working file is dirty even though `size`/`mtime` match what we recorded. Lets the scanner
+    /// answer "modified" from a `stat` instead of re-reading and re-hashing the whole `.kra` —
+    /// which the Krita docker's 1.5s status poll would otherwise pay on every tick, forever, on a
+    /// document that may be hundreds of MB. `#[serde(default)]` = false for pre-existing indexes,
+    /// which is exactly what they meant.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

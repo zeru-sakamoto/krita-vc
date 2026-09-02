@@ -922,3 +922,193 @@ fn storage_stats_cost() {
         mb(stats.actual_bytes)
     );
 }
+
+// --- layer-subset staging ----------------------------------------------------------------
+
+/// Layers for the partial-commit fixture. More than `LAYERS` on purpose: the whole question is
+/// what reverting the *unticked* ones costs, and with three layers "one ticked" is barely a
+/// subset.
+const PARTIAL_LAYERS: usize = 6;
+/// The layer the artist **unticks** — one of the two the fixture edits, so exactly one edited
+/// layer gets reverted. This is the shape the UI produces: `ChangesPanel` pre-ticks everything and
+/// tracks what was turned *off*, so a real partial commit keeps most of the stack and holds one or
+/// two layers back. (Ticking only one, the opposite, is the worst case for anything that tries to
+/// reconstruct less than the whole committed document — noted because it is tempting to bench.)
+const UNTICKED_LAYER: usize = 1;
+
+/// Everything else. `maindoc()` stamps `uuid="l{i}"` and `stage::layer_key` prefers the uuid, so
+/// these are the ids the frontend would send.
+fn ticked_layers() -> Vec<String> {
+    (0..PARTIAL_LAYERS)
+        .filter(|i| *i != UNTICKED_LAYER)
+        .map(|i| format!("l{i}"))
+        .collect()
+}
+
+/// One tracked document with `PARTIAL_LAYERS` full-grid layers, committed once, then edited on
+/// two layers and left dirty on disk. Returns the open repo, the document path, and the layers
+/// (so a caller can keep editing).
+#[allow(clippy::type_complexity)]
+fn partial_fixture(
+    root: &std::path::Path,
+) -> (
+    repo::Repo,
+    std::path::PathBuf,
+    Vec<Vec<(i64, i64, Vec<u8>)>>,
+) {
+    let kra_path = init_doc(root);
+    let mut r = repo::Repo::open(&kra_path).unwrap();
+    let mut rng = Rng(0x51ED_C0FF_EE15_D00D);
+
+    let mut layers: Vec<Vec<(i64, i64, Vec<u8>)>> =
+        (0..PARTIAL_LAYERS).map(|_| full_grid(&mut rng)).collect();
+    std::fs::write(root.join("art.kra"), doc(&layers)).unwrap();
+    commit::commit_snapshot(&mut r, "initial", "bench").unwrap();
+
+    // Edit two layers: the ticked one and one that will be reverted, so staging has real work.
+    for li in [0usize, 1usize] {
+        for k in 0..EDIT_TILES {
+            let idx = (li * 37 + k * 101) % layers[li].len();
+            let (x, y, _) = layers[li][idx];
+            layers[li][idx] = (x, y, random_tile(&mut rng));
+        }
+    }
+    std::fs::write(root.join("art.kra"), doc(&layers)).unwrap();
+    (r, kra_path, layers)
+}
+
+/// Baseline for a **layer-subset** commit (`commit_selected` with `layers`), which no other
+/// benchmark exercises. Prints the whole-artwork commit of the same edit as the control — the
+/// target is that saving one layer is not slower than saving all of them — then the phase
+/// breakdown of the partial path, then the cost of a scan afterwards (a partial commit
+/// deliberately leaves the tree dirty; the question is whether re-learning that reads the whole
+/// document).
+#[test]
+#[ignore = "benchmark — run manually in release mode with --nocapture"]
+fn partial_commit_baseline() {
+    println!(
+        "document: {} layers x {} tiles, 2 edited, 1 of them held back\n",
+        PARTIAL_LAYERS,
+        TILE_GRID * TILE_GRID
+    );
+
+    // --- control: the same edit committed whole -------------------------------------------
+    let ctl_dir = tempfile::tempdir().unwrap();
+    let (mut r, ctl_path, _) = partial_fixture(ctl_dir.path());
+    let t = Instant::now();
+    commit::commit_snapshot(&mut r, "whole", "bench").unwrap();
+    let whole = t.elapsed();
+    println!("whole-artwork commit:  {whole:>8.2?}   (control)");
+    let t = Instant::now();
+    let clean = krita_vc_lib::scan::scan(&r).unwrap();
+    println!(
+        "  scan after:          {:>8.2?}   ({} changes)",
+        t.elapsed(),
+        clean.len()
+    );
+    let (ctl_bytes, _) = dir_size(&store_of(&ctl_path));
+    drop(r);
+
+    // --- the partial commit ----------------------------------------------------------------
+    let dir = tempfile::tempdir().unwrap();
+    let (mut r, kra_path, _) = partial_fixture(dir.path());
+    let t = Instant::now();
+    commit::commit_selected(
+        &mut r,
+        "all but one layer",
+        "bench",
+        None,
+        Some(&ticked_layers()),
+    )
+    .unwrap();
+    let partial = t.elapsed();
+    println!(
+        "\npartial commit:        {partial:>8.2?}   ({:.1}x the control)",
+        partial.as_secs_f64() / whole.as_secs_f64().max(f64::MIN_POSITIVE)
+    );
+
+    // A partial commit leaves the tree dirty on purpose. What it must not do is re-read and
+    // re-hash the whole document to rediscover that — the Krita docker polls this every 1.5s.
+    for label in ["scan after (1st)", "scan after (2nd)"] {
+        let t = Instant::now();
+        let changes = krita_vc_lib::scan::scan(&r).unwrap();
+        println!(
+            "  {label}:    {:>8.2?}   ({} changes)",
+            t.elapsed(),
+            changes.len()
+        );
+    }
+    let (par_bytes, _) = dir_size(&store_of(&kra_path));
+    drop(r);
+
+    // --- phase breakdown, on a third repo in the same pre-commit state ---------------------
+    let ph_dir = tempfile::tempdir().unwrap();
+    let (mut r, ph_path, _) = partial_fixture(ph_dir.path());
+    let working = std::fs::read(ph_dir.path().join("art.kra")).unwrap();
+    let head = r
+        .commits
+        .last()
+        .unwrap()
+        .files
+        .iter()
+        .find(|f| f.path == "art.kra")
+        .unwrap()
+        .content
+        .clone()
+        .unwrap();
+
+    println!("\nphases:");
+    let keep: std::collections::HashSet<String> = ticked_layers().into_iter().collect();
+    let t = Instant::now();
+    let committed =
+        krita_vc_lib::stage::committed_subset(&r, "art.kra", &head, &working, &keep).unwrap();
+    println!(
+        "  committed subset:    {:>8.2?}   ({:.1} MB rebuilt)",
+        t.elapsed(),
+        mb(committed.len() as u64)
+    );
+
+    // What that replaced: the whole committed document rebuilt, plus the blake3 of it that
+    // `bytes_of` returned and `stage_changes` threw away.
+    let t = Instant::now();
+    let full = kra::reconstruct_kra(&r, "art.kra", &head).unwrap();
+    let full_t = t.elapsed();
+    let t = Instant::now();
+    let _discarded = repo::hash_bytes(&full);
+    println!(
+        "   (was: reconstruct   {:>8.2?}   {:.1} MB, + {:.2?} discarded hash)",
+        full_t,
+        mb(full.len() as u64),
+        t.elapsed()
+    );
+    drop(full);
+
+    let t = Instant::now();
+    let synth = krita_vc_lib::stage::stage_kra(&working, &committed, &keep).unwrap();
+    println!(
+        "  stage_kra:           {:>8.2?}   ({:.1} MB synthesized)",
+        t.elapsed(),
+        mb(synth.len() as u64)
+    );
+
+    let t = Instant::now();
+    let _ = repo::hash_bytes(&synth);
+    println!("  hash (synth):        {:>8.2?}", t.elapsed());
+
+    let prev = kra::load_manifest(&r, "art.kra", &head).unwrap();
+    let t = Instant::now();
+    kra::commit_kra(&mut r, "art.kra", &synth, Some(&prev)).unwrap();
+    println!("  commit_kra:          {:>8.2?}", t.elapsed());
+
+    let t = Instant::now();
+    r.save().unwrap();
+    println!("  save:                {:>8.2?}", t.elapsed());
+    drop(r);
+    let _ = ph_path;
+
+    println!(
+        "\nstore after: partial {:>6.1} MB vs whole {:>6.1} MB",
+        mb(par_bytes),
+        mb(ctl_bytes)
+    );
+}

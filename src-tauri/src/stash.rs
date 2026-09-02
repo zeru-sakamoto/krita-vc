@@ -140,13 +140,13 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
         }
         // Full store rebuild, not the incremental `restore_bytes` path — that one trusts the
         // on-disk file as a diff base, which isn't what's sitting there.
-        let (stashed, _) = commit::bytes_of(repo, f)?;
+        let stashed = commit::bytes_of(repo, f)?;
         let bytes = if is_conflict(&f.path) {
             // Guaranteed a `.kra` by the refuse check above. Fold the set-aside layers into the
             // edited working file instead of overwriting (and losing) it.
             let working = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
             let ancestor = match committed.get(&f.path) {
-                Some(cf) => Some(commit::bytes_of(repo, cf)?.0),
+                Some(cf) => Some(commit::bytes_of(repo, cf)?),
                 None => None,
             };
             crate::merge::merge_layers(&working, &stashed, ancestor.as_deref())?

@@ -31,13 +31,16 @@
 
 use crate::error::{KvcError, Result};
 use crate::merge::{
-    archive_layer_files, attr, image_node_with, layers_insert_at, layers_node_with, opts,
+    archive_layer_files, attr, image_node_with, layers_insert_at, layers_node_with,
     read_entry_with, subtree_attr, zip_err,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive};
 
+/// The document's layer stack and settings. The only entry both halves of a partial commit read.
+const MAINDOC_ENTRY: &str = "maindoc.xml";
 /// Krita's document composite. Dropped from a partial version — see [`stage_kra`].
 const COMPOSITE_ENTRY: &str = "mergedimage.png";
 /// Krita's small thumbnail, dropped for the same reason as the composite.
@@ -45,6 +48,29 @@ const PREVIEW_ENTRY: &str = "preview.png";
 
 fn fail(msg: &str) -> KvcError {
     KvcError::StageFailed(msg.to_string())
+}
+
+/// Zip options for the synthesized archive.
+///
+/// **Level 1, not the library default.** This buffer is never written to disk — `kra::commit_kra`
+/// re-opens it in the next breath and its entry-reuse fast path compares crc32+size, both computed
+/// over *uncompressed* bytes, so the level cannot affect what gets stored. It used `merge::opts`,
+/// which is `SimpleFileOptions::default()` = deflate level 6: a full level-6 compress pass over
+/// every entry of the whole document, thrown away microseconds later. Krita tile payloads are
+/// already LZF-compressed and gain ~nothing at any level, which is the same conclusion `kra::opts`
+/// reached for the restore path.
+///
+/// ponytail: `Stored` would drop the last of the compression cost, but the output is held whole in
+/// RAM alongside two other full documents (see `commit::stage_changes`) — level 1 keeps it near
+/// the input's size for a few percent of level 6's CPU. Revisit if that RAM ceiling ever moves.
+fn out_opts(name: &str) -> SimpleFileOptions {
+    if name == "mimetype" {
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+    } else {
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(1))
+    }
 }
 
 /// Build the `.kra` for a commit that saves only the layers in `keep`.
@@ -65,8 +91,8 @@ fn fail(msg: &str) -> KvcError {
 /// open: a color-space mismatch between the two versions, or a `maindoc.xml` that is missing,
 /// non-UTF-8, unparseable, or has no `<IMAGE>`/`<layers>`.
 pub fn stage_kra(working: &[u8], committed: &[u8], keep: &HashSet<String>) -> Result<Vec<u8>> {
-    let work_doc = read_entry_with(working, "maindoc.xml", fail)?;
-    let comm_doc = read_entry_with(committed, "maindoc.xml", fail)?;
+    let work_doc = read_entry_with(working, MAINDOC_ENTRY, fail)?;
+    let comm_doc = read_entry_with(committed, MAINDOC_ENTRY, fail)?;
     let work_xml = std::str::from_utf8(&work_doc).map_err(|_| fail("maindoc.xml is not UTF-8"))?;
     let comm_xml = std::str::from_utf8(&comm_doc)
         .map_err(|_| fail("the saved version's maindoc.xml is not UTF-8"))?;
@@ -103,42 +129,7 @@ pub fn stage_kra(working: &[u8], committed: &[u8], keep: &HashSet<String>) -> Re
 
     let work_top: Vec<roxmltree::Node> = top_layers(work_layers).collect();
     let comm_top: Vec<roxmltree::Node> = top_layers(comm_layers).collect();
-    let comm_by_key: HashMap<String, roxmltree::Node> =
-        comm_top.iter().map(|n| (layer_key(*n), *n)).collect();
-    let work_keys: HashSet<String> = work_top.iter().map(|n| layer_key(*n)).collect();
-
-    // The output stack, in order. Working order is the artist's own stacking order, so it drives.
-    let mut pieces: Vec<(String, Piece)> = Vec::new();
-    for n in &work_top {
-        let key = layer_key(*n);
-        if keep.contains(&key) {
-            pieces.push((key, Piece::Working(*n)));
-        } else if let Some(c) = comm_by_key.get(&key) {
-            pieces.push((key, Piece::Committed(*c)));
-        }
-        // Otherwise: added in the working file and not ticked — it simply isn't in this version.
-    }
-
-    // A layer *deleted* in the working file and left unticked means "don't save that deletion", so
-    // it has to come back. Its position is gone from the working order, so take it from the
-    // committed one: right after whichever committed predecessor is still in the stack. Walking
-    // committed order ascending means earlier re-insertions are already placed when later ones
-    // look for their predecessor.
-    for (ci, cn) in comm_top.iter().enumerate() {
-        let key = layer_key(*cn);
-        if work_keys.contains(&key) || keep.contains(&key) {
-            continue;
-        }
-        let at = comm_top[..ci]
-            .iter()
-            .rev()
-            .find_map(|p| {
-                let pk = layer_key(*p);
-                pieces.iter().position(|(k, _)| *k == pk)
-            })
-            .map_or(0, |i| i + 1);
-        pieces.insert(at, (key, Piece::Committed(*cn)));
-    }
+    let pieces = plan_pieces(&work_top, &comm_top, keep);
 
     // Data files belonging to layers kept verbatim from the working file. Everything else under
     // `layers/` is dropped on the way out, and reverted layers are copied in from `committed`.
@@ -225,6 +216,125 @@ pub fn stage_kra(working: &[u8], committed: &[u8], keep: &HashSet<String>) -> Re
     )
 }
 
+/// The output stack, in order: which top-level layers survive and where each one's XML and data
+/// files come from. Working order is the artist's own stacking order, so it drives.
+///
+/// Split out of [`stage_kra`] so [`committed_subset`] can answer "which committed layers will this
+/// commit actually read" from the two `maindoc.xml`s alone, before anything expensive is rebuilt.
+fn plan_pieces<'a>(
+    work_top: &[roxmltree::Node<'a, 'a>],
+    comm_top: &[roxmltree::Node<'a, 'a>],
+    keep: &HashSet<String>,
+) -> Vec<(String, Piece<'a>)> {
+    let comm_by_key: HashMap<String, roxmltree::Node> =
+        comm_top.iter().map(|n| (layer_key(*n), *n)).collect();
+    let work_keys: HashSet<String> = work_top.iter().map(|n| layer_key(*n)).collect();
+
+    let mut pieces: Vec<(String, Piece)> = Vec::new();
+    for n in work_top {
+        let key = layer_key(*n);
+        if keep.contains(&key) {
+            pieces.push((key, Piece::Working(*n)));
+        } else if let Some(c) = comm_by_key.get(&key) {
+            pieces.push((key, Piece::Committed(*c)));
+        }
+        // Otherwise: added in the working file and not ticked — it simply isn't in this version.
+    }
+
+    // A layer *deleted* in the working file and left unticked means "don't save that deletion", so
+    // it has to come back. Its position is gone from the working order, so take it from the
+    // committed one: right after whichever committed predecessor is still in the stack. Walking
+    // committed order ascending means earlier re-insertions are already placed when later ones
+    // look for their predecessor.
+    for (ci, cn) in comm_top.iter().enumerate() {
+        let key = layer_key(*cn);
+        if work_keys.contains(&key) || keep.contains(&key) {
+            continue;
+        }
+        let at = comm_top[..ci]
+            .iter()
+            .rev()
+            .find_map(|p| {
+                let pk = layer_key(*p);
+                pieces.iter().position(|(k, _)| *k == pk)
+            })
+            .map_or(0, |i| i + 1);
+        pieces.insert(at, (key, Piece::Committed(*cn)));
+    }
+    pieces
+}
+
+/// The `committed` argument for [`stage_kra`], rebuilt from the store **without replaying the
+/// whole document**.
+///
+/// A partial commit reads exactly two things out of the committed version: `maindoc.xml`, and the
+/// data files of the top-level layers being reverted — typically one or two out of a whole stack.
+/// Rebuilding all of it (what `commit::bytes_of` did) meant a delta-chain replay of every tile
+/// plus a full re-encode of `mergedimage.png` from its pixel blocks, then throwing nearly all of
+/// it away. So: reconstruct `maindoc.xml` alone, plan against it, and reconstruct only what the
+/// plan names.
+///
+/// The result is deliberately **not** an openable `.kra` — it is an input to [`stage_kra`] and
+/// nothing else. Two consequences, both fine:
+/// - the two `maindoc.xml`s get parsed twice (here and in `stage_kra`). They are the small part.
+/// - `stage_kra`'s `taken` collision set no longer sees committed data files belonging to layers
+///   that aren't being reverted. It doesn't need to: those can't appear in the output either, and
+///   a minted `layerN` is still checked against the whole working archive and everything already
+///   handed out.
+pub fn committed_subset(
+    repo: &crate::repo::Repo,
+    relpath: &str,
+    manifest_hash: &str,
+    working: &[u8],
+    keep: &HashSet<String>,
+) -> Result<Vec<u8>> {
+    let manifest = crate::kra::load_manifest(repo, relpath, manifest_hash)?;
+    let head = crate::kra::reconstruct_kra_from(repo, relpath, &manifest, &|n| n == MAINDOC_ENTRY)?;
+
+    let comm_doc = read_entry_with(&head, MAINDOC_ENTRY, fail)?;
+    let work_doc = read_entry_with(working, MAINDOC_ENTRY, fail)?;
+    let comm_xml = std::str::from_utf8(&comm_doc)
+        .map_err(|_| fail("the saved version's maindoc.xml is not UTF-8"))?;
+    let work_xml = std::str::from_utf8(&work_doc).map_err(|_| fail("maindoc.xml is not UTF-8"))?;
+    let opt = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let comm_tree = roxmltree::Document::parse_with_options(comm_xml, opt)
+        .map_err(|e| fail(&format!("saved version's maindoc: {e}")))?;
+    let work_tree = roxmltree::Document::parse_with_options(work_xml, opt)
+        .map_err(|e| fail(&format!("maindoc: {e}")))?;
+    let comm_image = image_node_with(&comm_tree, fail)?;
+    let work_image = image_node_with(&work_tree, fail)?;
+
+    let work_top: Vec<roxmltree::Node> = top_layers(layers_node_with(work_image, fail)?).collect();
+    let comm_top: Vec<roxmltree::Node> = top_layers(layers_node_with(comm_image, fail)?).collect();
+    let needed: HashSet<String> = plan_pieces(&work_top, &comm_top, keep)
+        .iter()
+        .filter_map(|(_, p)| match p {
+            Piece::Committed(n) => Some(subtree_attr(*n, "filename")),
+            Piece::Working(_) => None,
+        })
+        .flatten()
+        .collect();
+
+    let prefix = format!("{}/layers/", comm_image.attribute("name").unwrap_or(""));
+    crate::kra::reconstruct_kra_from(repo, relpath, &manifest, &|name| {
+        if name == MAINDOC_ENTRY {
+            return true;
+        }
+        // Same ['.', '/'] split as `repackage`: carries `layer2.defaultpixel` and
+        // `layer2.shapelayer/content.svg` along with their base filename.
+        match name.strip_prefix(&prefix) {
+            Some(rest) => {
+                let split = rest.find(['.', '/']).unwrap_or(rest.len());
+                needed.contains(&rest[..split])
+            }
+            None => false,
+        }
+    })
+}
+
 /// Where each output layer's XML and data files come from.
 enum Piece<'a> {
     /// Ticked — kept exactly as the working file has it.
@@ -278,7 +388,9 @@ fn repackage(
     let work_prefix = format!("{work_image}/layers/");
     let comm_prefix = format!("{comm_image}/layers/");
 
-    let mut out = Vec::new();
+    // Same order of magnitude as the input, so start there instead of reallocating
+    // and memcpying a multi-hundred-MB buffer up from nothing.
+    let mut out = Vec::with_capacity(working.len());
     {
         let mut zw = zip::ZipWriter::new(Cursor::new(&mut out));
 
@@ -300,8 +412,8 @@ fn repackage(
                     continue;
                 }
             }
-            zw.start_file(&name, opts(&name)).map_err(zip_err)?;
-            if name == "maindoc.xml" {
+            zw.start_file(&name, out_opts(&name)).map_err(zip_err)?;
+            if name == MAINDOC_ENTRY {
                 zw.write_all(maindoc.as_bytes())?;
             } else {
                 let buf = crate::repo::read_entry_capped(&mut f)?;
@@ -328,7 +440,8 @@ fn repackage(
             };
             let new_name = format!("{work_prefix}{new_fn}{}", &rest[split..]);
             let buf = crate::repo::read_entry_capped(&mut f)?;
-            zw.start_file(&new_name, opts(&new_name)).map_err(zip_err)?;
+            zw.start_file(&new_name, out_opts(&new_name))
+                .map_err(zip_err)?;
             zw.write_all(&buf)?;
         }
 

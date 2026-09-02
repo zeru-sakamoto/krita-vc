@@ -269,6 +269,58 @@ fn the_tree_is_still_dirty_after_a_partial_commit() {
     assert_eq!(dirty[0].1, "M");
 }
 
+/// …and it must reach that answer from a `stat`. The index used to record `size`/`mtime` as `0`
+/// to force the scanner off its fast path, which made every later scan read and blake3 the whole
+/// document — and `kvc status` is on the Krita docker's 1.5s poll, so that was a full read of a
+/// possibly-hundreds-of-MB painting, twice a second, forever after one partial commit.
+///
+/// There's no portable way to assert "didn't read the file", so this pins the index shape the
+/// cheap path depends on: real size/mtime (so the fast path can fire at all) plus the `partial`
+/// flag (so firing it still yields "M").
+#[test]
+fn a_partial_commit_leaves_the_index_able_to_answer_from_a_stat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = setup(dir.path(), 10, 10);
+
+    std::fs::write(&path, kra_layered(20, 20)).unwrap();
+    let mut r = repo::Repo::open(&path).unwrap();
+    commit::commit_selected(&mut r, "just the lines", "t", None, Some(&sel(&[LINES]))).unwrap();
+
+    let r = repo::Repo::open(&path).unwrap();
+    let tracked = r.index.files.get("art.kra").expect("still tracked");
+    assert!(tracked.partial, "the committed version is a layer subset");
+
+    let meta = std::fs::metadata(&path).unwrap();
+    let (size, mtime) = repo::size_mtime(&meta);
+    assert_eq!(
+        (tracked.size, tracked.mtime),
+        (size, mtime),
+        "the index must describe the file on disk, or the fast path can never fire"
+    );
+    assert_ne!((tracked.size, tracked.mtime), (0, 0));
+}
+
+/// The flag is not sticky: saving the whole artwork afterwards clears it, so the document goes
+/// back to being skippable on a size+mtime match.
+#[test]
+fn a_full_commit_clears_the_partial_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = setup(dir.path(), 10, 10);
+
+    std::fs::write(&path, kra_layered(20, 20)).unwrap();
+    let mut r = repo::Repo::open(&path).unwrap();
+    commit::commit_selected(&mut r, "just the lines", "t", None, Some(&sel(&[LINES]))).unwrap();
+    assert!(r.index.files["art.kra"].partial);
+
+    commit::commit_snapshot(&mut r, "all of it", "t").unwrap();
+    let r = repo::Repo::open(&path).unwrap();
+    assert!(!r.index.files["art.kra"].partial);
+    assert!(
+        scan::scan(&r).unwrap().is_empty(),
+        "clean after saving it all"
+    );
+}
+
 /// The version that lands holds the ticked layer's new pixels and the unticked layer's old ones.
 #[test]
 fn a_partial_commit_stores_only_the_ticked_layer() {

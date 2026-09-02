@@ -513,15 +513,44 @@ fn budget_size(size: u64) -> u64 {
 /// Reassemble a valid .kra from a manifest version. Krita reads entries by name, so the
 /// rebuilt archive is logically identical (mimetype stays first/stored, tiles uncompressed).
 pub fn reconstruct_kra(repo: &Repo, relpath: &str, manifest_hash: &str) -> Result<Vec<u8>> {
-    let manifest = load_manifest(repo, relpath, manifest_hash)?;
+    reconstruct_kra_subset(repo, relpath, manifest_hash, &|_| true)
+}
 
+/// [`reconstruct_kra`] restricted to the entries `want` accepts — the rest are simply absent from
+/// the output, which is therefore **not** a `.kra` Krita can open.
+///
+/// Only for callers that need a few named entries out of a version and would otherwise pay a full
+/// delta-chain replay of the whole document for them. [`crate::stage`] is the case this exists
+/// for: a layer-subset commit reverts one or two layers, and reconstructing the other forty (plus
+/// re-encoding `mergedimage.png` from its pixel blocks) was the largest single cost of a partial
+/// commit. Never use it to produce a document.
+pub fn reconstruct_kra_subset(
+    repo: &Repo,
+    relpath: &str,
+    manifest_hash: &str,
+    want: &dyn Fn(&str) -> bool,
+) -> Result<Vec<u8>> {
+    let manifest = load_manifest(repo, relpath, manifest_hash)?;
+    reconstruct_kra_from(repo, relpath, &manifest, want)
+}
+
+/// [`reconstruct_kra_subset`] against a manifest the caller already has. Loading one is a
+/// delta-chain replay of its own, so a caller taking two passes over the same version (see
+/// `stage::committed_subset`) should load once and come here.
+pub fn reconstruct_kra_from(
+    repo: &Repo,
+    relpath: &str,
+    manifest: &KraManifest,
+    want: &dyn Fn(&str) -> bool,
+) -> Result<Vec<u8>> {
     // Reconstruct entries' bytes in parallel — this is the branch-switch CPU cost (delta-chain
     // replay per tile) — but in budget-bounded chunks, each written serially to the zip and
     // dropped before the next chunk builds (peak RAM = output + one chunk, not the whole doc).
     let mut out = Vec::new();
     {
         let mut zw = ZipWriter::new(Cursor::new(&mut out));
-        let entries = &manifest.entries;
+        let entries: Vec<&KraEntry> = manifest.entries.iter().filter(|e| want(e.path())).collect();
+        let entries = &entries[..];
         let mut i = 0;
         while i < entries.len() {
             let mut j = i;
@@ -537,7 +566,7 @@ pub fn reconstruct_kra(repo: &Repo, relpath: &str, manifest_hash: &str) -> Resul
             let chunk: Vec<(&str, Vec<u8>, bool)> = entries[i..j]
                 .par_iter()
                 .map(|entry| -> Result<(&str, Vec<u8>, bool)> {
-                    match entry {
+                    match *entry {
                         KraEntry::Raw {
                             path, blob, stored, ..
                         } => {

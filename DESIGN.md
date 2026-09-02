@@ -20,9 +20,9 @@ screen that drifts from this file is the bug, not the exception.
   backed by tokens (`--text-*` in `@theme`, `ICON` in [`src/lib/iconSize.ts`](src/lib/iconSize.ts)).
   Amend this file first if a screen genuinely needs something different — never override locally.
   A value outside a closed set is a bug, not a judgment call.
-- **Still open:** the interiors of the individual panels (changes list, history graph, diff
-  viewer, layer stack, palette diff, performance tab, dialog bodies), plus Spacing and Motion if a
-  screen turns up a real need.
+- **Still open:** the interiors of the individual panels (changed-layer list, version map nodes,
+  history graph, diff viewer, layer stack, palette diff, performance tab, dialog bodies), plus
+  Spacing and Motion if a screen turns up a real need.
 
 ---
 
@@ -40,7 +40,7 @@ screen that drifts from this file is the bug, not the exception.
 | Genre              | Atmospheric | Dark creative tool — Krita/Blender/VS Code Dark+ family |
 | `DESIGN_VARIANCE`  | 5     | Bento + tactile depth is more expressive than flat panels, still structured |
 | `MOTION_INTENSITY` | 3     | VCS operations are frequent — over-animating adds friction   |
-| `VISUAL_DENSITY`   | 7     | File trees, diffs, commit logs demand compact, readable layout — the bento gutters are 8px for exactly this reason |
+| `VISUAL_DENSITY`   | 7     | Layer lists, diffs, version histories demand compact, readable layout — the bento gutters are 8px for exactly this reason |
 
 ---
 
@@ -234,11 +234,13 @@ palette, in this order of importance:
 | `--shadow-float`   | Dropdowns, popovers, toasts                                 |
 | `--shadow-modal`   | Dialogs and full overlays                                   |
 
-Applied through five utility classes in `global.css` — `.raised`, `.tactile`, `.inset-well`,
-`.glass`, `.row-selected` — rather than repeated class strings. **These are unlayered CSS, so they
-beat Tailwind's utilities layer**: never put a `shadow-*` utility on an element that already
-carries one of them, and never try to cancel one with `disabled:shadow-none` (handled inside
-`.tactile` instead).
+Applied through six utility classes in `global.css` — `.raised`, `.tactile`, `.inset-well`,
+`.row-selected`, and (§ Glass) `.glass` and `.scrim` — rather than repeated class strings. **These
+are unlayered CSS, so they beat Tailwind's utilities layer**: never put a `shadow-*` utility on an
+element carrying one of the four that set `box-shadow` (`.raised`, `.tactile`, `.inset-well`,
+`.row-selected`), and never try to cancel one with `disabled:shadow-none` (handled inside
+`.tactile` instead). `.glass` and `.scrim` set only background and border, so a floating surface
+correctly pairs `.glass` with `shadow-(--shadow-float)`.
 
 Only `--edge-light`, `--shadow-tint` and `--scrim` are mode-dependent; the two light themes and
 True Black override them, everything else derives.
@@ -278,6 +280,9 @@ is the app's hottest paint path.
 `.glass` is **opaque by default** and upgrades to `backdrop-filter` inside
 `@supports (backdrop-filter: blur(1px))`. This build has silently dropped compositing features
 before (see `TourOverlay.tsx`), so the fallback is the guaranteed path, not the exception.
+`.scrim` is its sibling for the layer *behind* a floating surface — a flat `--scrim` fill,
+upgrading to `blur(--scrim-blur)` under the same `@supports`. It is a separate class because the
+scrim tints and the surface frosts; one class doing both would put a border on the backdrop.
 
 ---
 
@@ -364,7 +369,12 @@ to confirm the curve is right rather than inherit it unexamined.
 
 ### Principles
 
-- Animate `transform` and `opacity` only — never `width`, `height`, `top`, or `padding`
+- Animate `transform` and `opacity` only — never `width`, `height`, `top`, or `padding`. This
+  extends to anything that *moves per frame* under a pointer, animated or not: a slider thumb is
+  positioned with `translate3d` and its fill with `scaleX`, never `left`/`width`. Inside a modal
+  those live under `.glass` over `.scrim` — a nested backdrop chain — and dirtying layout there
+  each drag frame makes this WebView re-rasterize the whole stack, which reads as the screen
+  dimming while you drag. `will-change: transform` keeps them on their own layer.
 - Start from `scale(0.97)` not `scale(0)` — nothing appears from nothing
 - Popovers scale from their trigger origin, not from the element's center
 - Keyboard-triggered VCS operations are instant — no animation whatsoever
@@ -432,9 +442,16 @@ anything else is a bug.
 --z-modal:    40;    /* dialogs, drawers */
 --z-toast:    50;    /* notifications */
 --z-tooltip:  60;    /* tooltips */
+--z-blocking: 70;    /* BusyOverlay — the non-dismissible write-in-progress block */
+--z-tour:     80;    /* the tour's dim bands and callout */
 ```
 
 Never use arbitrary z-index values. Reference these tokens for every layered element.
+
+The top two are deliberately **above the tooltip**, which every other scale in this file would
+call backwards. Both are modal-in-the-strong-sense: `BusyOverlay` exists to stop a stray click
+racing a file rewrite, and the tour's job is to be the only thing the user can reach. A tooltip
+surfacing through either one would be a hole in exactly the guarantee it is there to make.
 
 ---
 
@@ -488,13 +505,17 @@ the fourth is a plain 8px strip of `--surface` down the right edge (an `mr-2` on
 component lives there, it's just frame material). Without it the chrome reads as a C open to the
 right and the two right-hand corners curve into nothing.
 
-Frame thickness varies by side — 36px top, 48px left, 24px bottom, 8px right — because three sides
+Frame thickness varies by side — 44px top, 48px left, 24px bottom, 8px right — because three sides
 are functional and one is not. What stays uniform is the **well's 8px inset**: every card sits 8px
 from the well's edge on all four sides, matching the 8px card-to-card gutter.
 
+The top edge is 44px rather than the 36px this spec originally set, because it carries a *tactile
+chip* (the artwork switcher) and the window controls, not a flat label. A raised control needs
+vertical room on both sides of it or the bar reads as clamped around it.
+
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  TopBar (36px) — repository switcher                          │  ← frame
+│  TopBar (44px) — artwork switcher · window controls           │  ← frame
 ├────┬────────────────────────────────────────────────────────┬─┤
 │ A  ╭────────────────────────────────────────────────────────╮ │
 │ c  │ ╭──────────╮ ╭──────────────────╮ ╭─────────────────╮  │ │
@@ -512,23 +533,35 @@ to supply the left and bottom edges.
 
 | Zone            | Layer  | Width          | Content                                     |
 |-----------------|--------|----------------|---------------------------------------------|
-| Top bar         | frame  | full width, 36px | Repository switcher (folder the user designated) |
+| Top bar         | frame  | full width, 44px | Logo, artwork switcher, window controls — it is also the drag region |
 | Activity bar    | frame  | 48px fixed     | Icon-only vertical strip, leftmost          |
-| Status bar      | frame  | full width, 24px | Active file, branch, commit count         |
-| Sidebar         | card   | 240–320px, resizable | File tree, branch list, history        |
-| Main panel      | card   | `flex: 1`      | Primary workspace — diff view, commit canvas |
-| Inspector panel | card   | 280px, toggleable | Commit details, layer metadata, blame    |
+| Status bar      | frame  | full width, 24px | Active file, branch, version count        |
+| Sidebar         | card   | 240–320px, resizable | Changed layers, branch list, history, performance stats |
+| Main panel      | card   | `flex: 1`      | Primary workspace — version map, diff view  |
+| Inspector panel | card   | 280px, toggleable | Version metadata, layer details          |
+
+**There is no file tree.** A store versions one `.kra`, so the changes sidebar lists the *layers*
+that moved in the painting, not files — see CLAUDE.md → `ChangesPanel`. Any pattern in this file
+that says "tree row" means that list.
 
 Cards carry `--radius-panel` + `.raised` + `overflow-hidden` (so a card header's fill follows the
 top corners) and never a border. **Nothing draws a line between two cards** — the 8px gutter
 already says it.
 
-Desktop-only application. No mobile breakpoints. **Minimum window size:** 900 × 600px.
+Desktop-only application. No mobile breakpoints. **Layout is calibrated down to 900 × 600px** —
+that is the size the radii and the 8px gutters are checked against, and nothing may require more.
+It is a design target, not a constraint the shell enforces: `tauri.conf.json`'s window sets a
+1440 × 900 default with no `minWidth`/`minHeight`, so the app can currently be dragged below it.
 
-**Repository switcher (top bar):** a flat button — folder icon + repo name + caret — opening a
-dropdown menu of local repositories plus an "Add repository…" action. Local-only: no fetch/push/sync
-affordances. Menu surface: `--surface-2`, 1px `--border`, `panel` radius, `--shadow-float`; the
-active repo row shows a check in `--accent`. Closes on outside-click or Escape.
+**Artwork switcher (top bar):** a tactile chip — brush icon + artwork name — on `--surface-2`,
+`button` radius, sinking on press like any other. It opens a **searchable modal**, not a dropdown:
+the tracked list is unbounded, and a `Menu` that grows past a handful of rows is a scroll trap with
+no way to filter. The modal also hosts "Track an artwork…" and "Restore from a backup…", so every
+way in or out of an artwork sits in one place. Local-only: no fetch/push/sync affordances.
+
+The chip's left edge lines up with the well's 8px inset (i.e. with the sidebar card below it), and
+the logo column to its left is 48px wide to match the activity bar — the frame's two left-hand
+zones share one column so the bar doesn't read as two grids stacked.
 
 **Settings dialog (activity-bar gear):** a modal with **four** left-hand category tabs — Appearance,
 Performance, Storage, Set-Aside. The tab list is **static**: it renders the same four regardless of
@@ -543,17 +576,24 @@ surface rather than four. Field width is set by the field's own content, not by 
 
 Krita users navigate a docker-based UI. Panels in Krita VCS follow the same conventions.
 
-**Docker title bar** (40px height) — the card header:
+**Docker title bar** (40px height) — the card header. One definition,
+`PanelHeader` in [`src/components/shell/DockerPanel.tsx`](src/components/shell/DockerPanel.tsx),
+exported separately from `DockerPanel` because several cards own their own container (main panel,
+inspector, version map) or have no card at all (the diff toolbar):
 - Background: `--surface-2` (one lightness step above the card body)
-- Label: 11px, weight 500, `--text-muted`, uppercase
-- Right side: 16px action icons (collapse, close, options)
+- Label: `label` role — `text-caption font-medium uppercase`, `--text-muted`
+- Slots, in order: `leading` (a back button or a whole toolbar) · `title` · `meta` (the flexible
+  middle — a count, a commit message; present even when empty, which is what keeps `actions` flush
+  right) · `actions` (`ICON.default` icon buttons)
+- Horizontal inset: `pl-3 pr-1`, or `px-1` when the first element is *itself* a button — its own
+  padding already supplies the inset and 12px on top of it reads as a stray indent
 - Bottom border: 1px `--border` — the one border that survives, because it divides *inside* a
   single card rather than between two of them
 
-**Docker tab strip** (28px height, when panels are grouped):
-- Inactive tab: `--surface` background, `--text-muted` label
-- Active tab: `--surface-2` background, `--text` label, 2px `--accent` bottom border
-- Tab padding: `sm` horizontal (8px)
+**The uppercase-caption `title` treatment is reserved for this level.** In-card section headings
+("STORAGE SAVED", "LAYERS") and sub-labels inside a section ("BEFORE" / "AFTER") take the
+`subheading` role instead (`text-body font-medium`, § Type Scale). Three nesting levels sharing
+one style is why a screen ends up with no typographic signal for which label owns which region.
 
 **Panel dividers:** none. Cards are separated by the 8px gutter and their own elevation. A border
 between two cards double-states the separation and reintroduces the flat-panel look the bento
@@ -624,14 +664,22 @@ distinct branches for readability): lane 0 (mainline) = `--accent`, then `--info
 
 | Property    | Value                                          |
 |-------------|------------------------------------------------|
-| Shape       | Pill, `border-radius: 4px`                     |
+| Shape       | Pill — `--radius-panel`, which at this badge's ~15px height rounds it fully |
 | Background  | `--surface-3`                                  |
-| Text        | Mono font, 11px                                |
-| Colors      | `--text` local, `--accent` current HEAD |
+| Leading icon | `ICON.inline` `GitBranch`, inheriting the text color |
+| Text        | `mono` role (`text-dense font-mono`), truncating |
+| Colors      | `--text` local, `--accent` current branch      |
 
-### File Status Chip (change indicator in file tree)
+`--radius-badge` (6px) is for rectangular chips — the status badge, the file-status chip. A pill
+needs half its own height, and at 15px tall `--radius-panel` is the step that supplies it; a
+literal `border-radius: 4px` (what this row used to say) would have made it a rounded rectangle.
 
-Single-letter indicator, right-aligned in the tree row, mono 11px.
+### File Status Chip (change indicator on a changed-layer row)
+
+Two renderings of one vocabulary, chosen by Artist Mode. **On** (the default): the icon plus the
+word, `caption` scale. **Off**: the bare letter, `mono` + `caption`. The color is the same either
+way, and the icon is what keeps it legible in grayscale — § Accessibility, *"Never use color as
+the sole indicator of state."*
 
 | Symbol | Status     | Color           |
 |--------|------------|-----------------|
@@ -674,9 +722,13 @@ Two distinct button types. Both are tactile; they differ in whether they carry a
 | hover    | `--state-hover` overlay  | `--shadow-raised`  | `--text`   |
 | active   | —                        | `--shadow-pressed` + `translateY(1px)` | `--text` |
 | primary  | `--accent`               | `--shadow-raised`  | `--bg`     |
+| ghost    | none until hover, then `--state-hover` | none | `--text-muted` → `--text` on hover |
 | disabled | 40% opacity              | none (lies flat)   | `--text-muted` |
 
-Borderless — the elevation defines the edge.
+Borderless — the elevation defines the edge. Two sizes: `md` (28px tall, `body` text) and `sm`
+(`dense` text) for dense rows. `ghost` is the one variant that is *not* raised — it is for a
+tertiary action inside an already-raised surface, where a second chip would compete with the
+primary one; it is not a licence to drop elevation from an ordinary button.
 
 **Destructive button** (Delete / Reset / Discard):
 - Default: `--surface-3` background, raised
@@ -687,8 +739,11 @@ Borderless — the elevation defines the edge.
 | Element | Off | On |
 |---|---|---|
 | Track | `--surface-3`, `--shadow-well` (carved in) | **unchanged — still `--surface-3`, still recessed** |
-| Thumb | `--surface` or `--text-muted`, `--shadow-raised`, resting at the left | `--accent`, `--shadow-raised`, slid to the right |
+| Thumb | `--text`, `--shadow-raised`, resting at the left | `--accent`, `--shadow-raised`, slid to the right |
 | Travel | — | `--dur-normal` / `--ease-out`, `transform` only |
+
+Two sizes, both in `Switch.tsx`: `md` (20×36px track, 16px thumb) is the default; `sm` (16×28px,
+12px thumb) is for a switch sitting inside a dense row. Nothing else.
 
 **Never fill the track with the accent.** The track is the *housing*; the thumb is the part that
 moves and therefore the part that carries state. Filling the housing spends the accent on chrome —
@@ -712,8 +767,11 @@ the user is dialling in* or *one of a short list of named options* — a continu
 stops is a radio group wearing a costume, and a discrete slider showing a raw number tells the user
 nothing about what the number means.
 
-**Continuous slider** — numeric properties: opacity, threshold, offset. Common in creative tool
-panels.
+**Continuous slider** ‡ — numeric properties: opacity, threshold, offset. Common in creative tool
+panels, and **not currently built**: `src/components/ui/Slider.tsx` is the discrete one only (it
+takes an `options` array, so there is no continuous mode to reach). Reserved, per the same
+convention as § Motion's ‡ rows — decide the measurements once here rather than improvising them
+the day a numeric property needs one.
 
 | Element | Value |
 |---|---|
@@ -757,9 +815,27 @@ Single bar fixed at the bottom of the app shell.
 | Background | `--surface` — the frame's bottom edge, continuous with the activity bar |
 | Top border | None (it is the frame, not a panel against one) |
 | Font | `caption` scale (11px, `--text-muted`) |
-| Left zone | Active file name, modification indicator (`·` prefix for unsaved) |
-| Right zone | Branch name, commit count |
+| Left zone | Active file name, modification indicator (`·` prefix in `--warning-fg` for unsaved) |
+| Right zone | Browser-preview badge (outside the Tauri shell only), branch name, version count |
 | Separator | `--border` vertical 1px between zones |
+| Save progress | While a version is being written: a 2px indeterminate `--accent` bar along the bar's **top** edge, full width. `top-0`, not `-top-px` — the status bar is a seamless edge of the frame, so there is no border left to straddle |
+
+The browser-preview badge is outlined, not filled: on the two light themes `--warning` is already a
+pale cream, so a 20% wash of it over a light page is invisible. `--warning-fg` is the one warning
+token defined to contrast with its own theme's background, so the border holds in all eight.
+
+### Toast
+
+One slot, bottom-right (`bottom-4 right-4`), `--z-toast`, `.glass` + `--shadow-float`, `panel`
+radius, `role="status"`. A new toast **replaces** the current one
+rather than stacking — this app raises them for low-frequency manual actions (a finished backup),
+so what is wanted is a brief confirmation, not a notification feed that needs managing.
+
+| Property | Value |
+|---|---|
+| Variants | `success` (`--success-fg` + `CheckCircle`) / `error` (`--danger` + `WarningCircle`) — icon, not color alone |
+| Dismissal | Auto after 5s, or the `X` button |
+| Text | `body` scale |
 
 ---
 

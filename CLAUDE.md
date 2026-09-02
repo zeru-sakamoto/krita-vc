@@ -10,7 +10,8 @@ no fetch, no cloud sync. The UI exposes only local operations (commit history, l
 working-tree changes). Don't add remote-facing affordances unless the project scope changes.
 The Rust side is a **working custom local VCS** — its own store (not git), with a `.kra`
 tile-delta engine (`src-tauri/src/`: `repo`, `scan`, `commit`, `delta`, `kra`, `tiles`, `branch`,
-`gc`, `palette`, `stash`, `merge`, `stage`; commands in `commands.rs`).
+`gc`, `check`, `palette`, `stash`, `merge`, `stage`, `raster`, `cpu`, `diskspace`, `ops_log`;
+commands in `commands.rs`).
 
 **One `.kra` document = one history** (v2.0.0; see
 [`docs/per-document-tracking.md`](docs/per-document-tracking.md)). The unit the app versions is a
@@ -96,14 +97,30 @@ merge adds a second copy of a layer and must mint a fresh identity; staging *sub
 layer, and the preserved uuid is what makes the next diff recognise it), and **committed `layerN`
 filenames are kept unless they actually collide** with a layer that survived — tile streams are
 keyed `kra:{rel}:tile:{image}/layers/{layerN}:…`, so renaming unconditionally would re-store every
-reverted tile under fresh keys and lose dedup against the history it just came from. Changes
+reverted tile under fresh keys and lose dedup against the history it just came from (and a kept
+name also lets `commit_kra`'s crc32+size check reuse the whole entry without inflating it).
+The committed side comes from **`stage::committed_subset`, not a full `reconstruct_kra`**: it
+rebuilds `maindoc.xml` alone, plans the stack against it (`stage::plan_pieces`, shared with
+`stage_kra` so the two can't disagree), then reconstructs only the reverted layers' data files via
+`kra::reconstruct_kra_from`'s entry filter — one or two layers instead of the whole document plus a
+`mergedimage.png` re-encode, nearly all of which was discarded. The synthesized archive is written
+**deflate level 1** (`stage::out_opts`), not `merge::opts`' library-default level 6: it is never
+written to disk and crc32+size are computed over uncompressed bytes, so the level cannot change
+what gets stored. Together with the scan fix below these took a partial commit from 14x the cost of
+saving the whole artwork to ~7x (13.3s → 4.1s on a 235 MB fixture); see
+[`docs/performance.md`](docs/performance.md#layer-subset-staging). Changes
 outside the layer stack always come from the working file. **Two traps, each with a test in
-`tests/staging.rs`.** The index must record `size`/`mtime` as **0** for a partial commit
+`tests/staging.rs`.** The index must mark a partial commit **`TrackedFile.partial`**
 (`ScanChange::partial` → `store_change`): the committed content isn't what's on disk, so the
 artwork has to keep scanning dirty, and `scan_detailed`'s fast path skips a file whose size+mtime
-match the index — recording the working file's would make the next scan report it **clean** and
-the unticked layers would silently vanish. Its `(size, mtime) != (0, 0)` guard is the disarm, and
-zeroing only `mtime` is not enough. And `mergedimage.png`/`preview.png` are **dropped** from the
+match the index — which the working file's do. The flag is what `scan_detailed` consults *instead
+of* re-reading: on a size+mtime match a `partial` entry reports `"M"` straight from the `stat`
+(only when the caller didn't ask for bytes; the commit path needs them and reads on). This
+replaced zeroing `size`/`mtime` to disarm the fast path's `(size, mtime) != (0, 0)` guard, which
+worked but made **every** later scan read and blake3 the whole document — and `kvc status` is on
+the Krita docker's 1.5s poll, so one partial commit meant a full read of the painting twice a
+second, forever. `hash` stays the *synthesized* hash so a scan that does fall through (a same-tick
+rewrite trips the racy-clean guard) still comes out `"M"`. And `mergedimage.png`/`preview.png` are **dropped** from the
 synthesized archive rather than carried over, since they're Krita's renders of the whole stack and
 would show layers the version doesn't contain — right down to the artist's file manager once it's
 restored. Krita rewrites both on the next save; in the meantime `commands::stacked_composite_url`
@@ -137,9 +154,21 @@ diffs/previews, the hot loop, and a test pins both halves. A read-only `check_re
 (`check.rs`, reusing the extracted `gc::mark_live`; also `kvc check` and Settings → Storage →
 "Check for problems…") reports missing objects, broken chains, dangling tips, undecodable
 commit-log lines and unreadable packs; findings come back as a *successful* run, since
-`{"error":…}` means the check itself failed. See
-[`docs/data-integrity.md`](docs/data-integrity.md). **Settings** (activity-bar
-gear → `SettingsModal`) is the single home for user prefs, organized into three left-hand category
+`{"error":…}` means the check itself failed. An opt-in **scrub** (`check_repository(scrub)`,
+`kvc check --scrub true`) additionally re-hashes every live version's content by reusing
+`Repo::reconstruct_cached` + `verify_reads` — IO over the whole store, so it is never automatic.
+The `CheckModal` runs it over a **scope**, not just the open artwork: this one, every added one,
+or only ones **never checked before** (`lib/checkedRepos.ts`, a `localStorage` set stamped by
+`repository.tsx` after each run). A multi-repo pass can be cancelled *between* repos — nothing in
+the codebase can abort a check mid-flight, so the one in flight always finishes. See
+[`docs/data-integrity.md`](docs/data-integrity.md). Destructive operations (undo, discard,
+cleanup, branch delete) additionally append to **`ops.log`** (`ops_log.rs`) — same JSON-lines
+append + `sync_all` shape as `commits.log`, size-capped at 2 MB, truncate-oldest. Nothing reads
+it; it exists so "my work disappeared" has a sequence to reconstruct from. And commit / switch /
+rollback take a cheap free-space precheck first (`diskspace.rs`, `needed * 2` to cover
+`write_file_atomic`'s brief doubling) — atomic writes already made running out of disk *safe*,
+this just turns it into a clear error before anything is touched. **Settings** (activity-bar
+gear → `SettingsModal`) is the single home for user prefs, organized into four left-hand category
 tabs (a static list regardless of whether a repository is selected — a tab whose settings need one
 shows a plain "Open a repository…" fallback rather than disappearing, so the tab set never jumps
 around as you switch repos): **Appearance** (Artist-view toggle, a **custom title bar** toggle
@@ -147,16 +176,21 @@ around as you switch repos): **Appearance** (Artist-view toggle, a **custom titl
 as the draggable title bar with its own minimize/maximize/close controls via `@tauri-apps/api/window`,
 and the preference is applied live through `setDecorations`, no restart needed — see the Shell
 section below), an **author name** (`authorName.tsx`, persisted to `localStorage`, sent as the
-`author` on new commits/merges/rollbacks, falling back to `"You"`), and the theme picker), **Set-
-Aside** (the shelf: every stash with its origin branch + age; per-row remove and remove-all,
-confirms rendered as *sibling* modals per the `CleanupModal` pattern — `Modal` has no portal), and
-**Storage** (per-artwork `cacheMaxBytes` + `tilePixelDeltas` knobs — `get_repo_config`/`set_repo_config`
-→ `Repo::save_config`, a config-only write — plus "Clean up storage", plus two **app-global**
-settings that render *outside* the tab's artwork gate so they're reachable with nothing open:
-**"Where version history is kept"** (`get_store_root`/`set_store_root`; default is the hidden
-`.kvc/` container beside each artwork, and changing it moves nothing — it only decides where the
-*next* artwork's store is created, which the copy says plainly rather than implying a migration)
-and **"Background CPU use"** — see the CPU headroom note below). **Backup/restore** is **not** in Settings.
+`author` on new commits/merges/rollbacks, falling back to `"You"`), the theme picker, and "Replay
+tour"), **Performance** (**"Background CPU use"** — app-global, so it renders *outside* the tab's
+artwork gate and is labelled as applying everywhere; see the CPU headroom note below — plus the
+per-artwork **`lowMemoryDiff`** toggle, which decodes a working-file diff one archive entry at a
+time instead of holding the whole decompressed document in RAM: bounded peak memory for a little
+extra CPU, off by default because the in-memory path is faster for interactive diffs, and purely
+a diff-view knob that never affects stored data), **Storage** (per-artwork `cacheMaxBytes` +
+`tilePixelDeltas` knobs — `get_repo_config`/`set_repo_config` → `Repo::save_config`, a config-only
+write — plus "Clean up storage" and "Check for problems…", plus the app-global **"Where version
+history is kept"** (`get_store_root`/`set_store_root`, also outside the artwork gate; default is
+the hidden `.kvc/` container beside each artwork, and changing it moves nothing — it only decides
+where the *next* artwork's store is created, which the copy says plainly rather than implying a
+migration)), and **Set-Aside** (the shelf: every stash with its origin branch + age; per-row
+remove and remove-all, confirms rendered as *sibling* modals per the `CleanupModal` pattern —
+`Modal` has no portal). **Backup/restore** is **not** in Settings.
 Backup is its own zip-icon `IconButton` in `ActivityBar.tsx`, directly above the Settings gear,
 opening `BackupModal.tsx` — a **multi-select** of tracked artworks (all pre-ticked; more backup is
 the safer default for a safety feature) that writes **one** archive via `backupRepositories` →
@@ -166,8 +200,8 @@ on-disk shape, so plain extraction still yields tracked documents. `skip_in_back
 `cache/` (regenerable, budgeted 256 MB *per store* — the largest disposable chunk), `trash/`,
 `kvc.lock*` and `*.tmp`. This **replaced** the old one-zip-per-artwork "back up all"
 (`export_repository_zip`, `backupAllRepositories`, `BackupAllResultModal` are gone).
-Restore is **"Restore from a backup…"** in the `TopBar` switcher menu (and pointed at from the
-welcome screen — where a reinstall lands you), opening `RestoreModal.tsx`: `plan_restore`
+Restore is **"Restore from a backup…"** in the `TopBar` switcher modal (`SwitchArtworkModal`, and
+pointed at from the welcome screen — where a reinstall lands you), opening `RestoreModal.tsx`: `plan_restore`
 resolves each artwork to its **original folder if it still exists**, else a per-artwork subfolder
 of one you pick, and flags an occupied destination so that row defaults to **Skip** (Replace is
 the only alternative — see below). A row occupied by an **already-tracked** artwork also offers
@@ -280,8 +314,10 @@ Package manager is npm (`package-lock.json` is present).
 
 - `npm install` — install JS dependencies
 - `npm run dev` — start the Vite dev server only (frontend in browser, no Tauri shell)
-- `npm run build` — type-check (`tsc`) then build the frontend bundle to `dist/`
+- `npm run build` — **not just a build**: it runs `prettier --write` over `src/` + `index.html`, `cargo fmt` over `src-tauri/`, then `tsc`, then `node scripts/checkVersionMap.mjs` (pins the Version Map's `bendFraction` geometry), then `vite build` to `dist/`. The first two rewrite source files, so don't run it with a diff you aren't ready to have reformatted — use `npx tsc --noEmit` for a bare type-check.
+- `npm run format` / `npm run format:check` — Prettier on its own
 - `npm run preview` — preview the built frontend
+- `npm run screenshots` — boots the browser build headless and shoots its empty states; a smoke test that the frontend compiles and mounts, not a feature tour (there's no backend outside the Tauri shell)
 - `npm run tauri dev` — run the full desktop app (spawns the Vite dev server per `beforeDevCommand`, then opens the Tauri/webview window); this is the normal way to run the app end-to-end
 - `npm run tauri build` — produce a production desktop bundle (runs `npm run build` first per `beforeBuildCommand`, then compiles the Rust binary and packages installers)
 
@@ -293,6 +329,12 @@ Rust side (run from `src-tauri/`):
   commit/switch/rollback/diff against the <10s target
 - `cargo build --release --bin kvc` — build the headless `kvc` companion CLI (below); use
   `--bin krita-vc` (or no flag, since `default-run = "krita-vc"`) for the desktop app itself
+
+Helper scripts (`scripts/`, PowerShell ones are Windows dev-loop only):
+- `update-installed-kvc.ps1` — rebuild `kvc` and copy it over the installed
+  `%LOCALAPPDATA%\krita-vc\kvc.exe` the Krita docker shells out to, so a backend change reaches
+  the plugin without a full `npm run tauri build` + reinstall
+- `download-release.ps1 [tag]` — pull a GitHub release's assets into `./download` (gitignored)
 
 ## Architecture
 
@@ -321,8 +363,13 @@ Backend-driven UI; design is specified in `DESIGN.md` and tokens are mapped into
 (commits, branches, diffs, streamed layers — keyed by repo path + `refreshNonce`); cross-cutting
 presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist-friendly labels,
 `artistMode.tsx` the global toggle context, `repository.tsx` the selected-repository context,
-`useResize.ts` the shared drag-resize hook, `graph.ts` history-graph lane layout,
-`svgArt.ts` SVG layer compositing).
+`useResize.ts` the shared drag-resize hook, `useZoomPan.ts` the diff viewer's wheel-zoom/pan,
+`graph.ts` history-graph lane layout, `versionMap.ts` the Version Map's lane/column layout,
+`svgArt.ts` SVG layer compositing, `tauri.ts` the `inTauri()` shell check the browser-preview
+fallbacks branch on, `theme.tsx` the theme picker + `data-theme` stamp, and `perf.ts` — the
+Performance tab's client-side operation timing, measured as the `invoke` round-trip (what the
+user actually waits through) and capped at the last 100 samples per repo path in `localStorage`,
+because timing is per-machine and belongs with the browser, not the repo).
 
 - **Shell** (`src/components/shell/`): `AppShell.tsx` splits on the selected repository — a
   welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
@@ -343,7 +390,7 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
 - **Artworks** (`src/lib/repository.tsx`): the selected unit is **one `.kra` the user chose to
   track** (local-only — no remotes). The `TopBar` switcher selects among them; the list + selected
   id persist to `localStorage` (`current` is null until the user adds one), and `Repository.id` is
-  the document's path — which is why the ~30 Tauri commands took a per-document model with **zero
+  the document's path — which is why all ~40 Tauri commands took a per-document model with **zero
   signature changes**. In the desktop shell "Track an artwork…" opens a native *file* picker
   filtered to `.kra` (`tauri-plugin-dialog`) and creates its store (`init_repository`). There is no
   "create repository" flow: you can't create an artwork from the VCS, only start tracking one
@@ -356,13 +403,21 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
 - **UI primitives** (`src/components/ui/`): `Button.tsx` (`default`/`primary`/`destructive`/`ghost`,
   `sm`/`md`), `IconButton.tsx` (raised tactile chip that sinks on press — *not* the old flat
   no-chrome-until-hover button; see DESIGN.md → Krita Design Influence for why that was reversed),
-  `Switch.tsx`, `Slider.tsx`, `Modal.tsx`, `Menu.tsx` (dropdown with outside-click + Esc to close),
-  `Tooltip.tsx`, `Checkbox.tsx`, `Radio.tsx`. Shared across shell and VCS components — **these are
-  the only button and toggle types**; a hand-rolled one is a bug. `Tooltip`/`Menu`/`Modal` animate
-  both in and out (`src/lib/useExitTransition.ts`; `Modal` unmounts on `transitionend`, and its
-  `footer` is a render prop so a Cancel animates like an Escape). Type sizes come from the six
-  `text-*` tokens and icon sizes from `ICON` (`src/lib/iconSize.ts`) — an arbitrary `text-[Npx]` or
-  a literal `size={N}` is a bug.
+  `Switch.tsx`, `Slider.tsx`, `Modal.tsx`, `Menu.tsx` (dropdown with outside-click + Esc to close —
+  it also exports **`Select`**, the same surface driven by a value instead of by actions, which is
+  why there is no `Select.tsx`), `Tooltip.tsx`, `Checkbox.tsx`, `Radio.tsx`. Shared across shell
+  and VCS components — **these are the only button and toggle types**; a hand-rolled one is a bug.
+  `Tooltip`/`Menu`/`Modal` animate both in and out (`src/lib/useExitTransition.ts`; `Modal`
+  unmounts on `transitionend`, and its `footer` is a render prop so a Cancel animates like an
+  Escape). Type sizes come from the six `text-*` tokens and icon sizes from `ICON`
+  (`src/lib/iconSize.ts`) — an arbitrary `text-[Npx]` or a literal `size={N}` is a bug.
+  Two app-wide pieces live in `src/lib/` rather than here because neither is a control:
+  **`toast.tsx`** is a single-slot global toast (`ToastProvider` in `App.tsx`, `useToast().show`;
+  a new `show` replaces the old one — a low-frequency manual action like a backup needs a brief
+  confirmation, not a notification feed), and **`rightClickGuard.tsx`** suppresses the `mousedown`
+  default on non-left clicks over a button, because the browser engages `:active` for *any* button
+  and a tactile chip visibly sinking on right-click reads as a dead click; a burst of them nudges
+  the user toward left click via that same toast.
 - **VCS components** (`src/components/vcs/`): commit cards, the git-style history graph
   (`CommitGraph` + `CommitGraphRail`, lane layout from `lib/graph.ts`; lane colors are a deliberate
   functional exception to the single-accent rule), branch badge, file-status chip, the sidebar
@@ -598,10 +653,12 @@ presentation helpers in `src/lib/` (`format.ts` timestamps, `friendly.ts` artist
     branch-name chip under its caption. A branch created but not yet committed on shares its
     parent branch's tip node, so it shows up as a second chip there for free.
   - The canvas background is React Flow's `Lines` variant, colored by a `--color-grid` token
-    (`src/styles/global.css`) derived from each theme's own `--color-bg` via
-    `color-mix(in srgb, var(--color-bg) 75%, black)`, so dark themes render a near-black, barely
-    visible grid with no per-theme literals; the two light themes override it back to
-    `--color-border` (the darkening is dark-theme-only).
+    (`src/styles/global.css`) derived from each theme's own background via
+    `color-mix(in srgb, var(--color-bg) 88%, var(--color-text-muted))`, so every theme gets a
+    barely-visible grid with no per-theme literals; the two light themes override it to
+    `--color-border`. **It mixes toward `--color-text-muted`, not toward black** — mixing toward
+    black made the grid vanish on True Black, whose `--color-bg` is already `#000` and cannot get
+    darker. Any replacement must stay a mix toward a *contrasting* token for the same reason.
   - Opening a version unmounts the *canvas* (not the panel — see "mounted once" below), which
     would come back at the origin (i.e. scrolled to the *oldest* version). The viewport is stashed
     in a ref on the way out and handed back as `defaultViewport` on the way in.

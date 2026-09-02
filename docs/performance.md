@@ -191,6 +191,14 @@ nothing and makes layers pop in visibly chunkier.
 - **Scanner fast path** (`scan.rs`) — a tracked file whose size+mtime still match the index
   (`TrackedFile.size`/`mtime`, `repo::size_mtime`, nanosecond resolution) is assumed unchanged and
   never read or hashed. Big `.kra` files are the case this matters for.
+- **…including when the answer is "dirty"** (`TrackedFile.partial`) — after a
+  [layer-subset commit](#layer-subset-staging) the stored version is *not* what sits on disk, so
+  the artwork has to keep reading as modified. The index says so with a flag, and the scanner
+  reports `"M"` off the same size+mtime match instead of reading and blake3-ing the document. The
+  first design zeroed `size`/`mtime` to fail the fast path outright, which was correct and cost a
+  full read on **every** scan thereafter — `kvc status` is on the Krita docker's 1.5 s poll, so
+  one partial commit meant re-reading the whole painting twice a second, forever. Callers that
+  want the bytes (`keep_bytes`, i.e. the commit path) still read.
 - **Tracking guardrail** (`scan::is_supported`) — only `.kra` and palette files (`.gpl`/`.kpl`/
   `.aco`/`.ase`) are newly tracked, and Krita's autosave artifact (`*-autosave.kra`) is rejected
   even though it ends in `.kra`; any other file is rejected on a single lowercased-suffix check
@@ -286,6 +294,63 @@ nothing and makes layers pop in visibly chunkier.
   patch is already round-trip-verified when it's *written* (`prepare_stream`), and objects are
   content-addressed, so a second hash on every read was pure redundancy on the hottest loop in the
   diff.
+
+## Layer-subset staging
+
+Saving only some of a document's layers (`stage.rs`, reached from `commit_selected`'s `layers`)
+has to express "the document minus these layers" as a real version. The first implementation did
+that by rebuilding the committed `.kra` in full, re-packing the whole working document around it,
+and handing the result to `commit_kra` — so the cheaper-sounding operation was **14x the cost of
+just saving everything**, and it left the artwork in a state that re-read itself on every scan
+afterwards. `tests/bench.rs::partial_commit_baseline` exists because none of that was measured.
+
+Fixture: 6 layers x 2500 tiles (3200x3200, ~235 MB of incompressible tiles), two layers edited,
+one of them held back — the shape the UI produces, since `ChangesPanel` pre-ticks everything and
+tracks what the artist turns *off*. Two runs each, release, 4-core Windows.
+
+| | before | after |
+| --- | --- | --- |
+| **partial commit, end to end** | 13.27 / 13.34 s | **4.01 / 4.26 s** |
+| — rebuilding the committed side | 5.02 / 4.32 s (234.9 MB) | 0.65 / 0.73 s (39.1 MB) |
+| — blake3 of it, discarded | 35 ms | — |
+| — `stage_kra` (repack) | 8.52 / 8.50 s | 2.29 / 2.38 s |
+| — `commit_kra` | 0.23 s | 0.35 / 0.45 s |
+| **scan after a partial commit** | 145 / 156 ms | **0.08 / 0.16 ms** |
+| whole-artwork commit (control) | 0.54 / 0.60 s | 0.56 s |
+| store size | 238.2 MB | 238.2 MB |
+
+Four changes, in order of what they bought:
+
+- **Rebuild only the entries the staging reads** (`stage::committed_subset` →
+  `kra::reconstruct_kra_from` with an entry filter). A partial commit reads `maindoc.xml` plus the
+  data files of the layers being reverted — typically one or two out of a stack. It was replaying
+  every tile of the whole document through its delta chains and re-encoding `mergedimage.png` from
+  its pixel blocks, then discarding nearly all of it. Now it reconstructs `maindoc.xml` alone,
+  plans the stack against it (`stage::plan_pieces`, shared with `stage_kra` so the two can't
+  disagree), and reconstructs only what the plan names: 39 MB instead of 235, 5.4x faster. The
+  manifest is loaded once and both passes go through `reconstruct_kra_from`, since loading one is
+  a chain replay of its own.
+- **Stop compressing a buffer nobody reads** (`stage::out_opts`). `repackage` wrote the
+  synthesized archive through `merge::opts`, which is `SimpleFileOptions::default()` — deflate
+  level 6 — over every entry of the document. That buffer is never written to disk; `commit_kra`
+  re-opens it immediately and its reuse fast path compares crc32+size, computed over
+  *uncompressed* bytes, so the level cannot affect what gets stored. Level 1 (the same conclusion
+  `kra::opts` reached for restores, and for the same reason: Krita tiles are already LZF'd) is
+  3.5x faster and, as the table shows, stores byte-for-byte the same amount.
+- **Answer "still dirty" from a `stat`** (`TrackedFile.partial`) — see
+  [Skipping work entirely](#skipping-work-entirely). This is the one an artist feels: it was a
+  full read + blake3 of the painting on *every* scan, and `kvc status` is on the Krita docker's
+  1.5 s poll.
+- **Stop hashing what gets thrown away** (`commit::bytes_of` vs `bytes_and_hash_of`). `bytes_of`
+  returned a blake3 of the whole rebuilt document; three of its five callers discarded it.
+
+Still on the table, and now the dominant term: `stage_kra` re-packs the entire working document
+(2.3 s of the 4.0 s) to change one layer's worth of it, and `commit_kra` then decomposes that
+archive again. The upgrade is manifest-level splicing — commit the surviving working entries as
+usual and substitute the previous manifest's `KraEntry` values for the reverted ones, so no
+document is ever materialized. That would also retire the ~3x document peak RAM noted under
+[Ceilings](#ceilings--deferred-ponytail). Not built: the measured gap no longer justifies the
+blast radius.
 
 ## Output size / encode cost
 
@@ -507,6 +572,20 @@ Marked inline where they occur — noted here as a single index:
 - Tile pixel deltas (`tilePixelDeltas`) stay opt-in until the LZF decode/encode cost is
   benchmarked as affordable on 2-core hardware; the old "decode LZF and delta raw pixels"
   upgrade-path note in `tiles.rs` is now this flag.
+- A layer-subset commit still materializes a whole synthesized `.kra` and hands it to
+  `commit_kra`, which decomposes it again — the design that keeps the rest of the engine free of
+  special-casing. Upgrade path is manifest-level splicing: assemble the version by substituting
+  the previous manifest's `KraEntry` values for the reverted layers and never build a document at
+  all. See [Layer-subset staging](#layer-subset-staging).
+- `stage::repackage` holds the working document and the synthesized output whole in RAM (plus the
+  committed subset, now only the reverted layers), against the 64 MB `RESTORE_CHUNK_BUDGET` every
+  other path respects. Bounded in practice by `run_heavy`'s two permits; the fix is the same
+  manifest splice.
+- A change to a `.kra`'s `<IMAGE name>` (Krita derives it from the filename) changes every
+  `kra:{relpath}:entry:`/`:tile:` stream key and every manifest entry path, so the next commit
+  re-stores the whole document — `commit_kra`'s crc32+size reuse misses on every entry. This is
+  **not** specific to staging; a whole-artwork commit pays it too. Not worth a special case until
+  it shows up in the field.
 - Low-memory working diffs (`lowMemoryDiff`) stay opt-in: re-inflating one entry at a time bounds
   peak RAM but re-decompresses per layer, so the default in-memory path stays faster for
   interactive diffs. Only the working-tree diff view is affected; committed diffs and stored data

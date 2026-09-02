@@ -37,17 +37,19 @@ pub struct ScanChange {
     /// **synthesized** `.kra` holding only the layers the artist ticked — so the content being
     /// committed is deliberately *not* what sits on disk.
     ///
-    /// Load-bearing: it makes [`crate::commit::store_change`] record `size`/`mtime` as `0` in the
-    /// index. The fast path above skips a file whose size+mtime match the index, and the working
-    /// file's do — so recording them would make the very next scan report the artwork **clean**
-    /// and the unticked layers would silently vanish from the Changes panel. The `(0, 0)` guard is
-    /// the disarm, and zeroing only `mtime` is not enough. Costs one re-hash on the next scan.
+    /// Load-bearing: it makes [`crate::commit::store_change`] set `TrackedFile::partial`, which is
+    /// what keeps the artwork scanning dirty afterwards. The fast path below skips a file whose
+    /// size+mtime match the index, and the working file's do — so without the flag the very next
+    /// scan would report the artwork **clean** and the unticked layers would silently vanish from
+    /// the Changes panel.
     pub partial: bool,
 }
 
 /// Returns `(relativePath, status)` pairs for the tracked document if it differs from the index.
 /// A document whose size+mtime still match the index is assumed unchanged and skipped without
-/// reading/hashing it — the win for big `.kra` files.
+/// reading/hashing it — the win for big `.kra` files. A document whose last commit was a layer
+/// subset ([`crate::repo::TrackedFile::partial`]) is reported modified on the same evidence,
+/// also without reading it.
 pub fn scan(repo: &Repo) -> Result<Vec<(String, String)>> {
     Ok(scan_detailed(repo, false)?
         .into_iter()
@@ -100,7 +102,27 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
                 && (size, mtime) != (0, 0)
                 && mtime < index_mtime
             {
-                continue;
+                if !tf.partial {
+                    continue;
+                }
+                // The last commit stored a layer *subset* of this file, so it is dirty by
+                // construction — reading it to rediscover that is the one thing this path exists
+                // to avoid (`kvc status` is on the plugin's 1.5s poll). Callers that want the
+                // bytes fall through and read as usual.
+                if !keep_bytes {
+                    out.push(ScanChange {
+                        rel,
+                        status: "M".into(),
+                        // Not read, so not hashed — same as the deletion arm above. Every
+                        // `keep_bytes == false` caller uses only `rel`/`status`.
+                        hash: String::new(),
+                        size,
+                        mtime,
+                        bytes: None,
+                        partial: false,
+                    });
+                    continue;
+                }
             }
         }
 

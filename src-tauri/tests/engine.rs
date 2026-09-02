@@ -581,6 +581,7 @@ fn open_errors_and_index_roundtrip() {
             is_kra: false,
             size: 0,
             mtime: 0,
+            partial: false,
         },
     );
     r.save().unwrap();
