@@ -562,9 +562,8 @@ Marked inline where they occur — noted here as a single index:
   disk), which is deliberately not done: storage stays flat.
 - Scan byte retention (`scan::RETAIN_BUDGET`, 512 MB) bounds commit-path RAM; a document past the
   budget re-reads on commit instead of being held. Untuned constant. (This bound was documented
-  here, and referenced from `commit.rs`, for some time before it actually existed — the
-  performance audit found and implemented it. See
-  [`performance-audit.md`](performance-audit.md).)
+  here, and referenced from `commit.rs`, for some time before it actually existed — a performance
+  audit found and implemented it.)
 - Composite tiling re-encodes `mergedimage.png` on restore — pixels exact, bytes different from
   Krita's encoding, so the entry's crc changes and the *first* commit after a restore
   re-processes the composite (all blocks dedup; only the manifest is new). Self-healing, but a
