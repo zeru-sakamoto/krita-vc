@@ -159,6 +159,7 @@
   --z-tooltip: 60;
   --z-blocking: 70;
   --z-tour: 80;
+  --z-onboarding: 90;
 
   /* --- Elevation model ------------------------------------------------
    * Depth on dark comes from the palette's own lightness ladder
@@ -203,8 +204,27 @@
  * The light themes additionally flip the elevation + overlay tints,
  * which are the only mode-dependent tokens.
  * `data-theme` is stamped on <html> by lib/theme.tsx.
+ * `[data-theme-preview]` re-scopes a palette onto one subtree — the
+ * first-launch interview's theme cards (OnboardingOverlay).
  * ============================================================ */
-html[data-theme="krita-blue"] {
+
+/* Charcoal's identity tokens again, preview-only: they live in @theme on :root, which can't be
+   re-scoped to a subtree, so a Charcoal card shown while another theme is active needs its own
+   copy. Keep in sync with @theme above. */
+[data-theme-preview="charcoal"] {
+  --color-bg: #131210;
+  --color-surface: #1e1c1a;
+  --color-surface-2: #252320;
+  --color-surface-3: #2c2a27;
+  --color-border: #2d2b28;
+  --color-accent: #e07b39;
+  --color-text: #f0ede8;
+  --color-text-muted: #7a7570;
+  --color-danger: #c84b31;
+}
+
+html[data-theme="krita-blue"],
+[data-theme-preview="krita-blue"] {
   --color-bg: #1e1e24;
   --color-surface: #26262e;
   --color-surface-2: #2e2f39;
@@ -216,7 +236,8 @@ html[data-theme="krita-blue"] {
   --color-danger: #ff6b6b;
 }
 
-html[data-theme="electric-cyan"] {
+html[data-theme="electric-cyan"],
+[data-theme-preview="electric-cyan"] {
   --color-bg: #1a1d24;
   --color-surface: #22262f;
   --color-surface-2: #2a2f39;
@@ -228,7 +249,8 @@ html[data-theme="electric-cyan"] {
   --color-danger: #ff6b6b;
 }
 
-html[data-theme="sunset-coral"] {
+html[data-theme="sunset-coral"],
+[data-theme-preview="sunset-coral"] {
   --color-bg: #201e22;
   --color-surface: #2a2529;
   --color-surface-2: #322c31;
@@ -240,7 +262,8 @@ html[data-theme="sunset-coral"] {
   --color-danger: #c84b31;
 }
 
-html[data-theme="tokyo-night"] {
+html[data-theme="tokyo-night"],
+[data-theme-preview="tokyo-night"] {
   --color-bg: #1a1b26;
   --color-surface: #1f2335;
   --color-surface-2: #24283b;
@@ -252,7 +275,8 @@ html[data-theme="tokyo-night"] {
   --color-danger: #f7768e;
 }
 
-html[data-theme="true-black"] {
+html[data-theme="true-black"],
+[data-theme-preview="true-black"] {
   --color-bg: #000000;
   --color-surface: #0d0d0d;
   --color-surface-2: #161616;
@@ -272,7 +296,8 @@ html[data-theme="true-black"] {
    inverted Charcoal's own tokens and read as a dark theme run backwards). Bg is a genuine warm
    linen tone rather than nearly-white, cards step up from it, and the accent is its own clay
    terracotta rather than Charcoal's orange lightened — nothing here is derived from Charcoal. */
-html[data-theme="gallery"] {
+html[data-theme="gallery"],
+[data-theme-preview="gallery"] {
   color-scheme: light;
   --color-bg: #efe7d8;
   --color-surface: #fffcf6;
@@ -316,7 +341,8 @@ html[data-theme="gallery"] {
    color and accent were literally Krita Blue's dark bg/accent lifted verbatim — the tell that it
    was never designed as its own theme). Bg is a soft overcast gray, and the accent is a muted
    steel blue distinct from Krita Blue's brighter, more saturated hue. */
-html[data-theme="overcast"] {
+html[data-theme="overcast"],
+[data-theme-preview="overcast"] {
   color-scheme: light;
   --color-bg: #eceef2;
   --color-surface: #ffffff;

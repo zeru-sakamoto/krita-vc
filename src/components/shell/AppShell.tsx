@@ -8,12 +8,14 @@ import { Inspector } from "./Inspector";
 import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
 import { TourOverlay } from "./TourOverlay";
+import { OnboardingOverlay } from "./OnboardingOverlay";
 import { MainPanel } from "../MainPanel";
 import { VersionMapPanel } from "../vcs/VersionMapPanel";
 import { IconButton } from "../ui/IconButton";
 import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
+import { useOnboarding } from "../../lib/onboarding";
 import { useLegacyHistory } from "../../lib/legacyHistory";
 import { useRepository } from "../../lib/repository";
 import {
@@ -51,6 +53,7 @@ export function AppShell() {
     <>
       {current ? <RepoShell repo={current} /> : <WelcomeShell />}
       <BusyOverlay />
+      <OnboardingOverlay />
     </>
   );
 }
@@ -85,6 +88,7 @@ function WelcomeShell() {
 function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
   const { beginIfFirstTime, setConditions } = useTour();
+  const { active: onboarding } = useOnboarding();
   const { legacy } = useLegacyHistory();
   const { refreshNonce, refresh, scanning, setScanning } = useRepository();
   const commits = useCommits(repo.path, refreshNonce);
@@ -114,10 +118,13 @@ function RepoShell({ repo }: { repo: Repository }) {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [selectedFocusId, setSelectedFocusId] = useState<string | undefined>(undefined);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- fire once per RepoShell mount only
+  // Once per mount, but held while the first-launch interview is up so the two never stack —
+  // the tour starts the moment the interview finishes. `beginIfFirstTime` is a no-op after the
+  // tour's own flag is set, so re-firing when `onboarding` flips is harmless.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- not on beginIfFirstTime's identity
   useEffect(() => {
-    beginIfFirstTime();
-  }, []);
+    if (!onboarding) beginIfFirstTime();
+  }, [onboarding]);
 
   // Read the latest `scanning` without re-subscribing the focus listener below on every
   // scan start/stop.

@@ -100,8 +100,9 @@ export function TopBar() {
   );
 }
 
-/** Minimize/maximize/close buttons for the custom title bar (Settings → "Custom title bar"). */
-function WindowControls() {
+/** Minimize/maximize/close buttons for the custom title bar (Settings → "Custom title bar").
+ *  Also used by `OnboardingOverlay`, which covers this bar. */
+export function WindowControls() {
   const win = getCurrentWindow();
   return (
     <div className="ml-auto flex items-center gap-0.5">

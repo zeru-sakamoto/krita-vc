@@ -31,6 +31,7 @@ import { useRepository, type CheckReport, type CleanupReport } from "../../lib/r
 import { hasBeenChecked } from "../../lib/checkedRepos";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
+import { useOnboarding } from "../../lib/onboarding";
 import { inTauri } from "../../lib/tauri";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { useLegacyHistory } from "../../lib/legacyHistory";
@@ -174,6 +175,7 @@ function AppearanceSettings({
   theme,
   setTheme,
   onReplayTour,
+  onReplayWelcome,
 }: {
   artistMode: boolean;
   toggleArtistMode: () => void;
@@ -186,6 +188,7 @@ function AppearanceSettings({
   theme: ThemeId;
   setTheme: (id: ThemeId) => void;
   onReplayTour: () => void;
+  onReplayWelcome: () => void;
 }) {
   return (
     <>
@@ -260,9 +263,10 @@ function AppearanceSettings({
           }}
         />
       </div>
-      <Button className="mt-3" onClick={onReplayTour}>
-        Replay tour
-      </Button>
+      <div className="mt-3 flex gap-2">
+        <Button onClick={onReplayTour}>Replay tour</Button>
+        <Button onClick={onReplayWelcome}>Replay welcome</Button>
+      </div>
     </>
   );
 }
@@ -403,6 +407,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const { authorName, setAuthorName } = useAuthorName();
   const { theme, setTheme } = useTheme();
   const { restart: restartTour } = useTour();
+  const { restart: restartWelcome } = useOnboarding();
   const { config, update: updateConfig } = useRepoConfig(current?.path ?? "");
   const stashes = useStashes(current?.path ?? null, refreshNonce);
   const [showCleanup, setShowCleanup] = useState(false);
@@ -459,6 +464,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 setTheme={setTheme}
                 onReplayTour={() => {
                   restartTour();
+                  onClose();
+                }}
+                onReplayWelcome={() => {
+                  restartWelcome();
                   onClose();
                 }}
               />

@@ -712,6 +712,31 @@ rather than an inverted dark one — are picked from a
   theme switch, since the cached raster's actual color is never displayed). See the `ArtCanvas`
   section of [visual-diff-viewer.md](visual-diff-viewer.md).
 
+## First-launch interview
+
+A two-step, one-time welcome (`src/lib/onboarding.tsx` + `src/components/shell/OnboardingOverlay.tsx`):
+the artist's **name** (with a note that nothing leaves the computer — true, since the VCS is
+local-only and the name lives in `localStorage`), then a **theme** picked from preview cards.
+
+- **Gating.** `krita-vc:onboarding-completed`, same flag shape as the tour. Installs that predate
+  it skip the interview if the tour was completed or a *non-empty* name is set — non-empty because
+  `AuthorNameProvider` writes the key as `""` on first mount, so presence alone would silently skip
+  a fresh install that closed the window mid-interview.
+- **Answers save live** through `useAuthorName`/`useTheme`; only the done flag waits for
+  Skip/Get started. Clicking a card re-skins the whole app, which is the big preview.
+- **Full-window, not a `Modal`** — Escape/scrim dismissal would lose it for good. Rendered by
+  `AppShell` beside `BusyOverlay` (`--z-onboarding`, above the tour). It covers `TopBar`, which is
+  the window's title bar when the custom one is on, so it carries its own drag strip and
+  `WindowControls`.
+- **Tour sequencing.** `RepoShell` calls `beginIfFirstTime()` only once the interview is inactive,
+  so the tour starts right after "Get started" instead of stacking under it.
+- **Preview cards** paint a theme that isn't active by re-scoping its tokens onto the card:
+  `global.css`'s theme blocks match `html[data-theme="x"], [data-theme-preview="x"]`, and Charcoal
+  (which lives in `@theme`) has a preview-only copy of its identity tokens. Only identity tokens
+  follow the card — `:root`-derived vars (`--shadow-*`, `--glass-*`, `--color-state-*`) were
+  resolved from the active theme — so the mock uses plain fills and borders.
+- Replay via Settings → Appearance → "Replay welcome".
+
 ## Application tour
 
 A first-launch, one-time spotlight walkthrough of the shell — fired once and never again

@@ -726,6 +726,17 @@ because timing is per-machine and belongs with the browser, not the repo).
   (`useArtistMode()`); label helpers in `src/lib/friendly.ts`. The audience is artists, so prefer
   friendly labels over git/code jargon in new UI, and gate any unavoidable technical detail behind
   Artist Mode being off. See [`docs/frontend-architecture.md`](docs/frontend-architecture.md#artist-mode).
+- **First-launch interview** — `src/lib/onboarding.tsx` + `shell/OnboardingOverlay.tsx`: a
+  full-window two-step welcome (name with a "nothing leaves this computer" note, then theme
+  preview cards), gated on `krita-vc:onboarding-completed`; pre-existing installs skip it if the
+  tour flag or a **non-empty** author name exists (`AuthorNameProvider` writes `""` on mount, so
+  key presence means nothing). Answers save live through the existing providers. `RepoShell`
+  holds `beginIfFirstTime()` until it's done so the two overlays never stack. Cards paint
+  non-active themes via `[data-theme-preview="x"]` selectors added alongside each
+  `html[data-theme]` block (plus a preview-only Charcoal copy, since `@theme` can't be
+  re-scoped) — only identity tokens follow, so the mock avoids `:root`-derived shadows/overlays.
+  Replay: Settings → Appearance. See
+  [`docs/frontend-architecture.md`](docs/frontend-architecture.md#first-launch-interview).
 - **Application tour** — a first-launch, one-time spotlight walkthrough of the shell
   (`src/lib/tour.tsx` `TourProvider`/`useTour`, `src/components/shell/TourOverlay.tsx`), fired via
   `beginIfFirstTime()` (called once from `RepoShell` on mount) and gated on a `localStorage` flag

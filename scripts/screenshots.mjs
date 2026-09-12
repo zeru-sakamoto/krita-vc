@@ -26,7 +26,15 @@ page.on("console", (m) => {
 
 await page.goto(URL, { waitUntil: "networkidle" });
 
-// Fresh profile → no repositories → the welcome shell.
+// Fresh profile → the first-launch interview over the welcome shell.
+await page.screenshot({ path: `${OUT}/00-onboarding-name.png`, animations: "disabled" });
+console.log("  ✓ 00-onboarding-name");
+await page.getByRole("button", { name: "Next" }).click();
+await page.screenshot({ path: `${OUT}/00-onboarding-theme.png`, animations: "disabled" });
+console.log("  ✓ 00-onboarding-theme");
+await page.getByRole("button", { name: "Get started" }).click();
+
+// Interview done → no repositories → the welcome shell.
 await page.screenshot({ path: `${OUT}/01-welcome.png`, animations: "disabled" });
 console.log("  ✓ 01-welcome");
 

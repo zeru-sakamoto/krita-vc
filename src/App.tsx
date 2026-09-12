@@ -9,6 +9,7 @@ import { CpuBudgetProvider } from "./lib/cpuBudget";
 import { ToastProvider } from "./lib/toast";
 import { RightClickGuard } from "./lib/rightClickGuard";
 import { TourProvider } from "./lib/tour";
+import { OnboardingProvider } from "./lib/onboarding";
 
 function App() {
   return (
@@ -21,9 +22,11 @@ function App() {
               <AuthorNameProvider>
                 <WindowChromeProvider>
                   <CpuBudgetProvider>
-                    <TourProvider>
-                      <AppShell />
-                    </TourProvider>
+                    <OnboardingProvider>
+                      <TourProvider>
+                        <AppShell />
+                      </TourProvider>
+                    </OnboardingProvider>
                   </CpuBudgetProvider>
                 </WindowChromeProvider>
               </AuthorNameProvider>
