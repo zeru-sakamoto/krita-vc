@@ -1,28 +1,37 @@
 # CPU headroom, and v1.1.0
 
-**Timeframe:** 2026-08-01 (a single day) · **Commits:** `e6cae2e`, `c16a5e4`
+Dates: 2026-08-01, a single day. Commits: `e6cae2e`, `c16a5e4`.
 
-A single, well-documented root-cause commit. `e6cae2e`'s own message states the problem plainly:
+One commit with a well-documented root cause. The opening of `e6cae2e`'s message states the
+problem:
 
 > The engine was tuned purely for throughput: rayon's global pool sized to num_cpus across 17
 > parallel sites nested three deep, at normal priority, with no cap on concurrent operations. On a
-> 2-4 core laptop a commit or diff pinned every core and starved Krita.
+> 2-4 core laptop a commit or diff pinned every core and starved Krita
 
-And Krita, the commit goes on to note, was often the very thing that triggered that commit, by way
-of the plugin. The irony is the point: the plugin fires a commit from inside Krita's own process
-tree mid-paint, so an engine that maxes out every core to finish that commit as fast as possible
-ends up fighting the application it exists to serve.
+The message goes on to say that Krita was often the very thing that triggered the commit, through
+the plugin, and that is the whole story. The plugin runs a commit from inside Krita's own process
+tree while the artist is painting, so an engine that takes every core to finish the commit sooner
+ends up fighting the program it exists to help.
 
-The fix, shipped as v1.1.0 (`c16a5e4`), is a dedicated below-normal-priority worker pool
-(`cpu.rs`) sized to a user-configurable share of cores (default 75%), installed once at the single
-command-dispatch funnel so every nested `par_iter` inherits it for free. Alongside it, a two-permit
-semaphore caps heavy operations (diffs, commits), so rapid history-clicking can't stack unbounded
-64 MB decode buffers behind a cancelled-in-the-UI-but-still-running backend call. The `kvc` CLI
-gets the same treatment, since the plugin spawns it inside Krita's process tree where the headroom
-matters even more than in the desktop app. A few frontend memo dependency arrays were also
-narrowed to stop rebuilding multi-megabyte SVG strings on every streamed-layer update for no visual
-change. The commit's own measurement: on 4 cores, 75% was not slower than 100%, and 50% cost ~4% on
-commit time. Both paths are gated on I/O and serial work as much as raw parallel throughput.
+The fix is its own worker pool (`cpu.rs`). Its threads start at below-normal priority, and it is
+sized to a share of the cores the user can set, 75% by default. It is installed once, at the single
+funnel every command goes through, so every nested `par_iter` inherits it. Next to it, a semaphore
+with two permits caps heavy operations (diffs and commits): cancelling a diff in the UI never
+cancelled the backend, so clicking quickly through history used to stack up 64 MB decode buffers
+with no limit. The `kvc` CLI lowers its whole process and uses the same pool, because the plugin
+starts it inside Krita's process tree, where the headroom matters even more than in the desktop
+app. The plugin's 1.5-second poll also drops from two processes per tick to one, since `kvc status`
+now returns the branch list too. Three frontend memo dependency lists were narrowed as well, so
+streamed layers stop rebuilding multi-megabyte SVG strings for no visible change.
 
-**See also:** [`CLAUDE.md`](../../CLAUDE.md)'s "CPU headroom" section for the mechanism as it works
-today; `src-tauri/tests/bench.rs`'s `cpu_budget_sweep` for the ongoing measurement.
+The commit measures its own trade-off: on 4 cores, 75% was not slower than 100%, and 50% cost about
+4% on commit time, because both paths wait on I/O and serial work as much as on parallel
+throughput. `c16a5e4` bumps the version to 1.1.0.
+
+The setting first appears as a dropdown under Settings → Storage → "Background CPU use" (Gentle,
+Balanced, Full speed). During the redesign it moves to a new Performance tab in Settings (`1fcc980`)
+and becomes a slider (`7674a0d`); both are in [09](09-the-bento-redesign.md).
+
+See also: [`cpu-headroom.md`](../cpu-headroom.md) for how the mechanism works today, and
+`cpu_budget_sweep` in `src-tauri/tests/bench.rs` for the measurement you can rerun.

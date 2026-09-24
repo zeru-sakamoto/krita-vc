@@ -1,246 +1,282 @@
-# Visual Diff Viewer
+# Visual diff viewer
 
-For an art VCS, a code-style text patch is the wrong mental model — artists need to see the **actual
-layer imagery** and a **visual comparison** of what changed. Art (`.kra`) files render as a **layer
-stack + before/after canvas**. Color palettes (`.gpl`, `.kpl`, `.aco`, `.ase`) have their own
-`kind: "palette"` type and render as **color-swatch grids** (`PaletteDiffView`) regardless of
-Artist Mode — the first palette is embedded in the art diff's layer navigator; standalone palettes
-get their own panel. The swatch diff itself (parse each format → named sRGB swatches, match by
-name, classify added/removed/modified/unchanged) is computed in the **backend**
-(`palette.rs`/`commands::palette_dto` — see
-[version-control.md → Palette diffs](version-control.md#palette-diffs)); the frontend just renders
-the `swatches[]` it receives. Generic
-text files (config, settings) render as a friendly one-line summary (`FriendlyFileDiff`) in Artist
-Mode, or a code-style line diff (`DiffFileBlock`) with it off. See
-[frontend-architecture.md → Diff viewer](frontend-architecture.md#diff-viewer).
+For an art VCS, a code-style text patch is the wrong mental model. Artists need to see the actual
+layer imagery and a visual comparison of what changed, so art (`.kra`) files render as a layer stack
+next to a before and after canvas.
 
-> All imagery arrives as **inline SVG markup strings** and is composited in the webview — real
-> `.kra` layer rasters come from the backend as SVG `<image>` elements wrapping base64 PNGs, so
-> the viewer needs no raster pipeline of its own.
+Palettes have their own `kind: "palette"` and always render as color-swatch grids
+(`PaletteDiffView`), whether or not Artist Mode is on. Today they come from the palettes embedded in
+a `.kra`, which appear inside that artwork's layer navigator; standalone palette files are no longer
+tracked. The swatch diff (parse each format into named sRGB swatches, match them by name, and
+classify each as added, removed, modified or unchanged) is computed in the backend (`palette.rs` and
+`commands::palette_dto`, see [version-control.md](version-control.md#palette-diffs)), and the
+frontend just renders the `swatches[]` it receives. The only text entries left are palettes that
+failed to parse: they render as a one-line summary (`FriendlyFileDiff`) with Artist Mode on, or as a
+code-style line diff (`DiffFileBlock`) with it off. See
+[frontend-architecture.md](frontend-architecture.md#diff-viewer).
+
+All imagery is composited in the webview from inline SVG markup strings. Real `.kra` layer rasters
+come from the backend as SVG `<image>` elements. In the desktop shell their `href` is a `kvcimg://`
+URL served straight from the store's raster cache; outside the shell, or if a cache write fails, it's
+a base64 data URL. Either way the viewer needs no raster pipeline of its own.
 
 ## Data model (`src/types.ts`)
 
+Abridged; see `src/types.ts` for every field.
+
 ```ts
-type DiffEntry = ArtDiff | TextDiff | PaletteDiff;  // discriminated by `kind`
+type DiffEntry = ArtDiff | TextDiff | PaletteDiff;  // told apart by `kind`
 
 interface ArtDiff {
   kind: "art";
-  path: string;            // "characters/hero.kra"
-  status: FileStatus;      // M | A | D | U | R | C
-  width: number;           // artwork px → SVG viewBox
+  path: string;               // "hero.kra"
+  status: FileStatus;         // M | A | D | U | R | C
+  width: number;              // artwork pixels, used as the SVG viewBox
   height: number;
-  layers: ArtLayer[];      // ordered bottom→top
-  regions: ChangeRegion[]; // changed-region rects (normalized 0..1) for the box overlay
+  dpi?: number;               // plus colorModel and colorProfile from maindoc.xml
+  layers: ArtLayer[];         // ordered bottom to top
+  regions: ChangeRegion[];    // changed-region boxes, normalized 0..1, for the box overlay
+  beforeImage?: string | null;  // the composite at each state (mergedimage.png)
+  afterImage?: string | null;
+  diffImage?: string | null;    // the changed-pixel mask for the composite
+  diffOutline?: string | null;  // the outline of the changed pixels, normalized 0..1
 }
 
 interface ArtLayer {
   id: string;
+  topLevelId?: string;        // the top-level layer this one sits under (for the Changes panel)
   name: string;
-  opacity: number;         // 0..100
-  blendMode: BlendMode;    // normal | multiply | screen | overlay | add
-  change: LayerChange;     // added | removed | modified | unchanged
-  before: string | null;   // inner SVG markup; null when the layer didn't exist (added)
-  after: string | null;    // null when the layer was removed
+  opacity: number;            // 0..100
+  blendMode: BlendMode;       // normal | multiply | screen | overlay | add
+  change: LayerChange;        // added | removed | modified | unchanged
+  visible?: boolean;
+  layerType?: string;         // Krita node type, e.g. "paintlayer", "grouplayer"
+  bounds?: { x: number; y: number; w: number; h: number };  // painted area, tile-granular
+  before: string | null;      // inner SVG markup; null when the layer didn't exist (added)
+  after: string | null;       // null when the layer was removed
+  diffImage?: string | null;  // this layer's own highlight, only for modified layers
+  diffOutline?: string | null;
+  regions?: ChangeRegion[];
 }
 ```
 
-A layer's pixels at each state are just **SVG markup strings**. `before`/`after` differ for a
-modified layer; one side is `null` for added/removed layers.
+A layer's pixels at each state are SVG markup strings. `before` and `after` differ for a modified
+layer, and one side is `null` for an added or removed layer.
 
 ## SVG compositing helpers (`src/lib/svgArt.ts`)
 
-| Helper | Purpose |
+| Helper | What it does |
 |--------|---------|
-| `layersBody(layers, state)` | Inner markup for the layers at one state; each layer wrapped in a `<g>` with `opacity` + `mix-blend-mode` (`blendCss` maps `BlendMode` → CSS). Skips `null` markup. |
+| `layersBody(layers, state)` | The inner markup for the layers at one state. Each layer is wrapped in a `<g>` with `opacity` and `mix-blend-mode` (`blendCss` maps `BlendMode` to CSS), and `null` markup is skipped. |
 | `wrapSvg(body, w, h)` | Wraps markup in a scalable, self-contained `<svg>` (`viewBox`, `preserveAspectRatio`). |
-| `compositeSvg(layers, state, w, h)` | `wrapSvg(layersBody(...))` — used for thumbnails and the slider. |
+| `compositeSvg(layers, state, w, h)` | `wrapSvg(layersBody(...))`, used for thumbnails and the slider. |
 
 ## Components
 
-### `ArtDiffView` — orchestrator (`src/components/vcs/ArtDiffView.tsx`)
+### ArtDiffView
 
-Owns the per-file UI state and lays out the **layer panel + toolbar + canvas**:
+The orchestrator ([`src/components/vcs/ArtDiffView.tsx`](../src/components/vcs/ArtDiffView.tsx)).
+It owns the per-file UI state and lays out the layer panel, the toolbar and the canvas.
 
 | State | Default | Control |
 |-------|---------|---------|
-| `selectedId` | `"composite"` | Layer panel row click. |
-| `viewMode` | `"split"` | Toolbar: Side-by-side ↔ Swipe slider. |
-| `highlightOn` | `true` | Toolbar: eye toggle. |
-| `highlightMode` | `"pixels"` | Toolbar: Sparkle (changed pixels) ↔ BoundingBox (region boxes). |
+| `selectedId` | `"composite"` | Clicking a row in the layer panel. |
+| `viewMode` | `"split"` | Toolbar: side by side or swipe slider. |
+| `highlightOn` | `true` | Toolbar: the eye toggle. |
+| `highlightMode` | `"pixels"` | Toolbar: changed pixels (Sparkle) or region boxes (BoundingBox). |
 
-`selectedId` selects the layers to render: the whole stack (`composite`) or a single focused layer.
+`selectedId` decides which layers render: the whole stack (`composite`) or a single focused layer.
 
-**Zoom/pan** is shared across both view modes via `useZoomPan` (`src/lib/useZoomPan.ts`), called
-once in `ArtDiffView`. It owns `{scale, tx, ty}` and returns a CSS `transform` passed to **every**
-`ArtCanvas` (both split panes and the slider's two stacked layers), so before/after and the slider
-divider stay pixel-registered under zoom+pan. Wheel zooms toward the cursor; middle-mouse or
-space-held left-drag pans (plain left-drag stays reserved for the slider divider). The transform
-rides on the SVG-wrapping `<div>`, never re-serialized into the SVG string, so interaction stays on
-the compositor and the memoized SVG DOM is untouched. A toolbar "Reset zoom" button + a live % read
-out expose the state; switching view mode calls `reset()` (the panes and slider frame differ in width).
+Zoom and pan are shared across both view modes through `useZoomPan`
+([`src/lib/useZoomPan.ts`](../src/lib/useZoomPan.ts)), called once in `ArtDiffView`. It owns
+`{scale, tx, ty}` and returns a CSS `transform` that is passed to every `ArtCanvas` (both split
+panes and the slider's two stacked layers), so before and after, and the slider's divider, stay
+registered pixel for pixel under zoom and pan. The wheel zooms toward the cursor, and a plain left
+drag or a middle drag pans; the slider's divider stops the event so dragging it doesn't pan. The
+transform sits on the `<div>` around the SVG and is never serialized into the SVG string, so
+interaction stays on the compositor and the memoized SVG DOM isn't touched. A "Reset zoom" button
+and a live percentage in the toolbar show the state, and switching the view mode calls `reset()`,
+because the panes and the slider frame have different widths.
 
-### `LayerStackPanel` (`src/components/vcs/LayerStackPanel.tsx`)
+### LayerStackPanel
 
-Krita-style layer list, shown **top-first** (layers are stored bottom→top). Each row: a small SVG
-**thumbnail** (`compositeSvg` of that one layer), name, `opacity% · blendMode`, and a change marker
-reusing `FileStatusChip` (added→A, removed→D, modified→M, unchanged→none). A **Composite** row at the
-top selects the full stack. Selected row uses the accent left-border + tint.
+A Krita-style layer list ([`src/components/vcs/LayerStackPanel.tsx`](../src/components/vcs/LayerStackPanel.tsx)),
+shown top first (layers are stored bottom to top). Each row has a small SVG thumbnail
+(`compositeSvg` of that one layer), the name, `opacity% · blendMode`, and a change marker that reuses
+`FileStatusChip` (added is A, removed is D, modified is M, unchanged shows nothing). A Composite row
+at the top selects the full stack, and a "Color Palette" section below the layers shows an embedded
+palette that changed. It shows one palette only: `DiffView` passes the first matching `<kra>::`
+entry (`entries.find`), so when several embedded palettes changed in one version, the rest are
+computed by the backend but not shown. The selected row uses the accent left border and tint.
 
-### `ArtCanvas` (`src/components/vcs/ArtCanvas.tsx`)
+### ArtCanvas
 
-Renders one state's composited SVG over a **checkerboard matte** (so layer transparency reads true).
-The SVG is built inline (`dangerouslySetInnerHTML`) rather than via `<img>` so blend modes and
-filters composite correctly. `ArtCanvas` is `React.memo`'d so the slider divider drag / zoom-pan
-re-renders of its parent don't re-enter it when props are unchanged. When `overlay` is set, it
-appends a change-highlight overlay **in the same viewBox** (so it aligns with the art).
+Renders one state's composited SVG over a checkerboard, so layer transparency reads correctly
+([`src/components/vcs/ArtCanvas.tsx`](../src/components/vcs/ArtCanvas.tsx)). The SVG is built inline
+(`dangerouslySetInnerHTML`) rather than through `<img>`, so blend modes and filters composite
+correctly. `ArtCanvas` is wrapped in `React.memo`, so dragging the slider divider or zooming and
+panning its parent doesn't re-render it when its props haven't changed. When `overlay` is set, it
+appends a change-highlight overlay in the same viewBox, so the highlight lines up with the art.
 
-The overlay data (`diffImage`/`diffOutline`/`regions`) is passed as **explicit props**, not read
-off `diff` — `ArtDiffView` chooses the source from the current selection: the whole-file composite
-highlight for the **Composite** view, or the **selected layer's own** highlight when a single layer
-is focused (see "Per-layer highlights" below). A layer with no highlight of its own (unchanged,
-added, removed, or still streaming) yields empty props → the overlay simply doesn't draw. Only
-`diff.width`/`diff.height` (the viewBox) still come from `diff`.
+The overlay data (`diffImage`, `diffOutline`, `regions`) arrives as explicit props, not read from
+`diff`. `ArtDiffView` picks the source from the current selection: the whole-file highlight for the
+Composite view, or the selected layer's own highlight when a single layer is focused (see
+[Per-layer highlights](#per-layer-highlights)). A layer without a highlight of its own (unchanged,
+added, removed, or still streaming) gets empty props, and the overlay simply doesn't draw. Only
+`diff.width` and `diff.height` (the viewBox) still come from `diff`.
 
-- **pixels mode** (default) — the changed-pixel mask (`diffImage`, an `<image>` sized to the
-  viewBox): transparent except where before/after differ. The backend bakes a placeholder color
-  into that raster, but the frontend (`pixelOverlay`) only ever reads its **alpha** channel
-  (`mask-type:alpha`) and repaints with `var(--color-accent)` — so the highlight always matches the
-  active theme, and switching themes never needs the cached raster to be regenerated. Rendered
-  three ways for legibility on busy artwork: a flat accent tint of the changed pixels, a diagonal
-  **hatch pattern** masked to those same pixels (the alternating stripes give contrast a flat tint
-  can't against arbitrary underlying color), and a **dashed outline** that hugs the changed pixels'
-  silhouette (also stroked with `var(--color-accent)`). The
-  outline is a vector path (`diffOutline`, normalized 0..1) traced in Rust
-  (`raster::outline_from_grid`, marching the changed/unchanged cell boundary of a downsampled grid
-  into closed loops) — *not* a bounding box; the frontend scales it to the viewBox and strokes it
-  dashed with `non-scaling-stroke` (constant on-screen dash size at any zoom). All plain
-  fills/patterns/masks/paths — GPU-composited, no filters, rebuilt only when the memoized SVG changes
-  (never on zoom/pan). On a cache hit the outline is re-traced from the cached mask PNG
-  (`raster::outline_from_mask_png`), so no sibling cache file.
-- **box mode** — a subtle filled rect + **bold corner brackets** per `regions` entry (+ optional
-  labels), a coarse bbox fallback. Region coords are **normalized 0..1** of the viewBox (both the
-  composite's tile-bbox and a layer's own changed-pixel bbox) — `boxOverlay` scales them by
-  width/height, so a region must never be pre-scaled to pixels (doing so overflows past the
-  bottom-right of the canvas). Strokes use `vector-effect="non-scaling-stroke"` so they stay legible
-  in screen pixels even when a large canvas is shown fit-to-pane (plain document-space dashes would
-  otherwise go sub-pixel and disappear).
+- **Pixels mode** (the default) uses the changed-pixel mask (`diffImage`, an `<image>` sized to the
+  viewBox), which is transparent except where before and after differ. The backend bakes a
+  placeholder color into that raster, but the frontend (`pixelOverlay`) only ever reads its alpha
+  channel (`mask-type: alpha`) and repaints with `var(--color-accent)`, so the highlight always
+  matches the active theme and switching themes never needs the cached raster regenerated. It
+  renders three ways so it stays readable on busy artwork: a flat accent tint over the changed
+  pixels, a diagonal hatch pattern masked to the same pixels (the stripes give contrast a flat tint
+  can't, against any underlying color), and a dashed outline that follows the changed pixels' shape,
+  also stroked with `var(--color-accent)`. The outline is a vector path (`diffOutline`, normalized
+  0..1) traced in Rust (`raster::outline_from_grid`, which follows the boundary between changed and
+  unchanged cells of a downsampled grid into closed loops), not a bounding box. The frontend scales it
+  to the viewBox and strokes it dashed with `non-scaling-stroke`, so the dashes stay the same size on
+  screen at any zoom. All of it is plain fills, patterns, masks and paths, composited on the GPU with
+  no filters, and rebuilt only when the memoized SVG changes (never on zoom or pan). On a cache hit
+  the outline is traced again from the cached mask PNG (`raster::outline_from_mask_png`), so there's
+  no separate cache file for it.
+- **Box mode** draws a faint filled rectangle with bold corner brackets for each `regions` entry
+  (plus optional labels), a coarse bounding-box fallback. Region coordinates are normalized 0..1 of
+  the viewBox (for both the composite's tile bounding box and a layer's own changed-pixel bounding
+  box), and `boxOverlay` scales them by width and height, so a region must never be pre-scaled to
+  pixels, or it overflows past the bottom right of the canvas. Strokes use
+  `vector-effect="non-scaling-stroke"` so they stay readable in screen pixels even when a large
+  canvas is shown fit to the pane; plain document-space dashes would shrink below a pixel and vanish.
 
-**Per-layer highlights.** The composite's highlight (`ArtDiff.diffImage`/`diffOutline`/`regions`)
-ships with the first `commit_diff` and drives the **Composite** view. Each **modified** layer
-additionally carries its *own* `diffImage`/`diffOutline`/`regions` on `ArtLayer`, diffed in Rust
-from that layer's before/after rasters (`commands::layer_diff_overlay` → `raster::diff_overlay_full`,
-one changed-pixel grid → mask + outline + normalized bbox), so selecting a layer shows only *its*
-changed pixels rather than the whole-file silhouette painted on every layer. These are computed
-during the per-layer stream (reusing pixels already decoded for the layer raster — no extra decode)
-and the mask PNG is cached content-addressed by both layer raster keys. Added/removed/unchanged
-layers carry none.
+### Per-layer highlights
 
-### `CompareSlider` (`src/components/vcs/CompareSlider.tsx`)
+The composite's highlight (`ArtDiff.diffImage`, `diffOutline`, `regions`) ships with the first
+`commit_diff` and drives the Composite view. Each modified layer also carries its own `diffImage`,
+`diffOutline` and `regions` on `ArtLayer`, diffed in Rust from that layer's before and after rasters
+(`commands::layer_diff_overlay` → `raster::diff_overlay_full`: one changed-pixel grid gives the mask,
+the outline and the normalized bounding box). So selecting a layer shows only its changed pixels,
+not the whole file's silhouette painted on every layer. These are computed during the per-layer
+stream, reusing the pixels already decoded for the layer raster, with no extra decode, and the mask
+PNG is cached content-addressed by both layer raster keys. Added, removed and unchanged layers carry
+none.
 
-Swipe comparison: **after** fills the frame; **before** is clipped to the left of a draggable divider
-(`clip-path: inset(...)`). The divider uses the same pointer-capture drag pattern as the Sidebar
-resize handle, plus arrow-key nudging, and its `setPos` is **rAF-throttled** (pointermove fires
->100×/s) with the component `React.memo`'d — together these stop each drag frame from re-rendering
-both stacked canvases. The shared zoom/pan `transform` is applied identically to both canvases while
-the `clip-path` stays on the untransformed before-wrapper (frame screen space), so the reveal line
-tracks the image under any zoom+pan. The highlight overlay (when on) is drawn on the after side.
+### CompareSlider
+
+The swipe comparison ([`src/components/vcs/CompareSlider.tsx`](../src/components/vcs/CompareSlider.tsx)).
+The after state fills the frame, and the before state is clipped to the left of a draggable divider
+(`clip-path: inset(...)`). The divider uses the same pointer-capture drag pattern as the Sidebar's
+resize handle, plus nudging with the arrow keys. Its `setPos` is throttled to one update per
+animation frame (pointer moves fire more than 100 times a second), and the component is wrapped in
+`React.memo`, so a drag frame doesn't re-render both stacked canvases. The shared zoom and pan
+`transform` applies to both canvases the same way, while the `clip-path` stays on the untransformed
+wrapper around the before canvas (in the frame's screen space), so the reveal line tracks the image
+under any zoom and pan. When the highlight is on, it's drawn on the after side.
 
 ## How the modes combine
 
 ```
-ArtDiffView (owns shared useZoomPan → transform)
+ArtDiffView (owns the shared useZoomPan → transform)
 ├─ viewMode "split"  → ArtCanvas(before, transform) | ArtCanvas(after, transform, overlay=highlightOn)
 └─ viewMode "slider" → CompareSlider(transform, overlay=highlightOn)  // before clipped over after
-                        highlightMode ∈ { pixels, box } controls the overlay style
+                        highlightMode (pixels or box) picks the overlay style
 ```
 
-## Real backend data
+## Where the data comes from
 
-`ArtDiff`/`ArtLayer` are the swap point, and for `.kra` files the backend fills it in **two
-stages** so the panel appears immediately instead of blocking on every layer's raster:
+For `.kra` files the backend fills in `ArtDiff` and `ArtLayer` in two stages, so the panel appears
+immediately instead of waiting for every layer's raster. A version is always compared with its first
+parent; the working tree is compared with its last commit.
 
-1. **`commit_diff`** (see [version-control.md](version-control.md)) returns the cheap parts up
-   front — layer *metadata* (`ArtLayer` with `before`/`after` = `null`), the composite, and change
-   regions:
-   - **Composite** — `mergedimage.png` at each state in `ArtDiff.beforeImage`/`afterImage`,
-     re-encoded down to ≤`MAX_RASTER_DIM` (`raster::cap_png`; full-resolution composites of big
-     canvases dominated the IPC payload). The "Composite" navigator row prefers this over
-     stacking layers; `ArtDiffView` swaps in a single composite "layer" when these are present, so
-     the default view is correct the instant the diff loads.
+1. **`commit_diff`** (or `working_diff`, see [version-control.md](version-control.md)) returns the
+   cheap parts first: the layer metadata (`ArtLayer` with `before` and `after` set to `null`), the
+   composite, and the change regions.
+   - **The composite.** `mergedimage.png` at each state goes in `ArtDiff.beforeImage` and
+     `afterImage`, re-encoded down to at most `MAX_RASTER_DIM` (`raster::cap_png`), because
+     full-resolution composites of large canvases dominated the IPC payload. The navigator's
+     Composite row prefers this over stacking layers: `ArtDiffView` swaps in a single composite
+     "layer" when these are present, so the default view is right the moment the diff loads.
 
-     A version saved from a **layer subset** has no `mergedimage.png` — Krita rendered the whole
-     stack and we can't redo it, so `stage::stage_kra` drops it rather than ship a preview showing
-     layers the version doesn't contain (see
-     [version-control.md](version-control.md#layer-subset-staging--saving-only-some-layers)).
-     For those, `commands::stacked_composite_url` composites the stack itself
-     (`raster::composite_stack`) and caches it under `kra::stack_cache_key` like any other raster,
-     so the Composite pane — and the Version Map node, which draws `afterImage` and fetches no
-     per-layer rasters — isn't blank. Both the before and after sides fall back this way. It
-     models source-over, per-layer opacity, `visible`, one level of group opacity and the five
-     blend modes `svgArt.ts::blendCss` maps; masks and filter/clone/vector layers render as plain
-     paint — the same ceiling the frontend's SVG stacker has always had, and acceptable precisely
-     because this is a cached preview rather than anything written into the artwork. Its inputs
-     are the ordinary per-layer rasters, so the diff viewer and this share cache entries in both
-     directions. Krita rewrites the real composite on the next save.
-   - **Changed-pixel mask + outline** — `ArtDiff.diffImage` and `ArtDiff.diffOutline`: the
-     before/after composites diffed pixel-for-pixel in Rust (`raster::diff_overlay`, threshold
-     ~16/channel; each side is capped to `MAX_RASTER_DIM` right after decode so the compare never
-     holds two full-resolution composites at once). The mask is a transparent-except-changed PNG (its RGB is a fixed placeholder —
-     only the alpha channel is meaningful, since the frontend repaints with the active theme's
-     `--color-accent`), capped + cached (`kra::diff_cache_key`) + served over `kvcimg://`; the
-     outline is a vector path tracing the changed pixels' silhouette. Together they drive the
-     default "pixels" highlight; keyed off the composite so they need no layer stream.
-   - **Change regions** — one normalized bounding box over the tiles that differ between the two
-     commits (no pixel decode; just tile-hash comparison), feeding the coarse box-highlight overlay.
-   - **Per-layer `change`** (`added`/`removed`/`modified`/`unchanged`) — a layer is `modified` when
-     its curated metadata moved (`opacity`/`compositeop`/`name`) **or** its tiles differ. Both
-     halves are decided **per matched layer**, never per archive path: layers are paired by
-     `commands::layer_id` (uuid, name when there is none), and the tile comparison looks the old
-     side up under *that* layer's own `<image name>/layers/<filename>` — which is why
-     `kra::diff_tile_indexes` takes a `pair` map from new-side entry path to old-side entry path
-     (`""` for a layer with no counterpart, since no entry path is empty, so an added layer's
-     tiles all count as new and it still contributes to the union change region).
+     A version saved from a layer subset has no `mergedimage.png`. Krita rendered the whole stack and
+     the engine can't redo that render, so `stage::stage_kra` drops it rather than ship a preview
+     showing layers the version doesn't contain (see [layer-staging.md](layer-staging.md)). For those
+     versions, `commands::stacked_composite_url` composites the stack itself
+     (`raster::composite_stack`) and caches the result under `kra::stack_cache_key` like any other
+     raster, so the Composite pane, and the Version Map node, which draws `afterImage` and fetches no
+     per-layer rasters, isn't blank. Both the before and after sides fall back this way. It models
+     source-over blending, per-layer opacity, `visible`, one level of group opacity and the five
+     blend modes `svgArt.ts::blendCss` maps; masks and filter, clone and vector layers render as plain
+     paint. That's the same ceiling the frontend's SVG stacker has always had, and it's acceptable
+     because this is a cached preview, never anything written into the artwork. Its inputs are the
+     ordinary per-layer rasters, so the diff viewer and this share cache entries both ways. Krita
+     rewrites the real composite on the next save.
+   - **The changed-pixel mask and outline.** `ArtDiff.diffImage` and `ArtDiff.diffOutline` come from
+     comparing the before and after composites pixel by pixel in Rust (`raster::diff_overlay`, with a
+     threshold of about 16 per channel). Each side is capped to `MAX_RASTER_DIM` right after decoding,
+     so the comparison never holds two full-resolution composites at once. The mask is a PNG that's
+     transparent except where pixels changed; its RGB is a fixed placeholder, since only the alpha
+     channel matters and the frontend repaints it with the active theme's `--color-accent`. It's
+     capped, cached (`kra::diff_cache_key`) and served over `kvcimg://`. The outline is a vector path
+     tracing the changed pixels' shape. Together they drive the default "pixels" highlight, and since
+     they're computed from the composite, they don't need the layer stream.
+   - **Change regions.** One normalized bounding box over the tiles that differ between the two
+     commits (no pixel decoding, just comparing tile hashes), for the coarse box highlight.
+   - **Each layer's `change`** (`added`, `removed`, `modified` or `unchanged`). A layer is
+     `modified` when its curated metadata moved (`opacity`, `compositeop`, `name`) or its tiles
+     differ. Both are decided per matched layer, never per archive path. Layers are paired by
+     `commands::layer_id` (the uuid, or the name when there is none), and the tile comparison looks
+     up the old side under that matched layer's own `<image name>/layers/<filename>`. That's why
+     `kra::diff_tile_indexes` takes a `pair` map from each new-side entry path to its old-side entry
+     path (`""` for a layer with no counterpart, since no entry path is empty, so an added layer's
+     tiles all count as new and it still contributes to the change region).
 
-     **This is load-bearing.** Krita renumbers `layerN` data files whenever the stack changes —
-     insert one layer and every layer above it shifts — so pairing by path made an untouched
-     layer diff against nothing and report `modified`: add a layer, and the whole stack above it
-     lit up as changed in both the diff navigator and the Changes panel (whose rows roll up this
-     same `change`). It is the same class of bug `merge.rs` already guards against by collecting
-     data files filename-independently, and the raster path in the same loop already got it right
-     (`before_r` reads the *matched* old layer's `filename` and its own side's image name). Any
-     replacement must keep identity and content pairing on the same key.
+     This pairing matters. Krita renumbers its `layerN` data files whenever the stack changes, so
+     inserting one layer shifts every layer above it. Pairing by path made an untouched layer compare
+     against the wrong file and report `modified`: add a layer, and the whole stack above it lit up
+     as changed, in the diff navigator and in the Changes panel, whose rows roll up this same
+     `change`. `merge.rs` guards against the same class of bug by collecting data files independently
+     of their names, and the raster path in the same loop already got it right (`before_r` reads the
+     matched old layer's `filename` and its own side's image name). Any replacement must keep identity
+     and content pairing on the same key.
 2. **`commit_layers`** (or `working_layers`) is then fetched lazily by
-   [`useArtLayers`](../src/lib/repoData.ts) and **streamed**: the command takes a Tauri
-   `Channel<LayerDto>` and sends each layer the moment its rasters finish (rayon-parallel, so
-   out of order; the frontend merges by layer id over the metadata from stage 1). Each layer's
-   pixels are reconstructed from stored tiles (LZF-decoded, planar BGRA → RGBA) blitted onto a
-   canvas seeded from that entry's sibling `.defaultpixel` archive entry — Krita only stores
-   tiles for a layer's painted-on regions, so a uniformly-filled layer (e.g. a solid "Background"
-   layer) is otherwise mostly or entirely untiled; without this fill, those regions decoded as
-   transparent instead of their real color. The canvas is then downscaled to ≤`MAX_RASTER_DIM`
-   via an **area-average box filter** — `raster::cap_rgba`/`box_downscale`, in premultiplied-alpha
-   space so transparent edges don't bleed dark; sharper than the old nearest-neighbour under
-   zoom), PNG-encoded) and arrive as **SVG `<image href="data:image/png;base64,…">`
-   markup** in `ArtLayer.before`/`after`. A **modified** layer also carries its own
-   `diffImage`/`diffOutline`/`regions` in the same `LayerDto` (diffed from the before/after rasters
-   the stream already decoded), so the highlight follows the selected layer. `layersBody`/`wrapSvg`/
-   `ArtCanvas`/`CompareSlider` composite it all with **zero rendering changes** (blend modes,
-   checkerboard, overlays all still
-   apply). Layers pop in one by one; not-yet-arrived layers show a spinner thumb in the navigator
-   (and a canvas spinner if selected), with the "Loading layers…" header indicator until the
-   whole set lands.
+   [`useArtLayers`](../src/lib/repoData.ts) and streamed. The command takes a Tauri
+   `Channel<LayerDto>` and sends each layer as soon as its rasters are ready (in parallel with rayon,
+   so out of order; the frontend merges each one by layer id over the metadata from stage 1). Each
+   layer's pixels are rebuilt from the stored tiles (LZF-decoded, planar BGRA to RGBA) and drawn onto
+   a canvas first filled from that entry's `.defaultpixel` sibling. Krita only stores tiles for the
+   painted parts of a layer, so a uniformly filled layer (a solid "Background", for example) is
+   mostly or entirely untiled, and without the fill those areas would decode as transparent instead
+   of their real color. The canvas is then downscaled to at most `MAX_RASTER_DIM` with an
+   area-average box filter (`raster::cap_rgba` and `box_downscale`, in premultiplied alpha so
+   transparent edges don't darken; sharper than the old nearest-neighbor when zoomed), encoded as
+   PNG, and delivered as SVG `<image>` markup in `ArtLayer.before` and `after`. A modified layer also
+   carries its own `diffImage`, `diffOutline` and `regions` in the same `LayerDto` (see
+   [Per-layer highlights](#per-layer-highlights)). `layersBody`, `wrapSvg`, `ArtCanvas` and
+   `CompareSlider` composite all of it with no rendering changes (blend modes, the checkerboard and
+   the overlays still apply). Layers appear one by one; layers that haven't arrived show a spinner
+   thumbnail in the navigator (and a canvas spinner if selected), with a "Loading layers…" indicator
+   until the whole set has landed.
 
-Rasters use `preserveAspectRatio="xMidYMid meet"` (never `none`), so a before-side from a version
-with different canvas dimensions letterboxes instead of stretching.
+Rasters use `preserveAspectRatio="xMidYMid meet"`, never `none`, so a before side from a version with
+different canvas dimensions letterboxes instead of stretching.
 
-**Caching:** every capped PNG (composite and per-layer) is written to **`.kvc/cache/`**, keyed by
-a hash of the content that produced it (composite: the entry's content hash; layer: tile
-positions + hashes + dims + cap + the resolved `.defaultpixel` fill, so a fill-only change with
-no tile touched still invalidates the cache). Keys are content-derived, so entries never invalidate, unchanged
-layers share one entry across commits and across the committed/working paths, and a repeat view —
-including after an app restart — skips reconstruct/decode/encode entirely. In-session, the
-frontend also memoizes `commit_diff` results and streamed layer sets (small LRU maps in
-`repoData.ts`).
+## Caching
 
-Deferred (ponytail): non-RGBA-8 colorspaces (those layers fall back to the composite), per-layer
-change regions with labels, and `.kvc/cache` eviction (capped PNGs are small).
+Every capped PNG, composite or per-layer, is written to the store's `cache/` folder, keyed by a hash
+of the content that produced it. For a composite that's the entry's content hash. For a layer it's
+the tile positions and hashes, the dimensions, the cap and the resolved `.defaultpixel` fill, so a
+change to the fill alone, with no tile touched, still invalidates the entry. Because keys come from
+content, entries never need invalidating, unchanged layers share one entry across commits and across
+the committed and working paths, and a repeat view, even after an app restart, skips rebuilding,
+decoding and encoding entirely. The cache has a size budget (`Config.cacheMaxBytes`, 256 MB by
+default, "Preview cache size" in Settings → Storage) with oldest-first pruning, and "Clean up storage"
+prunes it too. Within a session the frontend also memoizes `commit_diff` results and streamed layer
+sets in small LRU maps in `repoData.ts`. See [performance.md](performance.md#caching-across-requests).
+
+## Not built yet
+
+- Color spaces other than 8-bit RGBA: those layers fall back to the composite.
+- Labels on the per-layer change regions.
+- Comparing two arbitrary versions. Every diff compares a version with its first parent (or the
+  working tree with its last commit). `layer_diff` can report metadata changes between any two
+  commits, but nothing in the UI calls it.

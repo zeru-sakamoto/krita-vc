@@ -1,133 +1,145 @@
 # Krita VCS
 
-A desktop **version-control client for Krita art files**, built with Tauri 2 + React 19 +
-TypeScript. Instead of code-style text patches, it shows artists what actually changed: the
-**layer stack** and a **visual diff** (before/after, swipe slider, changed-pixel highlighting, and
-synced zoom/pan) of each `.kra` file.
+A desktop version control app for Krita paintings, built with Tauri 2, React 19 and TypeScript.
+Instead of code-style text patches it shows artists what actually changed: the layer stack and a
+visual diff of each version (side by side or with a swipe slider, with changed pixels highlighted and
+zoom and pan kept in sync).
 
-> **Status:** fully working end to end. The Rust backend is a **real, custom local VCS** with its
-> own `.kvc/` store (not git) and a `.kra` tile-delta engine; the React frontend drives it over
-> Tauri IPC. There is **no mock data**: in a plain browser the UI renders, but all repository
-> actions are no-ops (UI-development mode only).
+> Status: working end to end, at v2.1.0. The Rust backend is a custom local version control system
+> with its own store (not git) and a `.kra` tile-delta engine, and the React frontend drives it over
+> Tauri IPC. In a plain browser the UI renders but every action does nothing; that mode is for UI
+> work only.
 
-## What it is (and isn't)
+## What it is, and what it isn't
 
-This is a **local-only** version-control system. There is intentionally **no remote, push, pull, or
-cloud sync**: no accounts, no server, nothing leaves your machine. A "repository" is just a folder
-you designate; the app creates a `.kvc/` store inside it and tracks the art files there. The UI
-exposes only local operations: commit history, working-tree changes, and local branches.
+Krita VCS is local-only. There's deliberately no remote, push, pull or cloud sync: no accounts, no
+server, and nothing leaves your machine. The unit it versions is one painting. You choose a `.kra`
+file to track, and its history lives in a hidden `.kvc` folder beside it, with a store of its own
+inside, so a folder of several tracked paintings still has one hidden folder. The UI only offers
+local operations: the painting's versions, its unsaved changes, and local branches.
 
-It does **not** use git. The backend is a purpose-built store optimized for large binary `.kra`
-files, where git's text-oriented delta model performs poorly.
+It doesn't use git. The backend is a purpose-built store for large binary `.kra` files, which git
+stores poorly: a small brush stroke changes compressed bytes all through the archive, so git's delta
+compression finds little to share between versions.
 
 ## Features
 
-- **Visual layer diffs** for `.kra` files: a Krita-style layer panel beside a before/after canvas.
-  - **Side-by-side** and **swipe slider** compare modes.
-  - **Synced zoom & pan**: wheel to zoom toward the cursor, space- or middle-mouse-drag to pan,
-    applied identically across both modes so before/after and the slider divider stay aligned.
-  - **Changed-pixel highlighting**: a true per-pixel diff (toggle on/off), with a coarse
-    region-box mode as a fallback. The highlight is **per-layer**: focus a layer and it outlines
-    only *that* layer's changed pixels, not the whole-file silhouette. Its color always matches
-    the active **theme's accent** (see Settings below).
-  - Click a layer to focus its diff, or view the composited artwork; color palettes (`.gpl`,
-    `.kpl`, `.aco`, `.ase`) — standalone or embedded inside a `.kra` — render as a color-by-color
-    swatch diff (added / removed / recolored, with hex values). When a version touches several
-    files, the inspector's file list picks which one the main panel shows, and it shows the
-    selected file's or layer's details (type, visibility, opacity, blend, painted bounds) or the
-    composite's size, resolution, and color space.
-- **Version Map**: the default view — this branch's line of versions laid out on a pannable,
-  zoomable canvas, each node carrying its own artwork thumbnail and the layers it changed instead
-  of a hash and a commit message. Click a version to open its full visual diff in place. The
-  classic branch-aware **History graph** and **Branches** list are still there, one Settings
-  toggle away ("Legacy version history"), for anyone who prefers them.
-- **Real local version control**: save a version of the whole artwork, or **tick just the layers
-  you want in it** — the ones you leave out stay unsaved, ready for a later version. Everything is
-  ticked by default, so saving everything stays one click. Plus roll back / undo. Rolling back to
-  the version you're already on just discards unsaved changes in place (no new history entry);
-  rolling back to an older one records a new commit, linked back to it in the graph by a dashed
-  connector. Changed your mind mid-edit? Discard everything since your last version in one go.
-- **Set aside** (stash): park working-tree changes off to the side and bring them back later,
-  without leaving a version in your history. A switch or merge blocked
-  by unsaved changes offers setting them aside as a one-click way through, and a Settings-modal
-  shelf lists every set-aside item with its origin branch and age.
-- **Branching & merging**: create, switch, merge (fast-forward or two-parent), and delete local
-  branches, all backed by real tree materialization. Conflicting edits are flagged for review; if
-  one side edited a file and the other deleted it, the edit wins, so a merge never quietly loses
-  work.
-- **Storage housekeeping**: a "Clean up storage" action reclaims history unreachable from any
-  branch tip or set-aside stash (mark-and-sweep GC), and the raster preview cache is
-  size-budgeted with LRU pruning.
-- **Settings** (activity-bar gear). Organized into three left-hand category tabs: **Appearance**
-  (the Artist Mode toggle, a **custom title bar** toggle — a frameless window with its own
-  draggable title bar and window controls, on by default, switch back to your OS's native frame
-  any time, no restart needed — a **theme selector** with 8 color themes including a true-black
-  option, applied instantly via CSS, with the visual-diff highlight color following the chosen
-  theme's accent, a **Legacy version history** toggle that brings back the old History and
-  Branches tabs alongside the Version Map, and the **author name** signed on your versions),
-  **Set-Aside** (every stash,
-  with per-item remove and remove-all), and **Storage** (per-repository **preview-cache size**,
-  **compact-storage**, and **low-memory diffs** options, plus "Clean up storage"). Backing up a
-  repository is its own one-click **zip-icon button** in the activity bar, right above the
-  Settings gear, so it doesn't require opening Settings at all.
-- **Artist Mode**: a global toggle (default on) that swaps git/code jargon for plain language
-  (`Version 3` instead of a hash, asset names instead of file paths, friendly file summaries).
-- **First-launch tour**: a one-time spotlight walkthrough of the whole shell — changes, history,
-  branches, performance, settings, and backup — shown automatically the first time you open a
-  repository. Replay it anytime from Settings → Appearance → "Replay tour".
-- A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md).
+- **The Version Map**, the default view: a painting's versions laid out left to right on a pannable,
+  zoomable canvas, each with its thumbnail, its note and the layers it changed. Click a version to
+  open its visual diff in place, with an Inspector for its details and a Restore action. Turn on "All
+  lines" to see every branch on its own lane, or start a new line from any past version. A dashed
+  card marks unsaved changes at the end of the current line. The older History graph and Branches
+  list are one setting away (Settings → Appearance → Legacy version history).
+- **Visual layer diffs** for `.kra` files: a Krita-style layer panel beside a before and after
+  canvas.
+  - Side-by-side and swipe-slider modes.
+  - Shared zoom and pan: the wheel zooms toward the cursor and a left or middle drag pans, the same
+    in both modes, so before and after, and the slider's divider, stay aligned.
+  - Changed-pixel highlighting (a tint, a hatch and a dashed outline that follows the changed
+    pixels), with coarse region boxes as a fallback. The highlight is per layer: focus a layer and it
+    shows only that layer's changes. Its color always follows the theme's accent.
+  - Click a layer for its type, visibility, opacity, blend mode and painted area, or the composite for
+    the canvas size, resolution and color space. Palettes embedded in the `.kra` get a swatch-by-swatch
+    diff with hex values.
+  - Each version is compared with the version before it, and your unsaved changes with the last
+    version.
+- **Saving versions**: save the whole painting, or tick only the layers you want in the version. The
+  layers you leave out stay changed, ready for a later version, and everything starts ticked, so
+  saving everything is still one click. Canvas size, animation and document settings always come
+  along.
+- **Going back**: restore any older version as a new version (nothing after it is lost), undo the
+  last version (its changes come back as unsaved work), or undo everything since your last version.
+  Restoring the version you're already on just discards unsaved changes, with no new history entry.
+- **Set aside** (stash): park unsaved work to the side of history and bring it back later, without
+  making a version. If the painting changed in the meantime, the set-aside layers are merged back in
+  on top instead of overwriting anything. A switch or merge blocked by unsaved work offers to set it
+  aside as the way through, and Settings lists everything on the shelf with its origin branch and
+  age.
+- **Branching and merging**: create (from the current version or any past one), switch, merge
+  (fast-forward or two-parent) and delete local branches, with real tree materialization. When both
+  sides changed the painting, the incoming version wins and is flagged for review; if one side
+  deleted a file and the other edited it, the edit wins, so a merge never quietly loses work.
+- **Backup and restore**: back up several paintings at once into one archive, checked right after
+  it's written. Restoring puts each painting back in its original folder when it still exists, skips
+  paintings already there unless you choose Replace, and can compare both histories side by side
+  first.
+- **Storage care**: "Clean up storage" reclaims history nothing can reach any more (mark and sweep,
+  with a dry run first and a 14-day trash folder), "Check for problems" verifies the whole history
+  without changing it, and the preview cache has a size budget with LRU pruning.
+- **Settings** (the gear in the activity bar), in four tabs:
+  - Appearance: Artist view, the custom title bar (the app's own frame and window controls, on by
+    default; switch back to the OS frame any time, no restart), Legacy version history, your name
+    for the versions you save, eight color themes (six dark, two light), and buttons to replay the
+    tour and the welcome.
+  - Performance: how much of the CPU background work may use (Gentle, Balanced or Full speed), and
+    low-memory diffs for large paintings.
+  - Storage: where version history is kept, the preview cache size, compact storage for heavily
+    reworked paintings, Clean up storage, Check for problems, and when you last made a backup.
+  - Set-Aside: the shelf.
+- **Artist Mode**, on by default, swaps git and code jargon for plain language ("Version 3" instead
+  of a hash, the painting's name instead of a file path, "Updated" instead of `M`).
+- **A first-launch welcome and tour**: a two-step welcome (your name, then a theme picked from preview
+  cards), then a one-time spotlight tour of the shell. Replay either from Settings → Appearance.
+- A dark, Krita-inspired UI built against [`DESIGN.md`](DESIGN.md), with light themes too.
 
 ## How it works
 
-- **Custom `.kvc/` store**: chains are sharded per tracked file (lazy-loaded), loose objects are
-  sharded 256-way, and a commit with many new objects writes a single pack file instead of many
-  loose files (per-file creates dominated large commits on Windows).
-- **Tracked file types**: the scanner only tracks files Krita VCS understands: `.kra` documents
-  and the color-palette formats (`.gpl`, `.kpl`, `.aco`, `.ase`). Anything else in the folder is
-  left untouched and is never staged or committed. Krita's own backup (`*.kra~`) and autosave
-  (`*-autosave.kra`) artifacts are skipped too — the latter matters because it ends in `.kra`,
-  so a naive extension check would version your scratch state as a real document.
-- **`.kra` tile-delta engine**: `.kra` files are ZIP archives of per-layer tiles; the engine diffs
-  and stores them at the tile level, so a small edit to one layer stores a small delta, not a whole
+- **One store per painting.** Each tracked `.kra` gets a self-contained store in the hidden `.kvc/`
+  container beside it (or under a folder you choose in Settings). Stores share nothing. Inside a
+  store, chains are sharded per tracked file and loaded lazily, loose objects are sharded 256 ways,
+  and a commit with many new objects writes one pack file instead of many loose files (creating files
+  one by one dominated large commits on Windows).
+- **Only `.kra` files are tracked.** Nothing else in the folder is touched, and Krita's autosave
+  (`*-autosave.kra`) and backup (`*.kra~`) files are never picked up. The autosave one matters,
+  because it ends in `.kra` and a naive extension check would version your scratch state as a real
+  document.
+- **A `.kra` tile-delta engine.** `.kra` files are zip archives of per-layer tiles, and the engine
+  diffs and stores them tile by tile, so a small edit to one layer stores a small delta, not a whole
   new file.
-- **Two-stage visual diffs**: `commit_diff` returns the capped composite + layer metadata fast,
-  then per-layer rasters **stream** in over a Tauri channel as each finishes. Rasters are cached
-  content-addressed in `.kvc/cache/` and served to the webview as browser-cacheable `kvcimg://`
-  URLs. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md) and
+- **Two-stage visual diffs.** `commit_diff` returns the capped composite and the layer metadata
+  quickly, then per-layer rasters stream in over a Tauri channel as each one finishes. Rasters are
+  cached content-addressed in the store's `cache/` and served to the webview as browser-cacheable
+  `kvcimg://` URLs. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md) and
   [`docs/performance.md`](docs/performance.md).
 
 ## Getting started
 
-Package manager is **npm**.
+The package manager is npm.
 
 ```bash
-npm install          # install JS dependencies
-npm run tauri dev    # run the full desktop app (Vite dev server + Tauri webview)
+npm install          # install the JS dependencies
+npm run tauri dev    # run the full desktop app (Vite dev server plus the Tauri webview)
 ```
 
-Then use the top-bar repository switcher to **Create** or **Browse** to a folder; that becomes a
-local repository (a `.kvc/` store is initialized inside it). Drop a `.kra` file in, commit, edit it
-in Krita, and commit again to see a visual diff.
+Then use the switcher at the top: choose "Track an artwork…" and pick a `.kra` file. Save a version
+in the Changes panel, edit the painting in Krita, save it, and save another version to see a visual
+diff.
 
-Frontend-only (in a browser, no Tauri shell; UI development only, no backend):
+Frontend only (in a browser, with no Tauri shell and no backend; for UI work):
 
 ```bash
-npm run dev          # Vite dev server at http://localhost:1420
+npm run dev          # Vite dev server at http://localhost:1420 (add ?mock for a demo history)
 ```
 
-Build / package:
+Build and package:
 
 ```bash
-npm run build        # type-check (tsc) + build the frontend bundle to dist/
-npm run tauri build  # production desktop bundle (frontend build + Rust binary + installers)
+npm run build        # formats the source (prettier, cargo fmt), type-checks, checks the Version Map
+                     # layout, and builds the frontend to dist/
+npm run tauri build  # production desktop bundle (frontend build, Rust binaries and installers)
+npx tsc --noEmit     # a type-check that doesn't reformat anything
 ```
+
+`npm run build` rewrites source files, so don't run it with changes you aren't ready to have
+reformatted.
 
 Rust side (from `src-tauri/`):
 
 ```bash
 cargo check          # compile the backend
-cargo test           # engine integration tests (tests/engine.rs) + unit tests
+cargo test           # integration tests in tests/ plus unit tests
 cargo test --release --test bench -- --ignored --nocapture   # performance baseline
+cargo build --release --bin kvc                              # the headless CLI the Krita plugin uses
 ```
 
 ## Project layout
@@ -135,57 +147,70 @@ cargo test --release --test bench -- --ignored --nocapture   # performance basel
 ```
 src/
 ├─ components/
-│  ├─ shell/   — AppShell, TopBar (repository switcher), ActivityBar, SettingsModal,
-│  │            Sidebar, Inspector, StatusBar, BusyOverlay, TourOverlay (first-launch tour)
-│  ├─ vcs/     — Version Map (VersionMapPanel, VersionNode — the default view), diff viewer
-│  │            (DiffView, ArtDiffView, ArtCanvas, CompareSlider, LayerStackPanel,
-│  │            PaletteDiffView), commit graph, branch/changes panels, StashDialogs
-│  │            (set-aside prompts)
-│  ├─ ui/      — IconButton, Button, Menu, Modal
+│  ├─ shell/   AppShell, TopBar and SwitchArtworkModal (the artwork switcher), ActivityBar,
+│  │           Sidebar, Inspector, StatusBar, SettingsModal, BackupModal, RestoreModal,
+│  │           RestoreCompareModal, BusyOverlay, OnboardingOverlay, TourOverlay, DockerPanel
+│  ├─ vcs/     the Version Map (VersionMapPanel, VersionNode), the diff viewer (DiffView,
+│  │           ArtDiffView, ArtCanvas, CompareSlider, LayerStackPanel, PaletteDiffView), the
+│  │           Changes, Performance and legacy History and Branches panels, the commit graph,
+│  │           branch and set-aside dialogs, useBranchActions
+│  ├─ ui/      Button, IconButton, Switch, Slider, Checkbox, Radio, Menu (and Select), Modal, Tooltip
 │  └─ MainPanel.tsx
-├─ lib/        — data hooks + Tauri invoke calls (repoData.ts), repository + artist-mode +
-│  │            legacy-history-toggle + author-name + tour (tour.tsx) contexts, shell
-│  │            detection (tauri.ts), SVG compositing, zoom/pan + resize hooks
-├─ styles/     — global.css (Tailwind v4 @theme tokens from DESIGN.md)
-└─ types.ts    — domain types (the frontend ↔ backend contract)
+├─ lib/        data hooks and Tauri calls (repoData.ts), the repository, Artist Mode, legacy
+│              history, author name, theme, window chrome, CPU budget, welcome and tour contexts,
+│              the Version Map layout, SVG compositing, zoom, pan and resize hooks
+├─ styles/     global.css (Tailwind v4 @theme tokens from DESIGN.md)
+└─ types.ts    domain types (the frontend and backend contract)
 
-src-tauri/src/ — Rust backend (crate krita_vc_lib)
-├─ repo, scan, commit, delta, branch, gc, stash   — the local VCS engine
-├─ kra, tiles, raster                        — .kra parsing, tile store, raster/diff imaging
-├─ palette                                   — .gpl/.kpl/.aco/.ase parsing + swatch diffing
-├─ commands.rs                               — Tauri #[command] IPC surface
-├─ bin/kvc.rs                                — headless CLI over the same engine (Krita plugin)
-└─ lib.rs / main.rs                          — Tauri builder + entry point
+src-tauri/src/   the Rust backend (crate krita_vc_lib)
+├─ repo, scan, commit, stage, delta, branch, stash, merge, gc, check   the local VCS engine
+├─ kra, tiles, raster          .kra parsing, the tile store, rasters and diff imaging
+├─ palette                     .gpl, .kpl, .aco and .ase parsing and the swatch diff
+├─ cpu, diskspace, ops_log     CPU budget, free-space preflight, audit log
+├─ commands.rs                 the Tauri #[command] IPC surface
+├─ bin/kvc.rs                  the headless CLI over the same engine (for the Krita plugin)
+└─ lib.rs, main.rs             the Tauri builder and entry point
 
-docs/          — developer documentation
-DESIGN.md      — visual + interaction spec
-krita-plugin/  — optional Krita docker plugin (see below)
+docs/          developer documentation
+content/       source copy for the marketing site, and the release notes (gitignored, local only)
+DESIGN.md      the visual and interaction spec
+krita-plugin/  the optional Krita docker plugin (see below)
 ```
 
 ## Krita plugin
 
-A companion "Version Control" docker for Krita itself: commit (with per-file ticks),
-quick-checkpoint, discard, set work aside and bring it back, and branch-switch without
-alt-tabbing to this app. It saves your open documents for you — on focus, on ⟳, and before
-every commit — so a version can't miss work still sitting in Krita's memory.
+A companion "Version Control" docker for Krita itself: save a version, discard changes, set work
+aside and bring it back, and switch or create branches, without switching to this app. It saves your
+painting for you (when you click into the panel, when you press refresh, and before every commit), so
+a version can't miss work still sitting in Krita's memory, and it reopens the painting after any
+action that rewrites it on disk.
 
-It's a small Python (PyKrita) plugin that shells out to `kvc`, a headless CLI built from the
-same Rust engine (`src-tauri/src/bin/kvc.rs`, no Tauri dependency), so the plugin and the
-desktop app always go through identical commit/branch code against the same `.kvc` store.
-Browsing/restoring history, undo, merges and repo init stay in the desktop app. See
-[`krita-plugin/README.md`](krita-plugin/README.md) for build + install steps.
+It's a small Python (PyKrita) plugin that runs `kvc`, a headless CLI built from the same Rust engine
+(`src-tauri/src/bin/kvc.rs`, no Tauri dependency), so the plugin and the desktop app go through the
+same code against the same store. Every installer puts `kvc` next to the app. Starting to track a
+painting, browsing and restoring history, undo, picking layers, merging and backups stay in the
+desktop app. See [`krita-plugin/README.md`](krita-plugin/README.md) for installing, building and
+troubleshooting.
 
 ## Documentation
 
-- [`docs/`](docs/README.md): frontend architecture, the file-tracking / version-control backend,
-  the visual diff viewer, and performance.
-- [`krita-plugin/README.md`](krita-plugin/README.md): the in-Krita version-control docker:
-  install, usage, and troubleshooting.
-- [`DESIGN.md`](DESIGN.md): design tokens, components, and interaction spec.
-- [`CLAUDE.md`](CLAUDE.md): repo guidance and commands.
+- [`docs/`](docs/README.md): the frontend and backend architecture, how each feature works
+  (version control, layer staging, setting work aside, backup and restore, the Version Map, the
+  visual diff viewer, the welcome and tour), data integrity, performance, and the project's history.
+- [`krita-plugin/README.md`](krita-plugin/README.md): the in-Krita docker, from install to
+  troubleshooting.
+- [`DESIGN.md`](DESIGN.md): design tokens, components and the interaction spec.
+- [Releases on GitHub](https://github.com/zeru-sakamoto/krita-vc/releases): the changelog, with
+  installers and the plugin zip for every version.
+- [`CLAUDE.md`](CLAUDE.md): repository guidance and commands for Claude Code.
+
+## License
+
+GNU General Public License v3.0. See [`LICENSE`](LICENSE).
 
 ## Recommended IDE setup
 
-[VS Code](https://code.visualstudio.com/) +
-[Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) +
-[rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+[VS Code](https://code.visualstudio.com/) with the
+[Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) and
+[rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+extensions.

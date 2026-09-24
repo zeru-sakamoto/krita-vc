@@ -1,42 +1,51 @@
 # The Version Map, and the per-document rewrite (v2.0.0)
 
-**Timeframe:** 2026-08-26 – 2026-08-27 · **Commits:** `fb65ca2` … `d4d821d`
+Dates: 2026-08-26 to 2026-08-27. Commits: `fb65ca2` to `d4d821d`.
 
-The biggest architectural pivot in the project's history, in two parts that happened to land back
-to back.
+The biggest architectural change in the project's history, in two parts that landed back to back.
 
-**Part one: the Version Map.** The list-based History and Branches tabs are replaced by a
-pannable, zoomable canvas of versions built on React Flow (`fb65ca2` "Add Version Map as the
-default history view"), which gains per-branch lanes the same day (`e542a35`) and a
-`create_branch_at` backend operation for forking a new branch from an arbitrary past commit ("go
-back to version 5 and try a different direction") rather than only from the current tip. A
-minimap visual-bug fix follows (`94547eb`).
+## Part one: the Version Map
 
-**Part two: one document, one history.** The next commit is the rewrite itself: `8b59e1b`
-"Rework tracking to one document = one history, plus UI polish." Its own message states the
-change directly: replace the folder-wide repository model with per-`.kra` tracking, where each
-artwork gets its own self-contained store (`objects/`, `chains/`, `cache/`, `commits.log`,
-`branches.json`, `stashes.json`, `config.json`) inside a shared `.kvc/<slug>/` container, addressed
-via a new `root`/`store` path split on `Repo` and an app-global, relocatable store root. Only
-`.kra` files are tracked from this point on. Standalone palette files (tracked since
-[04](04-settings-theming-palettes-and-the-first-plugin.md)) are dropped, though a `.kra`'s own
-*embedded* palettes are still diffed off the `.kra` itself. Scanning a document collapses from a
-directory walk to a single `stat`. Settings gains a "where version history is kept" control, and a
-missing/unmounted drive (`StoreUnreachable`) is made a distinct failure state from "never
-versioned" (`NotARepo`), so the two can't be conflated into an accidental empty store. **There is
-no migration path**: v1 folder repositories are simply unreadable by this version, which the
-commit message notes was acceptable because the project had no users yet.
+`fb65ca2` ("Add Version Map as the default history view") replaces the list-based History and
+Branches tabs as the default with a pannable, zoomable canvas of versions built on React Flow. The
+same day, `e542a35` draws each branch on its own lane (behind an opt-in "show all lines" toggle) and
+adds a `create_branch_at` backend operation, which starts a new branch from any past commit ("go
+back to version 5 and try a different direction") instead of only from the current tip. `94547eb`
+fixes a minimap drawing bug.
 
-Branch actions and pick-a-version branching are then wired directly into the new Version Map
-(`d4d821d`), closing the loop between the two halves of this era: a version picker that only
-exists because the Map gives you something to click on.
+## Part two: one document, one history
 
-Changing the unit of versioning from "a folder of files" to "one artwork" touched more of the
-codebase than anything else in this history. It's why standalone palette tracking was removed, why
-the scanner got cheaper, and why `Repository.id` becoming a document path let ~40 Tauri commands
-take the new model with zero signature changes.
+The next commit is the rewrite: `8b59e1b`, "Rework tracking to one document = one history, plus UI
+polish". Its message describes the change. The folder-wide repository model is replaced with
+per-`.kra` tracking, where each artwork gets its own self-contained store (`objects/`, `chains/`,
+`cache/`, `commits.log`, `branches.json`, `stashes.json`, `config.json`) inside a shared
+`.kvc/<slug>/` container, addressed through a new split between the `root` and `store` paths on
+`Repo`, with an app-wide store root that can be moved.
 
-**See also:** [`per-document-tracking.md`](../per-document-tracking.md) for the full mechanics of
-the shipped model (`store_dir_for`, the container layout, the three failure states);
-[`frontend-architecture.md`](../frontend-architecture.md#version-map) for how the Version Map
-works today.
+From here on only `.kra` files are tracked. Standalone palette files, tracked since
+[04](04-settings-theming-palettes-and-the-first-plugin.md), are dropped, although the palettes
+embedded in a `.kra` are still diffed from the `.kra` itself. Scanning a document shrinks from a
+directory walk to a single `stat`. Settings gains a "Where version history is kept" control. A
+drive that isn't mounted (`StoreUnreachable`) becomes a separate failure from "never versioned"
+(`NotARepo`), so the app can't answer a missing drive by creating a fresh, empty history.
+
+There is no migration. The commit message says only "No migration path" and that v1 folder
+repositories can't be read. The reason is written down elsewhere: `CLAUDE.md` and
+[`per-document-tracking.md`](../per-document-tracking.md) both say it was free because the app had
+no users yet.
+
+`d4d821d` then puts branch actions and pick-a-version branching on the Version Map itself.
+`create_branch_at` had been written and tested but was unreachable until then, because nothing
+else in the app let you pick a version.
+
+## Why it mattered
+
+Changing the unit of versioning from a folder of files to one artwork touched more of the codebase
+than any other change in this history. It is why standalone palette tracking went away and why the
+scanner got so much cheaper. It also explains a detail that looks odd from outside: the frontend's
+`Repository.id` simply became the document's path, which let every one of the app's Tauri commands
+(39 today) take the new model without a signature change.
+
+See also: [`per-document-tracking.md`](../per-document-tracking.md) for the mechanics of the
+shipped model (`store_dir_for`, the container layout, the three failure states), and
+[`version-map.md`](../version-map.md) for how the Version Map works today.
