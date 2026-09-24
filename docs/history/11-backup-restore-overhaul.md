@@ -1,22 +1,31 @@
-# Backup & restore overhaul
+# Backup and restore overhaul
 
-**Timeframe:** 2026-08-28 – 2026-08-29 · **Commits:** `2d3d59e` … `af73620`
+Dates: 2026-08-28 to 2026-08-29. Commits: `655b992` to `af73620`.
 
-Overlapping with the [Bento redesign](09-the-bento-redesign.md) and following straight on from the
-[per-document rewrite](10-version-map-and-the-per-document-rewrite.md), the application tour first
-gets Version Map steps with per-step gating on shell state (`2d3d59e`). A fresh install has no
-commits and no second branch, so tour steps needed a way to skip themselves when their target
-doesn't exist yet. A diff-panel/storage-report/`RETAIN_BUDGET` performance-bug fix follows
-(`655b992`).
+This era overlaps the [Bento redesign](09-the-bento-redesign.md) and follows straight on from the
+[per-document rewrite](10-version-map-and-the-per-document-rewrite.md). It opens with two smaller
+fixes.
 
-Then backup and restore are rebuilt for the new per-document world (`af73620` "Add multi-artwork
-backup, restore, and a restore version compare"): where the old model backed up one folder-wide
-repository at a time, the new one can only make sense of backup as "several independently-stored
-artworks," so this commit adds a multi-select backup that writes every chosen artwork's `.kra` +
-`.kvc/<slug>/` into a single archive, a restore flow that resolves each artwork back to its
-original folder when possible, and a version-compare view showing whether a backup is ahead of or
-behind what's already on this computer before you're asked to overwrite it. That last piece is what
-makes "replace" a real decision instead of a coin flip.
+`655b992` implements `scan::RETAIN_BUDGET`, the cap on how many bytes a scan keeps in memory for
+the commit that follows it. The docs had described that cap for a while, but it didn't exist. The
+same commit speeds up a lookup in the storage report, removes a duplicated heavy `working_diff`
+call, stops the minimap recomputing its bounds every frame, and adds a `corpus_baseline` benchmark
+that runs against real Krita documents.
 
-**See also:** [`data-integrity.md`](../data-integrity.md) for the current backup/restore mechanics
-(verified backups, the `MANIFEST.json` layout, `import_zip`'s store-root-aware extraction rules).
+`2d3d59e` fixes the first-launch tour for the new default layout. With History and Branches hidden
+behind the Legacy toggle, seven tour steps in a row pointed at elements that weren't on screen, and
+a step with no target made the tour overlay render nothing at all: no card, no Next, no Skip. Steps
+can now depend on what the shell is showing (legacy tabs on or off, whether there are versions,
+another branch, or unsaved changes), and the commit adds tour steps for the Version Map.
+
+Then `af73620` ("Add multi-artwork backup, restore, and a restore version compare") rebuilds backup
+and restore for the per-document model. The old backup zipped one folder-wide repository at a time.
+With every artwork now stored on its own, backup becomes a multi-select that writes each chosen
+artwork's `.kra` and its `.kvc/<slug>/` store into a single archive. Restore puts each artwork back
+in its original folder when that folder still exists. When the destination already holds a tracked
+artwork, a version comparison shows whether the backup is ahead of it or behind it before you
+decide to replace anything. Without that comparison, choosing Replace would be a guess.
+
+See also: [`backup-and-restore.md`](../backup-and-restore.md) for how backup and restore work
+today, including the `MANIFEST.json` layout and why restoring re-derives where history goes on the
+machine you restore to.

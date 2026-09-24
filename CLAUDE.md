@@ -84,7 +84,7 @@ stack (nothing to fold). **Any other conflict** still
 hard-refuses the whole pop with `StashConflict` (prefix `"stash conflict"`, distinct from the
 `"unsaved changes"` one) — a non-`.kra` file or a stashed *deletion* onto edited work. No
 frontend/CLI change: a merged pop returns normally, so the existing "brought back" path applies.
-See [`docs/version-control.md`](docs/version-control.md#stashes--setting-work-aside).
+See [`docs/stashes.md`](docs/stashes.md).
 **Layer-subset staging** (`stage.rs`, `stage::stage_kra`) is how "save only these layers" works:
 the store versions whole documents, so a partial commit **synthesizes** one — the working file
 with every *unticked* top-level layer reverted to its committed form — and stores that. Reached
@@ -170,7 +170,7 @@ rollback take a cheap free-space precheck first (`diskspace.rs`, `needed * 2` to
 this just turns it into a clear error before anything is touched. **Settings** (activity-bar
 gear → `SettingsModal`) is the single home for user prefs, organized into four left-hand category
 tabs (a static list regardless of whether a repository is selected — a tab whose settings need one
-shows a plain "Open a repository…" fallback rather than disappearing, so the tab set never jumps
+shows a plain "Open an artwork to see these settings." fallback rather than disappearing, so the tab set never jumps
 around as you switch repos): **Appearance** (Artist-view toggle, a **custom title bar** toggle
 (`windowChrome.tsx`, default **on** — the window boots with no OS-native chrome; `TopBar` doubles
 as the draggable title bar with its own minimize/maximize/close controls via `@tauri-apps/api/window`,
@@ -293,14 +293,24 @@ On the frontend, three memo dep arrays are deliberately *narrower* than the valu
 `compositeThumb`) — streamed layers reallocate `diff`/`diff.layers` every arrival while the fields
 those memos actually read never change, and depending on the whole object rebuilt multi-MB SVG
 strings per layer. Don't "fix" them back to exhaustive deps. See
-[`docs/performance.md`](docs/performance.md).
+[`docs/cpu-headroom.md`](docs/cpu-headroom.md) and [`docs/performance.md`](docs/performance.md).
 
-Deeper docs live in [`docs/`](docs/README.md): frontend architecture, file tracking & version
-control (the backend), the visual diff viewer, [performance](docs/performance.md) (why the
-`.kra` diff path is fast: staged/streamed loading, rayon parallelism, CPU headroom, the
-`cache/` raster cache, raster downscaling, and the dev/release build profile), and the
-[performance report](docs/performance-report.md) (the **Performance** tab: client-side operation
-timing + per-version storage-saved-vs-full-copy metrics).
+Deeper docs live in [`docs/`](docs/README.md) (index there): frontend and backend architecture
+(the latter has the full Tauri command and `kvc` CLI reference), file tracking & version control,
+per-document tracking, one page per feature ([layer staging](docs/layer-staging.md),
+[stashes](docs/stashes.md), [backup & restore](docs/backup-and-restore.md), the
+[Version Map](docs/version-map.md), the [visual diff viewer](docs/visual-diff-viewer.md), the
+[welcome & tour](docs/onboarding-and-tour.md)), [data integrity](docs/data-integrity.md),
+[performance](docs/performance.md) (why the `.kra` diff path is fast: staged/streamed loading, rayon
+parallelism, the `cache/` raster cache, raster downscaling, and the dev/release build profile),
+[CPU headroom](docs/cpu-headroom.md), the [performance report](docs/performance-report.md) (the
+**Performance** tab: client-side operation timing + per-version storage-saved-vs-full-copy metrics),
+and the [project history](docs/history/README.md) (one era per file, plus a release-tag table).
+Site copy for the marketing site (`kvc-site`) lives in `content/` (`SITE_CONTENT.md`,
+`SITE_CONTENT_GETTING_STARTED.md`, `KRITA_PLUGIN.md`) alongside `RELEASE_NOTES.md` (the source of
+the GitHub release bodies) and `PERFORMANCE_AUDIT.md`; keep it in step with the app when behavior
+changes. `content/` is **gitignored** (moved out of git in `af689cd`), so it has no history and no
+backup, and tracked docs must not link into it (GitHub would 404). The project is GPL-3.0 (`LICENSE`, since `e2cfae9`).
 
 ## Conventions
 
@@ -343,12 +353,12 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 - **Frontend** (`src/`): standard Vite + React 19 + TypeScript app. Entry point `src/main.tsx` mounts `App.tsx` into `index.html`. Built output goes to `dist/`, which `src-tauri/tauri.conf.json` (`build.frontendDist`) points at for packaged builds.
 - **Backend** (`src-tauri/`): Rust crate `krita_vc_lib`. `src-tauri/src/main.rs` is the binary entry point and just calls `krita_vc_lib::run()` defined in `src-tauri/src/lib.rs`, where the `tauri::Builder` is configured, plugins are registered, and Tauri commands are wired up via `invoke_handler(tauri::generate_handler![...])`.
 - **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Ten subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`, `discard`, `stash`, `stash-pop`, `stash-list`, `check`) taking `--repo <path to a .kra>` plus scalars (the flag name is unchanged — the plugin passes whatever it has, and the engine resolves the store from the document path), each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit — a panic is caught in `main` (`catch_unwind` + a silenced panic hook) and reported as `{"error":...}` JSON too, since the plugin parses stdout/stderr as JSON and a bare Rust backtrace would break it). The optional file-subset flag (`--paths` on `commit`/`discard`/`stash`) is a **JSON array** — the hand-rolled parser is a map, so a repeated flag would overwrite, and paths can contain commas; omitting it means "everything". Every mutating subcommand takes a real OS-level advisory lock (`<store>/kvc.lock`, `File::try_lock` — `LockFileEx`/`flock`, released automatically by the OS when the process's handle closes, even on a crash — tagged via a `kvc.lock.info` sidecar with a present-participle label like `"switching branches"` so a caller blocked by `KvcError::Locked` sees what's holding it and for how long) so it can't race a concurrent desktop-app write — the engine itself has no locking; reads (`status`, `branches`, `stash-list`, `check`) take none, so the plugin's 1.5s poll never contends. `status` carries a `stashes` count so that poll needn't spawn a third process, plus the tracked `document`. The **no-args usage line is load-bearing**: the plugin's "Locate kvc…" picker identifies the binary by its literal `"usage: kvc"` prefix, so widen the command list freely but never change that prefix. `stash-list` reuses `commands::stash_dtos` for its **newest-first** order, which "bring back latest" depends on. Contract tests: `src-tauri/tests/kvc_cli.rs` (spawns the real binary). Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
-- **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, one-tap checkpoint, discard, set-aside/bring-back, save-and-rescan (⟳), and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above. It scopes to the **active document**: `find_doc` replaced the old `find_repo` (which walked up looking for a `.kvc/` directory) and `is_tracked_document` replaced `in_repo` (a folder-prefix test that would have said yes to a *neighbouring* artwork — a different history entirely). Deliberately does not do tracking setup, history browsing/restore, undo, branch merge/delete, or anything remote — those stay desktop-app-only. The engine only sees the disk, Krita's canvas only memory, so the docker moves both ways and **both directions are load-bearing**:
+- **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, discard, set-aside/bring-back, save-and-rescan (⟳), and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above (the old one-tap "⚡ Checkpoint" button was removed in `af689cd`). It scopes to the **active document**: `find_doc` replaced the old `find_repo` (which walked up looking for a `.kvc/` directory) and `is_tracked_document` replaced `in_repo` (a folder-prefix test that would have said yes to a *neighbouring* artwork — a different history entirely). Known gap: `find_doc` still requires a `.kvc/` folder beside the document, which a custom store root never creates, so the docker reports such an artwork as untracked; the fix is to ask `kvc` instead. Every installer ships `kvc` beside the app (`kvc.exe`, `/usr/bin/kvc`, `Contents/MacOS/kvc`), and `get_binary_path` auto-finds it on `PATH` and at `%LOCALAPPDATA%\krita-vc\kvc.exe` or `%PROGRAMFILES%\krita-vc\kvc.exe`; the release's `kritavc-plugin.zip` holds only the plugin. Deliberately does not do tracking setup, history browsing/restore, undo, branch merge/delete, or anything remote — those stay desktop-app-only. The engine only sees the disk, Krita's canvas only memory, so the docker moves both ways and **both directions are load-bearing**:
   - **memory → disk** (`_save_tracked`, the tracked `.kra` when modified — `.kra` only, since Krita may raise an export dialog on a `.png` and hang the UI thread it's saving on). Driven by focus entering the docker (`QApplication.focusChanged` — not an event filter; focus lands on child widgets and `FocusIn` won't reach the dock), the ⟳ button, and `_commit_with_message`. Two traps: commit **must `refresh()` between the save and `_selected_paths()`** or it skips the very work just written (a doc clean *before* the save isn't in `_shown_paths`/`checked`); and `_save_tracked` sets `busy` because `doc.save()` spins the event loop, which would let the 1.5s poll `kvc status` a half-written `.kra`.
   - **disk → memory** (`_rebuild_docs`, wrapping switch/discard/stash/pop). Refuses while any open doc is unsaved, then **closes and reopens** each doc whose file changed (mtime/size snapshot — `switch` doesn't report what it rewrote). Drop the reopen and Krita keeps serving the pre-op copy, so the next Ctrl+S silently reverts the operation; drop the refusal and that reopen eats real work — the engine's dirty-tree guard never sees Krita's memory.
 
   Consequence to preserve: auto-save makes that refusal rare, so **Discard's confirm is the only thing standing between the artist and losing saved-but-uncommitted work** — saving isn't committing, and the reopen takes the undo history too. Also: checkbox state lives in `VcDocker.checked`, **not** the widget (the poll rebuilds the list and would wipe a tick mid-edit; the rebuild is skipped when the path list is unchanged). `kvc_client.py` blocks the UI thread by design (see its header). See [`krita-plugin/README.md`](krita-plugin/README.md).
-- **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (e.g. `greet` in `lib.rs`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `lib.rs` (or a module it includes) and registered in `generate_handler!`.
+- **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (all 39 live in `commands.rs`, e.g. `list_commits`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `commands.rs` and registered in `lib.rs`'s `generate_handler!`. The full list is in [`docs/backend-architecture.md`](docs/backend-architecture.md#tauri-command-reference).
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `dialog:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.
 - **App identity/config**: window size, app identifier (`com.zeru-sakamoto.krita-vc`), and bundle/icon settings live in `src-tauri/tauri.conf.json`.
@@ -374,7 +384,6 @@ because timing is per-machine and belongs with the browser, not the repo).
 - **Shell** (`src/components/shell/`): `AppShell.tsx` splits on the selected repository — a
   welcome state when none is selected (fresh install), else `RepoShell` owns layout + view state
   and wires a top bar plus four zones — `TopBar` (repository switcher) above `ActivityBar`
-  (changes/history/branches/performance, plus a gear opening `SettingsModal`) | `Sidebar` (resizable, content switches on the active view) |
   (changes/history/branches/performance, plus a gear opening `SettingsModal`) | `Sidebar` (resizable, content switches on the active view) |
   `MainPanel` (diff) | `Inspector` (commit metadata) — plus `StatusBar`. `BusyOverlay.tsx` is a
   full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
@@ -480,7 +489,7 @@ because timing is per-machine and belongs with the browser, not the repo).
   area-average box filter — `raster::box_downscale`, premultiplied-alpha; sharper than the old
   nearest-neighbour under the viewer's zoom). Capped PNGs are cached content-addressed in
   `cache/` (keys carry a `box1` filter-version token), so repeat views skip rasterization.
-  The viewer has **shared zoom/pan** (`useZoomPan`, wheel-to-cursor zoom + space/middle-mouse pan)
+  The viewer has **shared zoom/pan** (`useZoomPan`, wheel-to-cursor zoom + left-drag/middle-mouse pan)
   applied identically to both side-by-side panes and the swipe slider so before/after and the
   slider divider stay pixel-aligned; zoom/pan and the slider drag are rAF-coalesced (one state
   flush per frame), the canvases and `LayerStackPanel`'s per-layer rows are `React.memo`'d with
@@ -736,7 +745,7 @@ because timing is per-machine and belongs with the browser, not the repo).
   `html[data-theme]` block (plus a preview-only Charcoal copy, since `@theme` can't be
   re-scoped) — only identity tokens follow, so the mock avoids `:root`-derived shadows/overlays.
   Replay: Settings → Appearance. See
-  [`docs/frontend-architecture.md`](docs/frontend-architecture.md#first-launch-interview).
+  [`docs/onboarding-and-tour.md`](docs/onboarding-and-tour.md#first-launch-welcome).
 - **Application tour** — a first-launch, one-time spotlight walkthrough of the shell
   (`src/lib/tour.tsx` `TourProvider`/`useTour`, `src/components/shell/TourOverlay.tsx`), fired via
   `beginIfFirstTime()` (called once from `RepoShell` on mount) and gated on a `localStorage` flag
@@ -771,7 +780,7 @@ because timing is per-machine and belongs with the browser, not the repo).
   can't push it off screen. `VersionMap` also drops any open drilldown while the tour is active,
   since that unmounts the canvas and every map target on it. Replay anytime via Settings →
   Appearance → "Replay tour" (`restart()`). See
-  [`docs/frontend-architecture.md`](docs/frontend-architecture.md#application-tour).
+  [`docs/onboarding-and-tour.md`](docs/onboarding-and-tour.md#application-tour).
 
 All data flows through Tauri `invoke` keyed by the selected repository path; the component/prop
 boundaries (`Repository`, `DiffEntry`, `Commit` — incl. `parents` lineage — `Branch` incl. `tip`,

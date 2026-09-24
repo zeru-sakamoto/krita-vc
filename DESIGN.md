@@ -21,7 +21,8 @@ screen that drifts from this file is the bug, not the exception.
   Amend this file first if a screen genuinely needs something different — never override locally.
   A value outside a closed set is a bug, not a judgment call.
 - **Still open:** the interiors of the individual panels (changed-layer list, version map nodes,
-  history graph, diff viewer, layer stack, palette diff, performance tab, dialog bodies), plus
+  history graph, diff viewer, layer stack, palette diff, performance tab, dialog bodies), the
+  first-launch welcome (`OnboardingOverlay`, shipped in v2.1.0 without a spec here), plus
   Spacing and Motion if a screen turns up a real need.
 
 ---
