@@ -190,6 +190,10 @@ export interface ImportResult {
   /** Findings from the post-import integrity check. Non-fatal. */
   problems: string[];
   error: string | null;
+  /** Where the artwork that was already at `path` went — Replace keeps it beside the restore. */
+  replacedArtwork: string | null;
+  /** Where the history that was already tracked there went (cleared by a cleanup after 14 days). */
+  replacedHistory: string | null;
 }
 
 const RepositoryContext = createContext<RepositoryValue | null>(null);
@@ -208,6 +212,16 @@ function basename(path: string): string {
  */
 export function isStoreUnreachableError(e: unknown): boolean {
   return String(e).includes("history isn't reachable");
+}
+
+/**
+ * Every write refuses while the stored history has a hole in it (a damaged line in the log, a
+ * branch tip or earlier version the log doesn't have, an unreadable version index), because
+ * writing would make the loss permanent. The backend message already says to run "Check for
+ * problems"; this lets a dialog offer the button too.
+ */
+export function isDamagedHistoryError(e: unknown): boolean {
+  return String(e).includes("version history is damaged");
 }
 
 function readStoredList(): Repository[] {

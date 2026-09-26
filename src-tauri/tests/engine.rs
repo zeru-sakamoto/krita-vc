@@ -152,6 +152,41 @@ fn delta_roundtrip_and_threshold() {
     );
 }
 
+/// The scrub and cleanup's marking pass rebuild every version of a history through one memo. It
+/// used to keep every version it rebuilt: by the end of a scrub, the whole decompressed history;
+/// for marking, every version of the manifest (975 MB at 200 versions of a 45,000-tile
+/// painting). It now keeps a few patch bases — enough to rebuild each version from the one before.
+#[test]
+fn reconstruct_memo_keeps_only_a_few_patch_bases() {
+    let dir = tempfile::tempdir().unwrap();
+    init_doc(dir.path());
+    let mut r = repo::Repo::open(&tracked_doc(dir.path())).unwrap();
+    // Over the 64 KB patch floor and not compressed-looking, so each version is a bsdiff patch
+    // on the one before — the shape of a manifest's history.
+    let key = "kra:art.kra:manifest";
+    let mut versions = Vec::new();
+    for i in 0..12u32 {
+        let mut body: Vec<u8> = (0..100_000u32).map(|j| (j % 97) as u8).collect();
+        body[i as usize * 10] = 255;
+        versions.push((r.store_stream(key, &body).unwrap(), body));
+    }
+    let patched = r.chains.chain(key).unwrap();
+    assert!(patched.iter().filter(|v| v.base.is_some()).count() >= 10);
+
+    let mut memo = delta::ReconstructMemo::default();
+    for (hash, body) in &versions {
+        assert_eq!(&*r.reconstruct_cached(key, hash, &mut memo).unwrap(), body);
+        assert!(memo.len() <= 4, "the memo grew to {}", memo.len());
+    }
+
+    // A version nothing patches against — every tile — isn't kept at all.
+    let tile = "kra:art.kra:tile:img/layers/layer1:0,0";
+    let h = r.store_stream(tile, b"tile bytes").unwrap();
+    let mut memo = delta::ReconstructMemo::default();
+    r.reconstruct_cached(tile, &h, &mut memo).unwrap();
+    assert_eq!(memo.len(), 0);
+}
+
 // --- every stored version must rebuild, even on bsdiff-hostile binary data -------------
 
 #[test]
@@ -560,6 +595,37 @@ fn scan_status_and_lockfile_ignore() {
         .any(|(p, st)| p == "art.kra" && st == "D"));
 }
 
+/// A crash inside `write_file_atomic` leaves an artwork-sized `.kvctmp` beside the artwork, and the
+/// cleanup only looks inside the store. The scan already stats the document, so it takes out a
+/// leftover old enough that no write can still be using it — and never one that might be.
+#[test]
+fn scan_removes_a_stale_kvctmp_but_not_a_fresh_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let r = seeded_repo(&dir);
+    let leftover = root.join("art.kra.kvctmp");
+
+    std::fs::write(&leftover, b"crash leftover").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&leftover)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+        .unwrap();
+    scan::scan(&r).unwrap();
+    assert!(
+        !leftover.exists(),
+        "a two-hour-old temp is a crash leftover"
+    );
+
+    std::fs::write(&leftover, b"a write in flight").unwrap();
+    scan::scan(&r).unwrap();
+    assert!(
+        leftover.exists(),
+        "a fresh temp may belong to a running write"
+    );
+}
+
 // --- repo lifecycle --------------------------------------------------------------------
 
 #[test]
@@ -844,6 +910,111 @@ fn import_replaces_an_existing_artwork_in_place() {
     assert_eq!(doc_content(&tracked_doc(root)), maindoc(1));
 }
 
+/// Replace keeps both things it replaces. The old history used to go to the Recycle Bin — or, on
+/// a network share or a drive without one, be deleted outright with nothing said — and the old
+/// artwork was overwritten, taking any work saved since its last version. Now each is renamed
+/// aside on the same volume, and the result says where.
+#[test]
+fn import_replace_keeps_what_it_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = seeded_repo(&dir);
+    let root = dir.path();
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    repo::Repo::export_zip_multi(&[tracked_doc(root)], &zip_path).unwrap();
+
+    // A second version since the backup, then saved work that isn't a version yet.
+    std::fs::write(tracked_doc(root), kra_bytes(9)).unwrap();
+    commit::commit_snapshot(&mut r, "c2", "t").unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(10)).unwrap();
+    drop(r);
+
+    let results = import_all(&zip_path, root);
+    assert!(results[0].error.is_none(), "{:?}", results[0]);
+    assert_eq!(
+        doc_content(&tracked_doc(root)),
+        maindoc(1),
+        "the backup is in place"
+    );
+
+    let old_art = results[0]
+        .replaced_artwork
+        .as_deref()
+        .expect("artwork kept");
+    assert_eq!(doc_content(std::path::Path::new(old_art)), maindoc(10));
+    assert!(
+        old_art.ends_with(".kra"),
+        "{old_art} should still open in Krita"
+    );
+    let old_history = results[0]
+        .replaced_history
+        .as_deref()
+        .expect("history kept");
+    let log = std::fs::read_to_string(std::path::Path::new(old_history).join("commits.log"));
+    assert_eq!(
+        log.unwrap().lines().count(),
+        2,
+        "both old versions are there"
+    );
+}
+
+/// The restored history is unpacked beside its final place before anything already there moves,
+/// so an archive that turns out bad fails without touching the artwork or history in its way.
+#[test]
+fn failed_restore_leaves_the_existing_artwork_and_history_alone() {
+    use zip::write::SimpleFileOptions;
+    let dir = tempfile::tempdir().unwrap();
+    seeded_repo(&dir);
+    let root = dir.path();
+    let store = store_of(&tracked_doc(root));
+    let log_before = std::fs::read(store.join("commits.log")).unwrap();
+
+    // A store entry that escapes its folder: refused, but only after the artwork entry read fine.
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("evil.zip");
+    let manifest = serde_json::json!({
+        "version": 2,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "appVersion": "2.0.0",
+        "entries": [{ "dir": "ok", "relpath": "art.kra", "originalDir": "/x",
+                      "branch": "main", "tipCommit": "" }]
+    })
+    .to_string();
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        for (name, data) in [
+            ("MANIFEST.json", manifest.into_bytes()),
+            ("ok/art.kra", kra_bytes(3)),
+            ("ok/.kvc/slug/../../escape.txt", b"nope".to_vec()),
+        ] {
+            zw.start_file(name, SimpleFileOptions::default()).unwrap();
+            zw.write_all(&data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    let results = import_all(&zip_path, root);
+    assert!(results[0].error.is_some(), "{:?}", results[0]);
+    assert_eq!(
+        doc_content(&tracked_doc(root)),
+        maindoc(1),
+        "artwork untouched"
+    );
+    assert_eq!(
+        std::fs::read(store.join("commits.log")).unwrap(),
+        log_before,
+        "history untouched"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(store.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".restoring") || n.contains(".replaced-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 #[test]
 fn backup_skips_the_raster_cache() {
     let dir = tempfile::tempdir().unwrap();
@@ -882,6 +1053,57 @@ fn backup_skips_the_raster_cache() {
             .commits
             .len(),
         1
+    );
+}
+
+/// A backup holds each artwork's store lock while it zips it, like every writer does. The Krita
+/// docker can commit, switch or set work aside through `kvc` during a backup; racing it can pair
+/// the artwork from before that operation with a store from after it. A busy artwork is reported
+/// as failed rather than zipped mid-write, and the others still back up.
+#[test]
+fn backup_takes_each_artworks_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let a = init_doc_named(root, "art.kra");
+    let b = init_doc_named(root, "study.kra");
+    commit::commit_snapshot(&mut repo::Repo::open(&a).unwrap(), "a1", "t").unwrap();
+    commit::commit_snapshot(&mut repo::Repo::open(&b).unwrap(), "b1", "t").unwrap();
+
+    let busy = repo::RepoLock::acquire(&b, "committing").unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    let failed = repo::Repo::export_zip_multi(&[a.clone(), b.clone()], &zip_path).unwrap();
+    drop(busy);
+
+    assert_eq!(failed, vec![b.to_string_lossy().into_owned()]);
+    let manifest = repo::Repo::read_backup_manifest(&zip_path).unwrap();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.entries[0].relpath, "art.kra");
+}
+
+/// The archive is written beside its destination and renamed over it only once verified. The
+/// default name is one per day, so a second backup the same day replaces the first — and a run
+/// that fails partway must leave that first one alone.
+#[test]
+fn failed_backup_leaves_the_previous_one_intact() {
+    let out = tempfile::tempdir().unwrap();
+    let zip_path = out.path().join("backup.zip");
+    std::fs::write(&zip_path, b"this morning's good backup").unwrap();
+
+    // Nothing in this list can be backed up: it was never tracked.
+    let dir = tempfile::tempdir().unwrap();
+    let untracked = dir.path().join("art.kra");
+    std::fs::write(&untracked, kra_bytes(1)).unwrap();
+    assert!(repo::Repo::export_zip_multi(&[untracked], &zip_path).is_err());
+
+    assert_eq!(
+        std::fs::read(&zip_path).unwrap(),
+        b"this morning's good backup"
+    );
+    assert_eq!(
+        std::fs::read_dir(out.path()).unwrap().count(),
+        1,
+        "no partial archive left behind"
     );
 }
 
@@ -2585,6 +2807,93 @@ fn dry_run_cleanup_never_touches_trash() {
     );
 }
 
+/// Replace keeps the history it replaced beside the new store, and every log rewrite keeps a copy
+/// of the old log. Both would otherwise pile up forever; a cleanup ages them out on the trash's
+/// schedule, by the time in their names, and leaves anything newer — or anyone else's — alone.
+#[test]
+fn cleanup_ages_out_replaced_histories_and_old_log_copies() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = seeded_repo(&dir);
+    let store = store_of(&tracked_doc(dir.path()));
+    let slug = store.file_name().unwrap().to_string_lossy().into_owned();
+    let container = store.parent().unwrap().to_path_buf();
+    let replaced = |owner: &str, stamp: &str| container.join(format!("{owner}.replaced-{stamp}"));
+    let log_copy = |stamp: &str| store.join(format!("commits.log.{stamp}.bak"));
+
+    let (old, recent) = ("2020-01-01T00-00-00Z", repo::now_iso_filesafe());
+    for stamp in [old, recent.as_str()] {
+        std::fs::create_dir_all(replaced(&slug, stamp).join("objects")).unwrap();
+        std::fs::write(replaced(&slug, stamp).join("commits.log"), b"old").unwrap();
+        std::fs::write(log_copy(stamp), b"old log").unwrap();
+    }
+    std::fs::create_dir_all(replaced("another-artwork-abc123", old)).unwrap();
+
+    gc::collect_garbage(&mut r, false).unwrap();
+
+    assert!(!replaced(&slug, old).exists() && !log_copy(old).exists());
+    assert!(replaced(&slug, &recent).exists() && log_copy(&recent).exists());
+    assert!(
+        replaced("another-artwork-abc123", old).exists(),
+        "another artwork's store is not this cleanup's to touch"
+    );
+}
+
+/// Rewrite the four-version log keeping only the given 0-based lines.
+fn keep_log_lines(dir: &tempfile::TempDir, keep: &[usize]) {
+    let log = store_of(&tracked_doc(dir.path())).join("commits.log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let kept: String = keep.iter().map(|&i| format!("{}\n", lines[i])).collect();
+    std::fs::write(&log, kept).unwrap();
+}
+
+/// Cleanup roots everything reachable from the branch tips. A tip the log doesn't have used to
+/// root nothing, so every version read as unreachable and the whole store was swept. Refuse
+/// instead — the dry run too, since its numbers are what the confirm dialog shows.
+#[test]
+fn cleanup_refuses_when_a_branch_tip_is_missing_from_the_log() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    four_versions(&dir);
+    // What an interrupted undo used to leave: the log rewritten without its tip.
+    keep_log_lines(&dir, &[0, 1, 2]);
+    let store = store_of(&tracked_doc(dir.path()));
+    let objects = count_objects(&store);
+
+    let mut r = repo::Repo::open(&tracked_doc(dir.path())).unwrap();
+    for dry_run in [true, false] {
+        let err = gc::collect_garbage(&mut r, dry_run).unwrap_err();
+        assert!(is_damaged_history(&err), "{err}");
+    }
+    assert_eq!(count_objects(&store), objects, "nothing was swept");
+    assert_eq!(
+        std::fs::read_to_string(store.join("commits.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+}
+
+/// The same walk stops at a missing *parent*, and everything older is swept. This is the state
+/// after the next commit lands on a dangling tip: the tip is valid again and only its parent is
+/// gone, which a tips-only check can't see.
+#[test]
+fn cleanup_refuses_when_an_earlier_version_is_missing_from_the_log() {
+    use krita_vc_lib::gc;
+    let dir = tempfile::tempdir().unwrap();
+    four_versions(&dir);
+    keep_log_lines(&dir, &[0, 1, 3]);
+    let store = store_of(&tracked_doc(dir.path()));
+    let objects = count_objects(&store);
+
+    let mut r = repo::Repo::open(&tracked_doc(dir.path())).unwrap();
+    let err = gc::collect_garbage(&mut r, false).unwrap_err();
+    assert!(is_damaged_history(&err), "{err}");
+    assert_eq!(count_objects(&store), objects, "nothing was swept");
+}
+
 // --- objects layout: sharded writes, flat legacy reads -----------------------------------
 
 #[test]
@@ -2820,6 +3129,123 @@ fn commits_log_appends_and_migrates_legacy() {
     assert!(!text.contains("torn"));
 }
 
+/// A four-version history, for the tests that damage its log.
+fn four_versions(dir: &tempfile::TempDir) -> repo::Repo {
+    let mut r = seeded_repo(dir);
+    for i in 2..=4 {
+        std::fs::write(tracked_doc(dir.path()), kra_bytes(i)).unwrap();
+        commit::commit_snapshot(&mut r, &format!("c{i}"), "t").unwrap();
+    }
+    r
+}
+
+fn is_damaged_history(e: &KvcError) -> bool {
+    e.to_string().starts_with("version history is damaged")
+}
+
+/// A bad line in the *middle* of `commits.log` is damage in place — a crash only ever tears the
+/// last line. Treating it as a torn tail dropped every version after it, and the next save of any
+/// kind rewrote the log from that shortened list: permanently, and silently, since the rewritten
+/// log then checked clean. Now the store opens with every line that decodes, and writes refuse.
+#[test]
+fn damaged_log_line_refuses_writes_and_keeps_the_rest_of_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    four_versions(&dir);
+    let log = store_of(&tracked_doc(root)).join("commits.log");
+    let mut bytes = std::fs::read(&log).unwrap();
+    let line2 = bytes.iter().position(|&b| b == b'\n').unwrap() + 1;
+    bytes[line2] = b'X';
+    std::fs::write(&log, &bytes).unwrap();
+
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    assert_eq!(r.commits.len(), 3, "lines 1, 3 and 4 still read");
+
+    std::fs::write(tracked_doc(root), kra_bytes(5)).unwrap();
+    let err = commit::commit_snapshot(&mut r, "c5", "t").unwrap_err();
+    assert!(is_damaged_history(&err), "{err}");
+    let err = commit::undo_last_commit(&mut r).unwrap_err();
+    assert!(is_damaged_history(&err), "{err}");
+    assert_eq!(std::fs::read(&log).unwrap(), bytes, "all four records stay");
+}
+
+/// A rewrite of `commits.log` (undo, cleanup, a torn-tail repair) is the one write that can drop
+/// records, so it first keeps a copy of the log it replaces.
+#[test]
+fn log_rewrite_keeps_a_copy_of_the_log_it_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = four_versions(&dir);
+    let store = store_of(&tracked_doc(dir.path()));
+    let before = std::fs::read(store.join("commits.log")).unwrap();
+
+    commit::undo_last_commit(&mut r).unwrap();
+
+    let copies: Vec<_> = std::fs::read_dir(&store)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("commits.log.") && name.ends_with(".bak")
+        })
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(std::fs::read(&copies[0]).unwrap(), before);
+}
+
+/// A log can decode cleanly and still be missing a version that a later one builds on — the state
+/// a damaged line or an interrupted undo leaves once the next commit lands on top. The check
+/// names it instead of calling the history intact.
+#[test]
+fn check_reports_a_version_whose_parent_is_missing() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    four_versions(&dir);
+    let log = store_of(&tracked_doc(dir.path())).join("commits.log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    std::fs::write(&log, format!("{}\n{}\n{}\n", lines[0], lines[2], lines[3])).unwrap();
+
+    let report = check::check_repository(
+        &mut repo::Repo::open(&tracked_doc(dir.path())).unwrap(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        report.problems.iter().any(|p| p.kind == "missingParent"),
+        "{:?}",
+        report.problems
+    );
+}
+
+/// Undo *removes* the tip commit, so its save moves the branch tip before rewriting the log — the
+/// reverse of a commit, which only adds. In the old order, a crash between the two writes left
+/// `branches.json` naming a version the log no longer had: the map went empty, the next commit
+/// orphaned everything before it, and the next cleanup swept it. A directory where
+/// `branches.json`'s temp file goes fails exactly that second write.
+#[test]
+fn interrupted_undo_never_leaves_a_dangling_tip() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = four_versions(&dir);
+    let store = store_of(&tracked_doc(dir.path()));
+    std::fs::create_dir(store.join("branches.tmp")).unwrap();
+
+    assert!(commit::undo_last_commit(&mut r).is_err());
+    std::fs::remove_dir(store.join("branches.tmp")).unwrap();
+
+    let report = check::check_repository(
+        &mut repo::Repo::open(&tracked_doc(dir.path())).unwrap(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        !report.problems.iter().any(|p| p.kind == "danglingTip"),
+        "{:?}",
+        report.problems
+    );
+}
+
 // --- undo rewinds the index from the recorded file hash (no reconstruct-to-hash) ---------
 
 #[test]
@@ -2880,15 +3306,19 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
         f.set_modified(base + std::time::Duration::from_secs(i as u64 * 60))
             .unwrap();
     }
-    // One stale .tmp (crash leftover, >1h old) and one fresh .tmp (in-flight, must survive).
+    // Stale .tmp files (crash leftovers, >1h old) — one beside the state files, one from a cache
+    // write — and one fresh .tmp (in-flight, must survive).
     let stale = store_of(&tracked_doc(root)).join("config.tmp");
-    std::fs::write(&stale, [0u8; 40]).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&stale)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
-        .unwrap();
+    let stale_cache = cache.join("entry.png.1.tmp");
+    for (path, len) in [(&stale, 40), (&stale_cache, 10)] {
+        std::fs::write(path, vec![0u8; len]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .unwrap();
+    }
     // (In the pack dir with a name no real atomic write uses — GC's own `repo.save()`
     // legitimately creates and renames `.kvc/*.tmp` names mid-run.)
     let fresh = store_of(&tracked_doc(root)).join("objects/pack/inflight.tmp");
@@ -2901,7 +3331,7 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
         dry.cache_bytes_reclaimed, 200,
         "500 bytes cached, 300 budget"
     );
-    assert_eq!(dry.bytes_reclaimed, 40, "the stale tmp file");
+    assert_eq!(dry.bytes_reclaimed, 50, "the stale tmp files");
     assert!(cache.join("entry0.png").exists() && stale.exists());
 
     // Real run: prunes oldest-first to budget, writes the filter marker, sweeps only the
@@ -2915,6 +3345,7 @@ fn gc_prunes_cache_and_sweeps_stale_tmp() {
         raster::FILTER_VERSION
     );
     assert!(!stale.exists(), "stale tmp swept");
+    assert!(!stale_cache.exists(), "stale cache tmp swept");
     assert!(fresh.exists(), "fresh tmp untouched");
 
     // Stale filter marker: the whole cache is wiped regardless of budget.
@@ -2996,6 +3427,26 @@ fn gc_consolidates_small_packs() {
     assert!(packs(root) >= 8);
     gc::collect_garbage(&mut r, false).unwrap();
     assert_eq!(packs(root), 1, "small live packs merged into one");
+    // The packs it replaced go to trash like every other sweep, not straight to deletion: the
+    // merged pack's only other safety net is its fsync.
+    fn packs_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            packs_under(&p)
+                        } else {
+                            usize::from(p.extension().is_some_and(|x| x == "pack"))
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    let trashed = packs_under(&store_of(&tracked_doc(root)).join("trash"));
+    assert!(trashed >= 8, "only {trashed} replaced packs reached trash");
 
     // Every version still reconstructs from the consolidated pack — this session and reopened.
     for repo_ref in [&r, &repo::Repo::open(&tracked_doc(root)).unwrap()] {
@@ -3085,6 +3536,53 @@ fn chains_read_legacy_shards_and_rewrite_as_kvcc2() {
     std::fs::write(&bad, b"not a shard").unwrap();
     let r3 = repo::Repo::open(&tracked_doc(root)).unwrap();
     assert!(r3.chains.chain("file:whatever").is_none());
+}
+
+/// A shard that exists but won't decode reads as empty so the store still opens — but the next
+/// save used to write that empty shard over it, destroying the chain records of every version
+/// before it. With one document per store that's the one shard holding all of them. The save
+/// refuses instead and moves the damaged file aside for a repair; the retry then goes ahead on a
+/// fresh shard, and the check keeps naming what was set aside.
+#[test]
+fn unreadable_chain_shard_is_set_aside_not_overwritten() {
+    use krita_vc_lib::check;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    four_versions(&dir);
+    let chains = store_of(&tracked_doc(root)).join("chains");
+    let shards: Vec<_> = std::fs::read_dir(&chains)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(shards.len(), 1, "one document, one shard");
+    std::fs::write(&shards[0], b"bit rot").unwrap();
+
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    std::fs::write(tracked_doc(root), kra_bytes(5)).unwrap();
+    let err = commit::commit_snapshot(&mut r, "c5", "t").unwrap_err();
+    assert!(is_damaged_history(&err), "{err}");
+
+    let aside: Vec<_> = std::fs::read_dir(&chains)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::read(&aside[0]).unwrap(), b"bit rot");
+    let log = store_of(&tracked_doc(root)).join("commits.log");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 4);
+
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    commit::commit_snapshot(&mut r, "c5", "t").unwrap();
+    let report =
+        check::check_repository(&mut repo::Repo::open(&tracked_doc(root)).unwrap(), false).unwrap();
+    assert!(
+        report.problems.iter().any(|p| p.kind == "badChains"),
+        "{:?}",
+        report.problems
+    );
 }
 
 // --- composite tiling: mergedimage.png stored as deduped pixel blocks ---------------------
@@ -3918,6 +4416,43 @@ fn working_tree_writes_are_atomic() {
         !root.join("blocked.kra.kvctmp").exists(),
         "temp must be cleaned up"
     );
+}
+
+/// OneDrive, Dropbox and antivirus scanners hold a file open for a moment all the time, and art
+/// folders inside synced folders are common. A rename that finds the artwork held open is
+/// retried for about a second instead of failing the switch, rollback or discard outright.
+#[test]
+#[cfg(windows)]
+fn working_tree_write_waits_out_a_brief_lock() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("art.kra");
+    std::fs::write(&target, b"original").unwrap();
+
+    // Sharing nothing is what a sync client or scanner holding the file looks like.
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&target)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(holder);
+    });
+    let result = repo::write_file_atomic(&target, b"replaced");
+    release.join().unwrap();
+    result.unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"replaced");
+}
+
+/// An I/O error names the file it happened to. A bare "The process cannot access the file because
+/// it is being used by another process. (os error 32)" gives the artist nothing to act on.
+#[test]
+fn io_errors_name_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("no-such-folder").join("art.kra");
+    let err = repo::write_file_atomic(&target, b"x").unwrap_err();
+    assert!(err.to_string().contains("no-such-folder"), "{err}");
 }
 
 /// A damaged object in the store must never be written into the working tree. The restore paths

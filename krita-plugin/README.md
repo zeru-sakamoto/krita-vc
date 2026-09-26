@@ -174,7 +174,10 @@ the plugin folder.
   by mtime and size, since `switch` doesn't report what it rewrote), and checks again after reopening
   that the file didn't change during the reopen. Without the reopen, the next Ctrl+S would silently
   revert the operation; without the refusal, the reopen would destroy work the engine's dirty-tree
-  guard can't see.
+  guard can't see. The reopen runs even when the operation fails: "Set aside & switch" is two `kvc`
+  calls, and if the switch fails after the set-aside reverted the file, skipping the reopen would
+  let the next Ctrl+S write the set-aside work back over it. `test_kvc_client.py` pins this against
+  stub Qt modules.
 - The tick state lives in `VcDocker.checked`, not in the list widget, because the poll rebuilds the
   list and would wipe a tick mid-edit; the rebuild is skipped when the list of paths hasn't changed.
 - The author name is a plugin-local Krita setting (Krita has no login shared with the desktop app). It

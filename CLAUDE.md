@@ -141,22 +141,46 @@ storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powe
 modal in the **Settings modal**) reclaims history unreachable from any branch tip **or stash**
 (stashes are GC roots — nothing in `commits.log` references them) **and** prunes the raster
 cache (reported separately as `cacheBytesReclaimed`), sweeps stale `*.tmp` files, gates pack
-rewrites on >25% dead, and consolidates small packs; the raster cache (`cache/`) is
-size-budgeted (`Config.cacheMaxBytes`, default 256 MB) with LRU pruning. **Data integrity**: every
-working-tree write (switch/rollback/discard/stash-pop/restore-file) and every loose-object write
-goes temp-then-rename — `repo::write_file_atomic` appends a `.kvctmp` suffix rather than
-substituting the extension (`with_extension` would collapse `a.kra` and `a.gpl` onto one temp path)
-— and state-file writes plus the `commits.log` append are **fsynced** before the rename, without
-which "tips go last" isn't an ordering under power loss; object/pack payloads deliberately are not
-(commit hot path). The same restore paths set `Repo::verify_reads`, which makes `reconstruct`
+rewrites on >25% dead, and consolidates small packs (the packs it merges are quarantined like any
+other victim); the raster cache (`cache/`) is size-budgeted (`Config.cacheMaxBytes`, default
+256 MB) with LRU pruning. The same cleanup ages out, after 14 days, the history a restore replaced
+(`<store>.replaced-<time>/`) and old commit-log copies (`commits.log.<time>.bak`) — by the stamp in
+the name, since a renamed folder keeps its contents' mtime (`gc::prune_aged`). **Data integrity**:
+every working-tree write (switch/rollback/discard/stash-pop/restore-file), every loose-object and
+pack write, and every raster-cache write goes temp-then-rename — `repo::write_file_atomic` appends
+a `.kvctmp` suffix rather than substituting the extension (`with_extension` would collapse `a.kra`
+and `a.gpl` onto one temp path), and the scan deletes an hour-old `.kvctmp` beside the artwork —
+and the renames go through `repo::rename_retrying`, which waits out a Windows sharing violation
+(OneDrive, antivirus) for about a second. State files, the `commits.log` append **and object/pack
+payloads** are **fsynced** before the rename: an fsync makes only its own file durable, so without
+it the fsynced chain shard/log line could survive a power cut that the object they name did not.
+The same restore paths set `Repo::verify_reads`, which makes `reconstruct`
 re-hash every object it rebuilds and refuse with `KvcError::Corrupt` — deliberately **off** for
-diffs/previews, the hot loop, and a test pins both halves. A read-only `check_repository`
+diffs/previews, the hot loop, and a test pins both halves. **History holes are refused, not
+papered over** (each with a reproduction test in `tests/engine.rs`): `repo::parse_commit_log`
+treats only an undecodable *last* line as a torn append; a bad line with good ones after it is
+damage in place, so the store opens with every line that decodes and **every write refuses** with
+`KvcError::DamagedHistory` (prefix `"version history is damaged"`, matched by `isDamagedHistoryError`
+in `repository.tsx`) — `Repo::ensure_writable` at the top of each op that rewrites the artwork
+before saving, and again in every `save`/`save_branches`/`save_stashes`. `gc::mark_live` refuses the
+same way when the walk from a tip reaches a commit the log doesn't have (tip or parent), because
+everything behind that gap would be swept. `Repo::save` writes `branches.json` **before** the log
+when the log is *truncated* (undo: the tip must leave the undone commit before the log drops it;
+`commits_truncated`), after it when appending. Every log rewrite first copies the old log to
+`commits.log.<time>.bak`. A chain shard that exists but won't decode is noted as it loads and
+`save` refuses before writing, renaming it to `<name>.bin.corrupt-<time>` (the retry then starts a
+fresh shard) rather than write the empty shard it read as over it. `IoAt` carries the path on
+every I/O error through `io_at`. A read-only `check_repository`
 (`check.rs`, reusing the extracted `gc::mark_live`; also `kvc check` and Settings → Storage →
-"Check for problems…") reports missing objects, broken chains, dangling tips, undecodable
-commit-log lines and unreadable packs; findings come back as a *successful* run, since
+"Check for problems…") reports missing objects, broken chains, dangling tips, versions whose
+parent is missing (`missingParent`), undecodable commit-log lines, undecodable or set-aside chain
+shards (`badChains`) and unreadable packs; findings come back as a *successful* run, since
 `{"error":…}` means the check itself failed. An opt-in **scrub** (`check_repository(scrub)`,
 `kvc check --scrub true`) additionally re-hashes every live version's content by reusing
 `Repo::reconstruct_cached` + `verify_reads` — IO over the whole store, so it is never automatic.
+`reconstruct_cached`'s memo (`delta::ReconstructMemo`) keeps only the last four **patch bases** as
+`Arc`s — it used to keep every version it rebuilt, so a scrub held the whole decompressed history
+and marking held every manifest — and the scrub walks each stream in chain order to keep hitting it.
 The `CheckModal` runs it over a **scope**, not just the open artwork: this one, every added one,
 or only ones **never checked before** (`lib/checkedRepos.ts`, a `localStorage` set stamped by
 `repository.tsx` after each run). A multi-repo pass can be cancelled *between* repos — nothing in
@@ -164,10 +188,11 @@ the codebase can abort a check mid-flight, so the one in flight always finishes.
 [`docs/data-integrity.md`](docs/data-integrity.md). Destructive operations (undo, discard,
 cleanup, branch delete) additionally append to **`ops.log`** (`ops_log.rs`) — same JSON-lines
 append + `sync_all` shape as `commits.log`, size-capped at 2 MB, truncate-oldest. Nothing reads
-it; it exists so "my work disappeared" has a sequence to reconstruct from. And commit / switch /
-rollback take a cheap free-space precheck first (`diskspace.rs`, `needed * 2` to cover
-`write_file_atomic`'s brief doubling) — atomic writes already made running out of disk *safe*,
-this just turns it into a clear error before anything is touched. **Settings** (activity-bar
+it; it exists so "my work disappeared" has a sequence to reconstruct from. And switch / rollback
+take a cheap free-space precheck on the **artwork's** drive for the files they rewrite, and a commit
+on the **store's** drive for its new objects once they're prepared (`commit_prepared_batch`) — no
+doubling (`diskspace.rs`): atomic writes already made running out of disk *safe*, this just turns
+it into a clear error, and over-asking refused versions exactly when space ran low. **Settings** (activity-bar
 gear → `SettingsModal`) is the single home for user prefs, organized into four left-hand category
 tabs (a static list regardless of whether a repository is selected — a tab whose settings need one
 shows a plain "Open an artwork to see these settings." fallback rather than disappearing, so the tab set never jumps
@@ -198,7 +223,10 @@ the safer default for a safety feature) that writes **one** archive via `backupR
 `<dir>/` per artwork holding `<name>.kra` + `.kvc/<slug>/`, i.e. N copies of the single-document
 on-disk shape, so plain extraction still yields tracked documents. `skip_in_backup` drops
 `cache/` (regenerable, budgeted 256 MB *per store* — the largest disposable chunk), `trash/`,
-`kvc.lock*` and `*.tmp`. This **replaced** the old one-zip-per-artwork "back up all"
+`kvc.lock*` and `*.tmp`. Each artwork is zipped **under its `RepoLock`** ("backing up") — the
+Krita docker's `kvc` can write mid-backup, and a busy artwork lands in the failed list — and the
+archive is written as `<dest>.partial`, renamed over `dest` only once verified, so a failed run
+never destroys the same-day backup it would replace. This **replaced** the old one-zip-per-artwork "back up all"
 (`export_repository_zip`, `backupAllRepositories`, `BackupAllResultModal` are gone).
 Restore is **"Restore from a backup…"** in the `TopBar` switcher modal (`SwitchArtworkModal`, and
 pointed at from the welcome screen — where a reinstall lands you), opening `RestoreModal.tsx`: `plan_restore`
@@ -207,7 +235,7 @@ of one you pick, and flags an occupied destination so that row defaults to **Ski
 the only alternative — see below). A row occupied by an **already-tracked** artwork also offers
 **"Compare versions"** (`RestoreCompareModal.tsx` → `compare_restore_versions` →
 `Repo::backup_versions` + `open_light`), which is the only thing that makes Replace a decision
-rather than a coin flip: Replace deletes the on-disk history, and nothing else in the UI says
+rather than a coin flip: Replace swaps out the on-disk history, and nothing else in the UI says
 whether the backup is ahead of it or behind. Two text-only columns — `Version N`, message, age,
 newest first, each side numbered positionally within itself the way `friendly.ts`'s
 `versionNumbers` does (so the columns line up only when one history is a superset, which is the
@@ -231,9 +259,16 @@ and it redirects the app-data dir so the suite never touches the developer's rea
 Import **never renames**: the filename is baked into `doc.json`, `index.json` keys, chain shard
 filenames, `Commit.files[].path` and every `kra:{relpath}:…` stream key, so a clash is
 Replace-or-skip. Extraction is guarded by `safe_join` (zip-slip) and `read_entry_capped`
-(decompression bomb), Replace sends the old store to the Recycle Bin via `Repo::delete`, and every
-restored store is gated on `check::check_repository` before `addRepositoryPath` puts it back in
-the list. **Branching is real**:
+(decompression bomb), and every restored store is gated on `check::check_repository` before
+`addRepositoryPath` puts it back in the list. **Replace keeps what it replaces, and a failed restore
+changes nothing** (`import_one`): the incoming store is unpacked into `<store>.restoring` first, then
+the current store and artwork are *renamed* aside (`<store>.replaced-<time>`,
+`<name>.replaced-<time>.kra` — same volume, so it can't silently become a delete the way the old
+Recycle Bin move did on network shares), each step undoing the earlier ones on failure;
+`ImportResult.replacedArtwork`/`replacedHistory` say where they went. Tracking and restoring both
+refuse a configured store root that's missing (`refuse_missing_store_root`, the `locate_failure`
+rule) instead of recreating it empty — pinned by `tests/store_root_missing.rs`, its own binary for
+the same reason as `backup_store_root.rs`. **Branching is real**:
 `branches.json` maps branch name → tip
 commit id (+ the current branch); create is O(1) (an optional base branch materializes that
 branch's tree first, and `branch::create_branch_at` starts one at an **arbitrary commit** —
@@ -318,6 +353,13 @@ Deliberate simplifications/shortcuts (duplicated data that can't be shared acros
 boundary, a narrower fix than the "proper" one, etc.) get a plain comment at the point of the
 shortcut explaining what and why — no `ponytail:`-style tags, not a prose explanation elsewhere.
 
+**Never commit on your own.** An AI agent must ask the user and get explicit approval before every
+`git commit` (and before push, amend, or any other history-writing git command). Approval for one
+commit does not carry over to the next.
+
+Commit messages: a one-sentence summary title, a blank line, then concise one-sentence bullets
+saying what changed. No prose paragraphs.
+
 ## Commands
 
 Package manager is npm (`package-lock.json` is present).
@@ -333,7 +375,9 @@ Package manager is npm (`package-lock.json` is present).
 
 Rust side (run from `src-tauri/`):
 - `cargo check` / `cargo build` — compile the Rust backend without going through the Tauri CLI
-- `cargo test` — run the Rust tests (engine integration tests in `src-tauri/tests/`)
+- `cargo test` — run the Rust tests (engine integration tests in `src-tauri/tests/`). The release
+  workflow's `test` job runs these, `tsc --noEmit`, `checkVersionMap.mjs` and the plugin self-check
+  before any build; it `vite build`s first because the app binary embeds `dist/` at compile time
 - `cargo test --release --test bench -- --ignored --nocapture` — performance baseline
   (`tests/bench.rs`, `#[ignore]`d by default): synthesizes a Krita-scale document and times
   commit/switch/rollback/diff against the <10s target
@@ -355,7 +399,7 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 - **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Ten subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`, `discard`, `stash`, `stash-pop`, `stash-list`, `check`) taking `--repo <path to a .kra>` plus scalars (the flag name is unchanged — the plugin passes whatever it has, and the engine resolves the store from the document path), each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit — a panic is caught in `main` (`catch_unwind` + a silenced panic hook) and reported as `{"error":...}` JSON too, since the plugin parses stdout/stderr as JSON and a bare Rust backtrace would break it). The optional file-subset flag (`--paths` on `commit`/`discard`/`stash`) is a **JSON array** — the hand-rolled parser is a map, so a repeated flag would overwrite, and paths can contain commas; omitting it means "everything". Every mutating subcommand takes a real OS-level advisory lock (`<store>/kvc.lock`, `File::try_lock` — `LockFileEx`/`flock`, released automatically by the OS when the process's handle closes, even on a crash — tagged via a `kvc.lock.info` sidecar with a present-participle label like `"switching branches"` so a caller blocked by `KvcError::Locked` sees what's holding it and for how long) so it can't race a concurrent desktop-app write — the engine itself has no locking; reads (`status`, `branches`, `stash-list`, `check`) take none, so the plugin's 1.5s poll never contends. `status` carries a `stashes` count so that poll needn't spawn a third process, plus the tracked `document`. The **no-args usage line is load-bearing**: the plugin's "Locate kvc…" picker identifies the binary by its literal `"usage: kvc"` prefix, so widen the command list freely but never change that prefix. `stash-list` reuses `commands::stash_dtos` for its **newest-first** order, which "bring back latest" depends on. Contract tests: `src-tauri/tests/kvc_cli.rs` (spawns the real binary). Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
 - **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, discard, set-aside/bring-back, save-and-rescan (⟳), and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above (the old one-tap "⚡ Checkpoint" button was removed in `af689cd`). It scopes to the **active document**: `find_doc` replaced the old `find_repo` (which walked up looking for a `.kvc/` directory) and `is_tracked_document` replaced `in_repo` (a folder-prefix test that would have said yes to a *neighbouring* artwork — a different history entirely). Known gap: `find_doc` still requires a `.kvc/` folder beside the document, which a custom store root never creates, so the docker reports such an artwork as untracked; the fix is to ask `kvc` instead. Every installer ships `kvc` beside the app (`kvc.exe`, `/usr/bin/kvc`, `Contents/MacOS/kvc`), and `get_binary_path` auto-finds it on `PATH` and at `%LOCALAPPDATA%\krita-vc\kvc.exe` or `%PROGRAMFILES%\krita-vc\kvc.exe`; the release's `kritavc-plugin.zip` holds only the plugin. Deliberately does not do tracking setup, history browsing/restore, undo, branch merge/delete, or anything remote — those stay desktop-app-only. The engine only sees the disk, Krita's canvas only memory, so the docker moves both ways and **both directions are load-bearing**:
   - **memory → disk** (`_save_tracked`, the tracked `.kra` when modified — `.kra` only, since Krita may raise an export dialog on a `.png` and hang the UI thread it's saving on). Driven by focus entering the docker (`QApplication.focusChanged` — not an event filter; focus lands on child widgets and `FocusIn` won't reach the dock), the ⟳ button, and `_commit_with_message`. Two traps: commit **must `refresh()` between the save and `_selected_paths()`** or it skips the very work just written (a doc clean *before* the save isn't in `_shown_paths`/`checked`); and `_save_tracked` sets `busy` because `doc.save()` spins the event loop, which would let the 1.5s poll `kvc status` a half-written `.kra`.
-  - **disk → memory** (`_rebuild_docs`, wrapping switch/discard/stash/pop). Refuses while any open doc is unsaved, then **closes and reopens** each doc whose file changed (mtime/size snapshot — `switch` doesn't report what it rewrote). Drop the reopen and Krita keeps serving the pre-op copy, so the next Ctrl+S silently reverts the operation; drop the refusal and that reopen eats real work — the engine's dirty-tree guard never sees Krita's memory.
+  - **disk → memory** (`_rebuild_docs`, wrapping switch/discard/stash/pop). Refuses while any open doc is unsaved, then **closes and reopens** each doc whose file changed (mtime/size snapshot — `switch` doesn't report what it rewrote). Drop the reopen and Krita keeps serving the pre-op copy, so the next Ctrl+S silently reverts the operation; drop the refusal and that reopen eats real work — the engine's dirty-tree guard never sees Krita's memory. The reopen sits in a `finally`: a two-step op ("set aside & switch") can fail after its first step rewrote the file, and the error still propagates after the reopen (`test_kvc_client.py` pins it against stub Qt modules).
 
   Consequence to preserve: auto-save makes that refusal rare, so **Discard's confirm is the only thing standing between the artist and losing saved-but-uncommitted work** — saving isn't committing, and the reopen takes the undo history too. Also: checkbox state lives in `VcDocker.checked`, **not** the widget (the poll rebuilds the list and would wipe a tick mid-edit; the rebuild is skipped when the path list is unchanged). `kvc_client.py` blocks the UI thread by design (see its header). See [`krita-plugin/README.md`](krita-plugin/README.md).
 - **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (all 39 live in `commands.rs`, e.g. `list_commits`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `commands.rs` and registered in `lib.rs`'s `generate_handler!`. The full list is in [`docs/backend-architecture.md`](docs/backend-architecture.md#tauri-command-reference).

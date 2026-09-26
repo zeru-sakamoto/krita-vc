@@ -884,9 +884,21 @@ pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Write a capped PNG into the cache (creating the dir for pre-cache repos).
+///
+/// Temp-then-rename: entries are content-addressed and `serve_raster` hands them out as
+/// `immutable`, so one cut short under its final name — a crash, or closing the app while layers
+/// stream — would be trusted, and shown broken, until the cache is pruned. The temp name is unique
+/// per write because two layers with identical pixels share a key and rasterize in parallel. A
+/// crash leftover (`*.tmp`) is swept by the cleanup.
 pub fn cache_write(cache_dir: &std::path::Path, key: &str, png: &[u8]) {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let _ = std::fs::create_dir_all(cache_dir);
-    let _ = std::fs::write(cache_dir.join(format!("{key}.png")), png);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = cache_dir.join(format!("{key}.png.{}-{n}.tmp", std::process::id()));
+    let path = cache_dir.join(format!("{key}.png"));
+    if std::fs::write(&tmp, png).is_err() || crate::repo::rename_retrying(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Best-effort mtime refresh (LRU signal). Failure is fine — the entry just ages normally.
@@ -1193,6 +1205,38 @@ mod tests {
             cache.join("old.png").exists(),
             "a just-read entry must be treated as hot"
         );
+    }
+
+    /// Entries are content-addressed and served `immutable`, so a partly written one would be
+    /// trusted — and shown broken — until the cache is pruned. Writes go through a temp file and
+    /// a rename, so a reader (the `kvcimg` handler, a parallel layer with identical pixels) sees
+    /// the whole entry or none of it, never a truncated one.
+    #[test]
+    fn cache_readers_never_see_a_partial_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().to_path_buf();
+        let png: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+        cache_write(&cache, "k", &png);
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (cache, png, done) = (cache.clone(), png.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..30 {
+                    cache_write(&cache, "k", &png);
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let mut partial = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if cache_read(&cache, "k").is_some_and(|b| b != png) {
+                partial += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(partial, 0, "a reader saw a partly written entry");
+        assert_eq!(cache_read(&cache, "k").unwrap(), png);
     }
 
     #[test]

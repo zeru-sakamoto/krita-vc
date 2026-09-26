@@ -630,17 +630,24 @@ class VcDocker(DockWidget):
 
         self._set_busy(True)
         try:
-            op()
-            # Post-op snapshot, taken once — the same instant _reopen's later re-check compares
-            # against, so a file that changes again mid-reopen (another process, a stray autosave)
-            # is caught instead of silently handing the artist a stale document.
-            after = {path: kvc.stat_key(path) for path in docs}
-            # Reopen inside the busy window: _reopen closes/opens docs, which spins the Qt event
-            # loop; if busy were already cleared, the 1.5s poll and the focus-save handler could
-            # re-enter mid-reopen. (op() raising skips the reopen, as before.)
-            for path, (doc, _) in docs.items():
-                if after[path] != before[path]:
-                    self._reopen(path, doc, after[path])
+            try:
+                op()
+            finally:
+                # Even when op() raised: a two-step op ("set aside & switch") can fail after its
+                # first step already rewrote the file, and skipping the reopen would leave Krita
+                # holding the pre-op document marked unmodified — the next Ctrl+S would write it
+                # back over the reverted file. The exception still propagates afterwards.
+                #
+                # Post-op snapshot, taken once — the same instant _reopen's later re-check
+                # compares against, so a file that changes again mid-reopen (another process, a
+                # stray autosave) is caught instead of silently handing back a stale document.
+                after = {path: kvc.stat_key(path) for path in docs}
+                # Reopen inside the busy window: _reopen closes/opens docs, which spins the Qt
+                # event loop; if busy were already cleared, the 1.5s poll and the focus-save
+                # handler could re-enter mid-reopen.
+                for path, (doc, _) in docs.items():
+                    if after[path] != before[path]:
+                        self._reopen(path, doc, after[path])
         finally:
             self._set_busy(False)
         return True

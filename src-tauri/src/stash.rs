@@ -94,6 +94,8 @@ pub fn create(
 /// can't be done cleanly (different color space, unparseable) surfaces [`KvcError::MergeFailed`]
 /// and likewise leaves both sides untouched.
 pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
+    // The files land before the shelf's save, so a damaged history has to refuse up front.
+    repo.ensure_writable()?;
     let idx = repo
         .stashes
         .stashes

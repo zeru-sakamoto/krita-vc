@@ -52,9 +52,19 @@ A backup that hasn't been checked isn't a backup. `MANIFEST.json` is versioned a
 painting, its folder, document, original directory, branch and tip commit, plus a timestamp and the
 app version. After writing, `export_zip_multi` reopens the archive and checks the entry count and
 that the manifest reads back (`verify_zip`) before it reports success, instead of trusting
-`zw.finish()` alone. The export collects failures per painting rather than aborting the batch, so the
-modal can say "6 of 7 backed up" and name the one that failed. An archive that ended up holding
-nothing is deleted rather than left looking like a backup. Settings → Storage shows "last backed up
+`zw.finish()` alone. The archive is written to `<dest>.partial` and renamed over the destination
+only after that check. The default name is one per day (`krita-backup-<date>.zip`), so a second
+backup the same day replaces the first, and writing straight into it used to destroy the good one
+before a run that then failed. The export collects failures per painting rather than aborting the
+batch, so the modal can say "6 of 7 backed up" and name the one that failed. An archive that would
+hold nothing is an error, never a file on disk looking like a backup.
+
+Each painting is zipped under its store lock (`RepoLock`, "backing up"), like every write. The
+desktop app blocks its own writes during a backup, but the Krita docker can still commit, switch or
+set work aside through `kvc`, and zipping across one of those pairs the painting from one side of
+it with the history from the other, which restores as a painting that doesn't match its own
+history. The docker gets "busy: backing up" instead, and a painting that's busy when the backup
+reaches it is listed as one that couldn't be backed up. Settings → Storage shows "last backed up
 N days ago" (`Repository.lastBackupAt`, kept in the frontend's `localStorage`) so a stale backup
 doesn't go unnoticed. When the export finishes, the modal stays open as "Backup complete", with the
 destination and any paintings that couldn't be backed up.
@@ -74,15 +84,17 @@ painting to a destination: its original folder if that still exists, otherwise a
 folder you pick. Nothing is written yet. The modal states where the history will go, beside the
 painting or under the custom store root from Settings → Storage, because with a store root set,
 that isn't where plain extraction would have put it. A row whose destination is already occupied
-starts unticked. Skip is the safe default there, because Replace overwrites the painting and deletes
-its history.
+starts unticked. Skip is the safe default there, because Replace swaps out the painting and its
+history (both are kept beside the restore, see [below](#where-restored-history-goes), but it should
+still be a choice).
 
 ### Comparing versions before replacing
 
 When the occupant is a painting that's already tracked, its row also offers "Compare versions",
 which opens [`RestoreCompareModal`](../src/components/shell/RestoreCompareModal.tsx). This is what
-makes Replace a decision instead of a coin flip: Replace deletes the history on disk, and nothing
-else in the UI says whether the backup is ahead of it or behind.
+makes Replace a decision instead of a coin flip: Replace swaps out the history on disk (it's kept
+only until a cleanup ages it out), and nothing else in the UI says whether the backup is ahead of it
+or behind.
 
 One `compare_restore_versions` call fills two text columns, the backup on the left and this computer
 on the right, each listing `Version N`, the note and the age, newest first. Versions that exist on
@@ -127,19 +139,36 @@ chain shard filenames, `Commit.files[].path` and every `kra:{relpath}:…` strea
 resolved by folder, or by Replace or Skip, never by renaming.
 
 The rest of the import is guarded. Entry names are joined through `safe_join` (against zip-slip)
-and inflated through `read_entry_capped` (against decompression bombs). Replace sends the old store
-to the Recycle Bin through `Repo::delete`. And every restored store must pass a full
-`check::check_repository` before `addRepositoryPath` puts it back in the list.
+and inflated through `read_entry_capped` (against decompression bombs). A store root that was moved
+or renamed is reported as unreachable rather than recreated. And every restored store must pass a
+full `check::check_repository` before `addRepositoryPath` puts it back in the list.
+
+Replace keeps what it replaces, and a restore that fails changes nothing (`import_one`):
+
+1. The incoming history is unpacked into `<store>.restoring`, beside where it will live, and its
+   `doc.json` checked against the archive. A bad archive fails here, before anything that's already
+   there has moved.
+2. The current history is renamed to `<store>.replaced-<time>` and the current painting to
+   `<name>.replaced-<time>.kra`, which Krita still opens with a double-click. A rename in the same
+   folder can't quietly turn into a permanent delete, which is what the old Recycle Bin move did on
+   network shares and drives without a Recycle Bin, and it keeps the painting's saved-but-unversioned
+   work, which overwriting it used to lose.
+3. The restored history and painting take their places. If any step fails, the earlier ones are put
+   back.
+
+`ImportResult` reports both kept paths (`replacedArtwork`, `replacedHistory`) and the "Restore
+complete" screen shows them. The next "Clean up storage" more than 14 days later removes the old
+history (`gc::prune_aged`); the old painting is the artist's to keep or delete.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `export_repositories_zip(paths, dest)` | Write the given paintings, each `.kra` plus its store, into one archive at `dest`: `MANIFEST.json` and one `<dir>/` per painting holding `<name>.kra` and `.kvc/<slug>/`. Skips `cache/`, `trash/`, lock sidecars and temp files. Reopens and verifies the archive before reporting success, and returns the paintings that failed instead of aborting the batch. |
+| `export_repositories_zip(paths, dest)` | Write the given paintings, each `.kra` plus its store, into one archive at `dest`: `MANIFEST.json` and one `<dir>/` per painting holding `<name>.kra` and `.kvc/<slug>/`. Skips `cache/`, `trash/`, lock sidecars and temp files. Zips each painting under its store lock, writes `<dest>.partial` and renames it over `dest` only after reopening and verifying it, and returns the paintings that failed instead of aborting the batch. |
 | `read_backup_manifest(archive)` | What's inside an archive. Cheap and read-only, so the restore UI can list it before writing anything. |
 | `plan_restore(archive, fallbackDir)` | Where each painting would land (its original folder if it still exists, otherwise a subfolder of `fallbackDir`) and what's already there. A proposal only; nothing is written. |
 | `compare_restore_versions(archive, dir, destPath)` | Both sides of a clash: the versions in one painting of the archive and the versions already tracked at the destination, newest first, each scoped to its own branch tip. Read-only; the archive's `commits.log` is parsed straight out of the zip. |
-| `import_repository_zip(archive, items)` | Restore the chosen paintings. Each history goes where this machine keeps history (`store_dir_for` is recomputed, not copied from the archive). Guarded by `safe_join` and `read_entry_capped`, and each restored store is checked with `check_repository`. |
+| `import_repository_zip(archive, items)` | Restore the chosen paintings. Each history goes where this machine keeps history (`store_dir_for` is recomputed, not copied from the archive). Unpacks beside the destination first, keeps whatever it replaces (`replacedArtwork`, `replacedHistory` in the result), and leaves everything as it was if it fails. Guarded by `safe_join` and `read_entry_capped`, and each restored store is checked with `check_repository`. |
 | `delete_repository(path)` | Delete a painting's store, preferring the Recycle Bin, and remove the container if it's now empty. Never touches the `.kra`. Returns `true` if the Recycle Bin was used. |
 
 ## Tests
@@ -148,7 +177,13 @@ to the Recycle Bin through `Repo::delete`. And every restored store must pass a 
 `import_replaces_an_existing_artwork_in_place`, `backup_skips_the_raster_cache` and
 `import_rejects_zip_slip` cover the round trip of two paintings with their history, a restore with
 no custom root, Replace, the skipped cache, and an archive whose entry names try to escape the
-destination. `verify_zip_rejects_entry_count_mismatch` and `verify_zip_rejects_missing_manifest`
+destination. `import_replace_keeps_what_it_replaces`,
+`failed_restore_leaves_the_existing_artwork_and_history_alone`, `backup_takes_each_artworks_lock`
+and `failed_backup_leaves_the_previous_one_intact` pin the kept copies, the untouched destination
+after a bad archive, the lock, and the `.partial` write; `a_missing_store_root_is_reported_not_recreated`
+(`tests/store_root_missing.rs`, its own binary for the same reason as `backup_store_root.rs`) pins
+the store-root rule for tracking and restoring.
+`verify_zip_rejects_entry_count_mismatch` and `verify_zip_rejects_missing_manifest`
 unit-test the check against hand-built bad archives. See also
 [data-integrity.md](data-integrity.md#6-working-tree-safety) for how backup and restore fit into the
 wider set of integrity measures.

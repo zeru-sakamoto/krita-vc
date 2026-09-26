@@ -32,7 +32,7 @@ pub fn load_manifest_memo(
     repo: &Repo,
     relpath: &str,
     manifest_hash: &str,
-    memo: &mut std::collections::HashMap<String, Vec<u8>>,
+    memo: &mut crate::delta::ReconstructMemo,
 ) -> Result<KraManifest> {
     let mbytes = repo.reconstruct_cached(&manifest_key(relpath), manifest_hash, memo)?;
     serde_json::from_slice(&mbytes).map_err(|e| KvcError::BadIndex(e.to_string()))

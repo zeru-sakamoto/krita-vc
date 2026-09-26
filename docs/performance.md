@@ -154,9 +154,12 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   nearest full snapshot independently, redoing the shared prefix every time, which is quadratic in a
   file's history length. GC threads one content-hash memo (`Repo::reconstruct_cached` through
   `kra::load_manifest_memo`) through the marking loop, so each version is built from its immediate
-  predecessor exactly once: linear patch applications instead of quadratic, which turns marking a
-  long history from seconds into milliseconds. The memo is keyed by a pure content hash, so it dedups
-  safely across paths.
+  predecessor exactly once: linear patch applications instead of quadratic. The memo is keyed by a
+  pure content hash, so it dedups safely across paths. It's bounded (`delta::ReconstructMemo`: the
+  last four patch bases, as `Arc`s): walking oldest first, a version's base is the one just rebuilt,
+  so four keep the walk linear, where the old unbounded map held every manifest version it had built
+  (975 MB at 200 versions of a 45,000-tile painting). Marking such a history still takes seconds
+  (11.4 s measured), because each of those manifests is megabytes of JSON to rebuild and parse.
 - **The crc32 and size skip at commit time.** `commit_kra` compares each zip entry's crc32 and
   uncompressed size (from the central directory, with no inflating) against the previous commit's
   manifest for that path (which `commit_snapshot` passes in). A match reuses the old manifest entry

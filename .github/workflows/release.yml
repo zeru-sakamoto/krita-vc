@@ -1,10 +1,11 @@
 name: Release build
 
 # Manual only: run from the Actions tab (or `gh workflow run release.yml`) when you're ready
-# to cut a release. Builds Windows, macOS (universal), and Linux and opens a draft GitHub
-# Release with all installers attached for review before publishing. Also re-zips the Krita
-# plugin (krita-plugin/kritavc.desktop + krita-plugin/kritavc/) fresh from source and attaches
-# it as kritavc-plugin.zip, so the release always ships the plugin in sync with the app.
+# to cut a release. Runs the test suites (Rust, tsc, the plugin self-check), then builds Windows,
+# macOS (universal), and Linux and opens a draft GitHub Release with all installers attached for
+# review before publishing. Also re-zips the Krita plugin (krita-plugin/kritavc.desktop +
+# krita-plugin/kritavc/) fresh from source and attaches it as kritavc-plugin.zip, so the release
+# always ships the plugin in sync with the app.
 #
 # Signing/notarization is intentionally not configured (no certs in this repo yet) — builds
 # are unsigned, so macOS shows a Gatekeeper prompt and Windows a SmartScreen prompt on first
@@ -18,7 +19,35 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing gets built or drafted unless the suites pass. Windows only: it's where the artists
+  # are and where the engine's platform-specific paths (locking, free space, hidden folders) run.
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: node scripts/checkVersionMap.mjs
+      # The app binary embeds dist/ at compile time (tauri::generate_context!), and cargo test
+      # builds it, so the frontend has to exist first.
+      - run: npx vite build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: python krita-plugin/test_kvc_client.py
+
   build:
+    needs: test
     permissions:
       contents: write
     strategy:

@@ -29,6 +29,8 @@ pub fn commit_selected(
     only: Option<&[String]>,
     layers: Option<&[String]>,
 ) -> Result<Commit> {
+    // `save()` would refuse anyway; refusing here skips storing the whole document first.
+    repo.ensure_writable()?;
     // `keep_bytes`: changed files hand their just-read buffers straight to the commit below
     // (budgeted — see `scan::RETAIN_BUDGET`), so a big .kra isn't read twice per commit.
     let mut changes = scan::scan_detailed(repo, true)?;
@@ -47,8 +49,8 @@ pub fn commit_selected(
         stage_changes(repo, &mut changes, &prev_tree, sel)?;
     }
 
-    let needed: u64 = changes.iter().map(|c| c.size).sum();
-    crate::diskspace::check_available(repo, needed)?;
+    // No free-space precheck here: a commit writes only the objects that changed, often a few
+    // MB of a 1 GB painting, so it's sized where those are known (`commit_prepared_batch`).
 
     let mut files = Vec::new();
     for change in changes {
@@ -415,12 +417,17 @@ pub fn materialize_tree(
     current: &BTreeMap<String, CommittedFile>,
     target: &BTreeMap<String, CommittedFile>,
 ) -> Result<()> {
+    // Before the first file is rewritten: a switch, merge or new branch on a damaged history
+    // would change the artwork and then be refused at the save, leaving the two out of step.
+    repo.ensure_writable()?;
     let needed: u64 = target
         .iter()
         .filter(|(path, f)| current.get(*path).map(|c| &c.content) != Some(&f.content))
         .map(|(_, f)| f.original_size)
         .sum();
-    crate::diskspace::check_available(repo, needed)?;
+    // The artwork's drive, which is where these temp files land — not the store's, which a
+    // custom store root puts somewhere else.
+    crate::diskspace::check_available(&repo.root, needed)?;
     // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
     repo.verify_reads = true;
     for (path, f) in target {
@@ -475,6 +482,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
     if repo.branches.tip() == Some(commit_id) {
         return discard_to_tip(repo, commit_id);
     }
+    repo.ensure_writable()?;
     let target = tree_at_commit(&repo.commits, commit_id)
         .ok_or_else(|| KvcError::NoCommit(commit_id.to_string()))?;
     let current = current_tree(repo);
@@ -483,7 +491,8 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         .filter(|(path, f)| current.get(*path).map(|c| &c.content) != Some(&f.content))
         .map(|(_, f)| f.original_size)
         .sum();
-    crate::diskspace::check_available(repo, needed)?;
+    // The artwork's drive, where the temp copies land (see `materialize_tree`).
+    crate::diskspace::check_available(&repo.root, needed)?;
     // These bytes become the artist's files, so pay for the hash check (see `Repo::verify_reads`).
     repo.verify_reads = true;
 
@@ -595,6 +604,7 @@ pub fn discard_working_changes(
     tip_id: &str,
     paths: Option<&[String]>,
 ) -> Result<()> {
+    repo.ensure_writable()?;
     let target = tree_at_commit(&repo.commits, tip_id)
         .ok_or_else(|| KvcError::NoCommit(tip_id.to_string()))?;
     let dirty = scan::scan_detailed(repo, false)?;

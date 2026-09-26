@@ -210,6 +210,9 @@ impl Repo {
             })
             .collect();
 
+        // What this commit actually adds — usually a few MB, however large the painting.
+        let adding: u64 = new_objs.iter().map(|o| o.1.len() as u64).sum();
+        crate::diskspace::check_available(&self.store, adding)?;
         if new_objs.len() >= PACK_MIN_OBJECTS {
             self.packs.write_pack(&objects, &new_objs)?;
         } else {
@@ -287,16 +290,16 @@ impl Repo {
     /// reconstructing every version of one stream is quadratic in chain length. Threading a memo
     /// across those calls rebuilds each version from its immediate predecessor exactly once,
     /// collapsing the whole run to linear. A content hash is a pure function of the bytes, so the
-    /// memo is safe to share across stream keys (identical content dedups). Used by GC, which
-    /// loads many manifest versions of long-lived files in one pass.
+    /// memo is safe to share across stream keys (identical content dedups). Used by GC, the check
+    /// and the storage report, which rebuild many versions in one pass.
     pub fn reconstruct_cached(
         &self,
         key: &str,
         hash: &str,
-        memo: &mut std::collections::HashMap<String, Vec<u8>>,
-    ) -> Result<Vec<u8>> {
+        memo: &mut ReconstructMemo,
+    ) -> Result<std::sync::Arc<Vec<u8>>> {
         if let Some(bytes) = memo.get(hash) {
-            return Ok(bytes.clone());
+            return Ok(bytes);
         }
         let chain = self
             .chains
@@ -319,8 +322,51 @@ impl Repo {
         if self.verify_reads && crate::repo::hash_bytes(&bytes) != hash {
             return Err(KvcError::Corrupt(format!("{key}@{hash}")));
         }
-        memo.insert(hash.to_string(), bytes.clone());
+        let bytes = std::sync::Arc::new(bytes);
+        // Only a version something patches against is worth keeping. Every tile is a full
+        // snapshot nothing builds on, and keeping those is how a scrub came to hold the whole
+        // decompressed history.
+        if chain.iter().any(|x| x.base.as_deref() == Some(hash)) {
+            memo.put(hash, bytes.clone());
+        }
         Ok(bytes)
+    }
+}
+
+/// The memo [`Repo::reconstruct_cached`] threads through a pass over many versions: the last few
+/// patch bases it rebuilt, least recently used out first, shared by `Arc` so a hit doesn't copy.
+///
+/// Bounded because it used to hold everything: marking 200 versions of a 45,000-tile painting kept
+/// 975 MB of manifests, and a scrub kept the entire decompressed history. Four is plenty for a walk
+/// in history order, where a version's base is almost always the one rebuilt just before it; out of
+/// order, a miss costs one replay of a chain `delta_chain_max` long at most.
+#[derive(Default)]
+pub struct ReconstructMemo(std::collections::VecDeque<(String, std::sync::Arc<Vec<u8>>)>);
+
+impl ReconstructMemo {
+    const CAP: usize = 4;
+
+    fn get(&mut self, hash: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        let at = self.0.iter().position(|(h, _)| h == hash)?;
+        let entry = self.0.remove(at)?;
+        let bytes = entry.1.clone();
+        self.0.push_back(entry);
+        Some(bytes)
+    }
+
+    fn put(&mut self, hash: &str, bytes: std::sync::Arc<Vec<u8>>) {
+        if self.0.len() == Self::CAP {
+            self.0.pop_front();
+        }
+        self.0.push_back((hash.to_string(), bytes));
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -373,16 +419,25 @@ pub(crate) fn write_loose(objects: &Path, name: &str, data: &[u8]) -> Result<()>
     std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
     // Temp-then-rename, because the dedup above trusts *existence*: a plain write interrupted by
     // a crash would leave a truncated file under a name that claims a hash it doesn't have, and
-    // every later commit storing that content would skip the write and trust it forever. No
-    // fsync — this is the commit hot path (thousands of tiny objects), and an unsynced object is
-    // harmless given `save()`'s ordering: tips land last, so a lost object is only an orphan.
-    // A crash leftover is swept by GC, which deletes anything in `objects/` it can't name.
+    // every later commit storing that content would skip the write and trust it forever. A crash
+    // leftover is swept by GC, which deletes anything in `objects/` it can't name.
+    //
+    // And fsynced before the rename. `save()` fsyncs the chain shard and log line that name this
+    // object, and an fsync makes only *its own* file durable: NTFS journals the rename and the
+    // length but not the contents, so after a power cut the reference could survive and the
+    // object come back as zeros, taking the newest version with it. At most `PACK_MIN_OBJECTS`
+    // of these per commit; anything bigger is one pack.
     let tmp = dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, data).map_err(|e| io_at(&tmp, e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
+    if let Err(e) = crate::repo::sync_write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    crate::repo::rename_retrying(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_at(&path, e)
-    })
+    })?;
+    crate::repo::sync_parent_dir(&path);
+    Ok(())
 }
 
 /// Read a loose object, preferring the sharded path; repos from before sharding keep their flat
@@ -471,15 +526,21 @@ impl Packs {
     /// Write `objs` as one pack file and register its entries in the loaded index.
     pub(crate) fn write_pack(&self, objects: &Path, objs: &[&(String, Vec<u8>)]) -> Result<()> {
         use std::io::Write;
+        // The index records lengths as u32; an object of 4 GiB or more fails the commit instead of
+        // being silently truncated in it.
+        let too_big = |len: usize| {
+            u32::try_from(len)
+                .map_err(|_| KvcError::BadIndex(format!("{len}-byte object is too big to pack")))
+        };
         let index: Vec<(String, u64, u32)> = {
             let mut off = 0u64;
             objs.iter()
                 .map(|(name, data)| {
-                    let e = (name.clone(), off, data.len() as u32);
+                    let e = (name.clone(), off, too_big(data.len())?);
                     off += data.len() as u64;
-                    e
+                    Ok(e)
                 })
-                .collect()
+                .collect::<Result<_>>()?
         };
         let idx_plain =
             bincode::serialize(&index).map_err(|e| KvcError::BadIndex(e.to_string()))?;
@@ -492,19 +553,26 @@ impl Packs {
         let path = dir.join(format!("{pack_name}.pack"));
         if !path.exists() {
             let tmp = path.with_extension("tmp");
+            let at_tmp = |e| io_at(&tmp, e);
             {
-                let file = std::fs::File::create(&tmp).map_err(|e| io_at(&tmp, e))?;
+                let file = std::fs::File::create(&tmp).map_err(at_tmp)?;
                 let mut w = std::io::BufWriter::new(file);
-                w.write_all(PACK_MAGIC_V2)?;
-                w.write_all(&(idx_bytes.len() as u32).to_le_bytes())?;
-                w.write_all(&idx_bytes)?;
-                w.write_all(&body_len.to_le_bytes())?;
+                w.write_all(PACK_MAGIC_V2).map_err(at_tmp)?;
+                w.write_all(&too_big(idx_bytes.len())?.to_le_bytes())
+                    .map_err(at_tmp)?;
+                w.write_all(&idx_bytes).map_err(at_tmp)?;
+                w.write_all(&body_len.to_le_bytes()).map_err(at_tmp)?;
                 for (_, data) in objs {
-                    w.write_all(data)?;
+                    w.write_all(data).map_err(at_tmp)?;
                 }
-                w.into_inner().map_err(|e| KvcError::Io(e.into_error()))?;
+                // Fsynced before the rename, for the reason `write_loose` gives: the chain shard
+                // and log that name these objects are fsynced right after, and must never
+                // outlive them. One fsync per large commit, on data that has to reach the disk.
+                let file = w.into_inner().map_err(|e| at_tmp(e.into_error()))?;
+                file.sync_all().map_err(at_tmp)?;
             }
-            std::fs::rename(&tmp, &path).map_err(|e| io_at(&path, e))?;
+            crate::repo::rename_retrying(&tmp, &path).map_err(|e| io_at(&path, e))?;
+            crate::repo::sync_parent_dir(&path);
         }
 
         // Keep the in-memory index coherent for reads later in this session. `make_mut`

@@ -275,7 +275,9 @@ an artwork to see these settings." instead of disappearing, so the tabs never ju
   copy says plainly), the per-painting "Preview cache size" (`cacheMaxBytes`, 128 MB to 2 GB) and
   "Compact storage for heavily-revised art" (`tilePixelDeltas`) through
   `get_repo_config`/`set_repo_config`, "Clean up storage…" (`CleanupModal`: a dry run on open, then
-  a confirmed `cleanup_repository` pass), "Check for problems…" (`CheckModal`, over this painting,
+  a confirmed `cleanup_repository` pass; on a `"version history is damaged"` refusal,
+  `isDamagedHistoryError`, it says cleanup is unavailable and offers "Check for problems…" in place
+  of Clean up, which swaps it for the check dialog), "Check for problems…" (`CheckModal`, over this painting,
   every tracked painting, or only the ones never checked, with an optional full read-back), and a
   line saying when the last backup was made.
 - **Set-Aside** ("Stashes" with Artist Mode off): the shelf, see [stashes.md](stashes.md).

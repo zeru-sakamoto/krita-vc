@@ -220,7 +220,8 @@ pub async fn set_store_root(path: Option<String>) -> std::result::Result<(), Str
 }
 
 /// Zip the given documents (each `.kra` plus its store) into **one** archive at `dest` — a
-/// manual, user-triggered backup (see `Repo::export_zip_multi`). Read-only, so no `RepoLock`.
+/// manual, user-triggered backup (see `Repo::export_zip_multi`). Read-only, but each artwork is
+/// zipped under its `RepoLock` so a `kvc` write from the Krita docker can't land mid-zip.
 /// Independent artworks, so one failing shouldn't abort the rest: failures are collected and
 /// returned rather than short-circuiting the batch.
 #[tauri::command]
@@ -483,7 +484,7 @@ fn stored_bytes_by_commit(
     size_of: &std::collections::HashMap<String, u64>,
 ) -> std::collections::HashMap<String, u64> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut memo: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut memo = crate::delta::ReconstructMemo::default();
     let mut out = std::collections::HashMap::new();
     // repo.commits is append order = oldest-first.
     for c in &repo.commits {
@@ -958,6 +959,7 @@ pub async fn restore_file(
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "restoring a file")?;
         let mut repo = Repo::open(root)?;
+        repo.ensure_writable()?;
         // Verified rebuild: these bytes replace a file in the working tree.
         repo.verify_reads = true;
         let bytes = commit::file_at_commit(&repo, &file, &commit_id)?;

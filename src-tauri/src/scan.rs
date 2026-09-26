@@ -74,6 +74,9 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
     let mut out = Vec::new();
     for rel in repo.tracked_paths() {
         let abs = crate::repo::safe_join(&repo.root, &rel)?;
+        // The one place that looks beside the artwork regularly, so it's where a crashed
+        // working-tree write's artwork-sized temp gets cleared up.
+        crate::repo::remove_stale_kvctmp(&abs);
         let tracked = repo.index.files.get(&rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) if m.is_file() => m,
