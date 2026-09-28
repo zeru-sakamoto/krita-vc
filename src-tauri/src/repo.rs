@@ -23,12 +23,11 @@
 //!   doc.json       which document this store belongs to (relpath, display name, created)
 //!   config.json    engine config (delta-chain threshold, tile size, cache budget)
 //!   index.json     committed head per tracked file (drives the scanner)
-//!   chains/        delta-stream versions, one shard per tracked file (drives storage/restore);
-//!                  zstd-compressed bincode per shard. Repos from before sharding carry a
-//!                  monolithic chains.bin (or older chains.json) instead — split on first save
+//!   worktree.json  what the last scan learned about the saved-but-unversioned file (a cache)
+//!   chains/        delta-stream versions (drives storage/restore), zstd-compressed bincode:
+//!                  one shard for the manifest and small entries, one per tiled layer entry
 //!   commits.log    commit log, JSON-lines, append-only (a commit appends one line instead of
-//!                  rewriting the whole history; undo/GC rewrite it). Legacy repos carry a
-//!                  commits.json instead — migrated to the log on first save
+//!                  rewriting the whole history; undo/GC rewrite it)
 //!   branches.json  branch name -> tip commit id, plus the current branch
 //!   stashes.json   work set aside off to the side of history (also a GC root); absent = empty
 //!   objects/       content-addressed blobs (<hash>.full / <hash>.patch)
@@ -46,6 +45,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 pub const KVC_DIR: &str = ".kvc";
+
+/// The scan's memory of the working file's last hash — see `scan::scan_detailed`.
+pub const WORKTREE_FILE: &str = "worktree.json";
 
 /// Join a repo-relative path onto `root`, refusing anything that could escape the repository.
 /// Committed file paths live in `commits.log` (plain JSON that travels with a shared `.kvc/`
@@ -304,14 +306,41 @@ fn skip_in_backup(rel: &str) -> bool {
     rel.starts_with("cache/")
         || rel.starts_with("trash/")
         || rel.starts_with("kvc.lock")
+        || rel == WORKTREE_FILE
         || rel.ends_with(".tmp")
         || rel.ends_with(".kvctmp")
+}
+
+/// Stream one file into an open archive, straight from its handle. `compress` only for what still
+/// shrinks: the `.kra` is already a zip, and objects, packs and chain shards are zstd, so deflating
+/// them again was most of a backup's time (7.2 s of 7.6 s on a 105 MB painting) for a 13% smaller
+/// archive. The JSON state files and logs still deflate well.
+fn zip_file(
+    zw: &mut ZipWriter<std::fs::File>,
+    name: &str,
+    path: &Path,
+    compress: bool,
+) -> Result<()> {
+    // One open per file: its length comes from the handle. A backup of a long history is
+    // thousands of small files, and on Windows each open is a trip through the filter drivers.
+    let mut f = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
+    let len = f.metadata().map_err(|e| io_at(path, e))?.len();
+    let method = if compress {
+        CompressionMethod::Deflated
+    } else {
+        CompressionMethod::Stored
+    };
+    let opts = SimpleFileOptions::default()
+        .compression_method(method)
+        .large_file(len >= u32::MAX as u64);
+    zw.start_file(name, opts).map_err(zip_err)?;
+    std::io::copy(&mut f, zw).map_err(|e| io_at(path, e))?;
+    Ok(())
 }
 
 /// Write one artwork (document + store) into an open backup archive under `dir/`.
 fn zip_one_document(
     zw: &mut ZipWriter<std::fs::File>,
-    opts: SimpleFileOptions,
     kra_path: &Path,
     dir: &str,
     entry_count: &mut usize,
@@ -319,13 +348,22 @@ fn zip_one_document(
     if !Repo::is_repo(kra_path) {
         return Err(KvcError::NotARepo(kra_path.to_path_buf()));
     }
+    // Reading, but under the lock every writer takes: the Krita docker can commit, switch or set
+    // work aside through `kvc` mid-backup, and zipping across one of those pairs the artwork from
+    // one side of it with a store from the other — an artwork that doesn't match its own history.
+    // A busy artwork fails into the caller's list instead ("busy: … committing for 3s"). A store
+    // the lock file can't even be created in (read-only media) can't be written by anyone else
+    // either, so it's backed up without one rather than refused.
+    let _lock = match RepoLock::acquire(kra_path, "backing up") {
+        Ok(lock) => Some(lock),
+        Err(e @ KvcError::Locked(_)) => return Err(e),
+        Err(_) => None,
+    };
     let store = store_dir_for(kra_path);
     let relpath = doc_relpath(kra_path)?;
 
     // The document itself.
-    zw.start_file(format!("{dir}/{relpath}"), opts)
-        .map_err(zip_err)?;
-    zw.write_all(&std::fs::read(kra_path).map_err(|e| io_at(kra_path, e))?)?;
+    zip_file(zw, &format!("{dir}/{relpath}"), kra_path, false)?;
     *entry_count += 1;
 
     // Its store, rebased under `<dir>/.kvc/<slug>/` so the layout survives extraction even when
@@ -349,10 +387,13 @@ fn zip_one_document(
         if skip_in_backup(&rel) {
             continue;
         }
-        zw.start_file(format!("{dir}/{KVC_DIR}/{slug}/{rel}"), opts)
-            .map_err(zip_err)?;
-        let bytes = std::fs::read(entry.path()).map_err(|e| io_at(entry.path(), e))?;
-        zw.write_all(&bytes)?;
+        let compress = !(rel.starts_with("objects/") || rel.starts_with("chains/"));
+        zip_file(
+            zw,
+            &format!("{dir}/{KVC_DIR}/{slug}/{rel}"),
+            entry.path(),
+            compress,
+        )?;
         *entry_count += 1;
     }
 
@@ -376,6 +417,59 @@ fn zip_one_document(
     })
 }
 
+/// The body of [`Repo::export_zip_multi`]: every artwork it can back up into one verified archive
+/// at `path`, and the ones it couldn't. An archive of nothing is an error, never a file on disk
+/// claiming to be a backup.
+fn write_backup(kra_paths: &[PathBuf], path: &Path) -> Result<Vec<String>> {
+    let file = std::fs::File::create(path).map_err(|e| io_at(path, e))?;
+    let mut zw = ZipWriter::new(file);
+    let mut entry_count = 0usize;
+    let (mut entries, mut failed) = (Vec::new(), Vec::new());
+    let mut seen = HashSet::new();
+
+    for kra_path in kra_paths {
+        // The salted slug is unique per document by construction (it hashes the parent dir
+        // too), so two same-named paintings from different folders can't collide and no
+        // dedup bookkeeping is needed.
+        let salt = kra_path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dir = store_slug(kra_path, &salt);
+        if !seen.insert(dir.clone()) {
+            continue; // the same document listed twice
+        }
+        match zip_one_document(&mut zw, kra_path, &dir, &mut entry_count) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => failed.push(kra_path.to_string_lossy().into_owned()),
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(KvcError::Io(std::io::Error::other(
+            "nothing could be backed up",
+        )));
+    }
+
+    let manifest = BackupManifest {
+        version: 2,
+        timestamp: now_iso(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        entries,
+    };
+    let bytes = serde_json::to_vec(&manifest).map_err(|e| KvcError::BadIndex(e.to_string()))?;
+    zw.start_file(
+        "MANIFEST.json",
+        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+    )
+    .map_err(zip_err)?;
+    zw.write_all(&bytes).map_err(|e| io_at(path, e))?;
+    entry_count += 1;
+    zw.finish().map_err(zip_err)?;
+    verify_zip(path, entry_count, true)?;
+    Ok(failed)
+}
+
 fn failed_import(dir: &str, path: &str, store: &str, error: String) -> ImportResult {
     ImportResult {
         dir: dir.to_string(),
@@ -387,11 +481,39 @@ fn failed_import(dir: &str, path: &str, store: &str, error: String) -> ImportRes
         store: store.to_string(),
         problems: Vec::new(),
         error: Some(error),
+        replaced_artwork: None,
+        replaced_history: None,
     }
+}
+
+/// `path` with `suffix` appended to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Where Replace keeps the artwork it replaces: `art.replaced-<time>.kra`, beside it and still
+/// something Krita opens with a double-click.
+fn replaced_artwork_path(dest: &Path, stamp: &str) -> PathBuf {
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!("{stem}.replaced-{stamp}.kra"))
 }
 
 /// Restore one artwork out of an open archive. See [`Repo::import_zip`] for why the store's
 /// location is recomputed here rather than taken from the archive.
+///
+/// Replace never destroys what it replaces. The incoming history is unpacked into a staging
+/// folder beside its final place first, so a bad archive fails before anything that's already
+/// there is touched. Only then are the current artwork and history renamed aside — same folder,
+/// same volume, so a rename that can't happen fails instead of quietly turning into a delete the
+/// way a Recycle Bin move can on a network share — and the restored ones put in their place.
+/// The old history waits beside the new store for a cleanup to age it out
+/// (`gc::prune_aged`), and the old artwork stays in the art folder for the artist to keep or
+/// bin; `ImportResult` says where both went.
 fn import_one(
     za: &mut zip::ZipArchive<std::fs::File>,
     entry: &BackupEntry,
@@ -401,8 +523,9 @@ fn import_one(
     // rooted through it.
     let dest = safe_join(dest_dir, &entry.relpath)?;
     let prefix = format!("{}/{KVC_DIR}/", entry.dir);
+    refuse_missing_store_root(&dest)?;
 
-    // The artwork first, so a failure reading the archive has not destroyed anything yet.
+    // Read before anything is written, so a failure reading the archive changes nothing.
     let bytes = {
         let f = za
             .by_name(&format!("{}/{}", entry.dir, entry.relpath))
@@ -410,19 +533,9 @@ fn import_one(
         read_entry_capped(f)?
     };
     std::fs::create_dir_all(dest_dir).map_err(|e| io_at(dest_dir, e))?;
-    write_file_atomic(&dest, &bytes)?;
 
     // Where *this machine* keeps history — never the path baked into the archive.
     let store = store_dir_for(&dest);
-    // Replacing: send the old store to the Recycle Bin rather than blend it with the incoming
-    // one. This unavoidably leaves a window where the old history is gone and the new store is
-    // partial — that is what Replace means, and `Repo::delete` keeps the old one recoverable.
-    if Repo::is_repo(&dest) {
-        let _ = Repo::delete(&dest);
-    }
-    if store.exists() {
-        std::fs::remove_dir_all(&store).map_err(|e| io_at(&store, e))?;
-    }
     if let Some(container) = store.parent() {
         std::fs::create_dir_all(container).map_err(|e| io_at(container, e))?;
         // Only the default in-folder container gets hidden + a README; a user-chosen store root
@@ -431,44 +544,61 @@ fn import_one(
             dress_container(container);
         }
     }
-    std::fs::create_dir_all(&store).map_err(|e| io_at(&store, e))?;
-    let _lock = RepoLock::acquire(&dest, "restoring a backup")?;
 
-    for i in 0..za.len() {
-        let mut f = za.by_index(i).map_err(zip_err)?;
-        if f.is_dir() {
-            continue;
-        }
-        let name = f.name().to_string();
-        let Some(after) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        // `<slug>/<rel>` — the archive's slug is payload, `rel` is what we keep.
-        let Some((_slug, rel)) = after.split_once('/') else {
-            continue;
-        };
-        if rel.is_empty() || skip_in_backup(rel) {
-            continue;
-        }
-        let out = safe_join(&store, rel)?;
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-        }
-        let bytes = read_entry_capped(&mut f)?;
-        // Plain writes, not `write_atomic`: nothing here is live until the whole store has
-        // landed, and a crash mid-import leaves a partial store the check below refuses. Paying
-        // an fsync per object would make restoring a large history needlessly slow.
-        std::fs::write(&out, &bytes).map_err(|e| io_at(&out, e))?;
+    // Fixed name, cleared first: a leftover from a restore that crashed midway goes the next
+    // time this artwork is restored. Nothing else ever looks at it.
+    let staging = with_suffix(&store, ".restoring");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
+    }
+    if let Err(e) = unpack_store(za, &prefix, &staging, &entry.relpath) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
     }
 
-    // By construction these match, since nothing renames. A hand-edited archive could disagree,
-    // and a mismatch means every later scan and commit targets a file that is not there.
-    let meta = read_doc_meta(&store)?;
-    if meta.relpath != entry.relpath {
-        return Err(KvcError::BadIndex(format!(
-            "backup is inconsistent: its history is for {:?}, but the archive holds {:?}",
-            meta.relpath, entry.relpath
-        )));
+    let stamp = now_iso_filesafe();
+    let mut replaced_history = None;
+    if store.exists() {
+        // Not while something is writing to it — the Krita docker's `kvc`, mid-commit.
+        if Repo::is_repo(&dest) {
+            drop(RepoLock::acquire(&dest, "restoring a backup")?);
+        }
+        let aside = with_suffix(&store, &format!(".replaced-{stamp}"));
+        if let Err(e) = rename_retrying(&store, &aside) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(io_at(&store, e));
+        }
+        replaced_history = Some(aside);
+    }
+    // Every step from here puts back what came before it if it fails, so a failed Replace
+    // leaves the artwork and its history exactly as they were.
+    let undo_history = |replaced: &Option<PathBuf>| {
+        if let Some(aside) = replaced {
+            let _ = rename_retrying(aside, &store);
+        }
+    };
+    if let Err(e) = rename_retrying(&staging, &store) {
+        undo_history(&replaced_history);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(io_at(&store, e));
+    }
+    let mut replaced_artwork = None;
+    if dest.is_file() {
+        let aside = replaced_artwork_path(&dest, &stamp);
+        if let Err(e) = rename_retrying(&dest, &aside) {
+            let _ = std::fs::remove_dir_all(&store);
+            undo_history(&replaced_history);
+            return Err(io_at(&dest, e));
+        }
+        replaced_artwork = Some(aside);
+    }
+    if let Err(e) = write_file_atomic(&dest, &bytes) {
+        if let Some(aside) = &replaced_artwork {
+            let _ = rename_retrying(aside, &dest);
+        }
+        let _ = std::fs::remove_dir_all(&store);
+        undo_history(&replaced_history);
+        return Err(e);
     }
 
     // Reuse the read-only integrity check rather than inventing an import-specific one: it
@@ -476,6 +606,7 @@ fn import_one(
     // unreadable packs. Findings are reported, not fatal — a partly-good store beats none.
     let mut repo = Repo::open(&dest)?;
     let report = crate::check::check_repository(&mut repo, false)?;
+    let shown = |p: Option<PathBuf>| p.map(|p| p.to_string_lossy().into_owned());
     Ok(ImportResult {
         dir: entry.dir.clone(),
         path: dest.to_string_lossy().into_owned(),
@@ -487,7 +618,60 @@ fn import_one(
             .map(|p| format!("{}: {}", p.kind, p.detail))
             .collect(),
         error: None,
+        replaced_artwork: shown(replaced_artwork),
+        replaced_history: shown(replaced_history),
     })
+}
+
+/// Extract one artwork's store out of the archive into `into`, then confirm it's the history of
+/// the document the archive says it is.
+fn unpack_store(
+    za: &mut zip::ZipArchive<std::fs::File>,
+    prefix: &str,
+    into: &Path,
+    relpath: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(into).map_err(|e| io_at(into, e))?;
+    for i in 0..za.len() {
+        // Filter on the central directory's name first: only this artwork's entries are worth
+        // the seek to their local header that `by_index` costs.
+        let Some(rel) = za
+            .name_for_index(i)
+            .and_then(|name| name.strip_prefix(prefix))
+            // `<slug>/<rel>` — the archive's slug is payload, `rel` is what we keep.
+            .and_then(|after| after.split_once('/'))
+            .map(|(_slug, rel)| rel.to_string())
+        else {
+            continue;
+        };
+        if rel.is_empty() || rel.ends_with('/') || skip_in_backup(&rel) {
+            continue;
+        }
+        let mut f = za.by_index(i).map_err(zip_err)?;
+        if f.is_dir() {
+            continue;
+        }
+        let out = safe_join(into, &rel)?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        }
+        let bytes = read_entry_capped(&mut f)?;
+        // Plain writes, not `write_atomic`: nothing here is live until the whole store has
+        // landed and been renamed into place. Paying an fsync per object would make restoring a
+        // large history needlessly slow.
+        std::fs::write(&out, &bytes).map_err(|e| io_at(&out, e))?;
+    }
+
+    // By construction these match, since nothing renames. A hand-edited archive could disagree,
+    // and a mismatch means every later scan and commit targets a file that is not there.
+    let meta = read_doc_meta(into)?;
+    if meta.relpath != relpath {
+        return Err(KvcError::BadIndex(format!(
+            "backup is inconsistent: its history is for {:?}, but the archive holds {:?}",
+            meta.relpath, relpath
+        )));
+    }
+    Ok(())
 }
 
 pub fn objects_dir(store: &Path) -> PathBuf {
@@ -728,22 +912,6 @@ impl Default for Config {
     }
 }
 
-/// Read `config.json`, applying version migrations in-memory; `dirty` = the caller's `save()`
-/// should persist the migrated form. v1 → v2: the cache budget default dropped 512 → 256 MB,
-/// and 512 MB always meant "old default", never a user choice (there is no UI knob).
-fn read_config(kvc: &Path) -> Result<(Config, bool)> {
-    let mut config: Config = read_json(&kvc.join("config.json"))?;
-    let mut dirty = false;
-    if config.version < 2 {
-        if config.cache_max_bytes == 512 * 1024 * 1024 {
-            config.cache_max_bytes = default_cache_max_bytes();
-        }
-        config.version = 2;
-        dirty = true;
-    }
-    Ok((config, dirty))
-}
-
 /// Committed head of one tracked file — just enough for the scanner to spot changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -775,11 +943,9 @@ pub struct Index {
 }
 
 /// One stored version of a delta stream. A stream is any byte sequence we version
-/// (a generic file, a .kra manifest, a single layer entry, or a single tile).
+/// (a .kra manifest, a single archive entry, or a single tile).
 ///
-/// The object file's name is fully derivable from `hash` + `base` ([`Version::object_name`]);
-/// pre-KVCC2 shards stored it redundantly per version — dropped because chains grow with
-/// total tile-version history, so every duplicated 64-hex hash was paid forever.
+/// The object file's name is fully derivable from `hash` + `base` ([`Version::object_name`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Version {
@@ -802,42 +968,16 @@ impl Version {
     }
 }
 
-/// Pre-KVCC2 on-disk `Version` (bincode is not self-describing — the exact old shape is
-/// needed to decode legacy shards/monoliths). `object` is dropped on conversion.
-#[derive(Deserialize)]
-struct VersionV1 {
-    hash: String,
-    #[allow(dead_code)]
-    object: String,
-    base: Option<String>,
-    chain_len: usize,
-}
-
-impl From<VersionV1> for Version {
-    fn from(v: VersionV1) -> Version {
-        Version {
-            hash: v.hash,
-            base: v.base,
-            chain_len: v.chain_len,
-        }
-    }
-}
-
-/// streamKey -> ordered versions (head = last). The serialized form of one chain shard
-/// (and of the pre-sharding monolithic chains file).
+/// streamKey -> ordered versions (head = last). The serialized form of one chain shard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chains(pub BTreeMap<String, Vec<Version>>);
 
-/// Shard identity for a stream key. Every key embeds the tracked file's relpath
-/// (`file:{rel}`, `kra:{rel}:manifest`, `kra:{rel}:entry:{name}`, `kra:{rel}:tile:{e}:{x},{y}`),
-/// and all of one file's keys must land in one shard so a commit rewrites exactly the shards
-/// of the files it touched. The parse is forgiving: a pathological relpath containing a marker
-/// still maps *consistently* (same bucket for every key of that file), which is all sharding
-/// needs — a shard is a bucket, not an identity.
-fn shard_of(key: &str) -> &str {
-    if let Some(rest) = key.strip_prefix("file:") {
-        return rest;
-    }
+/// The document bucket for a stream key: its relpath. Every key embeds it (`kra:{rel}:manifest`,
+/// `kra:{rel}:entry:{name}`, `kra:{rel}:tile:{entry}:{x},{y}`). This is the shard the manifest and
+/// the small entries live in — and, in a store written before tiles got shards of their own, every
+/// tile too, which is why a lookup always faults it in first (see [`ChainStore::shard_for`]). The
+/// parse is forgiving: a pathological relpath containing a marker still maps *consistently*.
+fn doc_shard_of(key: &str) -> &str {
     if let Some(rest) = key.strip_prefix("kra:") {
         for marker in [":tile:", ":entry:"] {
             if let Some(pos) = rest.find(marker) {
@@ -852,6 +992,39 @@ fn shard_of(key: &str) -> &str {
     key
 }
 
+/// Shard identity for a stream key: one shard per tiled archive entry (a layer's tiles, or the
+/// composite's blocks), everything else in the document bucket. A store tracks one document, so
+/// per-document sharding meant one shard holding every version of every tile — rewritten whole on
+/// each commit and decoded whole by the first lookup of every command, however little either
+/// touched. Per entry, a commit that edits two layers rewrites those two shards and the small
+/// document one.
+fn shard_of(key: &str) -> &str {
+    match key
+        .strip_prefix("kra:")
+        .and_then(|rest| rest.find(":tile:"))
+    {
+        // `kra:{rel}:tile:{entry}` — the key minus its `:{x},{y}` tail.
+        Some(_) => key.rsplit_once(':').map_or(key, |(entry, _)| entry),
+        None => doc_shard_of(key),
+    }
+}
+
+/// Fold a second copy of one key's chain, found outside its own shard, into `own`: every version
+/// `own` lacks, in order, after its own. A split interrupted before the document shard was
+/// rewritten leaves the document's copy a prefix of the tile shard's, so that adds nothing. But
+/// every release up to v2.1.0 looks for all of a document's chains in the document shard, so on a
+/// store this one split it finds no tile chains and starts each tile it commits afresh there.
+/// Keeping both lines keeps every version findable by hash, with the older release's last, so the
+/// next patch is made against it; taking one copy dropped the other's versions, and a cleanup then
+/// swept their objects.
+fn merge_versions(own: &mut Vec<Version>, other: Vec<Version>) {
+    for v in other {
+        if own.iter().all(|o| o.hash != v.hash) {
+            own.push(v);
+        }
+    }
+}
+
 fn shard_file(dir: &Path, shard: &str) -> PathBuf {
     dir.join(format!(
         "{}.bin",
@@ -859,23 +1032,32 @@ fn shard_file(dir: &Path, shard: &str) -> PathBuf {
     ))
 }
 
-/// Per-file-sharded delta chains, loaded lazily. The monolithic predecessor (`chains.bin`) held
-/// every version of every tile stream ever committed, was rewritten in full on every commit and
-/// parsed in full on every open — the one cost that grew with *total repo history* instead of
-/// with the change at hand. Shards make both proportional to the files actually touched.
+/// Sharded delta chains, loaded lazily — one shard per tiled entry plus one for the rest of the
+/// document (see [`shard_of`]), so reading or committing costs what the command touches rather than
+/// the document's whole tile history.
+///
+/// A store written before per-entry sharding has everything in the document shard. It is split
+/// in memory the first time that shard loads, and the split persists with the next save, which
+/// writes the tile shards before the shrunken document shard: until that last write lands, the
+/// document shard still holds every key, so a crash anywhere in between only means splitting again.
+/// A key found in both files is merged, not chosen ([`merge_versions`]).
 ///
 /// Interior mutability (`RwLock`) lets read paths fault shards in from behind `&Repo` (rayon
 /// `par_iter` reconstructs included); pushes come only from the serial commit folds.
 pub struct ChainStore {
     dir: PathBuf,
-    /// Loaded shards by shard name (the relpath bucket). `Arc` so readers can hold a shard
-    /// without keeping the map locked.
+    /// Loaded shards by shard name. `Arc` so readers can hold a shard without keeping the map
+    /// locked.
     shards: RwLock<HashMap<String, Arc<Chains>>>,
     dirty: Mutex<HashSet<String>>,
-    /// Set when this store was populated from a legacy monolithic chains file: the next
-    /// [`ChainStore::flush`] writes every shard, then deletes the monolith. Until that delete,
-    /// the monolith remains the source of truth on open — a crash mid-split just re-runs it.
-    retire_monolith: bool,
+    /// Document shards that had tile keys split out of them. [`ChainStore::flush`] writes these
+    /// after every other dirty shard — see the type's doc for why the order matters.
+    split: Mutex<HashSet<String>>,
+    /// Shard files that exist but couldn't be read, noted as they fault in — `true` when the
+    /// bytes read fine and didn't decode. Reads carry on with an empty shard so the rest of the
+    /// store stays viewable; [`ChainStore::set_aside_unreadable`] stops a save from writing that
+    /// empty shard over one.
+    unreadable: Mutex<Vec<(PathBuf, bool)>>,
 }
 
 impl ChainStore {
@@ -884,32 +1066,36 @@ impl ChainStore {
             dir,
             shards: RwLock::new(HashMap::new()),
             dirty: Mutex::new(HashSet::new()),
-            retire_monolith: false,
+            split: Mutex::new(HashSet::new()),
+            unreadable: Mutex::new(Vec::new()),
         }
     }
 
-    /// Partition a legacy monolithic chains map into all-dirty shards (split persists on the
-    /// next save).
-    fn from_legacy(dir: PathBuf, legacy: Chains) -> ChainStore {
-        let mut map: HashMap<String, Chains> = HashMap::new();
-        for (key, versions) in legacy.0 {
-            map.entry(shard_of(&key).to_string())
-                .or_default()
-                .0
-                .insert(key, versions);
+    /// The shard holding `key`, with its document shard faulted in first: in a store from before
+    /// per-entry sharding the document shard is where `key` actually is, and loading it is what
+    /// splits it out.
+    fn shard_for(&self, key: &str) -> Arc<Chains> {
+        let (name, doc) = (shard_of(key), doc_shard_of(key));
+        if name != doc {
+            self.load(doc);
         }
-        let dirty: HashSet<String> = map.keys().cloned().collect();
-        let shards = map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        ChainStore {
-            dir,
-            shards: RwLock::new(shards),
-            dirty: Mutex::new(dirty),
-            retire_monolith: true,
+        self.load(name)
+    }
+
+    /// Read one shard file. `Err(true)` = there but undecodable, `Err(false)` = unreadable;
+    /// a missing file is an empty shard.
+    fn read_shard(path: &Path) -> std::result::Result<Chains, bool> {
+        match std::fs::read(path) {
+            Ok(raw) => decode_chains(&raw).ok_or(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Chains::default()),
+            Err(_) => Err(false),
         }
     }
 
     /// The loaded shard for `name`, faulting it in from disk (missing file = empty shard,
-    /// negative-cached so repeat misses don't re-stat).
+    /// negative-cached so repeat misses don't re-stat). A file that's there but won't read also
+    /// comes back empty, and is noted in `unreadable` so no save writes over it. Keys that belong
+    /// in another shard — a document shard from before per-entry sharding — are moved there.
     fn load(&self, name: &str) -> Arc<Chains> {
         if let Some(s) = self.shards.read().unwrap().get(name) {
             return s.clone();
@@ -918,16 +1104,77 @@ impl ChainStore {
         if let Some(s) = w.get(name) {
             return s.clone();
         }
-        let loaded = read_chains_file(&shard_file(&self.dir, name)).unwrap_or_default();
+        let path = shard_file(&self.dir, name);
+        let mut loaded = Self::read_shard(&path).unwrap_or_else(|undecodable| {
+            self.unreadable
+                .lock()
+                .unwrap()
+                .push((path.clone(), undecodable));
+            Chains::default()
+        });
+        if loaded.0.keys().any(|k| shard_of(k) != name) {
+            let (own, foreign): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut loaded.0)
+                .into_iter()
+                .partition(|(k, _)| shard_of(k) == name);
+            loaded.0 = own;
+            let mut dirty = self.dirty.lock().unwrap();
+            for (key, versions) in foreign {
+                let target = shard_of(&key).to_string();
+                let shard = w.entry(target.clone()).or_insert_with(|| {
+                    let p = shard_file(&self.dir, &target);
+                    Arc::new(Self::read_shard(&p).unwrap_or_else(|undecodable| {
+                        self.unreadable.lock().unwrap().push((p, undecodable));
+                        Chains::default()
+                    }))
+                });
+                merge_versions(Arc::make_mut(shard).0.entry(key).or_default(), versions);
+                dirty.insert(target);
+            }
+            dirty.insert(name.to_string());
+            self.split.lock().unwrap().insert(name.to_string());
+        }
         let arc = Arc::new(loaded);
         w.insert(name.to_string(), arc.clone());
         arc
     }
 
+    /// Refuse a save while any shard failed to read — before anything is written, since the save
+    /// would replace it with the empty shard it read as, and a shard holds the chain records of
+    /// every version of what it covers. A shard whose bytes didn't decode is renamed aside
+    /// (`<name>.bin.corrupt-<time>`), which lets the next attempt go ahead on a fresh shard
+    /// without destroying what a repair could salvage; the check keeps naming the set-aside file.
+    /// One that couldn't be read at all (a scanner holding it, say) is left alone and just
+    /// refuses. Every later save through this `Repo` refuses too: its view of the shard is empty.
+    fn set_aside_unreadable(&self) -> Result<()> {
+        let faults = self.unreadable.lock().unwrap().clone();
+        if faults.is_empty() {
+            return Ok(());
+        }
+        let mut detail = Vec::new();
+        for (path, undecodable) in &faults {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if *undecodable && path.is_file() {
+                let aside_name = format!("{name}.corrupt-{}", now_iso_filesafe());
+                rename_retrying(path, &path.with_file_name(&aside_name))
+                    .map_err(|e| io_at(path, e))?;
+                detail.push(format!(
+                    "chains/{name} couldn't be decoded, so it was kept aside as {aside_name}; \
+                     saving again starts a fresh one"
+                ));
+            } else {
+                detail.push(format!("chains/{name} couldn't be read"));
+            }
+        }
+        Err(KvcError::DamagedHistory(detail.join("; ")))
+    }
+
     /// The version chain for `key` (cloned — chains are short by design: at most
     /// `delta_chain_max`+1 per snapshot run).
     pub fn chain(&self, key: &str) -> Option<Vec<Version>> {
-        self.load(shard_of(key)).0.get(key).cloned()
+        self.shard_for(key).0.get(key).cloned()
     }
 
     /// The object name for one `(key, hash)` pair, without cloning the key's chain.
@@ -938,7 +1185,7 @@ impl ChainStore {
     /// clone is multiplied by (tiles x commits) and becomes the dominant cost of the whole
     /// report. Same lookup, no allocation of the surrounding `Vec`.
     pub fn object_name_of(&self, key: &str, hash: &str) -> Option<String> {
-        self.load(shard_of(key))
+        self.shard_for(key)
             .0
             .get(key)?
             .iter()
@@ -949,20 +1196,23 @@ impl ChainStore {
     /// Append a version to `key`'s chain and mark its shard dirty.
     pub(crate) fn push(&self, key: String, version: Version) {
         let name = shard_of(&key).to_string();
-        self.load(&name); // fault in before mutating, so we never clobber an unread shard
+        self.shard_for(&key); // fault in before mutating, so we never clobber an unread shard
         let mut w = self.shards.write().unwrap();
         let entry = w.get_mut(&name).expect("shard just loaded");
         Arc::make_mut(entry).0.entry(key).or_default().push(version);
         self.dirty.lock().unwrap().insert(name);
     }
 
-    /// Write every dirty shard (atomic each), then retire a legacy monolith if one is pending.
-    /// A failed write leaves its dirty mark in place for the next save.
-    fn flush(&mut self, kvc: &Path) -> Result<()> {
-        let dirty: Vec<String> = self.dirty.lock().unwrap().iter().cloned().collect();
-        if dirty.is_empty() && !self.retire_monolith {
+    /// Write every dirty shard (atomic each) — a document shard that had tiles split out of it
+    /// last, once the shards they went to are safely on disk. A failed write leaves its dirty mark
+    /// in place for the next save.
+    fn flush(&mut self) -> Result<()> {
+        let split = self.split.lock().unwrap().clone();
+        let mut dirty: Vec<String> = self.dirty.lock().unwrap().iter().cloned().collect();
+        if dirty.is_empty() {
             return Ok(());
         }
+        dirty.sort_by_key(|name| split.contains(name));
         std::fs::create_dir_all(&self.dir).map_err(|e| io_at(&self.dir, e))?;
         {
             let shards = self.shards.read().unwrap();
@@ -973,22 +1223,19 @@ impl ChainStore {
             }
         }
         self.dirty.lock().unwrap().clear();
-        if self.retire_monolith {
-            let _ = std::fs::remove_file(kvc.join("chains.bin"));
-            let _ = std::fs::remove_file(kvc.join("chains.json"));
-            self.retire_monolith = false;
-        }
+        self.split.lock().unwrap().clear();
         Ok(())
     }
 
     fn has_dirty(&self) -> bool {
-        self.retire_monolith || !self.dirty.lock().unwrap().is_empty()
+        !self.dirty.lock().unwrap().is_empty()
     }
 
     /// Replace the whole store with `new` (GC sweep): partition into shards, write every
-    /// non-empty shard, then delete shard files whose bucket no longer exists. Writes happen
-    /// before deletes and each write is atomic, so there is no window without valid chains.
-    pub fn rewrite_all(&mut self, kvc: &Path, new: Chains) -> Result<()> {
+    /// non-empty shard — document shards last, for the reason [`ChainStore::flush`] gives — then
+    /// delete shard files whose bucket no longer exists. Writes happen before deletes and each
+    /// write is atomic, so there is no window without valid chains.
+    pub fn rewrite_all(&mut self, new: Chains) -> Result<()> {
         let mut map: HashMap<String, Chains> = HashMap::new();
         for (key, versions) in new.0 {
             map.entry(shard_of(&key).to_string())
@@ -997,8 +1244,16 @@ impl ChainStore {
                 .insert(key, versions);
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| io_at(&self.dir, e))?;
-        let keep: HashSet<PathBuf> = map
-            .iter()
+        let mut order: Vec<(&String, &Chains)> = map.iter().collect();
+        order.sort_by_key(|(name, chains)| {
+            chains
+                .0
+                .keys()
+                .next()
+                .is_some_and(|k| doc_shard_of(k) == name.as_str())
+        });
+        let keep: HashSet<PathBuf> = order
+            .into_iter()
             .map(|(name, chains)| {
                 let path = shard_file(&self.dir, name);
                 write_chains_file(&path, chains).map(|_| path)
@@ -1012,29 +1267,40 @@ impl ChainStore {
                 }
             }
         }
-        // In-memory state now mirrors disk; a pending legacy monolith is finally retired too.
+        // In-memory state now mirrors disk.
         self.shards = RwLock::new(map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect());
         self.dirty = Mutex::new(HashSet::new());
-        if self.retire_monolith {
-            let _ = std::fs::remove_file(kvc.join("chains.bin"));
-            let _ = std::fs::remove_file(kvc.join("chains.json"));
-            self.retire_monolith = false;
-        }
+        self.split = Mutex::new(HashSet::new());
         Ok(())
     }
 
     /// Every chain across every shard, on-disk and in-memory merged (in-memory wins — it is
-    /// never older). Loads the whole store: tests and GC only, never a hot path.
+    /// never older). Loads the whole store: tests, GC and the check only, never a hot path.
+    ///
+    /// A key can sit in two files, its own shard and its document shard; the copies are merged as
+    /// [`ChainStore::load`] merges them ([`merge_versions`]).
     pub fn export_all(&self) -> Chains {
-        let mut all = Chains::default();
+        let (mut all, mut strays) = (Chains::default(), Vec::new());
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
-                if e.path().extension().is_some_and(|x| x == "bin") {
-                    if let Some(c) = read_chains_file(&e.path()) {
-                        all.0.extend(c.0);
+                let path = e.path();
+                if path.extension().is_none_or(|x| x != "bin") {
+                    continue;
+                }
+                let Some(c) = read_chains_file(&path) else {
+                    continue;
+                };
+                for (key, versions) in c.0 {
+                    if shard_file(&self.dir, shard_of(&key)) == path {
+                        all.0.insert(key, versions);
+                    } else {
+                        strays.push((key, versions));
                     }
                 }
             }
+        }
+        for (key, versions) in strays {
+            merge_versions(all.0.entry(key).or_default(), versions);
         }
         for shard in self.shards.read().unwrap().values() {
             all.0
@@ -1087,6 +1353,11 @@ pub struct Commit {
     /// Id of the commit a rollback restored, for the history graph's link line. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_from: Option<String>,
+    /// Bytes of new objects this version added to the store, counted as they were written — the
+    /// storage report's per-version cost. `None` on versions from before it was recorded, which
+    /// the report still has to rebuild by replaying their manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
 }
 
 /// Work set aside off to the side of history — see [`crate::stash`].
@@ -1162,16 +1433,6 @@ impl Branches {
     pub fn set_tip(&mut self, id: &str) {
         self.branches.insert(self.current.clone(), id.to_string());
     }
-
-    /// Migration for repos created before branching existed: everything lives on `main`,
-    /// whose tip is the newest commit. Persisted by the next `save()`.
-    fn migrated(commits: &[Commit]) -> Branches {
-        let mut b = Branches::default();
-        if let Some(last) = commits.last() {
-            b.set_tip(&last.id);
-        }
-        b
-    }
 }
 
 /// Loaded repository state. Mutated in-memory then flushed with [`Repo::save`].
@@ -1190,7 +1451,7 @@ pub struct Repo {
     pub doc: DocMeta,
     pub config: Config,
     pub index: Index,
-    /// Delta chains, sharded per tracked file and loaded lazily — see [`ChainStore`].
+    /// Delta chains, sharded and loaded lazily — see [`ChainStore`].
     pub chains: ChainStore,
     /// Lazily-indexed object packs (large commits write one pack instead of thousands of
     /// loose files) — see [`crate::delta::Packs`].
@@ -1201,12 +1462,17 @@ pub struct Repo {
     pub stashes: Stashes,
     /// How many of `commits` are already lines in `commits.log`; `save()` appends the rest.
     commits_persisted: usize,
-    /// Force a full log rewrite on the next `save()`: set on legacy `commits.json` migration
-    /// and whenever `commits` was truncated (undo, GC) — see [`Repo::note_commits_truncated`].
+    /// Force a full log rewrite on the next `save()`: set on a torn last line, and whenever
+    /// `commits` was truncated (undo, GC) — see [`Repo::note_commits_truncated`].
     commits_rewrite: bool,
-    /// `config` was migrated on load — the next `save()` persists it (saves otherwise never
-    /// touch `config.json`).
-    config_dirty: bool,
+    /// The rewrite *removes* commits, which flips the save order — see [`Repo::save`].
+    commits_truncated: bool,
+    /// Lines in the middle of `commits.log` that won't decode. The store still opens with every
+    /// line that does, for viewing; every write refuses ([`Repo::ensure_writable`]).
+    log_damage: Option<String>,
+    /// Bytes of new objects this `Repo` has written — what a commit records as its
+    /// [`Commit::stored_bytes`]. Reset by the commit before it stores anything.
+    pub(crate) added_bytes: u64,
     /// Re-hash every object [`Repo::reconstruct`] rebuilds and refuse a mismatch. In-memory only
     /// and off by default — deliberately **not** a user config knob. Turned on by the operations
     /// that write reconstructed bytes into the working tree (switch, rollback, discard, stash
@@ -1274,8 +1540,14 @@ pub struct ImportResult {
     pub store: String,
     /// Findings from the post-import integrity check, `"kind: detail"` each. Non-fatal.
     pub problems: Vec<String>,
-    /// Set when this artwork failed outright; `path`/`store` are then best-effort.
+    /// Set when this artwork failed outright; `path`/`store` are then best-effort. A failed
+    /// restore leaves whatever was already there untouched.
     pub error: Option<String>,
+    /// Where the artwork that was already at `path` went — Replace keeps it beside the restore.
+    pub replaced_artwork: Option<String>,
+    /// Where the history already tracked there went: beside the new store, until a cleanup ages
+    /// it out.
+    pub replaced_history: Option<String>,
 }
 
 impl Repo {
@@ -1297,6 +1569,7 @@ impl Repo {
         if store.join("config.json").exists() {
             return Err(KvcError::AlreadyRepo(kra_path.to_path_buf()));
         }
+        refuse_missing_store_root(kra_path)?;
         // The only "nesting" guard left: stores are siblings by design, so the folder-level
         // ancestor/descendant walks the folder model needed are gone. A store either already
         // exists for this exact document (above) or it doesn't.
@@ -1379,57 +1652,29 @@ impl Repo {
     /// works — unzip and any one subfolder is a tracked document. Prefer [`Repo::import_zip`]
     /// anyway: only it re-derives where *this machine* keeps history.
     ///
-    /// Independent artworks, so one failing (permission denied, store gone) collects into the
-    /// returned list instead of aborting the rest. The finished archive is reopened and checked
-    /// (entry count + manifest readability) before success is reported — an unverified backup is
-    /// not actually a backup.
+    /// Independent artworks, so one failing (permission denied, store gone, busy) collects into
+    /// the returned list instead of aborting the rest. The finished archive is reopened and
+    /// checked (entry count + manifest readability) before success is reported — an unverified
+    /// backup is not actually a backup.
+    ///
+    /// Written as `<dest>.partial` and renamed over `dest` only once verified. The default name is
+    /// one per day, so a second backup the same day replaces the first, and a run that fails
+    /// partway must leave that first one — the only good copy — where it was.
     pub fn export_zip_multi(kra_paths: &[PathBuf], dest: &Path) -> Result<Vec<String>> {
-        let file = std::fs::File::create(dest).map_err(|e| io_at(dest, e))?;
-        let mut zw = ZipWriter::new(file);
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        let mut entry_count = 0usize;
-        let (mut entries, mut failed) = (Vec::new(), Vec::new());
-        let mut seen = HashSet::new();
-
-        for kra_path in kra_paths {
-            // The salted slug is unique per document by construction (it hashes the parent dir
-            // too), so two same-named paintings from different folders can't collide and no
-            // dedup bookkeeping is needed.
-            let salt = kra_path
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let dir = store_slug(kra_path, &salt);
-            if !seen.insert(dir.clone()) {
-                continue; // the same document listed twice
+        let mut partial = dest.as_os_str().to_os_string();
+        partial.push(".partial");
+        let partial = PathBuf::from(partial);
+        let failed = match write_backup(kra_paths, &partial) {
+            Ok(failed) => failed,
+            Err(e) => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
             }
-            match zip_one_document(&mut zw, opts, kra_path, &dir, &mut entry_count) {
-                Ok(entry) => entries.push(entry),
-                Err(_) => failed.push(kra_path.to_string_lossy().into_owned()),
-            }
-        }
-
-        if entries.is_empty() {
-            // Never leave a zip on disk that claims to be a backup of nothing.
-            drop(zw);
-            let _ = std::fs::remove_file(dest);
-            return Err(KvcError::Io(std::io::Error::other(
-                "nothing could be backed up",
-            )));
-        }
-
-        let manifest = BackupManifest {
-            version: 2,
-            timestamp: now_iso(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-            entries,
         };
-        let bytes = serde_json::to_vec(&manifest).map_err(|e| KvcError::BadIndex(e.to_string()))?;
-        zw.start_file("MANIFEST.json", opts).map_err(zip_err)?;
-        zw.write_all(&bytes)?;
-        entry_count += 1;
-        zw.finish().map_err(zip_err)?;
-        verify_zip(dest, entry_count, true)?;
+        if let Err(e) = rename_retrying(&partial, dest) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(io_at(dest, e));
+        }
         Ok(failed)
     }
 
@@ -1449,8 +1694,9 @@ impl Repo {
     /// of the zip, nothing extracted.
     ///
     /// This is what lets restore answer the only question a clash actually poses: is the backup
-    /// ahead of the history already on this machine, or behind it? Replace deletes the on-disk
-    /// history, so the artist needs to see both lists before choosing.
+    /// ahead of the history already on this machine, or behind it? Replace swaps the on-disk
+    /// history out (it's kept aside only until a cleanup ages it out), so the artist needs to see
+    /// both lists before choosing.
     ///
     /// Scoped to the archived branch tip via [`crate::commit::ancestors`], matching
     /// `list_commits`' default scope so the two sides of the comparison are counted the same way.
@@ -1465,25 +1711,21 @@ impl Repo {
         let file = std::fs::File::open(archive).map_err(|e| io_at(archive, e))?;
         let mut za = zip::ZipArchive::new(file).map_err(zip_err)?;
         // `<dir>/.kvc/<slug>/commits.log` — the slug is payload (same strip as `import_one`), so
-        // find the log by shape rather than by reconstructing this machine's slug.
+        // find the log by shape rather than by reconstructing this machine's slug. Names come
+        // from the central directory already in memory; `by_index` would seek to every entry's
+        // local header just to read its name.
         let prefix = format!("{dir}/{KVC_DIR}/");
         let idx = (0..za.len()).find(|&i| {
-            za.by_index(i)
-                .ok()
-                .map(|f| f.name().to_string())
-                .and_then(|n| n.strip_prefix(&prefix).map(str::to_string))
-                .and_then(|after| {
-                    after
-                        .split_once('/')
-                        .map(|(_slug, rel)| rel == "commits.log")
-                })
-                .unwrap_or(false)
+            za.name_for_index(i)
+                .and_then(|n| n.strip_prefix(&prefix))
+                .and_then(|after| after.split_once('/'))
+                .is_some_and(|(_slug, rel)| rel == "commits.log")
         });
         let Some(idx) = idx else {
             return Ok(Vec::new()); // an artwork backed up before its first commit
         };
         let bytes = read_entry_capped(za.by_index(idx).map_err(zip_err)?)?;
-        let (commits, _torn) = parse_commit_log(&bytes);
+        let commits = parse_commit_log(&bytes).commits;
 
         // `tip_commit` is best-effort at export time (a document whose branches wouldn't load
         // still gets backed up); with no tip there is nothing to walk, so show the whole log.
@@ -1562,61 +1804,57 @@ impl Repo {
         Err(locate_failure(kra_path, custom_store_root().as_deref()))
     }
 
-    /// Validate the store and load its state. Chains load lazily per shard; only a store still
-    /// carrying the pre-sharding monolithic chains file pays a one-time full parse here (the
-    /// split persists on the next save).
+    /// Validate the store and load its state. Chains and packs load lazily, on first use.
     pub fn open(kra_path: &Path) -> Result<Repo> {
         let (root, kvc) = Self::locate(kra_path)?;
-        let (commits, persisted, migrate) = read_commits(&kvc)?;
-        let branches = read_branches(&kvc, &commits)?;
-        let chains = if kvc.join("chains.bin").is_file() || kvc.join("chains.json").is_file() {
-            ChainStore::from_legacy(chains_dir(&kvc), read_chains(&kvc)?)
-        } else {
-            ChainStore::empty(chains_dir(&kvc))
-        };
-        let (config, config_dirty) = read_config(&kvc)?;
-        Ok(Repo {
-            root,
-            doc: read_doc_meta(&kvc)?,
-            store: kvc.clone(),
-            config,
-            index: read_json_with_backup(&kvc.join("index.json"))?,
-            chains,
-            packs: crate::delta::Packs::default(),
-            commits,
-            branches,
-            stashes: read_stashes(&kvc)?,
-            commits_persisted: persisted,
-            commits_rewrite: migrate,
-            config_dirty,
-            verify_reads: false,
-        })
+        let history = load_history(&kvc)?;
+        Self::assemble(root, kvc, history)
     }
 
-    /// Like [`Repo::open`] but never touches chains — even the legacy-monolith parse is
-    /// skipped. For read paths that never reconstruct or store (scan, log).
-    /// Invariant: never call `reconstruct`/`store_stream`/`prepare_stream` on a light repo
-    /// (on a legacy repo the store would come up empty).
+    /// [`Repo::open`] for the paths that read history but never rebuild or store content (the
+    /// log, branches, the shelf). Since chains load lazily either way, the two are the same today;
+    /// the name keeps that promise visible at the call sites.
     pub fn open_light(kra_path: &Path) -> Result<Repo> {
+        Self::open(kra_path)
+    }
+
+    /// [`Repo::open`] without reading `commits.log`, for the status-type reads that only need the
+    /// document, its index, the branches and the shelf: `kvc status` on the Krita docker's poll,
+    /// the desktop app's scan and branch list. The log is the one part of a store that grows with
+    /// every version, and those callers never look at it.
+    ///
+    /// Invariant: read-only. `commits` is empty and the damage check never ran, so every write
+    /// refuses ([`Repo::ensure_writable`]) rather than rewrite the log from nothing.
+    pub fn open_without_log(kra_path: &Path) -> Result<Repo> {
         let (root, kvc) = Self::locate(kra_path)?;
-        let (commits, persisted, migrate) = read_commits(&kvc)?;
-        let branches = read_branches(&kvc, &commits)?;
-        let (config, config_dirty) = read_config(&kvc)?;
+        let history = LoadedHistory {
+            commits: Vec::new(),
+            branches: read_json_with_backup(&kvc.join("branches.json"))?,
+            persisted: 0,
+            rewrite: false,
+            damage: Some("opened without its history, for reading only".into()),
+        };
+        Self::assemble(root, kvc, history)
+    }
+
+    fn assemble(root: PathBuf, kvc: PathBuf, history: LoadedHistory) -> Result<Repo> {
         Ok(Repo {
             root,
             doc: read_doc_meta(&kvc)?,
-            store: kvc.clone(),
-            config,
+            config: read_json(&kvc.join("config.json"))?,
             index: read_json_with_backup(&kvc.join("index.json"))?,
             chains: ChainStore::empty(chains_dir(&kvc)),
             packs: crate::delta::Packs::default(),
-            commits,
-            branches,
+            commits: history.commits,
+            branches: history.branches,
             stashes: read_stashes(&kvc)?,
-            commits_persisted: persisted,
-            commits_rewrite: migrate,
-            config_dirty,
+            commits_persisted: history.persisted,
+            commits_rewrite: history.rewrite,
+            commits_truncated: false,
+            log_damage: history.damage,
+            added_bytes: 0,
             verify_reads: false,
+            store: kvc,
         })
     }
 
@@ -1639,48 +1877,78 @@ impl Repo {
     /// unreachable ones) so the next [`Repo::save`] rewrites `commits.log` instead of appending.
     pub fn note_commits_truncated(&mut self) {
         self.commits_rewrite = true;
+        self.commits_truncated = true;
     }
 
-    /// Flush mutated state atomically. Chains rewrite only their dirty shards — the shards of
-    /// files this commit actually touched; switch/merge/undo mutate only index/commits/branches
-    /// and skip chains entirely ([`ChainStore::has_dirty`]). The commit log normally takes one
-    /// O(1) append per new commit — never a rewrite that grows with total history. Write order
-    /// matters: `branches.json` (the tips) goes last, so a torn log append is always an
-    /// unreachable orphan record, never a dangling branch tip. `stashes.json` follows for the
-    /// same reason — a stash record must never outlive the chain content it points at.
-    pub fn save(&mut self) -> Result<()> {
-        let kvc = self.store.clone();
-        if self.config_dirty {
-            write_json(&kvc.join("config.json"), &self.config)?;
-            self.config_dirty = false;
+    /// Refuse to write while the history has a hole in it (damaged lines in the middle of
+    /// `commits.log`). Viewing still works; any write would make the loss permanent — the log
+    /// rewritten from the shortened list, or new versions built on a gap. Checked by the
+    /// operations that touch the working tree before they save, and by every save itself.
+    pub fn ensure_writable(&self) -> Result<()> {
+        match &self.log_damage {
+            Some(detail) => Err(KvcError::DamagedHistory(detail.clone())),
+            None => Ok(()),
         }
+    }
+
+    /// Flush mutated state atomically. Chains rewrite only their dirty shards — the entries this
+    /// commit actually touched; switch/merge/undo mutate only index/commits/branches and skip
+    /// chains entirely ([`ChainStore::has_dirty`]). The commit log normally takes one O(1) append
+    /// per new commit — never a rewrite that grows with total history.
+    ///
+    /// Write order matters, and it depends on which way the log moves. When commits are *added*,
+    /// `branches.json` (the tips) goes after the log, so a torn append is always an unreachable
+    /// orphan record, never a dangling tip. When commits are *removed* (undo), the tip has to
+    /// move off the undone commit before the log drops it — the same rule seen from the other
+    /// side — so `branches.json` goes first, naming a commit that both the old and the new log
+    /// hold. `stashes.json` goes last either way: a stash record must never outlive the chain
+    /// content it points at.
+    pub fn save(&mut self) -> Result<()> {
+        self.ensure_writable()?;
+        let kvc = self.store.clone();
+        // Before anything is written: the next write to an unreadable shard would replace it with
+        // the empty shard it read as, destroying what a repair could salvage.
+        self.chains.set_aside_unreadable()?;
         write_json_with_backup(&kvc.join("index.json"), &self.index)?;
         if self.chains.has_dirty() {
-            self.chains.flush(&kvc)?;
+            self.chains.flush()?;
         }
-        self.flush_commits(&kvc)?;
-        self.branches.generation = self.branches.generation.wrapping_add(1);
-        write_json_with_backup(&kvc.join("branches.json"), &self.branches)?;
+        if self.commits_truncated {
+            self.write_branches()?;
+            self.flush_commits(&kvc)?;
+        } else {
+            self.flush_commits(&kvc)?;
+            self.write_branches()?;
+        }
         write_json_with_backup(&kvc.join("stashes.json"), &self.stashes)?;
         Ok(())
+    }
+
+    fn write_branches(&mut self) -> Result<()> {
+        self.branches.generation = self.branches.generation.wrapping_add(1);
+        write_json_with_backup(&self.store.join("branches.json"), &self.branches)
     }
 
     /// Persist `config` alone — for settings edits, which never touch index/chains/commits/
     /// branches and shouldn't pay for `save()`'s full flush.
     pub fn save_config(&mut self) -> Result<()> {
-        write_json(&self.store.join("config.json"), &self.config)?;
-        self.config_dirty = false;
-        Ok(())
+        write_json(&self.store.join("config.json"), &self.config)
     }
 
     fn flush_commits(&mut self, kvc: &Path) -> Result<()> {
         let log = kvc.join("commits.log");
         if self.commits_rewrite {
+            // A rewrite is the one write that can drop records, so keep the log it replaces.
+            // Timestamped rather than one rolling `.bak`, so two undos don't overwrite the copy
+            // from before the first; a cleanup ages them out with the trash (`gc::prune_aged`).
+            // Within one second the first copy wins: it's the older, more valuable one.
+            let copy = kvc.join(format!("commits.log.{}.bak", now_iso_filesafe()));
+            if log.is_file() && !copy.exists() {
+                std::fs::copy(&log, &copy).map_err(|e| io_at(&copy, e))?;
+            }
             write_atomic(&log, &commit_lines(&self.commits)?)?;
-            // Retire a legacy commits.json once the log is safely in place (mirror of the
-            // chains-monolith retirement).
-            let _ = std::fs::remove_file(kvc.join("commits.json"));
             self.commits_rewrite = false;
+            self.commits_truncated = false;
             self.commits_persisted = self.commits.len();
         } else if self.commits.len() > self.commits_persisted {
             use std::io::Write;
@@ -1702,17 +1970,17 @@ impl Repo {
         Ok(())
     }
 
-    /// Flush only `branches.json` — safe on a [`Repo::open_light`] repo, where a full
-    /// [`Repo::save`] rewrites index/commits from possibly-partial state.
+    /// Flush only `branches.json`: a branch edit touches nothing else, so it shouldn't pay for
+    /// [`Repo::save`]'s index, chains and log.
     pub fn save_branches(&mut self) -> Result<()> {
-        self.branches.generation = self.branches.generation.wrapping_add(1);
-        write_json_with_backup(&self.store.join("branches.json"), &self.branches)
+        self.ensure_writable()?;
+        self.write_branches()
     }
 
     /// Flush only `stashes.json` — same reasoning as [`Repo::save_branches`]: dropping a stash
-    /// runs on an `open_light` repo, where a full [`Repo::save`] would rewrite index/commits from
-    /// possibly-partial state.
+    /// touches nothing else.
     pub fn save_stashes(&self) -> Result<()> {
+        self.ensure_writable()?;
         write_json_with_backup(&self.store.join("stashes.json"), &self.stashes)
     }
 }
@@ -1725,7 +1993,7 @@ impl Repo {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     sync_write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).map_err(|e| io_at(path, e))?;
+    rename_retrying(&tmp, path).map_err(|e| io_at(path, e))?;
     sync_parent_dir(path);
     Ok(())
 }
@@ -1735,14 +2003,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// would collapse `a.kra` and `a.gpl` onto one temp path, and `.kvctmp` can never match
 /// `scan::is_supported`, so the scanner ignores a crash leftover instead of tracking it.
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".kvctmp");
-    let tmp = PathBuf::from(name);
+    let tmp = kvctmp_of(path);
     if let Err(e) = sync_write(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = rename_retrying(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(io_at(path, e));
     }
@@ -1750,9 +2016,115 @@ pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// [`write_file_atomic`] for content a writer produces rather than a buffer holds: `write` fills
+/// the temp file, which is fsynced, hashed and renamed into place, and the blake3 of what landed is
+/// returned for the index. The restore paths rebuild a whole document this way instead of holding
+/// it in memory first. The hash is read back rather than taken on the way out, because the zip
+/// writer seeks back to patch each entry's header.
+pub fn write_file_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<String> {
+    let tmp = kvctmp_of(path);
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| io_at(&tmp, e))?;
+        write(&mut f)?;
+        f.sync_all().map_err(|e| io_at(&tmp, e))?;
+        drop(f);
+        hash_file(&tmp)
+    })();
+    let hash = match written {
+        Ok(hash) => hash,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if let Err(e) = rename_retrying(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_at(path, e));
+    }
+    sync_parent_dir(path);
+    Ok(hash)
+}
+
+/// [`hash_bytes`] of a file's contents, read 16 MB at a time — each piece hashed in parallel on a
+/// worker of the budgeted pool, like a whole buffer would be — so a document is never held whole.
+pub fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 16 << 20];
+    let parallel = rayon::current_thread_index().is_some();
+    loop {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..]).map_err(|e| io_at(path, e))? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if parallel {
+            hasher.update_rayon(&buf[..filled]);
+        } else {
+            hasher.update(&buf[..filled]);
+        }
+        if filled < buf.len() {
+            break;
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn kvctmp_of(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".kvctmp");
+    PathBuf::from(name)
+}
+
+/// Delete `path`'s `.kvctmp` if it's a crash leftover. [`write_file_atomic`] writes the whole
+/// artwork there first, so an interrupted write leaves an artwork-sized file in the art folder,
+/// where nothing else ever looks. An hour old means no write can still be using it.
+pub(crate) fn remove_stale_kvctmp(path: &Path) {
+    let tmp = kvctmp_of(path);
+    let stale = std::fs::metadata(&tmp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+    if stale {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `fs::rename`, retried for about a second while Windows reports the target busy. Sync clients
+/// (OneDrive, Dropbox) and antivirus scanners open a file for a moment all the time — the artwork,
+/// or a temp file we just wrote — which fails the rename with a sharing violation or access
+/// denied; the next try usually lands. A real permission problem still fails, a second later.
+pub(crate) fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut pause = std::time::Duration::from_millis(20);
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if held_open(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(250));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// ERROR_SHARING_VIOLATION, or access denied — which Windows also reports for a file another
+/// process has open without delete sharing. Neither means anything transient elsewhere.
+fn held_open(e: &std::io::Error) -> bool {
+    cfg!(windows)
+        && (e.raw_os_error() == Some(32) || e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 /// Write and `fsync` one file. `sync_all` (metadata included) rather than `sync_data`: the file
 /// is brand new, so its size is part of what has to survive.
-fn sync_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn sync_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = std::fs::File::create(path).map_err(|e| io_at(path, e))?;
     f.write_all(bytes).map_err(|e| io_at(path, e))?;
     f.sync_all().map_err(|e| io_at(path, e))?;
@@ -1763,7 +2135,7 @@ fn sync_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// the rename is journaled by the filesystem and a directory handle can't be opened for sync
 /// without `FILE_FLAG_BACKUP_SEMANTICS`. Best-effort: a failure here doesn't invalidate the write.
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) {
+pub(crate) fn sync_parent_dir(path: &Path) {
     if let Some(dir) = path.parent() {
         if let Ok(f) = std::fs::File::open(dir) {
             let _ = f.sync_all();
@@ -1772,7 +2144,7 @@ fn sync_parent_dir(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) {}
+pub(crate) fn sync_parent_dir(_path: &Path) {}
 
 /// Compact (not pretty) — `.kvc/` JSON is machine state; pretty-printing scaled
 /// badly with history size back when chains were JSON too.
@@ -1805,8 +2177,8 @@ fn write_json_with_backup<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// [`read_json`], falling back to `<path>.bak` on a **decode** failure only — a missing primary
 /// file is a different problem (some callers treat "absent" as a valid empty-state default) and
-/// shouldn't silently resurrect a stale backup instead of surfacing that. Mirrors `read_commits`'
-/// "degrade, don't propagate garbage" shape for the one-shot whole-file case.
+/// shouldn't silently resurrect a stale backup instead of surfacing that. Mirrors
+/// `parse_commit_log`'s "degrade, don't propagate garbage" shape for the one-shot whole-file case.
 fn read_json_with_backup<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     match read_json(path) {
         Err(KvcError::BadIndex(_)) => {
@@ -1822,10 +2194,7 @@ fn read_json_with_backup<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T>
     }
 }
 
-/// Chain shard format tag. Bincode is not self-describing, so dropping `Version.object`
-/// needed an explicit version: `KVCC2`-prefixed shards hold the slim `Version`; bare-zstd
-/// files are pre-KVCC2 and decode through [`VersionV1`]. Old shards convert lazily — each
-/// upgrades the next time its file is dirtied (or all at once in GC's `rewrite_all`).
+/// Chain shard format tag.
 const CHAINS_MAGIC: &[u8; 5] = b"KVCC2";
 
 /// One chain shard on disk: `KVCC2` + zstd-compressed bincode. zstd level 1 — the stream keys
@@ -1839,26 +2208,14 @@ fn write_chains_file(path: &Path, chains: &Chains) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
-/// Decode a chains payload in either format; `None` on anything unreadable.
+/// Decode a chains payload; `None` on anything unreadable.
 fn decode_chains(raw: &[u8]) -> Option<Chains> {
-    if let Some(body) = raw.strip_prefix(CHAINS_MAGIC.as_slice()) {
-        let plain = zstd::decode_all(body).ok()?;
-        bincode::deserialize(&plain).ok()
-    } else {
-        // Pre-KVCC2: bare zstd(bincode) with the redundant `object` field per version.
-        let plain = zstd::decode_all(raw).ok()?;
-        let legacy: BTreeMap<String, Vec<VersionV1>> = bincode::deserialize(&plain).ok()?;
-        Some(Chains(
-            legacy
-                .into_iter()
-                .map(|(k, vs)| (k, vs.into_iter().map(Version::from).collect()))
-                .collect(),
-        ))
-    }
+    let plain = zstd::decode_all(raw.strip_prefix(CHAINS_MAGIC.as_slice())?).ok()?;
+    bincode::deserialize(&plain).ok()
 }
 
 /// Read one chain shard; `None` on missing/unreadable (a missing shard is an empty one).
-fn read_chains_file(path: &Path) -> Option<Chains> {
+pub(crate) fn read_chains_file(path: &Path) -> Option<Chains> {
     decode_chains(&std::fs::read(path).ok()?)
 }
 
@@ -1872,67 +2229,83 @@ fn commit_lines(commits: &[Commit]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Parse an append-only `commits.log` body: `(commits, torn tail)`. Split out from
-/// [`read_commits`] so the same rules apply to a log read straight out of a backup archive
-/// ([`Repo::backup_versions`]), which has no store on disk to open.
-fn parse_commit_log(bytes: &[u8]) -> (Vec<Commit>, bool) {
+/// What a `commits.log` body decoded to.
+pub(crate) struct ParsedLog {
+    pub commits: Vec<Commit>,
+    /// The last line didn't decode: a crash mid-append. `branches.json` is written after the log,
+    /// so that record was never a tip — it's dropped, and the next save rewrites the log without it
+    /// rather than appending onto the fragment.
+    pub torn_tail: bool,
+    /// 1-based numbers of undecodable lines with good lines after them. A crash can't do that
+    /// (appends only ever tear the last line), so this is damage in place — a failing sector, a
+    /// sync client's conflicted copy, a hand edit — and every line that does decode is kept.
+    pub damaged: Vec<usize>,
+}
+
+/// Parse an append-only `commits.log` body. Split out from `load_history` so the same rules
+/// apply to a log read straight out of a backup archive ([`Repo::backup_versions`]), which has no
+/// store on disk to open.
+///
+/// Stopping at the first bad line, as this once did, was right for a torn tail and silently
+/// shortened history for damage in the middle: every version after it was dropped, and the next
+/// save rewrote the log from that shortened list.
+pub(crate) fn parse_commit_log(bytes: &[u8]) -> ParsedLog {
     let mut commits = Vec::new();
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.is_empty() {
+    let mut bad = Vec::new();
+    let mut last_line = 0;
+    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        last_line = i + 1;
         match serde_json::from_slice::<Commit>(line) {
             Ok(c) => commits.push(c),
-            Err(_) => {
-                // Torn tail from a crash mid-append — an orphan record, drop it. Flag a
-                // rewrite so the partial line is scrubbed rather than appended onto.
-                return (commits, true);
-            }
+            Err(_) => bad.push(i + 1),
         }
     }
-    (commits, false)
-}
-
-/// Load the commit history: `(commits, lines persisted in the log, migrate-from-legacy)`.
-/// Prefers `commits.log` (JSON-lines). A torn trailing line — a crash mid-append — is dropped
-/// silently: `branches.json` is written after the log, so a torn record is never a branch tip.
-/// A repo from before the log carries `commits.json` instead; it's parsed here and the caller
-/// flags a rewrite so the next save writes the log and retires the legacy file.
-fn read_commits(kvc: &Path) -> Result<(Vec<Commit>, usize, bool)> {
-    let log = kvc.join("commits.log");
-    if log.is_file() {
-        let bytes = std::fs::read(&log).map_err(|e| io_at(&log, e))?;
-        let (commits, torn) = parse_commit_log(&bytes);
-        let n = commits.len();
-        Ok((commits, n, torn))
-    } else {
-        let commits: Vec<Commit> = read_json(&kvc.join("commits.json"))?;
-        Ok((commits, 0, true))
+    let torn_tail = bad.last() == Some(&last_line);
+    if torn_tail {
+        bad.pop();
+    }
+    ParsedLog {
+        commits,
+        torn_tail,
+        damaged: bad,
     }
 }
 
-/// Load a pre-sharding monolithic chains file: `chains.bin` (zstd bincode, always pre-KVCC2),
-/// else the even older `chains.json` (self-describing JSON — its extra `object` field is
-/// simply ignored by serde). Retired by the first save after opening ([`ChainStore::flush`]).
-fn read_chains(kvc: &Path) -> Result<Chains> {
-    let bin = kvc.join("chains.bin");
-    if bin.is_file() {
-        let raw = std::fs::read(&bin).map_err(|e| io_at(&bin, e))?;
-        decode_chains(&raw).ok_or_else(|| KvcError::BadIndex(bin.display().to_string()))
-    } else {
-        read_json(&kvc.join("chains.json"))
-    }
+/// The commit history, the branches that point into it, and what the log's state means for the
+/// next save.
+struct LoadedHistory {
+    commits: Vec<Commit>,
+    branches: Branches,
+    persisted: usize,
+    rewrite: bool,
+    damage: Option<String>,
 }
 
-/// Load `branches.json`, migrating pre-branching repos in-memory (no write on the read path;
-/// the next `save()` persists it).
-fn read_branches(kvc: &Path, commits: &[Commit]) -> Result<Branches> {
-    let path = kvc.join("branches.json");
-    if path.is_file() {
-        read_json_with_backup(&path)
-    } else {
-        Ok(Branches::migrated(commits))
-    }
+fn load_history(kvc: &Path) -> Result<LoadedHistory> {
+    let path = kvc.join("commits.log");
+    let log = parse_commit_log(&std::fs::read(&path).map_err(|e| io_at(&path, e))?);
+    let damage = match log.damaged.as_slice() {
+        [] => None,
+        [line] => Some(format!("commits.log line {line} is unreadable")),
+        lines => Some(format!(
+            "commits.log lines {} are unreadable",
+            lines
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    };
+    Ok(LoadedHistory {
+        persisted: log.commits.len(),
+        rewrite: log.torn_tail,
+        commits: log.commits,
+        branches: read_json_with_backup(&kvc.join("branches.json"))?,
+        damage,
+    })
 }
 
 /// Why a document with no store at its expected path failed to open. Split out from
@@ -1947,6 +2320,16 @@ pub fn locate_failure(kra_path: &Path, custom_root: Option<&Path>) -> KvcError {
     }
 }
 
+/// Before creating a store: a configured store root that isn't there has been moved, renamed or
+/// unplugged, and creating it afresh would start a new, empty history beside the real one — the
+/// case `StoreUnreachable` exists to prevent. Same rule [`Repo::locate`] applies on open.
+fn refuse_missing_store_root(kra_path: &Path) -> Result<()> {
+    match locate_failure(kra_path, custom_store_root().as_deref()) {
+        e @ KvcError::StoreUnreachable(_) => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// A store always carries `doc.json`; a missing one means the store is damaged, not empty.
 fn read_doc_meta(store: &Path) -> Result<DocMeta> {
     read_json(&store.join("doc.json"))
@@ -1954,8 +2337,8 @@ fn read_doc_meta(store: &Path) -> Result<DocMeta> {
 
 /// Read just `branches.json`'s generation counter — for a cheap before/after staleness check
 /// around a read command, without paying for a full [`Repo::open_light`] (which also re-reads
-/// `commits.log`, the part that actually scales with history). A missing `branches.json` (a
-/// pre-branching repo) reads as generation 0, same as a fresh one.
+/// `commits.log`, the part that actually scales with history). A missing `branches.json` reads as
+/// generation 0; the open it brackets is what reports it.
 pub fn read_branches_generation(store: &Path) -> Result<u64> {
     let path = store.join("branches.json");
     if !path.is_file() {
@@ -1982,9 +2365,12 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 /// blake3 of a byte slice as lowercase hex. Multi-MB buffers (whole .kra files on scan/commit)
-/// hash multi-core; small buffers (tiles) stay on the cheap single-threaded path.
+/// hash multi-core when already on a worker of the budgeted pool; small buffers (tiles) stay on
+/// the cheap single-threaded path. Off the pool — the cheap reads `commands::run` keeps out of it
+/// — `update_rayon` would spill onto rayon's global pool: every core at normal priority, exactly
+/// what `cpu` exists to prevent.
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    if bytes.len() >= 1 << 20 {
+    if bytes.len() >= 1 << 20 && rayon::current_thread_index().is_some() {
         let mut h = blake3::Hasher::new();
         h.update_rayon(bytes);
         h.finalize().to_hex().to_string()

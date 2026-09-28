@@ -8,6 +8,8 @@
 
 use crate::error::{io_at, Result};
 use crate::repo::{hash_bytes, Repo};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Ceiling on what a scan hands back through `keep_bytes`. Retaining the buffer saves the commit
 /// path a second full read of the document, which is the right trade for ordinary art; past this
@@ -49,7 +51,8 @@ pub struct ScanChange {
 /// A document whose size+mtime still match the index is assumed unchanged and skipped without
 /// reading/hashing it — the win for big `.kra` files. A document whose last commit was a layer
 /// subset ([`crate::repo::TrackedFile::partial`]) is reported modified on the same evidence,
-/// also without reading it.
+/// also without reading it, and so is one already read at this size and mtime (`worktree.json`):
+/// a saved-but-unversioned painting is read once per save, not once per poll.
 pub fn scan(repo: &Repo) -> Result<Vec<(String, String)>> {
     Ok(scan_detailed(repo, false)?
         .into_iter()
@@ -74,6 +77,9 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
     let mut out = Vec::new();
     for rel in repo.tracked_paths() {
         let abs = crate::repo::safe_join(&repo.root, &rel)?;
+        // The one place that looks beside the artwork regularly, so it's where a crashed
+        // working-tree write's artwork-sized temp gets cleared up.
+        crate::repo::remove_stale_kvctmp(&abs);
         let tracked = repo.index.files.get(&rel);
         let meta = match std::fs::metadata(&abs) {
             Ok(m) if m.is_file() => m,
@@ -81,15 +87,7 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
             // nothing at all if we didn't.
             _ => {
                 if tracked.is_some() {
-                    out.push(ScanChange {
-                        rel,
-                        status: "D".into(),
-                        hash: String::new(),
-                        size: 0,
-                        mtime: 0,
-                        bytes: None,
-                        partial: false,
-                    });
+                    out.push(unread(rel, "D", 0, 0));
                 }
                 continue;
             }
@@ -110,24 +108,39 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
                 // to avoid (`kvc status` is on the plugin's 1.5s poll). Callers that want the
                 // bytes fall through and read as usual.
                 if !keep_bytes {
-                    out.push(ScanChange {
-                        rel,
-                        status: "M".into(),
-                        // Not read, so not hashed — same as the deletion arm above. Every
-                        // `keep_bytes == false` caller uses only `rel`/`status`.
-                        hash: String::new(),
-                        size,
-                        mtime,
-                        bytes: None,
-                        partial: false,
-                    });
+                    out.push(unread(rel, "M", size, mtime));
                     continue;
                 }
             }
         }
 
+        // Every caller that doesn't want the bytes uses only `rel`/`status`, and neither needs a
+        // read for a document with no committed version (it's `U` whatever it holds), nor for one
+        // this scan's predecessor already hashed at this exact size and mtime. That second case is
+        // the normal state while painting — saved but not yet a version — and the Krita docker
+        // polls `kvc status` every 1.5 s on Krita's UI thread: reading and hashing the whole
+        // painting on every tick was 78 ms at 105 MB, 136 ms at 195 MB, and seconds from a cold
+        // disk.
+        if !keep_bytes {
+            let known = match tracked {
+                None => Some(String::new()),
+                Some(_) => remembered_hash(&repo.store, &rel, size, mtime),
+            };
+            if let Some(hash) = known {
+                match tracked {
+                    Some(tf) if tf.hash == hash => continue,
+                    Some(_) => out.push(unread(rel, "M", size, mtime)),
+                    None => out.push(unread(rel, "U", size, mtime)),
+                }
+                continue;
+            }
+        }
+
         let bytes = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
         let hash = hash_bytes(&bytes);
+        if !keep_bytes {
+            remember_hash(&repo.store, &rel, size, mtime, &hash);
+        }
         let status = match tracked {
             None => "U",
             Some(tf) if tf.hash != hash => "M",
@@ -147,6 +160,70 @@ pub fn scan_detailed(repo: &Repo, keep_bytes: bool) -> Result<Vec<ScanChange>> {
         });
     }
     Ok(out)
+}
+
+/// A change reported without reading the file, so without a hash — same as the deletion arm.
+fn unread(rel: String, status: &str, size: u64, mtime: u64) -> ScanChange {
+    ScanChange {
+        rel,
+        status: status.into(),
+        hash: String::new(),
+        size,
+        mtime,
+        bytes: None,
+        partial: false,
+    }
+}
+
+/// What the last scan that had to read the working file learned: its size and mtime as stat'ed
+/// before the read, and the hash of what it read. `worktree.json` in the store — a cache, written
+/// best-effort and read only when it matches exactly, so a missing or unreadable one just means
+/// the next scan reads the file again.
+#[derive(Serialize, Deserialize)]
+struct Worktree {
+    rel: String,
+    size: u64,
+    mtime: u64,
+    hash: String,
+}
+
+/// The hash `worktree.json` remembers for `rel` at this size and mtime. The same racy-clean guard
+/// the index gets in [`scan_detailed`]: trusted only when the file's mtime is strictly older than
+/// the sidecar's own, since a rewrite inside the tick the file was stat'ed in would keep its mtime.
+fn remembered_hash(store: &Path, rel: &str, size: u64, mtime: u64) -> Option<String> {
+    let path = store.join(crate::repo::WORKTREE_FILE);
+    let written = crate::repo::size_mtime(&std::fs::metadata(&path).ok()?).1;
+    let w: Worktree = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    (w.rel == rel
+        && w.size == size
+        && w.mtime == mtime
+        && (size, mtime) != (0, 0)
+        && mtime < written)
+        .then_some(w.hash)
+}
+
+/// Record what this scan read (see [`remembered_hash`]). Temp-then-rename under a per-process
+/// name, because `kvc status` (no lock — it's the docker's poll) and the desktop app can both be
+/// scanning; whichever lands last wins, and both are whole, true records.
+fn remember_hash(store: &Path, rel: &str, size: u64, mtime: u64, hash: &str) {
+    let record = Worktree {
+        rel: rel.to_string(),
+        size,
+        mtime,
+        hash: hash.to_string(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let path = store.join(crate::repo::WORKTREE_FILE);
+    let tmp = store.join(format!(
+        "{}.{}.tmp",
+        crate::repo::WORKTREE_FILE,
+        std::process::id()
+    ));
+    if std::fs::write(&tmp, bytes).is_err() || crate::repo::rename_retrying(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// The only files Krita VCS tracks: Krita documents. Standalone palette files (`.gpl`/`.kpl`/

@@ -107,6 +107,12 @@ export interface ArtLayer {
   before: string | null; // null when change === "added"
   after: string | null; // null when change === "removed"
   /**
+   * The same markup pointing at a small (128 px) thumbnail, for the layer list. Absent when the
+   * backend had none to offer; the list then falls back to `before`/`after`, the full raster.
+   */
+  beforeThumb?: string | null;
+  afterThumb?: string | null;
+  /**
    * This layer's **own** change-highlight, diffed from its before/after rasters — mirrors the
    * composite-level `diffImage`/`diffOutline`/`regions` on `ArtDiff` but scoped to this layer, so
    * selecting a layer shows only *its* changed pixels (not the whole-file composite outline). Only

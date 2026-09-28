@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import {
   ClockCounterClockwise,
   GitBranch,
@@ -10,12 +10,16 @@ import {
 } from "@phosphor-icons/react";
 import { IconButton } from "../ui/IconButton";
 import { ICON } from "../../lib/iconSize";
-import { SettingsModal } from "./SettingsModal";
 import { BackupModal } from "./BackupModal";
 import { useRepository } from "../../lib/repository";
 import { useLegacyHistory } from "../../lib/legacyHistory";
 
 export type ActivityView = "changes" | "map" | "history" | "branches" | "performance";
+
+// Opened now and then, so it loads when it's first opened rather than with the app.
+const SettingsModal = lazy(() =>
+  import("./SettingsModal").then((m) => ({ default: m.SettingsModal }))
+);
 
 interface ActivityBarProps {
   active: ActivityView;
@@ -76,7 +80,11 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
         />
       </div>
       {backupOpen && <BackupModal onClose={() => setBackupOpen(false)} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <Suspense fallback={null}>
+          <SettingsModal onClose={() => setSettingsOpen(false)} />
+        </Suspense>
+      )}
     </nav>
   );
 }

@@ -4,13 +4,14 @@
 //! *before* anything is touched, instead of a mid-operation IO error partway through a batch of
 //! files.
 //!
-//! Deliberately a simple worst-case estimate, not a precise per-object accounting: `needed * 2`
-//! covers `write_file_atomic`'s brief doubling (temp file written before the old one is replaced),
-//! and callers sum the same size fields they already have on hand (`ScanChange::size`,
-//! `CommittedFile::original_size`) rather than computing anything new.
+//! Callers ask for what they're about to write, on the drive it lands on, and no more: a switch or
+//! rollback needs the restored files' size free on the **artwork's** drive (a temp copy replaces
+//! each one, and the file being replaced already holds its own space), and a commit needs its new
+//! objects' size on the **store's** — measured once they're prepared, since a commit usually adds
+//! a few MB to a painting of a GB. Over-asking refused versions exactly when the disk ran low,
+//! which is when an artist most needs to save them.
 
 use crate::error::{KvcError, Result};
-use crate::repo::Repo;
 use std::path::Path;
 
 /// Free bytes on the volume containing `path`, or `None` if that can't be determined (an
@@ -46,22 +47,19 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Refuse up front if the volume holding the **store** doesn't look like it has room for
-/// `needed_bytes` (doubled — see module docs). The store, not `repo.root`: these bytes are
-/// objects and chains, and a custom store root can put them on a different drive than the
-/// artwork. A `None` from [`free_bytes`] always passes: the check is a belt-and-suspenders
-/// precaution, not a hard dependency of any write.
-pub fn check_available(repo: &Repo, needed_bytes: u64) -> Result<()> {
-    evaluate(free_bytes(&repo.store), needed_bytes)
+/// Refuse up front if the volume holding `on` (an existing folder on the drive the bytes will
+/// land on) doesn't look like it has room for `needed`. A `None` from [`free_bytes`] always
+/// passes: the check is a belt-and-suspenders precaution, not a hard dependency of any write.
+pub fn check_available(on: &Path, needed: u64) -> Result<()> {
+    evaluate(free_bytes(on), needed)
 }
 
 /// The comparison itself, split out from the syscall so it's unit-testable without faking a
 /// real volume.
-fn evaluate(available: Option<u64>, needed_bytes: u64) -> Result<()> {
+fn evaluate(available: Option<u64>, needed: u64) -> Result<()> {
     let Some(available) = available else {
         return Ok(());
     };
-    let needed = needed_bytes.saturating_mul(2);
     if available < needed {
         return Err(KvcError::InsufficientDiskSpace { needed, available });
     }
@@ -82,20 +80,24 @@ mod tests {
     }
 
     #[test]
-    fn refuses_when_available_is_below_double_the_need() {
-        let err = evaluate(Some(100), 60).unwrap_err();
+    fn refuses_when_available_is_below_the_need() {
+        let err = evaluate(Some(100), 101).unwrap_err();
         assert!(matches!(
             err,
             KvcError::InsufficientDiskSpace {
-                needed: 120,
+                needed: 101,
                 available: 100
             }
         ));
     }
 
+    /// Not doubled: the file being replaced already occupies its space, so a temp-then-rename
+    /// needs one file's worth free, not two — and a commit writes only what changed. Doubling
+    /// refused to version a 1 GB painting with 1.5 GB free, when saving versions matters most.
     #[test]
-    fn passes_when_available_covers_double_the_need() {
-        assert!(evaluate(Some(200), 60).is_ok());
+    fn passes_when_available_covers_the_need() {
+        assert!(evaluate(Some(100), 60).is_ok());
+        assert!(evaluate(Some(100), 100).is_ok());
     }
 
     #[test]

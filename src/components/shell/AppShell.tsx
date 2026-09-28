@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderOpen, SidebarSimple } from "@phosphor-icons/react";
 import { ActivityBar, type ActivityView } from "./ActivityBar";
 import { BusyOverlay } from "./BusyOverlay";
@@ -7,8 +7,6 @@ import { Sidebar } from "./Sidebar";
 import { Inspector } from "./Inspector";
 import { StatusBar } from "./StatusBar";
 import { TopBar } from "./TopBar";
-import { TourOverlay } from "./TourOverlay";
-import { OnboardingOverlay } from "./OnboardingOverlay";
 import { MainPanel } from "../MainPanel";
 import { VersionMapPanel } from "../vcs/VersionMapPanel";
 import { IconButton } from "../ui/IconButton";
@@ -30,10 +28,18 @@ import {
 import { versionLabel, versionNumbers, assetName } from "../../lib/friendly";
 import type { Repository } from "../../types";
 
-// The scan itself is cheap (one `stat` call), so this throttles UI churn, not backend load —
-// long enough to absorb a rapid save-and-alt-tab-back loop while painting, short enough that
-// it's invisible on any real break (and "Rescan for changes" covers the gap either way).
+// The scan itself is cheap — a `stat`, plus one read of the painting per save it hasn't seen yet
+// (it remembers the hash of a saved-but-unversioned file) — so this throttles UI churn, not
+// backend load: long enough to absorb a rapid save-and-alt-tab-back loop while painting, short
+// enough that it's invisible on any real break (and "Rescan for changes" covers the gap either way).
 const FOCUS_REFRESH_THROTTLE_MS = 30_000;
+
+// The first-launch interview and the tour each show once (or on a replay), so they load when
+// they're shown rather than with the app — rendered only while active, not merely returning null.
+const OnboardingOverlay = lazy(() =>
+  import("./OnboardingOverlay").then((m) => ({ default: m.OnboardingOverlay }))
+);
+const TourOverlay = lazy(() => import("./TourOverlay").then((m) => ({ default: m.TourOverlay })));
 
 /**
  * Root application shell — owns layout + view state.
@@ -49,11 +55,16 @@ const FOCUS_REFRESH_THROTTLE_MS = 30_000;
  */
 export function AppShell() {
   const { current } = useRepository();
+  const { active: onboarding } = useOnboarding();
   return (
     <>
       {current ? <RepoShell repo={current} /> : <WelcomeShell />}
       <BusyOverlay />
-      <OnboardingOverlay />
+      {onboarding && (
+        <Suspense fallback={null}>
+          <OnboardingOverlay />
+        </Suspense>
+      )}
     </>
   );
 }
@@ -87,7 +98,7 @@ function WelcomeShell() {
 
 function RepoShell({ repo }: { repo: Repository }) {
   const { artistMode } = useArtistMode();
-  const { beginIfFirstTime, setConditions } = useTour();
+  const { active: touring, beginIfFirstTime, setConditions } = useTour();
   const { active: onboarding } = useOnboarding();
   const { legacy } = useLegacyHistory();
   const { refreshNonce, refresh, scanning, setScanning } = useRepository();
@@ -102,12 +113,17 @@ function RepoShell({ repo }: { repo: Repository }) {
     refreshNonce,
     setScanning
   );
+  const [activeView, setActiveView] = useState<ActivityView>("map");
   // Same reasoning as `workingItems` above: `PerformancePanel` mounts/unmounts every time the
   // Performance view is switched to/away from (Sidebar conditionally renders it on `view`, and
   // Sidebar itself unmounts in Map view), so a `useStorageStats` call inside it would recompute
-  // `repo_storage_stats` on every open. Hoisted here so it survives view switches.
-  const { stats: perfStats, loading: perfLoading } = useStorageStats(repo.path, refreshNonce);
-  const [activeView, setActiveView] = useState<ActivityView>("map");
+  // `repo_storage_stats` on every open. Hoisted here so the last answer survives view switches —
+  // but only fetched while that view is showing.
+  const { stats: perfStats, loading: perfLoading } = useStorageStats(
+    repo.path,
+    refreshNonce,
+    activeView === "performance"
+  );
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusedFile, setFocusedFile] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -390,7 +406,11 @@ function RepoShell({ repo }: { repo: Repository }) {
         branch={currentBranch.name}
         commitCount={commits.length}
       />
-      <TourOverlay setActiveView={setActiveView} />
+      {touring && (
+        <Suspense fallback={null}>
+          <TourOverlay setActiveView={setActiveView} />
+        </Suspense>
+      )}
     </div>
   );
 }

@@ -17,7 +17,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
-    /// `missingObject` | `brokenChain` | `danglingTip` | `badLogLine` | `badPack` | `corruptContent`
+    /// `missingObject` | `brokenChain` | `danglingTip` | `missingParent` | `badLogLine` |
+    /// `badChains` | `badPack` | `corruptContent`
     pub kind: String,
     pub detail: String,
 }
@@ -68,10 +69,25 @@ pub fn check_repository(repo: &mut Repo, scrub: bool) -> Result<CheckReport> {
         ));
     }
 
+    // --- every version's parents are in the log ---------------------------------------------
+    // A log can decode cleanly and still be missing a version later ones build on: the state a
+    // damaged line, or an interrupted undo, leaves once the next commit lands on top. Everything
+    // older than the gap is then unreachable, and nothing else here would say so.
+    for c in &repo.commits {
+        for parent in c.parents.iter().filter(|p| !ids.contains(p.as_str())) {
+            problems.push(problem(
+                "missingParent",
+                format!(
+                    "version {} builds on {parent}, which the history doesn't have",
+                    c.id
+                ),
+            ));
+        }
+    }
+
     // --- every commit-log line decodes ----------------------------------------------------
-    // `read_commits` stops at the first bad line and silently drops everything after it — right
-    // for a torn tail from a crash mid-append, wrong for damage in the middle of the file, which
-    // would quietly shorten history. Scan the whole thing here.
+    // The store opens with every line that does (a torn last line is dropped as a crash
+    // leftover); name the ones that don't.
     let log = repo.store.join("commits.log");
     if log.is_file() {
         let bytes = std::fs::read(&log).map_err(|e| crate::error::io_at(&log, e))?;
@@ -98,11 +114,25 @@ pub fn check_repository(repo: &mut Repo, scrub: bool) -> Result<CheckReport> {
     // what it was (it's always `false` on a freshly-opened `Repo`, but don't assume that).
     let prior_verify_reads = repo.verify_reads;
     repo.verify_reads = scrub;
-    let mut scrub_memo: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut scrub_memo = crate::delta::ReconstructMemo::default();
+    // Each stream's versions in chain order, so a patch's base is the version rebuilt just before
+    // it and the memo — a few entries, not the whole history — keeps hitting.
+    let chain_pos = |key: &str, hash: &str| {
+        marks
+            .all
+            .0
+            .get(key)
+            .and_then(|chain| chain.iter().position(|v| v.hash == hash))
+    };
+    let mut in_order: Vec<(&String, Option<usize>, &String)> = marks
+        .marked
+        .iter()
+        .map(|(key, hash)| (key, chain_pos(key, hash), hash))
+        .collect();
+    in_order.sort();
     let mut objects_checked = 0usize;
     let mut versions_scrubbed = 0usize;
-    for (key, hash) in &marks.marked {
+    for (key, _, hash) in in_order {
         let version = marks
             .all
             .0
@@ -136,6 +166,27 @@ pub fn check_repository(repo: &mut Repo, scrub: bool) -> Result<CheckReport> {
         }
     }
     repo.verify_reads = prior_verify_reads;
+
+    // --- chain shards decode ----------------------------------------------------------------
+    // An unreadable shard reads as empty everywhere else, which shows up as a `brokenChain` per
+    // version. Name the file, and keep naming one a save set aside (`Repo::save` moves it to
+    // `.corrupt-<time>` rather than write over it) until someone repairs or removes it.
+    if let Ok(rd) = std::fs::read_dir(crate::repo::chains_dir(&repo.store)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.contains(".bin.corrupt-") {
+                problems.push(problem(
+                    "badChains",
+                    format!("{name} couldn't be decoded and was kept aside; the versions it recorded can't be rebuilt from it"),
+                ));
+            } else if p.extension().is_some_and(|x| x == "bin")
+                && crate::repo::read_chains_file(&p).is_none()
+            {
+                problems.push(problem("badChains", format!("{name} is unreadable")));
+            }
+        }
+    }
 
     // --- packs parse ----------------------------------------------------------------------
     // An unparseable pack is skipped everywhere else in the engine, which turns real corruption

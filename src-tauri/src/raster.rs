@@ -269,16 +269,25 @@ fn box_downscale(rgba: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u
     out
 }
 
-/// Downscale an RGBA8 buffer so its longest side is at most `MAX_RASTER_DIM`, returning the new
-/// buffer and dimensions. Returns the input unchanged when it's already within the cap.
-pub fn cap_rgba(rgba: &[u8], width: u32, height: u32) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
+/// The capped size of a `width`x`height` raster: longest side at most `MAX_RASTER_DIM`.
+fn capped_dims(width: u32, height: u32) -> (u32, u32) {
     let longest = width.max(height);
     if longest <= MAX_RASTER_DIM || width == 0 || height == 0 {
-        return (std::borrow::Cow::Borrowed(rgba), width, height);
+        return (width, height);
     }
     let scale = MAX_RASTER_DIM as f64 / longest as f64;
     let nw = ((width as f64 * scale).round() as u32).max(1);
     let nh = ((height as f64 * scale).round() as u32).max(1);
+    (nw, nh)
+}
+
+/// Downscale an RGBA8 buffer so its longest side is at most `MAX_RASTER_DIM`, returning the new
+/// buffer and dimensions. Returns the input unchanged when it's already within the cap.
+pub fn cap_rgba(rgba: &[u8], width: u32, height: u32) -> (std::borrow::Cow<'_, [u8]>, u32, u32) {
+    let (nw, nh) = capped_dims(width, height);
+    if (nw, nh) == (width, height) {
+        return (std::borrow::Cow::Borrowed(rgba), width, height);
+    }
     let out = box_downscale(
         rgba,
         width as usize,
@@ -289,9 +298,151 @@ pub fn cap_rgba(rgba: &[u8], width: u32, height: u32) -> (std::borrow::Cow<'_, [
     (std::borrow::Cow::Owned(out), nw, nh)
 }
 
+/// Tiles decoded per parallel batch while rasterizing a layer: enough to keep every worker busy,
+/// few enough that the decoded pixels in flight stay a few MB rather than the whole layer.
+const DECODE_BATCH: usize = 256;
+
+/// A layer's pixels at the capped raster size: every tile decoded (`decode` returns its RGBA
+/// pixels, or `None` for one that won't decode), blitted over `default_pixel`, and box-filtered
+/// down to `MAX_RASTER_DIM` — the output of full-size canvas + [`blit`] + [`cap_rgba`], exactly.
+///
+/// It no longer goes through that full-size canvas when it doesn't have to. A 600 dpi A3 layer's
+/// canvas is 7016 x 9921 x 4 = 278 MB, filled with the default pixel, blitted into, then read
+/// again to shrink it, three layers at a time — a cold layer diff peaked at 902 MB. Every source
+/// pixel belongs to exactly one output pixel's box, so the premultiplied sums [`box_downscale`]
+/// takes can be accumulated straight from the tiles into a buffer the size of the output, and the
+/// integer arithmetic comes out identical. That needs every canvas pixel counted once: tiles on
+/// their `tw`x`th` grid at distinct positions, which is how Krita writes them. Anything else
+/// (overlapping tiles, where the last one blitted wins) takes the canvas path, as does a layer
+/// already within the cap.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_tiles<T: Sync>(
+    tiles: &[T],
+    pos: impl Fn(&T) -> (i64, i64),
+    decode: impl Fn(&T) -> Result<Option<Vec<u8>>> + Sync,
+    width: i64,
+    height: i64,
+    tw: i64,
+    th: i64,
+    default_pixel: Option<[u8; 4]>,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let (w, h) = (width as usize, height as usize);
+    let (nw, nh) = capped_dims(width as u32, height as u32);
+    let mut seen = std::collections::HashSet::with_capacity(tiles.len());
+    let disjoint = tiles
+        .iter()
+        .map(&pos)
+        .all(|(x, y)| x.rem_euclid(tw) == 0 && y.rem_euclid(th) == 0 && seen.insert((x, y)));
+
+    if (nw, nh) == (width as u32, height as u32) || !disjoint {
+        let mut canvas = vec![0u8; w * h * 4];
+        if let Some(fill) = default_pixel {
+            for px in canvas.chunks_exact_mut(4) {
+                px.copy_from_slice(&fill);
+            }
+        }
+        each_decoded(tiles, &pos, &decode, |x, y, px| {
+            blit(&mut canvas, width, height, x, y, px, tw, th)
+        })?;
+        let (capped, cw, ch) = cap_rgba(&canvas, width as u32, height as u32);
+        return Ok((capped.into_owned(), cw, ch));
+    }
+
+    let (nw, nh) = (nw as usize, nh as usize);
+    // The inverse of `box_downscale`'s partition, whose box `x` spans `x*w/nw .. (x+1)*w/nw`:
+    // the box holding source column `sx` is the last one starting at or before it.
+    let col_of: Vec<u32> = (0..w).map(|sx| (((sx + 1) * nw - 1) / w) as u32).collect();
+    let row_of: Vec<u32> = (0..h).map(|sy| (((sy + 1) * nh - 1) / h) as u32).collect();
+    // Per output pixel: Σ r·a, Σ g·a, Σ b·a, Σ a, as `box_downscale` sums them. u32 holds any box
+    // (at most 25 x 17 source pixels at the 32,768 px canvas limit) at 255·255 per pixel.
+    let mut acc = vec![[0u32; 4]; nw * nh];
+    // How many of each box's pixels a tile covered; the rest are the default pixel.
+    let mut covered = vec![0u16; if default_pixel.is_some() { nw * nh } else { 0 }];
+    each_decoded(tiles, &pos, &decode, |x, y, px| {
+        for row in 0..th {
+            let sy = y + row;
+            if sy < 0 || sy >= height {
+                continue;
+            }
+            let base = row_of[sy as usize] as usize * nw;
+            for col in 0..tw {
+                let sx = x + col;
+                if sx < 0 || sx >= width {
+                    continue;
+                }
+                let d = base + col_of[sx as usize] as usize;
+                let i = ((row * tw + col) * 4) as usize;
+                let a = px[i + 3] as u32;
+                let s = &mut acc[d];
+                s[0] += px[i] as u32 * a;
+                s[1] += px[i + 1] as u32 * a;
+                s[2] += px[i + 2] as u32 * a;
+                s[3] += a;
+                if !covered.is_empty() {
+                    covered[d] += 1;
+                }
+            }
+        }
+    })?;
+
+    // Box sizes, as `box_downscale` computes them.
+    let span = |i: usize, src: usize, dst: usize| {
+        let s0 = i * src / dst;
+        (((i + 1) * src) / dst).max(s0 + 1).min(src) - s0
+    };
+    let widths: Vec<u64> = (0..nw).map(|x| span(x, w, nw) as u64).collect();
+    let mut out = vec![0u8; nw * nh * 4];
+    for (y, out_row) in out.chunks_exact_mut(nw * 4).enumerate() {
+        let rows = span(y, h, nh) as u64;
+        for x in 0..nw {
+            let d = y * nw + x;
+            let count = rows * widths[x];
+            let [mut r, mut g, mut b, mut a] = acc[d].map(u64::from);
+            if let Some(fill) = default_pixel {
+                let n = count - covered[d] as u64;
+                let fa = fill[3] as u64;
+                r += n * fill[0] as u64 * fa;
+                g += n * fill[1] as u64 * fa;
+                b += n * fill[2] as u64 * fa;
+                a += n * fa;
+            }
+            let o = &mut out_row[x * 4..x * 4 + 4];
+            // Half-up rounding, exactly as `box_downscale`.
+            o[3] = ((2 * a + count) / (2 * count)).min(255) as u8;
+            if a > 0 {
+                o[0] = ((2 * r + a) / (2 * a)).min(255) as u8;
+                o[1] = ((2 * g + a) / (2 * a)).min(255) as u8;
+                o[2] = ((2 * b + a) / (2 * a)).min(255) as u8;
+            }
+        }
+    }
+    Ok((out, nw as u32, nh as u32))
+}
+
+/// Decode `tiles` in parallel batches of [`DECODE_BATCH`] and hand each one's pixels to `each`,
+/// in order, on this thread.
+fn each_decoded<T: Sync>(
+    tiles: &[T],
+    pos: &impl Fn(&T) -> (i64, i64),
+    decode: &(impl Fn(&T) -> Result<Option<Vec<u8>>> + Sync),
+    mut each: impl FnMut(i64, i64, &[u8]),
+) -> Result<()> {
+    use rayon::prelude::*;
+    for batch in tiles.chunks(DECODE_BATCH) {
+        let decoded: Vec<Option<Vec<u8>>> = batch.par_iter().map(decode).collect::<Result<_>>()?;
+        for (t, px) in batch.iter().zip(decoded) {
+            if let Some(px) = px {
+                let (x, y) = pos(t);
+                each(x, y, &px);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decode a PNG into a straight-alpha RGBA8 buffer + dimensions. Returns `None` for anything we
 /// don't handle (16-bit, palette, grayscale, malformed) — callers treat that as "skip", never
-/// an error. RGB is expanded to opaque RGBA. Shared by [`diff_mask_png`] and
+/// an error. RGB is expanded to opaque RGBA. Shared by [`diff_overlay_full`] and
 /// [`composite_stack`].
 pub fn decode_png_rgba(png_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
@@ -448,8 +599,22 @@ fn changed_grid(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<bool>, usize
     Some((grid, w, h))
 }
 
-/// Accent-tinted PNG (transparent elsewhere) from a changed grid, capped to `MAX_RASTER_DIM`.
-fn mask_png_from_grid(grid: &[bool], w: usize, h: usize) -> Option<Vec<u8>> {
+/// Text-chunk keys a change mask carries its outline and bounding box under, so a cache hit has
+/// both without decoding the mask and tracing it again — which every Version Map node paid on a
+/// warm cache, only to throw the result away. The box key is always written, so its absence marks
+/// a mask cached before this existed.
+const OUTLINE_KEY: &str = "kvc-outline";
+const BBOX_KEY: &str = "kvc-bbox";
+
+/// Accent-tinted PNG (transparent elsewhere) from a changed grid, capped to `MAX_RASTER_DIM`, with
+/// its `outline` and `bbox` riding along as text chunks (see [`mask_meta`]).
+fn mask_png_from_grid(
+    grid: &[bool],
+    w: usize,
+    h: usize,
+    outline: Option<&str>,
+    bbox: Option<(f64, f64, f64, f64)>,
+) -> Option<Vec<u8>> {
     let mut mask = vec![0u8; w * h * 4];
     for (i, &c) in grid.iter().enumerate() {
         if c {
@@ -457,7 +622,39 @@ fn mask_png_from_grid(grid: &[bool], w: usize, h: usize) -> Option<Vec<u8>> {
         }
     }
     let (capped, cw, ch) = cap_rgba(&mask, w as u32, h as u32);
-    rgba_to_png(&capped, cw, ch).ok()
+    let bbox = match bbox {
+        Some((x, y, bw, bh)) => format!("{x} {y} {bw} {bh}"),
+        None => "none".to_string(),
+    };
+    let mut texts = vec![(BBOX_KEY, bbox.as_str())];
+    if let Some(d) = outline {
+        texts.push((OUTLINE_KEY, d));
+    }
+    encode_png(&capped, cw, ch, &texts).ok()
+}
+
+/// What a change mask cached by [`mask_png_from_grid`] says about itself — `(outline, bbox)` —
+/// read from its text chunks, which precede the pixel data, so the pixels are never decoded.
+/// `None` for a mask cached before the chunks existed; the caller then decodes it.
+#[allow(clippy::type_complexity)]
+pub fn mask_meta(path: &std::path::Path) -> Option<(Option<String>, Option<(f64, f64, f64, f64)>)> {
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let reader = png::Decoder::new(file).read_info().ok()?;
+    let text = |key: &str| {
+        reader
+            .info()
+            .uncompressed_latin1_text
+            .iter()
+            .find(|c| c.keyword == key)
+            .map(|c| c.text.clone())
+    };
+    let bbox = text(BBOX_KEY)?;
+    let nums: Vec<f64> = bbox.split(' ').filter_map(|n| n.parse().ok()).collect();
+    let bbox = match nums[..] {
+        [x, y, w, h] => Some((x, y, w, h)),
+        _ => None,
+    };
+    Some((text(OUTLINE_KEY), bbox))
 }
 
 /// Trace the boundary between changed and unchanged pixels into SVG path data, in a **normalized
@@ -572,35 +769,22 @@ fn outline_from_grid(grid: &[bool], w: usize, h: usize) -> Option<String> {
     (!d.is_empty()).then_some(d)
 }
 
-/// A transparent PNG that is opaque (accent-tinted) only where the two composites differ. Both
-/// PNGs are decoded to RGBA and compared pixel-for-pixel; a size mismatch index-samples the
-/// `before` into the `after`'s grid. Capped to `MAX_RASTER_DIM` like the composites. `None` if
-/// either side can't be decoded (highlight simply absent — never fatal).
-pub fn diff_mask_png(before_png: &[u8], after_png: &[u8]) -> Option<Vec<u8>> {
-    let (grid, w, h) = changed_grid(before_png, after_png)?;
-    mask_png_from_grid(&grid, w, h)
-}
-
-/// Both halves of the changed-pixel highlight from one decode: the accent mask PNG and the SVG
-/// path outlining the changed pixels (normalized 0..1; `None` if not outline-able).
-pub fn diff_overlay(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<u8>, Option<String>)> {
-    let (mask, outline, _) = diff_overlay_full(before_png, after_png)?;
-    Some((mask, outline))
-}
-
-/// All three halves of the changed-pixel highlight from a single decode: the accent mask PNG, the
-/// SVG outline path, and the changed pixels' bounding box **normalized 0..1** (`(x, y, w, h)`,
-/// `None` when nothing changed) — the same convention as `changed_region`, so the region-box
-/// overlay consumes it directly (the frontend scales it to the viewBox). Used for both composite
-/// and per-layer highlights.
+/// The changed-pixel highlight from a single decode of two PNGs: an accent mask PNG, transparent
+/// except where they differ (a size mismatch index-samples the `before` into the `after`'s grid;
+/// capped to `MAX_RASTER_DIM`), the SVG path outlining the changed pixels (normalized 0..1; `None`
+/// if not outline-able), and their bounding box **normalized 0..1** (`(x, y, w, h)`, `None` when
+/// nothing changed) — the same convention as the composite's tile region, so the region-box
+/// overlay consumes it directly. Used for both composite and per-layer highlights. `None` if either
+/// side can't be decoded (highlight simply absent — never fatal).
+#[allow(clippy::type_complexity)]
 pub fn diff_overlay_full(
     before_png: &[u8],
     after_png: &[u8],
 ) -> Option<(Vec<u8>, Option<String>, Option<(f64, f64, f64, f64)>)> {
     let (grid, w, h) = changed_grid(before_png, after_png)?;
-    let png = mask_png_from_grid(&grid, w, h)?;
     let outline = outline_from_grid(&grid, w, h);
     let bbox = bbox_from_grid(&grid, w, h);
+    let png = mask_png_from_grid(&grid, w, h, outline.as_deref(), bbox)?;
     Some((png, outline, bbox))
 }
 
@@ -754,6 +938,11 @@ fn blend_channel(cb: f32, cs: f32, blend: &str) -> f32 {
 
 /// Encode an RGBA8 buffer as PNG bytes.
 pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    encode_png(rgba, width, height, &[])
+}
+
+/// [`rgba_to_png`] with `texts` as `tEXt` chunks, which the encoder writes ahead of the pixels.
+fn encode_png(rgba: &[u8], width: u32, height: u32, texts: &[(&str, &str)]) -> Result<Vec<u8>> {
     let mut png = Vec::new();
     {
         let mut enc = png::Encoder::new(Cursor::new(&mut png), width, height);
@@ -763,6 +952,10 @@ pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
         // byte size doesn't. Fast deflate + no row filter over max compression.
         enc.set_compression(png::Compression::Fast);
         enc.set_filter(png::FilterType::NoFilter);
+        for (key, text) in texts {
+            enc.add_text_chunk(key.to_string(), text.to_string())
+                .map_err(|e| KvcError::BadTiles(format!("png text: {e}")))?;
+        }
         let mut w = enc
             .write_header()
             .map_err(|e| KvcError::BadTiles(format!("png header: {e}")))?;
@@ -772,9 +965,41 @@ pub fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     Ok(png)
 }
 
-/// Encode an RGBA8 buffer as a PNG and wrap it in a `data:` URL.
-pub fn rgba_to_png_data_url(rgba: &[u8], width: u32, height: u32) -> Result<String> {
-    Ok(png_bytes_to_data_url(&rgba_to_png(rgba, width, height)?))
+/// Longest side of a layer-list thumbnail. The navigator draws them 36 x 28 px, so this is room
+/// for a 3x display with plenty to spare.
+pub const THUMB_DIM: u32 = 128;
+
+/// A small PNG of a capped raster for the layer list, box-filtered like the raster itself.
+///
+/// The list used to point its thumbnails at the full capped raster, so the webview decoded up to
+/// 2048 x 2048 (16 MB of bitmap) per layer to draw 36 x 28 px of it — eleven layers meant eleven
+/// full decodes before the list settled.
+pub fn thumb_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let longest = width.max(height);
+    if longest == 0 {
+        return None;
+    }
+    let scale = (THUMB_DIM as f64 / longest as f64).min(1.0);
+    let tw = ((width as f64 * scale).round() as u32).max(1);
+    let th = ((height as f64 * scale).round() as u32).max(1);
+    let small = if (tw, th) == (width, height) {
+        rgba.to_vec()
+    } else {
+        box_downscale(
+            rgba,
+            width as usize,
+            height as usize,
+            tw as usize,
+            th as usize,
+        )
+    };
+    rgba_to_png(&small, tw, th).ok()
+}
+
+/// [`thumb_png`] from an already-encoded raster, for one cached before thumbnails existed.
+pub fn thumb_from_png(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    let (rgba, w, h) = decode_png_rgba(png_bytes)?;
+    thumb_png(&rgba, w, h)
 }
 
 /// Re-encode an already-encoded PNG (e.g. mergedimage.png) so its longest side fits
@@ -874,23 +1099,75 @@ pub fn cache_total_bytes(cache_dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Read a cached capped PNG, or `None` on miss/any error. A hit refreshes the file's mtime so
-/// LRU pruning treats recently-served entries as hot.
+/// Where a cached capped PNG lives.
+pub fn cache_path(cache_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+    cache_dir.join(format!("{key}.png"))
+}
+
+/// Read a cached capped PNG, or `None` on miss/any error — for the callers that need its pixels.
+/// A hit counts as a use for pruning, like [`cached_url`].
 pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
-    let path = cache_dir.join(format!("{key}.png"));
+    let path = cache_path(cache_dir, key);
+    let meta = std::fs::metadata(&path).ok()?;
     let bytes = std::fs::read(&path).ok()?;
-    touch(&path);
+    touch_if_stale(&path, &meta);
     Some(bytes)
 }
 
-/// Write a capped PNG into the cache (creating the dir for pre-cache repos).
-pub fn cache_write(cache_dir: &std::path::Path, key: &str, png: &[u8]) {
-    let _ = std::fs::create_dir_all(cache_dir);
-    let _ = std::fs::write(cache_dir.join(format!("{key}.png")), png);
+/// The URL for a cached raster, or `None` on a miss — for the callers that only build its URL,
+/// which the webview then fetches through `kvcimg` anyway, so a hit is a `stat`: reading a 2048 px
+/// composite just to print its URL cost several MB per call, two or three calls per Version Map
+/// node. Outside the shell the URL inlines the file, and an entry pruned between the `stat` and
+/// that read (a prune from the other heavy command) is a miss too; it used to come back as an
+/// empty data URL, a blank image. A hit counts as a use for pruning.
+pub fn cached_url(
+    store: &std::path::Path,
+    cache_dir: &std::path::Path,
+    key: &str,
+) -> Option<String> {
+    let path = cache_path(cache_dir, key);
+    let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+    touch_if_stale(&path, &meta);
+    if img_protocol_enabled() {
+        return Some(img_url(store, key));
+    }
+    std::fs::read(&path)
+        .ok()
+        .map(|png| png_bytes_to_data_url(&png))
 }
 
-/// Best-effort mtime refresh (LRU signal). Failure is fine — the entry just ages normally.
-fn touch(path: &std::path::Path) {
+/// Write a capped PNG into the cache (creating the dir for pre-cache repos).
+///
+/// Temp-then-rename: entries are content-addressed and `serve_raster` hands them out as
+/// `immutable`, so one cut short under its final name — a crash, or closing the app while layers
+/// stream — would be trusted, and shown broken, until the cache is pruned. The temp name is unique
+/// per write because two layers with identical pixels share a key and rasterize in parallel. A
+/// crash leftover (`*.tmp`) is swept by the cleanup.
+pub fn cache_write(cache_dir: &std::path::Path, key: &str, png: &[u8]) {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let _ = std::fs::create_dir_all(cache_dir);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = cache_dir.join(format!("{key}.png.{}-{n}.tmp", std::process::id()));
+    let path = cache_dir.join(format!("{key}.png"));
+    if std::fs::write(&tmp, png).is_err() || crate::repo::rename_retrying(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Best-effort mtime refresh (the LRU signal [`cache_prune`] sorts on), at most once a day per
+/// entry: pruning only needs to tell this week's entries from last month's, and rewriting the
+/// mtime on every hit was a file open for write per raster per view. Failure is fine — the entry
+/// just ages normally.
+fn touch_if_stale(path: &std::path::Path, meta: &std::fs::Metadata) {
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < DAY);
+    if fresh {
+        return;
+    }
     if let Ok(f) = std::fs::File::options().write(true).open(path) {
         let _ = f.set_modified(std::time::SystemTime::now());
     }
@@ -975,28 +1252,34 @@ fn img_protocol_enabled() -> bool {
     IMG_PROTOCOL.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// URL for a cached raster PNG: a `kvcimg` URL when the scheme is live and the cache file is
-/// really on disk (the handler serves exactly that file), else an inline data URL.
-/// The repo root rides in the URL hex-encoded; the handler only serves roots that commands
-/// have registered (`commands::register_served_repo`), so the scheme can't read arbitrary paths.
-/// `store` is the document store — the kvcimg handler resolves `<store>/cache/<key>.png` from
-/// the hex-encoded path in the URL, so it must be the folder that actually holds `cache/`.
+/// URL for a raster PNG the caller has in hand, just written to the cache as `key`: a `kvcimg` URL
+/// when the scheme is live and the write landed (the handler serves exactly that file), else an
+/// inline data URL of `png`. A cache hit goes through [`cached_url`] instead.
 pub fn raster_url(
     store: &std::path::Path,
     cache_dir: &std::path::Path,
     key: &str,
     png: &[u8],
 ) -> String {
-    if img_protocol_enabled() && cache_dir.join(format!("{key}.png")).is_file() {
-        let root_hex = hex(store.to_string_lossy().as_bytes());
-        // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
-        // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
-        #[cfg(windows)]
-        return format!("http://kvcimg.localhost/{root_hex}/{key}.png");
-        #[cfg(not(windows))]
-        return format!("kvcimg://localhost/{root_hex}/{key}.png");
+    if img_protocol_enabled() && cache_path(cache_dir, key).is_file() {
+        return img_url(store, key);
     }
     png_bytes_to_data_url(png)
+}
+
+/// The `kvcimg` URL for a cache entry. The store rides in it hex-encoded; the handler only serves
+/// stores that commands have registered (`commands::register_served_repo`), so the scheme can't
+/// read arbitrary paths. It resolves `<store>/cache/<key>.png`, so `store` must be the folder that
+/// actually holds `cache/`.
+fn img_url(store: &std::path::Path, key: &str) -> String {
+    let root_hex = hex(store.to_string_lossy().as_bytes());
+    // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
+    // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
+    if cfg!(windows) {
+        format!("http://kvcimg.localhost/{root_hex}/{key}.png")
+    } else {
+        format!("kvcimg://localhost/{root_hex}/{key}.png")
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1139,7 +1422,7 @@ mod tests {
     #[test]
     fn png_encode_is_decodable() {
         let rgba = vec![255u8; 4 * 4 * 4]; // 4x4 opaque white
-        let url = rgba_to_png_data_url(&rgba, 4, 4).unwrap();
+        let url = png_bytes_to_data_url(&rgba_to_png(&rgba, 4, 4).unwrap());
         assert!(url.starts_with("data:image/png;base64,"));
     }
 
@@ -1161,8 +1444,9 @@ mod tests {
     fn cache_prune_deletes_oldest_until_under_budget() {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path();
-        // 5 entries x 100 bytes with strictly increasing mtimes.
-        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        // 5 entries x 100 bytes with strictly increasing mtimes, all old enough (days) that a hit
+        // refreshes them — a hit on an entry touched today leaves its mtime alone.
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
         for i in 0..5u32 {
             let p = cache.join(format!("entry{i}.png"));
             std::fs::write(&p, [0u8; 100]).unwrap();
@@ -1193,6 +1477,38 @@ mod tests {
             cache.join("old.png").exists(),
             "a just-read entry must be treated as hot"
         );
+    }
+
+    /// Entries are content-addressed and served `immutable`, so a partly written one would be
+    /// trusted — and shown broken — until the cache is pruned. Writes go through a temp file and
+    /// a rename, so a reader (the `kvcimg` handler, a parallel layer with identical pixels) sees
+    /// the whole entry or none of it, never a truncated one.
+    #[test]
+    fn cache_readers_never_see_a_partial_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().to_path_buf();
+        let png: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+        cache_write(&cache, "k", &png);
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (cache, png, done) = (cache.clone(), png.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..30 {
+                    cache_write(&cache, "k", &png);
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        let mut partial = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            if cache_read(&cache, "k").is_some_and(|b| b != png) {
+                partial += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(partial, 0, "a reader saw a partly written entry");
+        assert_eq!(cache_read(&cache, "k").unwrap(), png);
     }
 
     #[test]
@@ -1285,7 +1601,7 @@ mod tests {
     #[test]
     fn diff_mask_transparent_where_equal() {
         let png = rgba_to_png(&[10, 20, 30, 255, 40, 50, 60, 255], 2, 1).unwrap();
-        let mask = diff_mask_png(&png, &png).unwrap();
+        let (mask, _, _) = diff_overlay_full(&png, &png).unwrap();
         let (rgba, _, _) = decode_png_rgba(&mask).unwrap();
         assert!(
             rgba.iter().all(|&b| b == 0),
@@ -1298,7 +1614,7 @@ mod tests {
         let before = rgba_to_png(&[0, 0, 0, 255, 0, 0, 0, 255], 2, 1).unwrap();
         // Flip only the second pixel well past the threshold.
         let after = rgba_to_png(&[0, 0, 0, 255, 200, 200, 200, 255], 2, 1).unwrap();
-        let mask = diff_mask_png(&before, &after).unwrap();
+        let (mask, _, _) = diff_overlay_full(&before, &after).unwrap();
         let (rgba, _, _) = decode_png_rgba(&mask).unwrap();
         assert_eq!(
             &rgba[0..4],
@@ -1318,7 +1634,7 @@ mod tests {
         // corners at x = 1/3 and 2/3 — never the 0..1 span a whole-canvas box would have.
         let before = rgba_to_png(&[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255], 3, 1).unwrap();
         let after = rgba_to_png(&[0, 0, 0, 255, 200, 200, 200, 255, 0, 0, 0, 255], 3, 1).unwrap();
-        let (_png, outline) = diff_overlay(&before, &after).unwrap();
+        let (_png, outline, _) = diff_overlay_full(&before, &after).unwrap();
         let d = outline.expect("a changed pixel yields an outline");
         assert_eq!(d.matches('Z').count(), 1, "one closed loop");
         assert!(
@@ -1331,7 +1647,119 @@ mod tests {
     #[test]
     fn outline_none_when_identical() {
         let png = rgba_to_png(&[10, 20, 30, 255], 1, 1).unwrap();
-        assert!(diff_overlay(&png, &png).unwrap().1.is_none());
+        assert!(diff_overlay_full(&png, &png).unwrap().1.is_none());
+    }
+
+    /// A layer's raster is accumulated straight into the capped size instead of through a
+    /// full-resolution canvas — and must come out bit-for-bit what the canvas path produced, or
+    /// every cached raster keyed to the same filter token would silently disagree with a fresh one.
+    #[test]
+    fn rasterize_tiles_matches_the_full_canvas_path() {
+        // Over the cap so the box filter runs; odd dimensions so edge tiles are cut by the
+        // canvas; tiles at negative offsets and past the edge; holes left to the default pixel.
+        let (w, h, t) = (2230i64, 150i64, 64i64);
+        let mut seed = 0x5EEDu64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u8
+        };
+        let mut tiles: Vec<(i64, i64, Vec<u8>)> = Vec::new();
+        for ty in -1..4 {
+            for tx in -1..37 {
+                if next() % 4 == 0 {
+                    continue;
+                }
+                let px: Vec<u8> = (0..t * t * 4).map(|_| next()).collect();
+                tiles.push((tx * t, ty * t, px));
+            }
+        }
+        for fill in [None, Some([10, 200, 30, 128]), Some([0, 0, 0, 0])] {
+            let (got, gw, gh) = rasterize_tiles(
+                &tiles,
+                |tile| (tile.0, tile.1),
+                |tile| Ok(Some(tile.2.clone())),
+                w,
+                h,
+                t,
+                t,
+                fill,
+            )
+            .unwrap();
+            let mut canvas = vec![0u8; (w * h * 4) as usize];
+            if let Some(f) = fill {
+                for p in canvas.chunks_exact_mut(4) {
+                    p.copy_from_slice(&f);
+                }
+            }
+            for (x, y, px) in &tiles {
+                blit(&mut canvas, w, h, *x, *y, px, t, t);
+            }
+            let (want, ww, wh) = cap_rgba(&canvas, w as u32, h as u32);
+            assert_eq!((gw, gh), (ww, wh));
+            let diff = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(diff, 0, "{diff} bytes differ with fill {fill:?}");
+        }
+
+        // Tiles that overlap off the grid can't be summed once each; the canvas path decides
+        // (the last tile blitted wins), and so the answer is still the canvas path's.
+        let skewed = vec![tiles[0].clone(), (10, 10, tiles[1].2.clone())];
+        let (got, _, _) = rasterize_tiles(
+            &skewed,
+            |tile| (tile.0, tile.1),
+            |tile| Ok(Some(tile.2.clone())),
+            w,
+            h,
+            t,
+            t,
+            None,
+        )
+        .unwrap();
+        let mut canvas = vec![0u8; (w * h * 4) as usize];
+        for (x, y, px) in &skewed {
+            blit(&mut canvas, w, h, *x, *y, px, t, t);
+        }
+        assert!(got == cap_rgba(&canvas, w as u32, h as u32).0.as_ref());
+    }
+
+    /// A cached change mask answers its outline and box from its own text chunks, without its
+    /// pixels being decoded; one cached before the chunks existed says so, and gets decoded.
+    #[test]
+    fn change_mask_carries_its_outline_and_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = rgba_to_png(&[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255], 3, 1).unwrap();
+        let after = rgba_to_png(&[0, 0, 0, 255, 200, 200, 200, 255, 0, 0, 0, 255], 3, 1).unwrap();
+        let (mask, outline, bbox) = diff_overlay_full(&before, &after).unwrap();
+        cache_write(dir.path(), "m", &mask);
+        let meta = mask_meta(&cache_path(dir.path(), "m")).expect("chunks present");
+        assert_eq!(meta, (outline, bbox));
+        assert!(meta.0.is_some() && meta.1.is_some());
+
+        let (unchanged, _, _) = diff_overlay_full(&before, &before).unwrap();
+        cache_write(dir.path(), "same", &unchanged);
+        assert_eq!(
+            mask_meta(&cache_path(dir.path(), "same")),
+            Some((None, None))
+        );
+
+        cache_write(
+            dir.path(),
+            "old",
+            &rgba_to_png(&[0, 0, 0, 0], 1, 1).unwrap(),
+        );
+        assert_eq!(mask_meta(&cache_path(dir.path(), "old")), None);
+    }
+
+    #[test]
+    fn thumbnails_fit_the_thumb_size() {
+        let rgba = vec![200u8; 2048 * 1448 * 4];
+        let png = thumb_png(&rgba, 2048, 1448).unwrap();
+        let (_, w, h) = decode_png_rgba(&png).unwrap();
+        assert_eq!((w, h), (THUMB_DIM, 91));
+        // Already small: kept as is.
+        let (_, w, h) = decode_png_rgba(&thumb_png(&[1, 2, 3, 4], 1, 1).unwrap()).unwrap();
+        assert_eq!((w, h), (1, 1));
     }
 
     #[test]

@@ -109,17 +109,32 @@ pub enum KvcError {
     #[error("not enough free disk space: this needs about {needed} bytes, {available} available")]
     InsufficientDiskSpace { needed: u64, available: u64 },
 
+    // The stored history has a hole in it: a damaged line in the middle of `commits.log`, a branch
+    // tip or earlier version the log doesn't have, or a chain shard that won't decode. Every write
+    // refuses, because writing is what would make the loss permanent — a log rewritten from the
+    // shortened list, or a cleanup sweeping everything behind the gap. The "version history is
+    // damaged" prefix is matched by the frontend — keep it stable.
+    #[error("version history is damaged: {0}. Run Check for problems (Settings → Storage) to see what's wrong")]
+    DamagedHistory(String),
+
+    #[error("{}: {source}", .path.display())]
+    IoAt { path: PathBuf, source: io::Error },
+
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, KvcError>;
 
-/// Map an IO error against a path, promoting permission failures to a clearer variant.
+/// Map an IO error against a path: permission failures get a clearer variant, and everything else
+/// keeps the path, so the artist sees which file was busy or missing instead of a bare OS message.
 pub fn io_at(path: &std::path::Path, e: io::Error) -> KvcError {
     if e.kind() == io::ErrorKind::PermissionDenied {
         KvcError::PermissionDenied(path.to_path_buf())
     } else {
-        KvcError::Io(e)
+        KvcError::IoAt {
+            path: path.to_path_buf(),
+            source: e,
+        }
     }
 }

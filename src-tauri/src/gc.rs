@@ -9,7 +9,7 @@
 //! leaves only re-collectable orphans, never a reference to missing data.
 
 use crate::commit::ancestors;
-use crate::error::{io_at, Result};
+use crate::error::{io_at, KvcError, Result};
 use crate::kra;
 use crate::repo::{Chains, Repo};
 use serde::Serialize;
@@ -132,17 +132,40 @@ pub(crate) struct Marks {
 /// and keep walking.
 pub(crate) fn mark_live(repo: &Repo, tolerant: bool) -> Result<Marks> {
     // --- mark: reachable commits --------------------------------------------------------
+    // A hole in the history ends the walk early, and everything behind it reads as unreachable:
+    // a tip the log doesn't have roots nothing at all, and a missing parent cuts off every older
+    // version. GC sweeping on that deletes live history, so it refuses; the check reports the
+    // same holes and keeps walking.
+    if !tolerant {
+        repo.ensure_writable()?;
+        if !repo.branches.branches.contains_key(&repo.branches.current) {
+            return Err(KvcError::DamagedHistory(format!(
+                "the current branch '{}' doesn't exist",
+                repo.branches.current
+            )));
+        }
+    }
+    let known: HashSet<&str> = repo.commits.iter().map(|c| c.id.as_str()).collect();
     let mut reachable: HashSet<String> = HashSet::new();
-    for tip in repo.branches.branches.values().filter(|t| !t.is_empty()) {
-        reachable.extend(ancestors(&repo.commits, tip));
+    for (name, tip) in repo.branches.branches.iter().filter(|(_, t)| !t.is_empty()) {
+        let reach = ancestors(&repo.commits, tip);
+        if !tolerant {
+            if let Some(gap) = reach.iter().find(|id| !known.contains(id.as_str())) {
+                return Err(KvcError::DamagedHistory(format!(
+                    "branch '{name}' leads back to version {gap}, which the history doesn't have"
+                )));
+            }
+        }
+        reachable.extend(reach);
     }
 
     // --- mark: live (stream key, content hash) pairs -------------------------------------
     // One reconstruct memo across all manifest loads: a long-lived `.kra` has many manifest
     // versions on the reachable chain, and each shares a patch-chain prefix with the next —
     // memoizing keeps the whole marking pass linear instead of quadratic in history length.
-    let mut manifest_memo: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    // Commits are walked oldest first, so each manifest's base is the one just rebuilt and a
+    // bounded memo is all that takes.
+    let mut manifest_memo = crate::delta::ReconstructMemo::default();
     let mut live: HashSet<(String, String)> = HashSet::new();
     let mut problems: Vec<(String, String)> = Vec::new();
     // Stashes are roots too, not just branch tips: a stash's content is referenced by nothing in
@@ -157,15 +180,11 @@ pub(crate) fn mark_live(repo: &Repo, tolerant: bool) -> Result<Marks> {
         .chain(repo.stashes.stashes.iter().flat_map(|s| &s.files));
     for f in rooted {
         let Some(content) = &f.content else { continue };
-        if f.is_kra {
-            live.insert((kra::manifest_stream_key(&f.path), content.clone()));
-            match kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo) {
-                Ok(manifest) => live.extend(kra::referenced_streams(&f.path, &manifest)),
-                Err(e) if tolerant => problems.push((f.path.clone(), e.to_string())),
-                Err(e) => return Err(e),
-            }
-        } else {
-            live.insert((format!("file:{}", f.path), content.clone()));
+        live.insert((kra::manifest_stream_key(&f.path), content.clone()));
+        match kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo) {
+            Ok(manifest) => live.extend(kra::referenced_streams(&f.path, &manifest)),
+            Err(e) if tolerant => problems.push((f.path.clone(), e.to_string())),
+            Err(e) => return Err(e),
         }
     }
 
@@ -328,7 +347,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     // --- write state FIRST (crash between = harmless re-collectable orphans) -------------
     repo.commits.retain(|c| reachable.contains(&c.id));
     repo.note_commits_truncated(); // dropped commits must leave the log
-    repo.chains.rewrite_all(&repo.store.clone(), new_chains)?;
+    repo.chains.rewrite_all(new_chains)?;
     repo.save()?;
 
     // --- quarantine loose (moved to .kvc/trash/, not deleted outright — see gap #5) --------
@@ -345,15 +364,17 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         } else if worth_rewriting(p.dead_bytes, p.total) {
             // Rewrite with survivors only; write the new pack (or loose files for a small
             // remainder) before quarantining the old one, so a crash never loses live objects.
+            let pack = std::fs::File::open(&p.path).map_err(|e| io_at(&p.path, e))?;
             let survivors: Vec<(String, Vec<u8>)> = p
                 .entries
                 .iter()
                 .filter(|(n, ..)| live_objects.contains(n))
                 .map(|(n, off, len)| {
-                    crate::delta::read_exact_at(&p.path, *off, *len as usize)
+                    crate::delta::read_exact_at(&pack, &p.path, *off, *len as usize)
                         .map(|bytes| (n.clone(), bytes))
                 })
                 .collect::<Result<_>>()?;
+            drop(pack);
             if survivors.len() >= crate::delta::PACK_MIN_OBJECTS {
                 let refs: Vec<&(String, Vec<u8>)> = survivors.iter().collect();
                 repo.packs.write_pack(&objects, &refs)?;
@@ -368,7 +389,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     repo.packs.invalidate();
 
     // --- consolidate small surviving packs into one (fragmentation, not reclamation) -------
-    consolidate_small_packs(repo)?;
+    consolidate_small_packs(repo, &trash_dir)?;
 
     // --- stale temp files: crash leftovers, not reachable-once data, no recovery value -----
     for (path, _) in &stale_tmp {
@@ -383,7 +404,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     // --- age out quarantined trash past its retention window --------------------------------
     let cutoff =
         std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_MAX_AGE_DAYS * 86_400);
-    report.trash_bytes_pruned = prune_trash(&kvc, cutoff);
+    report.trash_bytes_pruned = prune_trash(&kvc, cutoff) + prune_aged(&kvc, cutoff);
 
     let tip = repo.branches.tip().map(str::to_string);
     let _ = crate::ops_log::append(
@@ -472,9 +493,51 @@ fn prune_trash(kvc: &Path, cutoff: std::time::SystemTime) -> u64 {
     freed
 }
 
-/// `*.tmp` leftovers of `write_atomic`/`write_pack` interrupted by a crash — never cleaned by
-/// anything else. Only files older than an hour qualify (paranoia margin; the app is
-/// single-process, so anything old is definitively dead).
+/// Age out what Replace and log rewrites keep, on the trash's retention: the history a restore
+/// replaced (`<store>.replaced-<time>/`, beside the store) and the old logs undo and cleanup
+/// rewrote over (`commits.log.<time>.bak`). Aged by the time in the name, not the mtime: a
+/// renamed folder keeps the mtime of whatever last changed inside it, which could be months
+/// before the restore. The stamps are `now_iso_filesafe`'s fixed-width UTC, so string order is
+/// time order. Returns the bytes freed.
+fn prune_aged(store: &Path, cutoff: std::time::SystemTime) -> u64 {
+    let secs = cutoff
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = crate::repo::epoch_to_iso(secs).replace(':', "-");
+    let expired = |stamp: &str| stamp < cutoff.as_str();
+    let mut freed = 0u64;
+    if let Ok(rd) = std::fs::read_dir(store) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stamp = name
+                .strip_prefix("commits.log.")
+                .and_then(|s| s.strip_suffix(".bak"));
+            if stamp.is_some_and(expired) {
+                freed += e.metadata().map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let (Some(container), Some(slug)) = (store.parent(), store.file_name()) else {
+        return freed;
+    };
+    let prefix = format!("{}.replaced-", slug.to_string_lossy());
+    if let Ok(rd) = std::fs::read_dir(container) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.strip_prefix(&prefix).is_some_and(expired) && e.path().is_dir() {
+                freed += dir_size(&e.path());
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    freed
+}
+
+/// `*.tmp` leftovers of `write_atomic`/`write_pack`/`raster::cache_write` interrupted by a crash
+/// — never cleaned by anything else. Only files older than an hour qualify (paranoia margin; the
+/// app is single-process, so anything old is definitively dead).
 fn stale_tmp_files(repo: &Repo) -> Vec<(PathBuf, u64)> {
     let kvc = repo.store.clone();
     let mut out = Vec::new();
@@ -482,6 +545,7 @@ fn stale_tmp_files(repo: &Repo) -> Vec<(PathBuf, u64)> {
         kvc.clone(),
         crate::repo::chains_dir(&repo.store),
         crate::delta::pack_dir(&repo.objects_dir()),
+        repo.cache_dir(),
     ] {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
@@ -507,8 +571,10 @@ fn stale_tmp_files(repo: &Repo) -> Vec<(PathBuf, u64)> {
 
 /// Merge many small live packs into one. Purely a fragmentation fix (no bytes reclaimed):
 /// every pack header is parsed when the index loads, so dozens of small packs from mid-size
-/// commits add up. Write-before-delete, then invalidate the in-memory index.
-fn consolidate_small_packs(repo: &mut Repo) -> Result<()> {
+/// commits add up. The merged pack is written (and fsynced) before the small ones go, and they
+/// go to `trash_dir` like everything else a sweep removes — deleted outright, a power cut that
+/// beat the merged pack's data to the disk would take live objects with it.
+fn consolidate_small_packs(repo: &mut Repo, trash_dir: &Path) -> Result<()> {
     let objects = repo.objects_dir();
     let pack_dir = crate::delta::pack_dir(&objects);
     let mut small: Vec<(PathBuf, Vec<(String, u64, u32)>)> = Vec::new();
@@ -532,11 +598,12 @@ fn consolidate_small_packs(repo: &mut Repo) -> Result<()> {
     let mut merged: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen = HashSet::new();
     for (path, entries) in &small {
+        let pack = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
         for (name, off, len) in entries {
             if seen.insert(name.clone()) {
                 merged.push((
                     name.clone(),
-                    crate::delta::read_exact_at(path, *off, *len as usize)?,
+                    crate::delta::read_exact_at(&pack, path, *off, *len as usize)?,
                 ));
             }
         }
@@ -544,7 +611,7 @@ fn consolidate_small_packs(repo: &mut Repo) -> Result<()> {
     let refs: Vec<&(String, Vec<u8>)> = merged.iter().collect();
     repo.packs.write_pack(&objects, &refs)?;
     for (path, _) in &small {
-        let _ = std::fs::remove_file(path);
+        let _ = quarantine(trash_dir, &objects, path);
     }
     repo.packs.invalidate();
     Ok(())

@@ -24,33 +24,40 @@ pub struct WorkingChange {
     pub staged: bool,
 }
 
-/// Run blocking engine work off the UI thread, flattening both join and engine errors.
-///
-/// The `cpu::install` wrap is the *entire* integration point for CPU budgeting: every command
-/// funnels through here, and nested `par_iter`s inherit the installing pool, so this one line
-/// keeps the whole engine inside its thread budget and at below-normal priority.
+/// Run a cheap read off the UI thread, flattening both join and engine errors: history, branches,
+/// the shelf, a scan, settings. Deliberately **not** on the CPU-budgeted pool. None of these does
+/// parallel work, and at the default budget a 2-core laptop's pool is a single worker: a command
+/// holds its worker for the whole closure, so a `list_commits` queued behind any serial stretch
+/// of a diff or a commit — reading a file, walking a zip, an fsync — waited it out (1.9 s behind a
+/// 2 s one). `repo::hash_bytes`, the one parallel step a scan can reach, stays single-threaded
+/// off the pool rather than spill onto rayon's unbudgeted global one.
 async fn run<T, F>(f: F) -> std::result::Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(move || crate::cpu::install(f))
+    tauri::async_runtime::spawn_blocking(f)
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
 
-/// `run`, plus a slot from the heavy-operation semaphore held for the whole call.
+/// For commands that write, or that decode a whole document (diffs, layer streams, the storage
+/// report): a slot from the heavy-operation semaphore held for the whole call, on the budgeted pool.
 ///
-/// For commands that write, or that decode a whole document (diffs and layer streams). Cheap
-/// reads deliberately keep using plain `run` so a `list_commits` never queues behind a diff.
+/// The `cpu::install` wrap is the *entire* integration point for CPU budgeting: every parallel
+/// command funnels through here, and nested `par_iter`s inherit the installing pool, so this one
+/// line keeps the engine's parallel work inside its thread budget and at below-normal priority.
 async fn run_heavy<T, F>(f: F) -> std::result::Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
     let _permit = crate::cpu::heavy_permit().await;
-    run(f).await
+    tauri::async_runtime::spawn_blocking(move || crate::cpu::install(f))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Call `f`, rechecking `branches.json`'s generation counter (bumped on every write, see
@@ -220,7 +227,8 @@ pub async fn set_store_root(path: Option<String>) -> std::result::Result<(), Str
 }
 
 /// Zip the given documents (each `.kra` plus its store) into **one** archive at `dest` — a
-/// manual, user-triggered backup (see `Repo::export_zip_multi`). Read-only, so no `RepoLock`.
+/// manual, user-triggered backup (see `Repo::export_zip_multi`). Read-only, but each artwork is
+/// zipped under its `RepoLock` so a `kvc` write from the Krita docker can't land mid-zip.
 /// Independent artworks, so one failing shouldn't abort the rest: failures are collected and
 /// returned rather than short-circuiting the batch.
 #[tauri::command]
@@ -350,7 +358,7 @@ pub async fn check_repository(
 /// Settings knobs a user can see/edit for this repo (cache budget, tile pixel deltas).
 #[tauri::command]
 pub async fn get_repo_config(path: String) -> std::result::Result<Config, String> {
-    run(move || Ok(Repo::open_light(Path::new(&path))?.config)).await
+    run(move || Ok(Repo::open_without_log(Path::new(&path))?.config)).await
 }
 
 #[tauri::command]
@@ -373,7 +381,7 @@ pub async fn set_repo_config(
 }
 
 /// One row of the storage report: what a full copy of version N would have cost, versus what it
-/// actually added to the delta store.
+/// actually added to the store.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionRow {
@@ -384,9 +392,9 @@ pub struct VersionRow {
     pub file_count: u32,
     /// Sum of the original (uncompressed) sizes of every file tracked at this version.
     pub original_bytes: u64,
-    /// On-disk bytes this version *added* to the store — the objects it was the first to
-    /// introduce (first-reference attribution). 0 for versions whose objects were all already
-    /// stored by an earlier version, and for pre-`original_size` history it may under-count.
+    /// On-disk bytes this version *added* to the store — the objects it was the first to write.
+    /// 0 for versions whose objects were all already stored, and for pre-`original_size` history
+    /// it may under-count.
     pub stored_bytes: u64,
 }
 
@@ -474,35 +482,36 @@ fn object_of(repo: &Repo, key: &str, hash: &str) -> Option<String> {
     repo.chains.object_name_of(key, hash)
 }
 
-/// Attribute each stored object's bytes to the **first** commit (oldest-first) that references it,
-/// so a version's `stored_bytes` is exactly what it newly added to the store (objects are
+/// Attribute each stored object's bytes to the **first** of `commits` (oldest-first) that references
+/// it, so a version's `stored_bytes` is exactly what it newly added to the store (objects are
 /// content-addressed and shared across versions). Best-effort: a manifest that fails to reconstruct
 /// still attributes its own object, just not its tile sub-streams.
-fn stored_bytes_by_commit(
+///
+/// Only for versions from before [`Commit::stored_bytes`] was recorded — replaying every manifest
+/// is what made this report take 27 s at 200 versions of a 45,000-tile painting. Those versions are
+/// always a prefix of the log, so attribution among them needs no later version.
+fn stored_bytes_by_commit<'a>(
     repo: &Repo,
+    commits: impl Iterator<Item = &'a Commit>,
     size_of: &std::collections::HashMap<String, u64>,
 ) -> std::collections::HashMap<String, u64> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut memo: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut memo = crate::delta::ReconstructMemo::default();
     let mut out = std::collections::HashMap::new();
     // repo.commits is append order = oldest-first.
-    for c in &repo.commits {
+    for c in commits {
         let mut refs: Vec<String> = Vec::new();
         for f in &c.files {
             let Some(content) = &f.content else { continue };
-            if f.is_kra {
-                if let Some(o) = object_of(repo, &kra::manifest_stream_key(&f.path), content) {
-                    refs.push(o);
-                }
-                if let Ok(manifest) = kra::load_manifest_memo(repo, &f.path, content, &mut memo) {
-                    for (k, h) in kra::referenced_streams(&f.path, &manifest) {
-                        if let Some(o) = object_of(repo, &k, &h) {
-                            refs.push(o);
-                        }
+            if let Some(o) = object_of(repo, &kra::manifest_stream_key(&f.path), content) {
+                refs.push(o);
+            }
+            if let Ok(manifest) = kra::load_manifest_memo(repo, &f.path, content, &mut memo) {
+                for (k, h) in kra::referenced_streams(&f.path, &manifest) {
+                    if let Some(o) = object_of(repo, &k, &h) {
+                        refs.push(o);
                     }
                 }
-            } else if let Some(o) = object_of(repo, &format!("file:{}", f.path), content) {
-                refs.push(o);
             }
         }
         let mut stored = 0u64;
@@ -517,29 +526,47 @@ fn stored_bytes_by_commit(
 }
 
 /// Pure storage-report computation (no async, testable): per-version original sizes and per-version
-/// delta-store cost vs the store's real on-disk footprint. `original_size` and per-version
-/// attribution are effectively forward-only — history from before those existed under-counts.
+/// store cost vs the store's real on-disk footprint. `original_size` and per-version attribution
+/// are effectively forward-only — history from before those existed under-counts.
 pub fn compute_storage_stats(repo: &Repo) -> StorageStats {
-    let size_of = object_size_map(repo);
-    let stored_by_commit = stored_bytes_by_commit(repo, &size_of);
-    let per_version: Vec<VersionRow> = repo
-        .commits
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            // O(commits × files) tree re-fold per version; fine for hand-scale histories.
-            let tree = commit::tree_at_commit(&repo.commits, &c.id).unwrap_or_default();
-            let original_bytes = tree.values().map(|f| f.original_size).sum();
-            VersionRow {
-                version: (i + 1) as u32,
-                commit_id: c.id.clone(),
-                message: c.message.clone(),
-                file_count: tree.len() as u32,
-                original_bytes,
-                stored_bytes: stored_by_commit.get(&c.id).copied().unwrap_or(0),
+    let legacy = repo.commits.iter().filter(|c| c.stored_bytes.is_none());
+    let replayed = if legacy.clone().next().is_some() {
+        stored_bytes_by_commit(repo, legacy, &object_size_map(repo))
+    } else {
+        Default::default()
+    };
+    // Each version's tree is its first parent's plus its own `files` (the fold `tree_at_commit`
+    // does), and parents always precede children in the log — so one pass builds them all,
+    // instead of refolding from the root once per version.
+    let mut trees: std::collections::HashMap<&str, std::collections::BTreeMap<&str, u64>> =
+        std::collections::HashMap::new();
+    let mut per_version = Vec::with_capacity(repo.commits.len());
+    for (i, c) in repo.commits.iter().enumerate() {
+        let mut tree = c
+            .parents
+            .first()
+            .and_then(|p| trees.get(p.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        for f in &c.files {
+            if f.status == "D" {
+                tree.remove(f.path.as_str());
+            } else {
+                tree.insert(f.path.as_str(), f.original_size);
             }
-        })
-        .collect();
+        }
+        per_version.push(VersionRow {
+            version: (i + 1) as u32,
+            commit_id: c.id.clone(),
+            message: c.message.clone(),
+            file_count: tree.len() as u32,
+            original_bytes: tree.values().sum(),
+            stored_bytes: c
+                .stored_bytes
+                .unwrap_or_else(|| replayed.get(&c.id).copied().unwrap_or(0)),
+        });
+        trees.insert(c.id.as_str(), tree);
+    }
     let naive_bytes = per_version.iter().map(|r| r.original_bytes).sum();
     let actual_bytes =
         dir_bytes(&repo.objects_dir()) + dir_bytes(&crate::repo::chains_dir(&repo.store));
@@ -552,16 +579,17 @@ pub fn compute_storage_stats(repo: &Repo) -> StorageStats {
 }
 
 /// Per-version original-size breakdown + the delta store's real footprint, for the
-/// Performance report.
+/// Performance report. Heavy: on history from before per-version sizes were recorded it replays
+/// every manifest, and two of those must not run side by side.
 #[tauri::command]
 pub async fn repo_storage_stats(path: String) -> std::result::Result<StorageStats, String> {
-    run(move || Ok(compute_storage_stats(&Repo::open(Path::new(&path))?))).await
+    run_heavy(move || Ok(compute_storage_stats(&Repo::open(Path::new(&path))?))).await
 }
 
 #[tauri::command]
 pub async fn scan_repository(path: String) -> std::result::Result<Vec<WorkingChange>, String> {
     run(move || {
-        let repo = Repo::open_light(Path::new(&path))?;
+        let repo = Repo::open_without_log(Path::new(&path))?;
         Ok(scan::scan(&repo)?
             .into_iter()
             .map(|(path, status)| WorkingChange {
@@ -667,7 +695,7 @@ pub async fn list_branches(path: String) -> std::result::Result<Vec<BranchDto>, 
     run(move || {
         let root = Path::new(&path);
         read_consistent(root, || {
-            let repo = Repo::open_light(root)?;
+            let repo = Repo::open_without_log(root)?;
             Ok(branch_dtos(&repo))
         })
     })
@@ -880,7 +908,7 @@ pub fn stash_dtos(repo: &Repo) -> Vec<StashDto> {
 #[tauri::command]
 pub async fn list_stashes(path: String) -> std::result::Result<Vec<StashDto>, String> {
     run(move || {
-        let repo = Repo::open_light(Path::new(&path))?;
+        let repo = Repo::open_without_log(Path::new(&path))?;
         Ok(stash_dtos(&repo))
     })
     .await
@@ -958,11 +986,16 @@ pub async fn restore_file(
         let root = Path::new(&path);
         let _lock = RepoLock::acquire(root, "restoring a file")?;
         let mut repo = Repo::open(root)?;
-        // Verified rebuild: these bytes replace a file in the working tree.
+        repo.ensure_writable()?;
+        // Verified rebuild: these bytes replace a file in the working tree. Rebuilt straight into
+        // the temp file beside it, like every other restore, never held whole in memory.
         repo.verify_reads = true;
-        let bytes = commit::file_at_commit(&repo, &file, &commit_id)?;
+        let content = commit::content_at_commit(&repo, &file, &commit_id)?;
         let target: PathBuf = crate::repo::safe_join(&repo.root, &file)?;
-        crate::repo::write_file_atomic(&target, &bytes)?;
+        crate::repo::write_file_atomic_with(&target, |out| {
+            kra::write_kra(&repo, &file, content, out)?;
+            Ok(())
+        })?;
         Ok(())
     })
     .await
@@ -1016,6 +1049,12 @@ pub struct LayerDto {
     /// Inner SVG `<image>` markup for each state, or null when the layer is absent then.
     pub before: Option<String>,
     pub after: Option<String>,
+    /// The same markup pointing at a small thumbnail, for the layer list — omitted where there is
+    /// none, and the list falls back to `before`/`after`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_thumb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_thumb: Option<String>,
     /// This layer's own changed-pixel highlight, diffed from its before/after rasters — the
     /// composite's overlay must not be reused per layer. Only populated for `change == "modified"`
     /// layers (added/removed have no before/after pair); empty otherwise. Mirrors the composite
@@ -1096,21 +1135,8 @@ pub enum DiffEntryDto {
     Palette(PaletteDiffDto),
 }
 
-/// Assemble a palette DTO from the before/after file bytes (either side `None` for add/delete).
-/// `None` when neither side parses as a palette — the caller then degrades to a text entry.
-fn palette_dto(
-    path: &str,
-    status: &str,
-    old_bytes: Option<&[u8]>,
-    new_bytes: Option<&[u8]>,
-) -> Option<PaletteDiffDto> {
-    let old = old_bytes.and_then(|b| crate::palette::parse(path, b));
-    let new = new_bytes.and_then(|b| crate::palette::parse(path, b));
-    palette_dto_from(path, status, old.as_ref(), new.as_ref())
-}
-
-/// [`palette_dto`] once both sides are already parsed — lets a caller parse each side with its
-/// own format (an embedded palette can be `.gpl` on one side and `.kpl` on the other).
+/// Assemble a palette DTO from both sides, each already parsed with its own format (an embedded
+/// palette can be `.gpl` on one side and `.kpl` on the other). `None` when neither side parsed.
 fn palette_dto_from(
     path: &str,
     status: &str,
@@ -1276,7 +1302,8 @@ fn top_level_id(meta: &kra::ImageMeta, l: &LayerNode) -> String {
 
 /// Composite (mergedimage.png) as a capped PNG data URL. The decode/resize/encode runs once per
 /// unique composite — the result is disk-cached in `.kvc/cache/` keyed by the entry's content
-/// hash, and on a hit `bytes` is never called (no reconstruct at all).
+/// hash, and on a hit `bytes` is never called (no reconstruct at all) and the cached file isn't
+/// read either: the URL is all anyone here needs.
 fn composite_data_url(
     repo: &Repo,
     content_hash: Option<String>,
@@ -1284,15 +1311,11 @@ fn composite_data_url(
 ) -> Result<Option<String>> {
     let cache_dir = repo.cache_dir();
     let key = content_hash.map(|h| kra::composite_cache_key(&h));
-    if let Some(k) = &key {
-        if let Some(png) = crate::raster::cache_read(&cache_dir, k) {
-            return Ok(Some(crate::raster::raster_url(
-                &repo.store,
-                &cache_dir,
-                k,
-                &png,
-            )));
-        }
+    if let Some(url) = key
+        .as_deref()
+        .and_then(|k| crate::raster::cached_url(&repo.store, &cache_dir, k))
+    {
+        return Ok(Some(url));
     }
     let Some(b) = bytes()? else { return Ok(None) };
     let capped = crate::raster::cap_png(&b);
@@ -1337,13 +1360,8 @@ fn stacked_composite_url(
     };
     let key = kra::stack_cache_key(&manifest.version_key());
     let cache_dir = repo.cache_dir();
-    if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        return Ok(Some(crate::raster::raster_url(
-            &repo.store,
-            &cache_dir,
-            &key,
-            &png,
-        )));
+    if let Some(url) = crate::raster::cached_url(&repo.store, &cache_dir, &key) {
+        return Ok(Some(url));
     }
 
     let (w, h) = (meta.width, meta.height);
@@ -1388,10 +1406,14 @@ fn stacked_composite_url(
         .flatten()
         .collect();
 
-    let stack: Vec<crate::raster::StackLayer> = rasters
+    let pngs: Vec<_> = rasters
         .iter()
-        .map(|(r, o, b)| crate::raster::StackLayer {
-            png: &r.png,
+        .filter_map(|(r, o, b)| Some((r.png(&cache_dir)?, *o, b)))
+        .collect();
+    let stack: Vec<crate::raster::StackLayer> = pngs
+        .iter()
+        .map(|(png, o, b)| crate::raster::StackLayer {
+            png,
             opacity: *o,
             blend: b,
         })
@@ -1408,11 +1430,34 @@ fn stacked_composite_url(
     )))
 }
 
+/// A cached change mask's URL, outline and box: from the text chunks the mask carries
+/// ([`crate::raster::mask_meta`]), never decoding its pixels — or, for a mask cached before those
+/// existed, by decoding it and tracing again. `None` on a cache miss.
+#[allow(clippy::type_complexity)]
+fn cached_overlay(
+    repo: &Repo,
+    key: &str,
+) -> Option<(String, Option<String>, Option<(f64, f64, f64, f64)>)> {
+    let cache_dir = repo.cache_dir();
+    let url = crate::raster::cached_url(&repo.store, &cache_dir, key)?;
+    let (outline, bbox) =
+        match crate::raster::mask_meta(&crate::raster::cache_path(&cache_dir, key)) {
+            Some(meta) => meta,
+            None => {
+                let png = crate::raster::cache_read(&cache_dir, key)?;
+                (
+                    crate::raster::outline_from_mask_png(&png),
+                    crate::raster::bbox_from_mask_png(&png),
+                )
+            }
+        };
+    Some((url, outline, bbox))
+}
+
 /// The changed-pixel highlight for a diff: the accent mask as a capped PNG URL, plus the SVG path
 /// (normalized 0..1) that outlines the changed pixels' silhouette. Keyed by both composite content
 /// hashes, so a warm cache reads neither composite; on a miss both raw `mergedimage.png` bytes are
-/// pulled (each behind its own deferred closure, mirroring `composite_data_url`) and diffed. The
-/// outline is rebuilt from the cached mask on a hit (no source re-read, no sibling cache file).
+/// pulled (each behind its own deferred closure, mirroring `composite_data_url`) and diffed.
 /// `(None, None)` when either side is missing (added/removed file) or can't be decoded.
 fn diff_overlay_parts(
     repo: &Repo,
@@ -1426,14 +1471,13 @@ fn diff_overlay_parts(
     };
     let cache_dir = repo.cache_dir();
     let key = kra::diff_cache_key(bh, ah);
-    if let Some(png) = crate::raster::cache_read(&cache_dir, &key) {
-        let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &png);
-        return Ok((Some(url), crate::raster::outline_from_mask_png(&png)));
+    if let Some((url, outline, _)) = cached_overlay(repo, &key) {
+        return Ok((Some(url), outline));
     }
     let (Some(before), Some(after)) = (before_bytes()?, after_bytes()?) else {
         return Ok((None, None));
     };
-    let Some((mask, outline)) = crate::raster::diff_overlay(&before, &after) else {
+    let Some((mask, outline, _)) = crate::raster::diff_overlay_full(&before, &after) else {
         return Ok((None, None));
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
@@ -1468,13 +1512,14 @@ fn layer_diff_overlay(
     };
     let cache_dir = repo.cache_dir();
     let key = kra::diff_cache_key(&before.key, &after.key);
-    if let Some(mask) = crate::raster::cache_read(&cache_dir, &key) {
-        let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
-        let outline = crate::raster::outline_from_mask_png(&mask);
-        let regions = region(crate::raster::bbox_from_mask_png(&mask));
-        return (Some(url), outline, regions);
+    if let Some((url, outline, bbox)) = cached_overlay(repo, &key) {
+        return (Some(url), outline, region(bbox));
     }
-    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full(&before.png, &after.png)
+    let (Some(before_png), Some(after_png)) = (before.png(&cache_dir), after.png(&cache_dir))
+    else {
+        return (None, None, Vec::new());
+    };
+    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full(&before_png, &after_png)
     else {
         return (None, None, Vec::new());
     };
@@ -1489,23 +1534,19 @@ fn layer_diff_overlay(
 /// them (`with_rasters = false`) and the UI fetches them lazily via `commit_layers`/`working_layers`.
 /// `on_layer` (raster path only) is called with each finished layer as rayon completes it —
 /// out of order — so the UI can render layers progressively instead of waiting for the slowest.
+///
+/// `old_manifest` is the parent version's, loaded by the caller once: every layer/region/composite
+/// read below reuses it, and so does the caller's embedded-palette diff — it used to be loaded
+/// twice per diff. The new side is either a committed manifest or an in-memory working file.
 pub fn art_diff_dto(
     repo: &Repo,
     path: &str,
     status: &str,
     new_src: &kra::KraSource,
-    old: Option<&CommittedFile>,
+    old_manifest: Option<&kra::KraManifest>,
     with_rasters: bool,
     on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
 ) -> Result<ArtDiffDto> {
-    // Reconstruct + parse the old side's manifest ONCE; every layer/region/composite read below
-    // reuses it instead of re-reconstructing (walking the patch chain) per call. The new side
-    // is either a committed manifest (loaded once by the caller) or an in-memory working file.
-    let old_manifest = match old.and_then(|o| o.content.as_deref()) {
-        Some(h) => Some(kra::load_manifest(repo, path, h)?),
-        None => None,
-    };
-
     let new_meta = {
         let xml = new_src
             .entry_bytes(repo, path, "maindoc.xml")?
@@ -1597,8 +1638,8 @@ pub fn art_diff_dto(
                     "unchanged"
                 }
             };
-            // Keep the raster structs (URL + capped PNG + cache key) around: a modified layer's
-            // before/after pixels feed its own change highlight below without re-decoding.
+            // Keep the raster structs (URL + cache key + the PNG when freshly made) around: a
+            // modified layer's before/after pixels feed its own change highlight below.
             let after_r = if with_rasters {
                 new_src.layer_raster(repo, path, &new_meta.name, &nl.filename, w, h, &tile_cache)?
             } else {
@@ -1620,10 +1661,14 @@ pub fn art_diff_dto(
                 _ => None,
             };
             let after = after_r.as_ref().map(|r| img(r.url.clone()));
-            let before = match change {
-                "added" => None,
-                "unchanged" => after.clone(),
-                _ => before_r.as_ref().map(|r| img(r.url.clone())),
+            let after_thumb = after_r.as_ref().and_then(|r| r.thumb.clone()).map(&img);
+            let (before, before_thumb) = match change {
+                "added" => (None, None),
+                "unchanged" => (after.clone(), after_thumb.clone()),
+                _ => (
+                    before_r.as_ref().map(|r| img(r.url.clone())),
+                    before_r.as_ref().and_then(|r| r.thumb.clone()).map(&img),
+                ),
             };
             // Per-layer change highlight — only modified layers with both sides present. Added/
             // removed layers get none (no pair to diff; the row label conveys the change).
@@ -1647,6 +1692,8 @@ pub fn art_diff_dto(
                     .map(|(x, y, bw, bh)| BoundsDto { x, y, w: bw, h: bh }),
                 before,
                 after,
+                before_thumb,
+                after_thumb,
                 diff_image,
                 diff_outline,
                 regions,
@@ -1667,7 +1714,7 @@ pub fn art_diff_dto(
                 .any(|nl| layer_id(nl) == layer_id(ol))
             {
                 let entry_path = format!("{}/layers/{}", om.name, ol.filename);
-                let before = if with_rasters {
+                let before_r = if with_rasters {
                     kra::layer_raster(
                         repo,
                         path,
@@ -1678,7 +1725,6 @@ pub fn art_diff_dto(
                         h,
                         &tile_cache,
                     )?
-                    .map(|r| img(r.url))
                 } else {
                     None
                 };
@@ -1693,8 +1739,10 @@ pub fn art_diff_dto(
                     layer_type: ol.kind.clone(),
                     bounds: kra::layer_bounds(&old_index, &entry_path, w, h)
                         .map(|(x, y, bw, bh)| BoundsDto { x, y, w: bw, h: bh }),
-                    before,
+                    before: before_r.as_ref().map(|r| img(r.url.clone())),
                     after: None,
+                    before_thumb: before_r.and_then(|r| r.thumb).map(&img),
+                    after_thumb: None,
                     diff_image: None,
                     diff_outline: None,
                     regions: Vec::new(),
@@ -1785,13 +1833,24 @@ pub fn art_diff_dto(
     })
 }
 
-/// Minimal text placeholder for a file (non-.kra, deleted, or an .kra we couldn't raster).
+/// Minimal text placeholder for a file (deleted, or a `.kra` we couldn't raster).
 fn text_entry(f: &CommittedFile) -> DiffEntryDto {
     DiffEntryDto::Text(TextDiffDto {
         path: f.path.clone(),
         status: f.status.clone(),
         lines: Vec::new(),
     })
+}
+
+/// The parent version's manifest for a diff, if it has one.
+fn parent_manifest(
+    repo: &Repo,
+    path: &str,
+    old: Option<&CommittedFile>,
+) -> Result<Option<std::sync::Arc<kra::KraManifest>>> {
+    old.and_then(|o| o.content.as_deref())
+        .map(|h| kra::load_manifest(repo, path, h))
+        .transpose()
 }
 
 /// The visual diff for one file: an art diff (metadata + composite, rasters only when
@@ -1804,55 +1863,44 @@ fn diff_entry(
     old: Option<&CommittedFile>,
     with_rasters: bool,
 ) -> Vec<DiffEntryDto> {
-    if f.is_kra && f.status != "D" {
-        // Load the manifest once and run both the art diff and the embedded-palette diff off it,
-        // so the `.kra` can emit its Art entry plus one Palette entry per changed document palette.
-        let Some(manifest) = f
-            .content
-            .as_deref()
-            .and_then(|h| kra::load_manifest(repo, &f.path, h).ok())
-        else {
-            return vec![text_entry(f)];
-        };
-        let new_src = kra::KraSource::Committed(&manifest);
-        let Ok(art) = art_diff_dto(repo, &f.path, &f.status, &new_src, old, with_rasters, None)
-        else {
-            return vec![text_entry(f)];
-        };
-        let old_manifest = old
-            .and_then(|o| o.content.as_deref())
-            .and_then(|h| kra::load_manifest(repo, &f.path, h).ok());
-        let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
-        let mut out = vec![DiffEntryDto::Art(art)];
-        out.extend(
-            kra_palette_dtos(repo, &f.path, &new_src, old_src.as_ref())
-                .into_iter()
-                .map(DiffEntryDto::Palette),
-        );
-        return out;
+    if f.status == "D" {
+        return vec![text_entry(f)];
     }
-    if crate::palette::is_palette(&f.path) {
-        let recon =
-            |h: Option<&str>| h.and_then(|h| repo.reconstruct(&format!("file:{}", f.path), h).ok());
-        let new_bytes = if f.status == "D" {
-            None
-        } else {
-            recon(f.content.as_deref())
-        };
-        let old_bytes = recon(old.and_then(|o| o.content.as_deref()));
-        if let Some(dto) = palette_dto(
-            &f.path,
-            &f.status,
-            old_bytes.as_deref(),
-            new_bytes.as_deref(),
-        ) {
-            return vec![DiffEntryDto::Palette(dto)];
-        }
-    }
-    vec![text_entry(f)]
+    // Load both manifests once and run both the art diff and the embedded-palette diff off them,
+    // so the `.kra` can emit its Art entry plus one Palette entry per changed document palette.
+    let Some(manifest) = f
+        .content
+        .as_deref()
+        .and_then(|h| kra::load_manifest(repo, &f.path, h).ok())
+    else {
+        return vec![text_entry(f)];
+    };
+    let Ok(old_manifest) = parent_manifest(repo, &f.path, old) else {
+        return vec![text_entry(f)];
+    };
+    let new_src = kra::KraSource::Committed(&manifest);
+    let Ok(art) = art_diff_dto(
+        repo,
+        &f.path,
+        &f.status,
+        &new_src,
+        old_manifest.as_deref(),
+        with_rasters,
+        None,
+    ) else {
+        return vec![text_entry(f)];
+    };
+    let old_src = old_manifest.as_deref().map(kra::KraSource::Committed);
+    let mut out = vec![DiffEntryDto::Art(art)];
+    out.extend(
+        kra_palette_dtos(repo, &f.path, &new_src, old_src.as_ref())
+            .into_iter()
+            .map(DiffEntryDto::Palette),
+    );
+    out
 }
 
-/// Art diff for a committed `.kra`: load its manifest once, then run the shared builder.
+/// Art diff for a committed `.kra`: load its manifests once, then run the shared builder.
 pub fn committed_art_dto(
     repo: &Repo,
     f: &CommittedFile,
@@ -1865,12 +1913,13 @@ pub fn committed_art_dto(
         .as_deref()
         .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))?;
     let manifest = kra::load_manifest(repo, &f.path, hash)?;
+    let old_manifest = parent_manifest(repo, &f.path, old)?;
     art_diff_dto(
         repo,
         &f.path,
         &f.status,
         &kra::KraSource::Committed(&manifest),
-        old,
+        old_manifest.as_deref(),
         with_rasters,
         on_layer,
     )
@@ -1974,10 +2023,87 @@ fn last_committed(repo: &Repo, file: &str) -> Option<CommittedFile> {
         .and_then(|tree| tree.get(file).cloned())
 }
 
-/// Working-tree art diff, shared by `working_diff` and `working_layers`. Parses the working
-/// `.kra` **in memory** (`parse_working`) — viewing a diff never touches the object store:
-/// no bsdiff, no chain reconstructs, no writes. `None` old side (untracked file or empty
-/// history) yields an all-"added" diff.
+/// The working `.kra` last parsed by [`parsed_working`], and what identified the bytes it was
+/// parsed from.
+struct ParsedWorking {
+    path: PathBuf,
+    size: u64,
+    mtime: u64,
+    low_memory: bool,
+    kra: std::sync::Arc<kra::WorkingKra>,
+}
+
+static WORKING: std::sync::Mutex<Option<ParsedWorking>> = std::sync::Mutex::new(None);
+
+/// How long a parse kept for `working_layers` waits to be taken. It normally is within
+/// milliseconds; this leaves room for a wait behind the other heavy commands.
+pub const WORKING_PARSE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The working `.kra` at `abs`, parsed — shared between the two commands a Changes refresh makes:
+/// `working_diff`, then `working_layers`. Each read the painting, inflated every entry and hashed
+/// every tile on its own, back to back (255 ms apiece on a 105 MB painting). `last` is the second
+/// of the pair: it takes the parse and lets go of it, so a whole document isn't kept resident
+/// between refreshes.
+///
+/// Keyed by size + mtime as stat'ed before the read, the scan's own fast-path rule: a rewrite
+/// inside the same timestamp tick would be missed, at worst for one refresh of a diff view, never
+/// stored data. `working_layers` doesn't always follow — returning to Changes serves the layers
+/// from the frontend's cache, and a painting that can't be diffed never asks for them — so an
+/// untaken parse goes after [`WORKING_PARSE_TTL`] rather than staying, a painting's worth of
+/// memory, until the next refresh.
+fn parsed_working(
+    abs: &Path,
+    low_memory: bool,
+    last: bool,
+) -> Result<std::sync::Arc<kra::WorkingKra>> {
+    let meta = std::fs::metadata(abs).map_err(|e| crate::error::io_at(abs, e))?;
+    let (size, mtime) = crate::repo::size_mtime(&meta);
+    {
+        let mut slot = WORKING.lock().unwrap();
+        let hit = slot.as_ref().is_some_and(|p| {
+            p.path == abs && (p.size, p.mtime) == (size, mtime) && p.low_memory == low_memory
+        });
+        if hit {
+            return Ok(if last {
+                slot.take().expect("just matched").kra
+            } else {
+                slot.as_ref().expect("just matched").kra.clone()
+            });
+        }
+    }
+    let bytes = std::fs::read(abs).map_err(|e| crate::error::io_at(abs, e))?;
+    let parsed = std::sync::Arc::new(kra::parse_working(&bytes, low_memory)?);
+    drop(bytes);
+    *WORKING.lock().unwrap() = (!last).then(|| ParsedWorking {
+        path: abs.to_path_buf(),
+        size,
+        mtime,
+        low_memory,
+        kra: parsed.clone(),
+    });
+    if !last {
+        // A `Weak`, so waiting doesn't keep alive a parse `working_layers` took and dropped. It
+        // does keep the allocation, so no later parse can land at the address compared below.
+        // A thread that can't be spawned only means the parse stays until the next refresh.
+        let kept = std::sync::Arc::downgrade(&parsed);
+        let _ = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(WORKING_PARSE_TTL);
+            let mut slot = WORKING.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|p| std::ptr::eq(std::sync::Arc::as_ptr(&p.kra), kept.as_ptr()))
+            {
+                *slot = None;
+            }
+        });
+    }
+    Ok(parsed)
+}
+
+/// Working-tree art diff for `working_layers`. Parses the working `.kra` **in memory**
+/// (`parse_working`) — viewing a diff never touches the object store: no bsdiff, no chain
+/// reconstructs, no writes. `None` old side (untracked file or empty history) yields an all-"added"
+/// diff.
 fn working_art_dto(
     repo: &Repo,
     file: &str,
@@ -1985,16 +2111,16 @@ fn working_art_dto(
     on_layer: Option<&(dyn Fn(LayerDto) + Sync)>,
 ) -> Result<ArtDiffDto> {
     let abs = crate::repo::safe_join(&repo.root, file)?;
-    let bytes = std::fs::read(&abs).map_err(|e| crate::error::io_at(&abs, e))?;
-    let working = kra::parse_working(&bytes, repo.config.low_memory_diff)?;
+    let working = parsed_working(&abs, repo.config.low_memory_diff, true)?;
     let old = last_committed(repo, file);
     let status = if old.is_some() { "M" } else { "A" };
+    let old_manifest = parent_manifest(repo, file, old.as_ref())?;
     art_diff_dto(
         repo,
         file,
         status,
         &kra::KraSource::Working(&working),
-        old.as_ref(),
+        old_manifest.as_deref(),
         with_rasters,
         on_layer,
     )
@@ -2014,34 +2140,9 @@ pub async fn working_diff(
             // Register only after the open succeeds, so a failed open never adds anything to
             // the kvcimg scheme's allowlist.
             register_served_repo(&repo.store.to_string_lossy());
-            if !file.to_lowercase().ends_with(".kra") {
-                let old = last_committed(&repo, &file);
-                let status = if old.is_some() { "M" } else { "A" };
-                if crate::palette::is_palette(&file) {
-                    let abs = crate::repo::safe_join(&repo.root, &file)?;
-                    let new_bytes = std::fs::read(&abs).ok();
-                    let old_bytes = old
-                        .as_ref()
-                        .and_then(|o| o.content.as_deref())
-                        .and_then(|h| repo.reconstruct(&format!("file:{}", file), h).ok());
-                    if let Some(dto) =
-                        palette_dto(&file, status, old_bytes.as_deref(), new_bytes.as_deref())
-                    {
-                        return Ok(vec![DiffEntryDto::Palette(dto)]);
-                    }
-                }
-                return Ok(vec![text_entry(&CommittedFile {
-                    path: file.clone(),
-                    status: status.into(),
-                    content: None,
-                    is_kra: false,
-                    file_hash: None,
-                    original_size: 0,
-                })]);
-            }
             // Parse the working `.kra` once, then run the art diff and the embedded-palette diff
-            // off the same source (mirrors `diff_entry`'s committed path). `working_art_dto`
-            // stays for the raster-streaming `working_layers`.
+            // off the same source (mirrors `diff_entry`'s committed path). The parse is kept for
+            // the `working_layers` call that follows (see `parsed_working`).
             let art_text = || {
                 text_entry(&CommittedFile {
                     path: file.clone(),
@@ -2053,24 +2154,27 @@ pub async fn working_diff(
                 })
             };
             let abs = crate::repo::safe_join(&repo.root, &file)?;
-            let Ok(bytes) = std::fs::read(&abs) else {
-                return Ok(vec![art_text()]);
-            };
-            let Ok(working) = kra::parse_working(&bytes, repo.config.low_memory_diff) else {
+            let Ok(working) = parsed_working(&abs, repo.config.low_memory_diff, false) else {
                 return Ok(vec![art_text()]);
             };
             let new_src = kra::KraSource::Working(&working);
             let old = last_committed(&repo, &file);
             let status = if old.is_some() { "M" } else { "A" };
-            let Ok(art) = art_diff_dto(&repo, &file, status, &new_src, old.as_ref(), false, None)
-            else {
+            let Ok(old_manifest) = parent_manifest(&repo, &file, old.as_ref()) else {
                 return Ok(vec![art_text()]);
             };
-            let old_manifest = old
-                .as_ref()
-                .and_then(|o| o.content.as_deref())
-                .and_then(|h| kra::load_manifest(&repo, &file, h).ok());
-            let old_src = old_manifest.as_ref().map(kra::KraSource::Committed);
+            let Ok(art) = art_diff_dto(
+                &repo,
+                &file,
+                status,
+                &new_src,
+                old_manifest.as_deref(),
+                false,
+                None,
+            ) else {
+                return Ok(vec![art_text()]);
+            };
+            let old_src = old_manifest.as_deref().map(kra::KraSource::Committed);
             let mut out = vec![DiffEntryDto::Art(art)];
             out.extend(
                 kra_palette_dtos(&repo, &file, &new_src, old_src.as_ref())

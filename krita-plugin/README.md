@@ -155,10 +155,20 @@ the plugin folder.
 - **Process details.** Reads time out after 30 seconds and writes after 300. On Windows the call uses
   `CREATE_NO_WINDOW`, or the 1.5-second poll would flash a console window, and output is decoded as
   UTF-8 explicitly, because the Windows default code page mangles non-ASCII paths, branch names and
-  messages. Calls block Krita's UI thread by design (see the header of `kvc_client.py`).
-- **The poll.** A 1.5-second timer runs `kvc status`, which returns the changes, the branch list and
-  the set-aside count in one process, so a tick costs one spawn. It returns early when the docker
-  isn't visible.
+  messages. Calls block Krita's UI thread by design (see the header of `kvc_client.py`), except the
+  commit: it hashes and stores the whole painting (about 3 s at 105 MB), so the docker runs it
+  through `QProcess` (`_run_kvc_async`, with the same argv as `kvc_client.commit_args`) while its
+  busy state keeps the buttons and the poll off. The other writes stay blocking, since the document
+  has to be reopened after them before Krita can be used anyway.
+- **The poll.** A 1.5-second timer runs `kvc status`, which returns the changes, the branch list,
+  the set-aside count and the store's path in one process, so a tick costs at most one spawn. It
+  usually costs none: `kvc_client.status_cached` stats the document and the store's `index.json`,
+  `branches.json` and `stashes.json`, and reuses the last answer while all four `(mtime, size)`
+  pairs match. The key is taken before the spawn, so a save landing mid-status shows up on the next
+  tick, and the docker forgets the answer after any operation it runs itself. The engine does its
+  part too: `kvc status` never reads the commit log, and a saved-but-unversioned painting is read and
+  hashed once per save rather than on every tick. The poll returns early when the docker isn't
+  visible.
 - **Which document.** `find_doc` accepts the active document if it's a `.kra` with a `.kvc` folder
   beside it and lets `kvc` give the real answer. `is_tracked_document` compares exact paths, not a
   folder prefix, because a neighboring painting has a different history entirely.
@@ -174,7 +184,10 @@ the plugin folder.
   by mtime and size, since `switch` doesn't report what it rewrote), and checks again after reopening
   that the file didn't change during the reopen. Without the reopen, the next Ctrl+S would silently
   revert the operation; without the refusal, the reopen would destroy work the engine's dirty-tree
-  guard can't see.
+  guard can't see. The reopen runs even when the operation fails: "Set aside & switch" is two `kvc`
+  calls, and if the switch fails after the set-aside reverted the file, skipping the reopen would
+  let the next Ctrl+S write the set-aside work back over it. `test_kvc_client.py` pins this against
+  stub Qt modules.
 - The tick state lives in `VcDocker.checked`, not in the list widget, because the poll rebuilds the
   list and would wipe a tick mid-edit; the rebuild is skipped when the list of paths hasn't changed.
 - The author name is a plugin-local Krita setting (Krita has no login shared with the desktop app). It

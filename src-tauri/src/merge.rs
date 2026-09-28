@@ -22,7 +22,7 @@
 
 use crate::error::{KvcError, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive};
 
@@ -36,6 +36,18 @@ use zip::{CompressionMethod, ZipArchive};
 /// attributes (`selected`, …) every save, so an untouched layer's XML still differs between two
 /// saves. `None` (no committed base) folds all.
 pub fn merge_layers(base: &[u8], incoming: &[u8], ancestor: Option<&[u8]>) -> Result<Vec<u8>> {
+    Ok(merge_layers_into(base, incoming, ancestor, Cursor::new(Vec::new()))?.into_inner())
+}
+
+/// [`merge_layers`] written straight into `out`. Bringing set-aside work back hands it the temp file
+/// beside the artwork, so the merged document — larger than either input — is never held whole in
+/// memory on top of the three it's built from.
+pub fn merge_layers_into<W: Write + Seek>(
+    base: &[u8],
+    incoming: &[u8],
+    ancestor: Option<&[u8]>,
+    out: W,
+) -> Result<W> {
     let base_doc = read_entry(base, "maindoc.xml")?;
     let inc_doc = read_entry(incoming, "maindoc.xml")?;
     let base_xml =
@@ -175,6 +187,9 @@ pub fn merge_layers(base: &[u8], incoming: &[u8], ancestor: Option<&[u8]>) -> Re
         // changes are outside the layer stack (e.g. canvas size) — nothing a layer merge can fold.
         return Err(fail("set-aside file has no changed layers to bring back"));
     }
+    // Every ancestor layer's decompressed tiles, needed only to pick what folds in: not carried
+    // through the repack.
+    drop(anc_layers);
 
     // Splice the fragments in as the first children of base's <layers> (top of the stack).
     let insert_at = layers_insert_at(base_xml, base_layers, fail)?;
@@ -188,19 +203,32 @@ pub fn merge_layers(base: &[u8], incoming: &[u8], ancestor: Option<&[u8]>) -> Re
     }
     merged.push_str(&base_xml[insert_at..]);
 
-    repackage(base, incoming, &merged, base_name, inc_name, &file_renames)
+    repackage(
+        base,
+        incoming,
+        &merged,
+        base_name,
+        inc_name,
+        &file_renames,
+        out,
+    )
 }
 
 /// Rebuild the `.kra`: every base entry (with `maindoc.xml` swapped for the merged one), then the
 /// incoming layer data files copied under their new names into base's `layers/` directory.
-fn repackage(
+///
+/// Every entry but `maindoc.xml` is **raw-copied** — its compressed bytes, crc32 and size carried
+/// over as they are — rather than inflated and deflated again at the library default, level 6,
+/// which was a full compress pass over the whole painting for bytes that don't change.
+fn repackage<W: Write + Seek>(
     base: &[u8],
     incoming: &[u8],
     merged_maindoc: &str,
     base_image: &str,
     inc_image: &str,
     file_renames: &[(String, String)],
-) -> Result<Vec<u8>> {
+    out: W,
+) -> Result<W> {
     let mut base_zip = ZipArchive::new(Cursor::new(base)).map_err(zip_err)?;
     let mut inc_zip = ZipArchive::new(Cursor::new(incoming)).map_err(zip_err)?;
     let rename: HashMap<&str, &str> = file_renames
@@ -208,23 +236,21 @@ fn repackage(
         .map(|(o, n)| (o.as_str(), n.as_str()))
         .collect();
 
-    let mut out = Vec::new();
+    let mut zw = zip::ZipWriter::new(out);
     {
-        let mut zw = zip::ZipWriter::new(Cursor::new(&mut out));
-
         // Base entries in original order; mimetype stays first + stored, like Krita writes it.
         for i in 0..base_zip.len() {
-            let mut f = base_zip.by_index(i).map_err(zip_err)?;
+            let f = base_zip.by_index_raw(i).map_err(zip_err)?;
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().to_string();
-            zw.start_file(&name, opts(&name)).map_err(zip_err)?;
-            if name == "maindoc.xml" {
+            if f.name() == "maindoc.xml" {
+                drop(f);
+                zw.start_file("maindoc.xml", opts("maindoc.xml"))
+                    .map_err(zip_err)?;
                 zw.write_all(merged_maindoc.as_bytes())?;
             } else {
-                let buf = crate::repo::read_entry_capped(&mut f)?;
-                zw.write_all(&buf)?;
+                zw.raw_copy_file(f).map_err(zip_err)?;
             }
         }
 
@@ -233,26 +259,22 @@ fn repackage(
         let inc_prefix = format!("{inc_image}/layers/");
         let base_prefix = format!("{base_image}/layers/");
         for i in 0..inc_zip.len() {
-            let mut f = inc_zip.by_index(i).map_err(zip_err)?;
+            let Some(new_name) = inc_zip.name_for_index(i).and_then(|name| {
+                let rest = name.strip_prefix(&inc_prefix)?;
+                let split = rest.find(['.', '/']).unwrap_or(rest.len());
+                let new_fn = rename.get(&rest[..split])?;
+                Some(format!("{base_prefix}{new_fn}{}", &rest[split..]))
+            }) else {
+                continue;
+            };
+            let f = inc_zip.by_index_raw(i).map_err(zip_err)?;
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().to_string();
-            let Some(rest) = name.strip_prefix(&inc_prefix) else {
-                continue;
-            };
-            let split = rest.find(['.', '/']).unwrap_or(rest.len());
-            let Some(&new_fn) = rename.get(&rest[..split]) else {
-                continue;
-            };
-            let new_name = format!("{base_prefix}{new_fn}{}", &rest[split..]);
-            let buf = crate::repo::read_entry_capped(&mut f)?;
-            zw.start_file(&new_name, opts(&new_name)).map_err(zip_err)?;
-            zw.write_all(&buf)?;
+            zw.raw_copy_file_rename(f, new_name).map_err(zip_err)?;
         }
-        zw.finish().map_err(zip_err)?;
     }
-    Ok(out)
+    zw.finish().map_err(zip_err)
 }
 
 // --- small helpers ---------------------------------------------------------------------
@@ -369,14 +391,14 @@ pub(crate) fn subtree_attr(node: roxmltree::Node, attr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Filename components of every `<image>/layers/<name>...` entry in a `.kra` archive.
+/// Filename components of every `<image>/layers/<name>...` entry in a `.kra` archive — read from
+/// the central directory, not by opening each entry.
 pub(crate) fn archive_layer_files(kra: &[u8], image: &str) -> Result<HashSet<String>> {
     let prefix = format!("{image}/layers/");
-    let mut zip = ZipArchive::new(Cursor::new(kra)).map_err(zip_err)?;
+    let zip = ZipArchive::new(Cursor::new(kra)).map_err(zip_err)?;
     let mut out = HashSet::new();
-    for i in 0..zip.len() {
-        let f = zip.by_index(i).map_err(zip_err)?;
-        if let Some(rest) = f.name().strip_prefix(&prefix) {
+    for name in zip.file_names() {
+        if let Some(rest) = name.strip_prefix(&prefix) {
             let split = rest.find(['.', '/']).unwrap_or(rest.len());
             if split > 0 {
                 out.insert(rest[..split].to_string());
@@ -384,6 +406,52 @@ pub(crate) fn archive_layer_files(kra: &[u8], image: &str) -> Result<HashSet<Str
         }
     }
     Ok(out)
+}
+
+/// The data-file names (`layerN`, as [`archive_layer_files`] reads them) of `ancestor`'s top-level
+/// layers that `incoming` also has, matched by uuid — the only ancestor layers [`merge_layers`]
+/// ever compares — and the `<image>/layers/` prefix they sit under. Lets the caller rebuild the
+/// ancestor from those alone.
+pub(crate) fn shared_layer_files(
+    ancestor: &[u8],
+    incoming: &[u8],
+) -> Result<(String, HashSet<String>)> {
+    let anc_doc = read_entry(ancestor, "maindoc.xml")?;
+    let inc_doc = read_entry(incoming, "maindoc.xml")?;
+    let anc_xml =
+        std::str::from_utf8(&anc_doc).map_err(|_| fail("ancestor maindoc.xml is not UTF-8"))?;
+    let inc_xml =
+        std::str::from_utf8(&inc_doc).map_err(|_| fail("set-aside maindoc.xml is not UTF-8"))?;
+    let opts = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let anc_tree = roxmltree::Document::parse_with_options(anc_xml, opts)
+        .map_err(|e| fail(&format!("ancestor maindoc: {e}")))?;
+    let inc_tree = roxmltree::Document::parse_with_options(inc_xml, opts)
+        .map_err(|e| fail(&format!("set-aside maindoc: {e}")))?;
+    fn top<'a>(image: roxmltree::Node<'a, 'a>) -> Result<Vec<roxmltree::Node<'a, 'a>>> {
+        Ok(layers_node(image)?
+            .children()
+            .filter(|n| n.is_element() && n.has_tag_name("layer"))
+            .collect())
+    }
+    let anc_image = image_node(&anc_tree)?;
+    let incoming_uuids: HashSet<&str> = top(image_node(&inc_tree)?)?
+        .iter()
+        .filter_map(|l| l.attribute("uuid"))
+        .collect();
+    let mut files = HashSet::new();
+    for layer in top(anc_image)? {
+        if layer
+            .attribute("uuid")
+            .is_some_and(|u| incoming_uuids.contains(u))
+        {
+            files.extend(subtree_attr(layer, "filename"));
+        }
+    }
+    let prefix = format!("{}/layers/", anc_image.attribute("name").unwrap_or(""));
+    Ok((prefix, files))
 }
 
 /// Layer attributes that mark a real creative choice — not Krita's per-save UI churn (`selected`
@@ -443,19 +511,22 @@ fn layer_content(kra: &[u8], image: &str, files: &HashSet<String>) -> Result<Vec
     let mut zip = ZipArchive::new(Cursor::new(kra)).map_err(zip_err)?;
     let mut out = Vec::new();
     for i in 0..zip.len() {
+        // Match on the central directory's name; only a match is worth opening.
+        let wanted = zip.name_for_index(i).is_some_and(|name| {
+            name.strip_prefix(&prefix).is_some_and(|rest| {
+                let split = rest.find(['.', '/']).unwrap_or(rest.len());
+                files.contains(&rest[..split])
+            })
+        });
+        if !wanted {
+            continue;
+        }
         let mut f = zip.by_index(i).map_err(zip_err)?;
         if f.is_dir() {
             continue;
         }
-        let name = f.name().to_string();
-        let Some(rest) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let split = rest.find(['.', '/']).unwrap_or(rest.len());
-        if files.contains(&rest[..split]) {
-            let buf = crate::repo::read_entry_capped(&mut f)?;
-            out.push(canon_entry(buf));
-        }
+        let buf = crate::repo::read_entry_capped(&mut f)?;
+        out.push(canon_entry(buf));
     }
     out.sort();
     Ok(out)

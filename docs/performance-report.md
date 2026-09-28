@@ -59,26 +59,30 @@ the delta store's real size on disk.
   captured for free at commit time (the scanner already read the file) and set everywhere a
   `CommittedFile` is built (commit, rollback, merge). It's `#[serde(default)]`, so older
   `commits.log` lines still deserialize.
-- **The whole-store figure.** `commands::compute_storage_stats(&Repo)` (pure and testable) folds each
-  commit's full tree with `commit::tree_at_commit` and sums `original_size` over its files, giving
-  one `VersionRow` per commit. `naiveBytes` is the sum of those rows, `actualBytes` is the size of
+- **The whole-store figure.** `commands::compute_storage_stats(&Repo)` (pure and testable) builds
+  each commit's full tree and sums `original_size` over its files, giving one `VersionRow` per
+  commit. `naiveBytes` is the sum of those rows, `actualBytes` is the size of
   the store's `objects/` and `chains/` folders, and `savedBytes = naive − actual` (never below zero).
-  It's exposed as the `repo_storage_stats` command (`useStorageStats` in `repoData.ts`), called once
-  in `RepoShell` (`AppShell.tsx`) and passed to `PerformancePanel` as props. It isn't called inside
-  the panel, which mounts and unmounts on every switch to and from the Performance view and would
-  otherwise recompute the figures on every visit. It refetches only on a real `refreshNonce` bump (a
-  write, or the refresh when the window regains focus; see
-  [frontend-architecture.md](frontend-architecture.md#app-shell)). The per-version tree re-fold is
-  quadratic (commits × files), which is fine for histories made by hand.
+  It's exposed as the `repo_storage_stats` command (on `run_heavy`), called from `useStorageStats` in
+  `RepoShell` (`AppShell.tsx`) and passed to `PerformancePanel` as props, so the last answer survives
+  switching views. It's fetched only while the Performance view is showing, and only when the
+  `refreshNonce` moved since the last answer; it used to run at startup and after every write and
+  focus refresh in every view. The trees are built in one pass over the log (each version's is its
+  first parent's plus its own files), not refolded from the root per version.
 - **Stored bytes per version (`VersionRow.storedBytes`).** Each version also reports what it added to
-  the store, by first-reference attribution. That reuses the GC mark, so it needed no change to the
-  commit path and works on existing history. `object_size_map` builds an `objectName → bytes` map
-  once from a walk of the loose objects plus `delta::read_pack_header` (mirroring `gc.rs`), and
-  `stored_bytes_by_commit` walks the commits oldest first with a `seen` set. It maps each commit's
-  files to object names (for a `.kra`, `kra::manifest_stream_key` plus the manifest's
-  `kra::referenced_streams`, resolved through `repo.chains.chain(key)` → `Version::object_name()`;
-  for any other file, `("file:{path}", content)`) and credits each object's bytes to the first commit
-  that refers to it. So a version that changed a few tiles of a large painting shows a big saving:
+  the store. Since the September 2026 audit, a commit records it as it writes
+  (`Commit.storedBytes`, counted in `commit_prepared_batch` and `commit_prepared`), and the report
+  just reads it; rollbacks and merges record 0, since everything they point at is already stored.
+  Versions from before that (always a prefix of the log) are still attributed the old way, which
+  replays their manifests (27 s at 200 versions of a 45,000-tile painting): `object_size_map` builds
+  an `objectName → bytes` map once from a walk of the loose objects plus `delta::read_pack_header`
+  (mirroring `gc.rs`), and `stored_bytes_by_commit` walks those commits oldest first with a `seen`
+  set. It maps each commit's document to object names (`kra::manifest_stream_key` plus the
+  manifest's `kra::referenced_streams`, resolved through `repo.chains.chain(key)` →
+  `Version::object_name()`) and credits each object's bytes to the first commit that refers to it.
+  The two methods agree on an ordinary history, but a recorded figure counts only what that commit
+  itself wrote: content first stored by set-aside work, or by a version later undone, is already on
+  disk when a commit reuses it, so it counts toward no version (it's still in `actualBytes`). So a version that changed a few tiles of a large painting shows a big saving:
   `originalBytes` is the whole painting (a full copy) and `storedBytes` is just the new delta. It
   counts objects only, so the stored bytes of all versions add up to at most `actualBytes` (it leaves
   out the chain shards, pack index overhead and objects orphaned by undo). The summary keeps the

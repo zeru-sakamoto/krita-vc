@@ -27,7 +27,12 @@ import { stashSummary, stashTitle } from "../vcs/StashDialogs";
 import { useArtistMode } from "../../lib/artistMode";
 import { useAuthorName } from "../../lib/authorName";
 import { THEMES, useTheme, type ThemeId } from "../../lib/theme";
-import { useRepository, type CheckReport, type CleanupReport } from "../../lib/repository";
+import {
+  isDamagedHistoryError,
+  useRepository,
+  type CheckReport,
+  type CleanupReport,
+} from "../../lib/repository";
 import { hasBeenChecked } from "../../lib/checkedRepos";
 import { useRepoConfig, useStashes } from "../../lib/repoData";
 import { useTour } from "../../lib/tour";
@@ -510,7 +515,15 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </div>
         </div>
       </Modal>
-      {showCleanup && <CleanupModal onClose={() => setShowCleanup(false)} />}
+      {showCleanup && (
+        <CleanupModal
+          onClose={() => setShowCleanup(false)}
+          onCheck={() => {
+            setShowCleanup(false);
+            setShowCheck(true);
+          }}
+        />
+      )}
       {showCheck && <CheckModal onClose={() => setShowCheck(false)} />}
       {showDropAll && <DropAllStashesModal onClose={() => setShowDropAll(false)} />}
       {confirmDrop && <DropStashModal stash={confirmDrop} onClose={() => setConfirmDrop(null)} />}
@@ -699,6 +712,8 @@ const PROBLEM_LABEL: Record<string, string> = {
   brokenChain: "A version can't be rebuilt",
   danglingTip: "A branch points at a version that isn't there",
   badLogLine: "The history file is damaged",
+  missingParent: "A version's earlier history is missing",
+  badChains: "The version index is unreadable",
   badPack: "A storage bundle is unreadable",
   corruptContent: "Stored data doesn't match what it should be",
 };
@@ -927,13 +942,18 @@ function CheckModal({ onClose }: { onClose: () => void }) {
  * "Clean up storage": a dry run on open shows what a real pass would free (space held by
  * versions no branch can reach — leftovers of undo and deleted branches), then one confirm
  * runs it for real. Cleaning never touches current artwork or any version still in history.
+ *
+ * On a store whose history has a hole in it, the backend refuses both passes: reachability stops
+ * at the hole, so everything behind it would read as unreachable and be swept. That refusal is
+ * shown in plain words with a way to the check, instead of as the raw error.
  */
-function CleanupModal({ onClose }: { onClose: () => void }) {
+function CleanupModal({ onClose, onCheck }: { onClose: () => void; onCheck: () => void }) {
   const { cleanupRepository } = useRepository();
   const [preview, setPreview] = useState<CleanupReport | null>(null);
   const [result, setResult] = useState<CleanupReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [damaged, setDamaged] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -942,7 +962,9 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
         if (!cancelled) setPreview(r);
       })
       .catch((e) => {
-        if (!cancelled) setError(String(e));
+        if (cancelled) return;
+        setError(String(e));
+        setDamaged(isDamagedHistoryError(e));
       });
     return () => {
       cancelled = true;
@@ -957,6 +979,7 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
       setResult(await cleanupRepository(false));
     } catch (e) {
       setError(String(e));
+      setDamaged(isDamagedHistoryError(e));
     } finally {
       setBusy(false);
     }
@@ -972,10 +995,21 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
       footer={(close) => (
         <>
           <Button onClick={close}>{result ? "Done" : "Cancel"}</Button>
-          {!result && (
-            <Button variant="primary" disabled={busy || preview == null || nothing} onClick={clean}>
-              {busy ? "Cleaning…" : "Clean up"}
+          {damaged ? (
+            <Button variant="primary" onClick={onCheck}>
+              <ShieldCheck size={ICON.dense} />
+              Check for problems…
             </Button>
+          ) : (
+            !result && (
+              <Button
+                variant="primary"
+                disabled={busy || preview == null || nothing}
+                onClick={clean}
+              >
+                {busy ? "Cleaning…" : "Clean up"}
+              </Button>
+            )
           )}
         </>
       )}
@@ -985,7 +1019,14 @@ function CleanupModal({ onClose }: { onClose: () => void }) {
         deleted branches. Your current artwork and every version you can still see are never
         touched.
       </p>
-      {error && <p className="text-dense text-danger">{error}</p>}
+      {damaged ? (
+        <p className="text-dense text-danger">
+          Clean up storage is unavailable because the history has problems. Run Check for problems
+          first.
+        </p>
+      ) : (
+        error && <p className="text-dense text-danger">{error}</p>
+      )}
       {!error && result ? (
         <p className="text-body text-text">
           Freed <span className="font-medium">{formatBytes(totalOf(result))}</span>

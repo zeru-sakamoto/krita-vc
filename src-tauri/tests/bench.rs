@@ -177,7 +177,7 @@ fn tile_storage_experiment() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let working = kra::parse_working(&bytes, false).unwrap();
-    let index = working.tile_index();
+    let index = working.tile_index_ref();
 
     let (mut n, mut lzf, mut cur, mut raw_z) = (0u64, 0u64, 0u64, 0u64);
     let mut undecodable = 0u64;
@@ -186,7 +186,7 @@ fn tile_storage_experiment() {
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).unwrap();
         let name = f.name().to_string();
-        if !index.contains_key(&name) {
+        if !index.contains_key(name.as_str()) {
             continue;
         }
         let mut buf = Vec::new();
@@ -393,7 +393,14 @@ fn large_canvas_baseline() {
     let t = Instant::now();
     let m_prev = kra::load_manifest(&r, "art.kra", &h_prev).unwrap();
     let m_last = kra::load_manifest(&r, "art.kra", &h_last).unwrap();
-    let changed = kra::changed_entry_paths(&m_prev.tile_index(), &m_last.tile_index());
+    let changed = kra::diff_tile_indexes(
+        &m_prev.tile_index_ref(),
+        &m_last.tile_index_ref(),
+        &Default::default(),
+        0,
+        0,
+    )
+    .changed_paths;
     println!(
         "diff detect:         {:>8.2?}  ({} entries changed)",
         t.elapsed(),
@@ -770,7 +777,7 @@ fn corpus_baseline() {
             println!(
                 "load manifest:       {:>8.2?}  ({} tiled entries)",
                 t.elapsed(),
-                m.tile_index().len()
+                m.tile_index_ref().len()
             );
 
             let t = Instant::now();
@@ -1097,7 +1104,7 @@ fn partial_commit_baseline() {
 
     let prev = kra::load_manifest(&r, "art.kra", &head).unwrap();
     let t = Instant::now();
-    kra::commit_kra(&mut r, "art.kra", &synth, Some(&prev)).unwrap();
+    kra::commit_kra(&mut r, "art.kra", &synth, Some(&*prev)).unwrap();
     println!("  commit_kra:          {:>8.2?}", t.elapsed());
 
     let t = Instant::now();

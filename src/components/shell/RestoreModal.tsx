@@ -60,7 +60,8 @@ export function RestoreModal({ archive, onClose }: { archive: string; onClose: (
         setPlans(rows);
         setStoreRoot(root);
         setTimestamp(manifest?.timestamp ?? null);
-        // Occupied rows default to Skip: replacing overwrites the artwork *and* its history.
+        // Occupied rows default to Skip: replacing swaps out the artwork *and* its history (both
+        // are kept beside the restore, but the artist should still choose it).
         setSkipped(rows.filter((r) => r.occupied).map((r) => r.dir));
         setPhase("pick");
       } catch (e) {
@@ -137,6 +138,17 @@ export function RestoreModal({ archive, onClose }: { archive: string; onClose: (
                   <span className="block truncate text-caption text-text-muted">
                     History kept in {r.store}
                   </span>
+                  {r.replacedArtwork && (
+                    <span className="block truncate text-caption text-text-muted">
+                      The artwork that was here is now {r.replacedArtwork}
+                    </span>
+                  )}
+                  {r.replacedHistory && (
+                    <span className="block truncate text-caption text-text-muted">
+                      Its old history was set aside in {r.replacedHistory} — Clean up storage
+                      removes it after 14 days
+                    </span>
+                  )}
                   {r.problems.length > 0 && (
                     <ul className="mt-1 flex flex-col gap-0.5 text-caption text-warning-fg">
                       {r.problems.map((p) => (
@@ -225,8 +237,8 @@ export function RestoreModal({ archive, onClose }: { archive: string; onClose: (
                           <span className="flex items-center gap-1">
                             <Warning size={ICON.inline} weight="fill" />
                             {p.tracked
-                              ? "Already here — restoring replaces this artwork and its history"
-                              : "A file is already here — restoring overwrites it"}
+                              ? "Already here — restoring replaces this artwork and its history (the current ones are kept beside it)"
+                              : "A file is already here — restoring replaces it (a copy is kept beside it)"}
                           </span>
                           {/* Only a tracked artwork has a history to weigh against the backup's. */}
                           {p.tracked && (

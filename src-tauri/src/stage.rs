@@ -50,19 +50,12 @@ fn fail(msg: &str) -> KvcError {
     KvcError::StageFailed(msg.to_string())
 }
 
-/// Zip options for the synthesized archive.
+/// Zip options for the one entry the synthesized archive writes itself, `maindoc.xml` — every other
+/// entry is raw-copied (see [`repackage`]).
 ///
 /// **Level 1, not the library default.** This buffer is never written to disk — `kra::commit_kra`
 /// re-opens it in the next breath and its entry-reuse fast path compares crc32+size, both computed
-/// over *uncompressed* bytes, so the level cannot affect what gets stored. It used `merge::opts`,
-/// which is `SimpleFileOptions::default()` = deflate level 6: a full level-6 compress pass over
-/// every entry of the whole document, thrown away microseconds later. Krita tile payloads are
-/// already LZF-compressed and gain ~nothing at any level, which is the same conclusion `kra::opts`
-/// reached for the restore path.
-///
-/// ponytail: `Stored` would drop the last of the compression cost, but the output is held whole in
-/// RAM alongside two other full documents (see `commit::stage_changes`) — level 1 keeps it near
-/// the input's size for a few percent of level 6's CPU. Revisit if that RAM ceiling ever moves.
+/// over *uncompressed* bytes, so the level cannot affect what gets stored.
 fn out_opts(name: &str) -> SimpleFileOptions {
     if name == "mimetype" {
         SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
@@ -374,6 +367,11 @@ fn or_q(s: &str) -> &str {
 /// Rebuild the archive: the working file's entries (minus the composite, the preview, and the data
 /// files of layers that didn't survive), with `maindoc.xml` swapped for the staged stack, then the
 /// reverted layers' data files copied out of the committed version.
+///
+/// Every entry but `maindoc.xml` is **raw-copied**: its compressed bytes, crc32 and size go across
+/// as they are. Inflating and deflating them again was 961 ms of work on a 105 MB painting (a raw
+/// copy of the same entries: 35 ms), and the crc32 + size [`crate::kra::commit_kra`]'s reuse check
+/// compares come out identical either way — they describe the uncompressed bytes.
 fn repackage(
     working: &[u8],
     committed: &[u8],
@@ -395,7 +393,7 @@ fn repackage(
         let mut zw = zip::ZipWriter::new(Cursor::new(&mut out));
 
         for i in 0..wz.len() {
-            let mut f = wz.by_index(i).map_err(zip_err)?;
+            let f = wz.by_index_raw(i).map_err(zip_err)?;
             if f.is_dir() {
                 continue;
             }
@@ -412,12 +410,12 @@ fn repackage(
                     continue;
                 }
             }
-            zw.start_file(&name, out_opts(&name)).map_err(zip_err)?;
             if name == MAINDOC_ENTRY {
+                drop(f);
+                zw.start_file(&name, out_opts(&name)).map_err(zip_err)?;
                 zw.write_all(maindoc.as_bytes())?;
             } else {
-                let buf = crate::repo::read_entry_capped(&mut f)?;
-                zw.write_all(&buf)?;
+                zw.raw_copy_file(f).map_err(zip_err)?;
             }
         }
 
@@ -426,23 +424,19 @@ fn repackage(
             .map(|(o, n)| (o.as_str(), n.as_str()))
             .collect();
         for i in 0..cz.len() {
-            let mut f = cz.by_index(i).map_err(zip_err)?;
+            let Some(new_name) = cz.name_for_index(i).and_then(|name| {
+                let rest = name.strip_prefix(&comm_prefix)?;
+                let split = rest.find(['.', '/']).unwrap_or(rest.len());
+                let new_fn = rename.get(&rest[..split])?;
+                Some(format!("{work_prefix}{new_fn}{}", &rest[split..]))
+            }) else {
+                continue;
+            };
+            let f = cz.by_index_raw(i).map_err(zip_err)?;
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().to_string();
-            let Some(rest) = name.strip_prefix(&comm_prefix) else {
-                continue;
-            };
-            let split = rest.find(['.', '/']).unwrap_or(rest.len());
-            let Some(&new_fn) = rename.get(&rest[..split]) else {
-                continue;
-            };
-            let new_name = format!("{work_prefix}{new_fn}{}", &rest[split..]);
-            let buf = crate::repo::read_entry_capped(&mut f)?;
-            zw.start_file(&new_name, out_opts(&new_name))
-                .map_err(zip_err)?;
-            zw.write_all(&buf)?;
+            zw.raw_copy_file_rename(f, new_name).map_err(zip_err)?;
         }
 
         zw.finish().map_err(zip_err)?;

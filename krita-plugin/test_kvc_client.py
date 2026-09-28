@@ -2,7 +2,8 @@
 
 Only the failure modes matter here — every one of these used to reach a Qt slot as a
 non-KvcError and abort Krita. Stubs `krita` so this runs outside Krita; no test runner
-in the repo (the Rust tests are the real suite), so asserts in __main__ it is.
+in the repo (the Rust tests are the real suite), so asserts in __main__ it is. The docker's
+reopen-after-a-failed-op rule rides along, against stub Qt modules (`load_docker`).
 """
 
 import importlib.util
@@ -197,6 +198,98 @@ def test_exec_requests_utf8_decoding():
     subprocess.run = run
     kvc._exec("kvc", ["status"], 30)
     assert captured.get("encoding") == "utf-8", captured
+
+
+def load_docker():
+    """vc_docker, loaded against stub Qt/Krita modules — enough to call its methods unbound.
+
+    Registered as `kritavc.vc_docker` beside the already-loaded client so its relative
+    `from . import kvc_client` resolves without running the package __init__.
+    """
+
+    class Stubs(types.ModuleType):
+        def __getattr__(self, name):
+            return type(name, (), {})
+
+    for name in ("PyQt5", "PyQt5.QtCore", "PyQt5.QtGui", "PyQt5.QtWidgets"):
+        sys.modules.setdefault(name, Stubs(name))
+    _krita.DockWidget = object
+    pkg = types.ModuleType("kritavc")
+    pkg.__path__ = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "kritavc")]
+    sys.modules["kritavc"] = pkg
+    sys.modules["kritavc.kvc_client"] = kvc
+    spec = importlib.util.spec_from_file_location(
+        "kritavc.vc_docker", os.path.join(pkg.__path__[0], "vc_docker.py")
+    )
+    docker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(docker)
+    return docker
+
+
+def test_rebuild_docs_reopens_when_a_later_step_fails():
+    # "Set aside & switch": the set-aside reverts the file on disk, then the switch fails. The
+    # reopen must still happen, or Krita keeps the pre-set-aside document marked unmodified and
+    # the next Ctrl+S writes the set-aside work back over the reverted file.
+    docker = load_docker()
+    disk = {"stat": ("old", 1)}
+    reopened = []
+    fake = types.SimpleNamespace(
+        _repo_docs=lambda: {"art.kra": (object(), False)},
+        _show_error=lambda message: None,
+        _set_busy=lambda busy: None,
+        _reopen=lambda path, doc, expected: reopened.append(path),
+    )
+
+    def op():
+        disk["stat"] = ("reverted", 1)  # step one rewrote the file
+        raise kvc.KvcError("busy")  # step two failed
+
+    real_stat = kvc.stat_key
+    kvc.stat_key = lambda path: disk["stat"]
+    try:
+        docker.VcDocker._rebuild_docs(fake, op)
+    except kvc.KvcError:
+        pass
+    else:
+        raise AssertionError("the failed step must still reach the caller")
+    finally:
+        kvc.stat_key = real_stat
+    assert reopened == ["art.kra"], reopened
+
+
+def test_status_poll_skips_the_spawn_while_nothing_changed():
+    # The docker polls every 1.5 s on Krita's UI thread. While the document and the store's
+    # state files are as they were at the last answer, that answer stands — no process.
+    spawns = []
+    disk = {"doc": 1}
+    real_status, real_stat = kvc.status, kvc.stat_key
+    kvc.status = lambda repo: spawns.append(repo) or {"store": "S", "changes": []}
+    kvc.stat_key = lambda path: (disk["doc"] if path == "D" else 0, 1)
+    try:
+        kvc._status_cache.clear()
+        for _ in range(5):
+            kvc.status_cached("D")
+        # First call learns the store; second takes the key; the rest are free.
+        assert len(spawns) == 2, spawns
+        disk["doc"] = 2  # a save
+        kvc.status_cached("D")
+        kvc.status_cached("D")
+        assert len(spawns) == 3, spawns
+        kvc.forget_status()  # the docker ran an operation itself
+        kvc.status_cached("D")
+        kvc.status_cached("D")
+        assert len(spawns) == 4, spawns
+    finally:
+        kvc.status, kvc.stat_key = real_status, real_stat
+        kvc._status_cache.clear()
+
+
+def test_async_commit_builds_the_same_argv():
+    # The docker runs the commit through QProcess with `commit_args`; the blocking `commit`
+    # must keep building the very same command line.
+    seen = capture_args()
+    kvc.commit("R", "m", "me", ["a.kra"])
+    assert seen[0] == kvc.commit_args("R", "m", "me", ["a.kra"]), seen[0]
 
 
 def test_autodiscovered_binary_must_verify():

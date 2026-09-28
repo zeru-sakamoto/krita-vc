@@ -12,7 +12,7 @@
 
 use crate::commit;
 use crate::error::{io_at, KvcError, Result};
-use crate::repo::{hash_bytes, now_iso, safe_join, Repo, Stash};
+use crate::repo::{now_iso, safe_join, Repo, Stash};
 use crate::scan;
 
 /// Every stash on the shelf, oldest first — so `last()` is the latest.
@@ -94,6 +94,8 @@ pub fn create(
 /// can't be done cleanly (different color space, unparseable) surfaces [`KvcError::MergeFailed`]
 /// and likewise leaves both sides untouched.
 pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
+    // The files land before the shelf's save, so a damaged history has to refuse up front.
+    repo.ensure_writable()?;
     let idx = repo
         .stashes
         .stashes
@@ -119,10 +121,19 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
         return Err(KvcError::StashConflict(refuse.join(", ")));
     }
 
-    // Compute every file's final bytes first: a merge that can't be done cleanly errors here,
-    // before anything hits the disk, so the working tree and the stash stay untouched.
+    // Every file's inputs are gathered before the first write. The output isn't: a merge and a
+    // plain bring-back are both built straight into the temp file beside the artwork as they're
+    // written, never held whole in memory — the merged document is bigger than any of the three it
+    // comes from. A merge that can't be done cleanly fails there and its temp is deleted, so the
+    // working file and the stash stay untouched. That's all-or-nothing because a store tracks one
+    // document, so a stash holds at most one file.
     enum Action {
-        Write(std::path::PathBuf, Vec<u8>),
+        Merge {
+            abs: std::path::PathBuf,
+            stashed: Vec<u8>,
+            ancestor: Option<Vec<u8>>,
+        },
+        Restore(std::path::PathBuf, crate::repo::CommittedFile),
         Delete(std::path::PathBuf),
     }
     // The committed tree the set-aside version diverged from — the merge base for a conflicting
@@ -138,36 +149,54 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
             actions.push(Action::Delete(abs));
             continue;
         }
-        // Full store rebuild, not the incremental `restore_bytes` path — that one trusts the
+        // Full store rebuild, not the incremental `write_restored` path — that one trusts the
         // on-disk file as a diff base, which isn't what's sitting there.
+        if !is_conflict(&f.path) {
+            actions.push(Action::Restore(abs, f.clone()));
+            continue;
+        }
+        // Guaranteed a `.kra` by the refuse check above. Fold the set-aside layers into the edited
+        // working file instead of overwriting (and losing) it.
         let stashed = commit::bytes_of(repo, f)?;
-        let bytes = if is_conflict(&f.path) {
-            // Guaranteed a `.kra` by the refuse check above. Fold the set-aside layers into the
-            // edited working file instead of overwriting (and losing) it.
-            let working = std::fs::read(&abs).map_err(|e| io_at(&abs, e))?;
-            let ancestor = match committed.get(&f.path) {
-                Some(cf) => Some(commit::bytes_of(repo, cf)?),
-                None => None,
-            };
-            crate::merge::merge_layers(&working, &stashed, ancestor.as_deref())?
-        } else {
-            stashed
+        let ancestor = match committed.get(&f.path).and_then(|cf| cf.content.as_deref()) {
+            Some(content) => Some(merge_ancestor(repo, &f.path, content, &stashed)?),
+            None => None,
         };
-        actions.push(Action::Write(abs, bytes));
+        actions.push(Action::Merge {
+            abs,
+            stashed,
+            ancestor,
+        });
     }
 
     for action in &actions {
+        let abs = match action {
+            Action::Merge { abs, .. } | Action::Restore(abs, _) | Action::Delete(abs) => abs,
+        };
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        }
         match action {
             Action::Delete(abs) => {
                 if abs.exists() {
                     std::fs::remove_file(abs).map_err(|e| io_at(abs, e))?;
                 }
             }
-            Action::Write(abs, bytes) => {
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-                }
-                crate::repo::write_file_atomic(abs, bytes)?;
+            Action::Merge {
+                abs,
+                stashed,
+                ancestor,
+            } => {
+                crate::repo::write_file_atomic_with(abs, |out| {
+                    // The working file is the merge's base: read whole, while the temp beside it
+                    // fills.
+                    let working = std::fs::read(abs).map_err(|e| io_at(abs, e))?;
+                    crate::merge::merge_layers_into(&working, stashed, ancestor.as_deref(), out)?;
+                    Ok(())
+                })?;
+            }
+            Action::Restore(abs, f) => {
+                commit::write_committed(repo, f, abs)?;
             }
         }
     }
@@ -182,6 +211,25 @@ pub fn pop(repo: &mut Repo, id: &str) -> Result<Stash> {
     repo.stashes.stashes.remove(idx);
     repo.save_stashes()?;
     Ok(stash)
+}
+
+/// The committed version a set-aside `.kra` diverged from, rebuilt with only what
+/// [`crate::merge::merge_layers`] compares against: `maindoc.xml`, and the data files of the
+/// top-level layers the set-aside version also has. The rest of the document was rebuilt too, only
+/// to go unread — a whole extra copy of the painting in memory beside the set-aside version, the
+/// working file and the merged result.
+fn merge_ancestor(repo: &Repo, relpath: &str, content: &str, stashed: &[u8]) -> Result<Vec<u8>> {
+    const MAINDOC: &str = "maindoc.xml";
+    let manifest = crate::kra::load_manifest(repo, relpath, content)?;
+    let head = crate::kra::reconstruct_kra_from(repo, relpath, &manifest, &|n| n == MAINDOC)?;
+    let (prefix, files) = crate::merge::shared_layer_files(&head, stashed)?;
+    crate::kra::reconstruct_kra_from(repo, relpath, &manifest, &|name| {
+        name == MAINDOC
+            || name.strip_prefix(&prefix).is_some_and(|rest| {
+                let split = rest.find(['.', '/']).unwrap_or(rest.len());
+                files.contains(&rest[..split])
+            })
+    })
 }
 
 /// Take a stash off the shelf without restoring it. The content stays in the object store until
@@ -205,7 +253,7 @@ pub fn drop_all(repo: &mut Repo) -> Result<usize> {
     Ok(n)
 }
 
-/// Mirror of `commit::commit_id`. `now_iso` is second-granularity and the label may be empty, so
+/// `commit::commit_id`'s shape. `now_iso` is second-granularity and the label may be empty, so
 /// the shelf position joins the seed to keep ids distinct.
 fn stash_id(
     timestamp: &str,
@@ -213,13 +261,5 @@ fn stash_id(
     position: usize,
     files: &[crate::repo::CommittedFile],
 ) -> String {
-    let mut seed = format!("{timestamp}\n{label}\n{position}\n");
-    for f in files {
-        seed.push_str(&format!(
-            "{}:{}\n",
-            f.path,
-            f.content.as_deref().unwrap_or("-")
-        ));
-    }
-    hash_bytes(seed.as_bytes())[..12].to_string()
+    commit::record_id(&format!("{timestamp}\n{label}\n{position}\n"), files)
 }

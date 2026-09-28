@@ -106,10 +106,15 @@ because a merge adds a second copy of a layer while staging substitutes the same
 
 ### Output details
 
-The synthesized archive is written at deflate level 1 (`stage::out_opts`), not the zip crate's
-default level 6 that `merge::opts` supplies. It is never written to disk: `commit_kra` reopens it
-immediately, and crc32 and size are computed over uncompressed bytes, so the level can't change what
-is stored. Level 6 over a whole document's already-LZF-compressed tiles was pure wasted work.
+Every entry of the synthesized archive but `maindoc.xml` is **raw-copied** (`raw_copy_file`, and
+`raw_copy_file_rename` for a reverted layer's data files): its compressed bytes, method, crc32 and
+size go across as they are, from the working file or the committed subset, never inflated and
+deflated again. The archive is never written to disk (`commit_kra` reopens it immediately), and the
+crc32 and size its reuse check compares describe the uncompressed bytes, so nothing about what gets
+stored changes. The one entry it writes itself, `maindoc.xml`, uses deflate level 1
+(`stage::out_opts`). Recompressing every entry was 961 ms of work on a 105 MB painting, against
+35 ms for the copy; before that, at the zip crate's default level 6, it was the largest cost of a
+partial commit. `tests/staging.rs::kept_entries_are_copied_compressed` pins it.
 
 `mergedimage.png` and `preview.png` are dropped from the synthesized archive. They are Krita's
 renders of the whole stack, which the engine can't redo, so carrying the working copies would ship a
