@@ -144,17 +144,20 @@ fn branch_list(repo: &Repo) -> Vec<serde_json::Value> {
 
 fn run_status(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
-    let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
+    // Without the commit log: nothing here reads it, and it's the one part of a store that grows
+    // with every version — on the docker's 1.5 s poll, forever.
+    let repo = Repo::open_without_log(Path::new(repo_path)).map_err(|e| e.to_string())?;
     let changes = scan::scan_detailed(&repo, false).map_err(|e| e.to_string())?;
     let changes: Vec<_> = changes
         .iter()
         .map(|c| json!({ "path": c.rel, "status": c.status }))
         .collect();
     // Stash count and the branch list ride along so the plugin's 1.5s poll needs exactly one
-    // process: `open_light` already read the shelf and branches.json, so both are free here,
-    // whereas a second `kvc branches` spawn would re-parse the whole commit log to get them.
+    // process: the open already read the shelf and branches.json, so both are free here. `store`
+    // is what lets the docker skip the spawn altogether while nothing it names has changed.
     Ok(json!({
         "document": repo.doc.relpath,
+        "store": repo.store,
         "branch": repo.branches.current,
         "branches": branch_list(&repo),
         "changes": changes,
@@ -189,7 +192,7 @@ fn run_commit(flags: &HashMap<String, String>) -> Result<String, String> {
 
 fn run_branches(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
-    let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
+    let repo = Repo::open_without_log(Path::new(repo_path)).map_err(|e| e.to_string())?;
     Ok(json!({ "current": repo.branches.current, "branches": branch_list(&repo) }).to_string())
 }
 
@@ -288,7 +291,7 @@ fn run_stash_pop(flags: &HashMap<String, String>) -> Result<String, String> {
 
 fn run_stash_list(flags: &HashMap<String, String>) -> Result<String, String> {
     let repo_path = require(flags, "repo")?;
-    let repo = Repo::open_light(Path::new(repo_path)).map_err(|e| e.to_string())?;
+    let repo = Repo::open_without_log(Path::new(repo_path)).map_err(|e| e.to_string())?;
     // Reuses the desktop's DTO rather than reading repo.stashes directly: it reverses the
     // engine's oldest-first storage to newest-first, which "bring back the latest" relies on.
     Ok(json!({ "stashes": stash_dtos(&repo) }).to_string())

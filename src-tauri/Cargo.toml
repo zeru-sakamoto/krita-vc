@@ -66,11 +66,7 @@ tokio = { version = "1", features = ["sync"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
+# Integration tests also use the normal dependencies (zip, serde_json, bincode, zstd, blake3).
 [dev-dependencies]
 tempfile = "3"
-zip = "2"
-serde_json = "1"
-# For fabricating legacy monolithic chains files in migration tests.
-bincode = "1"
-zstd = "0.13"
 

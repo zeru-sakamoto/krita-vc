@@ -91,6 +91,11 @@ fn status_commit_roundtrip_and_lock() {
     assert!(ok);
     assert_eq!(status["branch"], "main");
     assert_eq!(status["document"], "art.kra");
+    // The docker stats the store's state files to skip the next poll's spawn when none changed.
+    assert_eq!(
+        status["store"].as_str().map(PathBuf::from),
+        Some(krita_vc_lib::repo::store_dir_for(&doc))
+    );
 
     std::fs::write(&doc, kra_bytes("hello-world")).unwrap();
 
@@ -352,4 +357,31 @@ fn check_scrub_flag_reports_corruption() {
     assert_eq!(report["ok"], false);
     assert_eq!(report["scrubPerformed"], true);
     assert_eq!(report["problems"][0]["kind"], "corruptContent");
+}
+
+/// The docker's 1.5 s poll — `status`, and the `branches`/`stash-list` reads beside it — never
+/// reads the commit log, the one part of a store that grows with every version: shown by holding
+/// it open with no sharing, which fails any read of it.
+#[cfg(windows)]
+#[test]
+fn poll_reads_never_touch_the_commit_log() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let doc = init_doc(dir.path());
+    let (ok, _) = kvc(&doc, &["commit", "--message", "first", "--author", "Zeru"]);
+    assert!(ok);
+    std::fs::write(&doc, kra_bytes("edited")).unwrap();
+
+    let log = krita_vc_lib::repo::store_dir_for(&doc).join("commits.log");
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&log)
+        .unwrap();
+    for cmd in ["status", "branches", "stash-list"] {
+        let (ok, out) = kvc(&doc, &[cmd]);
+        assert!(ok, "{cmd}: {out}");
+    }
+    let (_, status) = kvc(&doc, &["status"]);
+    assert_eq!(status["changes"][0]["status"], "M");
 }

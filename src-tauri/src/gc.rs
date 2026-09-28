@@ -180,15 +180,11 @@ pub(crate) fn mark_live(repo: &Repo, tolerant: bool) -> Result<Marks> {
         .chain(repo.stashes.stashes.iter().flat_map(|s| &s.files));
     for f in rooted {
         let Some(content) = &f.content else { continue };
-        if f.is_kra {
-            live.insert((kra::manifest_stream_key(&f.path), content.clone()));
-            match kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo) {
-                Ok(manifest) => live.extend(kra::referenced_streams(&f.path, &manifest)),
-                Err(e) if tolerant => problems.push((f.path.clone(), e.to_string())),
-                Err(e) => return Err(e),
-            }
-        } else {
-            live.insert((format!("file:{}", f.path), content.clone()));
+        live.insert((kra::manifest_stream_key(&f.path), content.clone()));
+        match kra::load_manifest_memo(repo, &f.path, content, &mut manifest_memo) {
+            Ok(manifest) => live.extend(kra::referenced_streams(&f.path, &manifest)),
+            Err(e) if tolerant => problems.push((f.path.clone(), e.to_string())),
+            Err(e) => return Err(e),
         }
     }
 
@@ -351,7 +347,7 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
     // --- write state FIRST (crash between = harmless re-collectable orphans) -------------
     repo.commits.retain(|c| reachable.contains(&c.id));
     repo.note_commits_truncated(); // dropped commits must leave the log
-    repo.chains.rewrite_all(&repo.store.clone(), new_chains)?;
+    repo.chains.rewrite_all(new_chains)?;
     repo.save()?;
 
     // --- quarantine loose (moved to .kvc/trash/, not deleted outright — see gap #5) --------
@@ -368,15 +364,17 @@ pub fn collect_garbage(repo: &mut Repo, dry_run: bool) -> Result<GcReport> {
         } else if worth_rewriting(p.dead_bytes, p.total) {
             // Rewrite with survivors only; write the new pack (or loose files for a small
             // remainder) before quarantining the old one, so a crash never loses live objects.
+            let pack = std::fs::File::open(&p.path).map_err(|e| io_at(&p.path, e))?;
             let survivors: Vec<(String, Vec<u8>)> = p
                 .entries
                 .iter()
                 .filter(|(n, ..)| live_objects.contains(n))
                 .map(|(n, off, len)| {
-                    crate::delta::read_exact_at(&p.path, *off, *len as usize)
+                    crate::delta::read_exact_at(&pack, &p.path, *off, *len as usize)
                         .map(|bytes| (n.clone(), bytes))
                 })
                 .collect::<Result<_>>()?;
+            drop(pack);
             if survivors.len() >= crate::delta::PACK_MIN_OBJECTS {
                 let refs: Vec<&(String, Vec<u8>)> = survivors.iter().collect();
                 repo.packs.write_pack(&objects, &refs)?;
@@ -600,11 +598,12 @@ fn consolidate_small_packs(repo: &mut Repo, trash_dir: &Path) -> Result<()> {
     let mut merged: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen = HashSet::new();
     for (path, entries) in &small {
+        let pack = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
         for (name, off, len) in entries {
             if seen.insert(name.clone()) {
                 merged.push((
                     name.clone(),
-                    crate::delta::read_exact_at(path, *off, *len as usize)?,
+                    crate::delta::read_exact_at(&pack, path, *off, *len as usize)?,
                 ));
             }
         }

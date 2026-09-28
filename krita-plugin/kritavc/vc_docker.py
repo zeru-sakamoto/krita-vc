@@ -9,11 +9,12 @@ an open document).
 """
 
 import functools
+import json
 import os
 import traceback
 
 from krita import DockWidget, Krita
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QProcess, QTimer, Qt
 from PyQt5.QtGui import QPalette
 from PyQt5.QtWidgets import (
     QApplication,
@@ -404,10 +405,10 @@ class VcDocker(DockWidget):
             self.status_label.setText("✓ Saved")
 
         try:
-            # One spawn per tick, not two: `status` carries the branch list as well, and it's
-            # free there (open_light already parsed branches.json). A separate `kvc branches`
-            # re-parsed the whole commit log in a second process for data we already had.
-            result = kvc.status(self.tracked_doc)
+            # At most one spawn per tick, not two: `status` carries the branch list as well, and
+            # it's free there (the open already parsed branches.json). And none at all while the
+            # document and the store's state files are as they were at the last answer.
+            result = kvc.status_cached(self.tracked_doc)
         except kvc.KvcError as e:
             self._show_error(str(e))
             self.commit_button.setEnabled(False)
@@ -529,6 +530,10 @@ class VcDocker(DockWidget):
         self.branch_button.setEnabled(not busy)
         self.options_button.setEnabled(not busy)
         self.refresh_button.setEnabled(not busy)
+        if not busy:
+            # Whatever just ran may have changed what `status` reports. Its files' stats say so
+            # too, unless the change landed inside their filesystem's timestamp resolution.
+            kvc.forget_status()
 
     @guard
     def _on_refresh_clicked(self):
@@ -715,17 +720,82 @@ class VcDocker(DockWidget):
             if not self._require_repo():
                 return
         author = self.author_edit.text().strip() or "You"
+        args = kvc.commit_args(self.tracked_doc, message, author, self._selected_paths())
+        # Committing doesn't rewrite the working tree, so no reopen is needed, and nothing has to
+        # wait for it: the busy state keeps the poll and the buttons off until it's done.
         self._set_busy(True)
+        self.status_label.setText("Saving version…")
         try:
-            # Committing doesn't rewrite the working tree, so no reopen needed here.
-            kvc.commit(self.tracked_doc, message, author, self._selected_paths())
-            self.message_box.setPlainText("")
-            self.status_label.setText("Saved version ✓")
-        except kvc.KvcError as e:
-            self._show_error(str(e))
-        finally:
+            self._run_kvc_async(args, kvc.WRITE_TIMEOUT, self._on_commit_done)
+        except kvc.KvcError:
             self._set_busy(False)
+            raise
+
+    def _run_kvc_async(self, args, timeout, on_done):
+        """Run kvc without blocking Krita's UI thread, then call `on_done(raw, code)` on it with
+        what `kvc_client._exec` would have returned.
+
+        A commit hashes and stores the whole painting — about 3 s at 105 MB, more for bigger
+        ones — and `subprocess.run` held Krita's UI frozen for all of it. A run past `timeout` is
+        killed and reported the way the blocking call's timeout was."""
+        binary = kvc.get_binary_path()
+        if not binary:
+            raise kvc.KvcError("kvc CLI not found. Set its location in the docker settings.")
+        proc = QProcess(self)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        state = {"done": False, "timed_out": False}
+
+        def fail(message):
+            return json.dumps({"error": message}), 1
+
+        def on_timeout():
+            state["timed_out"] = True
+            proc.kill()
+
+        def finish(*_):
+            if state["done"]:
+                return
+            state["done"] = True
+            timer.stop()
+            if state["timed_out"]:
+                raw, code = fail(
+                    f"kvc didn't finish within {timeout}s. "
+                    "Close the Krita VC app if it's open, then retry."
+                )
+            elif proc.error() == QProcess.FailedToStart:
+                raw, code = fail(f"couldn't run kvc: {proc.errorString()}")
+            elif proc.exitStatus() != QProcess.NormalExit:
+                raw, code = fail("kvc stopped unexpectedly")
+            else:
+                code = proc.exitCode()
+                stream = proc.readAllStandardOutput() if code == 0 else proc.readAllStandardError()
+                raw = bytes(stream).decode("utf-8", "replace")
+            proc.deleteLater()
+            timer.deleteLater()
+            on_done(raw, code)
+
+        timer.timeout.connect(on_timeout)
+        proc.finished.connect(finish)
+        # A process that never starts emits no `finished`.
+        proc.errorOccurred.connect(
+            lambda error: finish() if error == QProcess.FailedToStart else None
+        )
+        proc.start(binary, args)
+        timer.start(timeout * 1000)
+
+    @guard
+    def _on_commit_done(self, raw, code):
+        self._set_busy(False)
+        try:
+            kvc._parse(raw, code)
+        except kvc.KvcError as e:
             self.refresh()
+            self._show_error(str(e))
+            return
+        self.message_box.setPlainText("")
+        self.refresh()
+        self.status_label.setText("Saved version ✓")
 
     @guard
     def _on_discard(self):

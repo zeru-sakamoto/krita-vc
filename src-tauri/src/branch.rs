@@ -230,6 +230,8 @@ pub fn merge_branch(repo: &mut Repo, source: &str, author: &str) -> Result<Commi
         branch: repo.branches.current.clone(),
         files,
         restored_from: None,
+        // Everything a merge records is already stored.
+        stored_bytes: Some(0),
     };
 
     // Materialize the merged result: apply the commit's own diff onto the current tree.

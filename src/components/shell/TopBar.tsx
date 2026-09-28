@@ -1,11 +1,10 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { Minus, PaintBrush, Square, Trash, X } from "@phosphor-icons/react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as pickArchive } from "@tauri-apps/plugin-dialog";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Radio } from "../ui/Radio";
-import { RestoreModal } from "./RestoreModal";
 import { SwitchArtworkModal } from "./SwitchArtworkModal";
 import { Tooltip } from "../ui/Tooltip";
 import { ICON } from "../../lib/iconSize";
@@ -13,6 +12,11 @@ import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
 import type { Repository } from "../../types";
+
+// Restoring a backup is rare, so its screens load when first needed rather than with the app.
+const RestoreModal = lazy(() =>
+  import("./RestoreModal").then((m) => ({ default: m.RestoreModal }))
+);
 
 /**
  * Slim top bar spanning the window. Hosts the artwork switcher — one `.kra` the user has
@@ -94,7 +98,9 @@ export function TopBar() {
         <RemoveRepoModal repo={modal.repo} onClose={() => setModal(null)} />
       )}
       {modal?.kind === "restore" && (
-        <RestoreModal archive={modal.archive} onClose={() => setModal(null)} />
+        <Suspense fallback={null}>
+          <RestoreModal archive={modal.archive} onClose={() => setModal(null)} />
+        </Suspense>
       )}
     </header>
   );

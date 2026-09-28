@@ -30,7 +30,9 @@ instead of waiting for the slowest layer to hold up the others.
 ## Parallelism (rayon)
 
 Independent per-layer and per-tile work is spread across cores instead of running one after another.
-All of it runs inside the engine's own budgeted pool (see [cpu-headroom.md](cpu-headroom.md)).
+All of it runs inside the engine's own budgeted pool (see [cpu-headroom.md](cpu-headroom.md)). The
+cheap reads (history, branches, a scan) deliberately don't: they do no parallel work, and on a
+2-core laptop the pool is a single worker that a diff holds for its whole run.
 
 - **Layer rasterization.** `art_diff_dto` rasterizes all of a document's layers with `par_iter()`
   (`commands.rs`), keeping the order through an indexed collect.
@@ -45,16 +47,20 @@ All of it runs inside the engine's own budgeted pool (see [cpu-headroom.md](cpu-
   race; only the fold needs `&mut`. Peak memory is one chunk, not the whole decompressed document.
   (A first commit or a big edit used to inflate every changed entry at once, the mirror image of the
   restore-side chunking below.)
-- **Rebuilding a `.kra`, in chunks.** `reconstruct_kra` (`kra.rs`) resolves the manifest entries'
-  bytes, replaying tile chains as needed, with `par_iter()` in chunks bounded by the same 64 MB
-  budget, writing each chunk to the zip before the next one is built. Every decompressed entry and
-  the whole output zip used to sit in memory together (about twice the document's size, a paging risk
-  on a 4 GB machine); now the peak is the output plus one chunk. `materialize_kra`'s full rebuilds are
-  chunked the same way, although switching and rolling back normally take its cheaper incremental
-  path and only fall back to this.
+- **Rebuilding a `.kra`, in chunks, straight to disk.** `write_kra_from` (`kra.rs`) resolves the
+  manifest entries' bytes, replaying tile chains as needed, with `par_iter()` in chunks bounded by the
+  same 64 MB budget, writing each chunk to the zip before the next one is built. Every decompressed
+  entry and the whole output zip used to sit in memory together (about twice the document's size, a
+  paging risk on a 4 GB machine). The restore paths (discard, `restore_file`, bringing set-aside
+  work back, the fallback of a switch or rollback) now hand it the temp file beside the artwork
+  (`kra::write_kra`, `repo::write_file_atomic_with`), so the peak is one chunk; only callers that
+  want the bytes in memory (`reconstruct_kra`: a set-aside merge, staging's committed subset, undo's
+  hash fallback) still build a `Vec`. `materialize_kra_into`'s full rebuilds are chunked the same
+  way, although switching and rolling back normally take its cheaper incremental path and only fall
+  back to this.
 - **The commit's dedup filter.** `commit_prepared_batch` (`delta.rs`) checks in parallel whether
   each candidate object already exists, cheapest check first (the in-memory pack index snapshot,
-  then the sharded loose path, then the legacy flat path). Thousands of serial `stat` calls per large
+  then the sharded loose path). Thousands of serial `stat` calls per large
   commit hurt on a cold hard drive. The pack index is handed out as an `Arc` snapshot, so parallel
   lookups never hold its mutex.
 - **Raster downscaling.** `box_downscale` (`raster.rs`) runs in parallel over destination rows with
@@ -65,13 +71,22 @@ All of it runs inside the engine's own budgeted pool (see [cpu-headroom.md](cpu-
   parallel before the serial chain fold. Content-addressed writes are independent and idempotent,
   and thousands of small file creates in a row (NTFS plus Defender) were a dominant commit cost on
   Windows.
-- **Decoding tiles within one layer.** `layer_raster` reconstructs and LZF-decodes each tile in
-  parallel, then blits them serially onto the shared canvas. Nested rayon is fine here; it's one
-  work-stealing pool.
+- **Decoding tiles within one layer, straight into the capped raster.** `layer_raster` (and the
+  working file's `rasterize_working_tiles`) reconstructs and LZF-decodes tiles in parallel batches of
+  256 (`raster::rasterize_tiles`), and adds each one's pixels straight into a buffer the size of the
+  capped output. Every source pixel belongs to exactly one output pixel's box, so the premultiplied
+  sums `box_downscale` takes can be accumulated from the tiles directly, with the same integer
+  rounding; a unit test pins the result bit for bit to the old full-canvas path. That canvas was
+  `width × height × 4` bytes per layer (278 MB for one 600 dpi A3 layer, three layers at a time),
+  filled with the default pixel, blitted into, then read again to shrink it. Tiles off the 64 px grid
+  or overlapping (Krita never writes them) and layers already within the cap still take the canvas
+  path. Nested rayon is fine here; it's one work-stealing pool.
 - **blake3 hashing.** `hash_bytes` (`repo.rs`) uses blake3's rayon-parallel `update_rayon` for
-  buffers of 1 MB or more (whole `.kra` files during a scan or commit). Small buffers such as tiles
-  stay on the cheap single-threaded path, because spinning up parallel hashing for a few KB is pure
-  overhead.
+  buffers of 1 MB or more (whole `.kra` files during a scan or commit) when it's already on a worker
+  of the budgeted pool. Off it (the cheap reads) it hashes on one thread rather than spill onto
+  rayon's global pool, which is every core at normal priority. Small buffers such as tiles stay on
+  the cheap single-threaded path, because spinning up parallel hashing for a few KB is pure overhead.
+  `hash_file` hashes a file the same way, 16 MB at a time.
 
 The `prepare_stream` and `commit_prepared` split in `delta.rs` is what all of this relies on: the
 read-only preparation (`&self`) can run in parallel across streams, and only the serial fold
@@ -116,6 +131,21 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   full read on every scan afterwards; `kvc status` runs on the Krita docker's 1.5-second poll, so one
   partial commit meant reading the whole painting twice a second, forever. Callers that want the
   bytes (`keep_bytes`, the commit path) still read.
+- **A saved-but-unversioned painting is read once per save, not once per poll**
+  (`<store>/worktree.json`). Saved but not yet a version is the normal state while painting, and it
+  fails the fast path by definition, so every scan used to read and blake3 the whole file just to
+  answer "modified": about 80 ms per `kvc status` at 105 MB and 140 ms at 195 MB, on the Krita docker's
+  1.5-second poll, and seconds when the file had dropped out of the page cache. A scan that has to
+  read now records the size and mtime it stat'ed and the hash it got, and the next scans answer from
+  that while both still match, under the same racy-clean guard as the index (the file's mtime must be
+  strictly older than the sidecar's). A document with no versions yet is `U` whatever it holds, so
+  it isn't read at all. The file is a cache: written best-effort (temp and rename under a
+  per-process name, since `kvc status` and the app can scan at once), left out of backups, and a
+  missing or unreadable one only means the next scan reads again. Callers that want the bytes still
+  read. Together with the docker skipping the spawn while nothing changed (see
+  [cpu-headroom.md](cpu-headroom.md#the-plugins-poll-at-most-one-process-usually-none)), a poll went
+  from about 80 ms to 9 ms at 105 MB (140 ms to 9 ms at 195 MB), the same as a clean poll, and
+  usually to four `os.stat` calls.
 - **One `stat` per scan.** A store tracks a single document, so there's no directory to walk:
   `scan_detailed` stats one path. `scan::is_supported` (`.kra` only, with Krita's `-autosave.kra`
   artifact rejected on a lowercased suffix check) now gates `Repo::init` instead of a walk, so a
@@ -129,14 +159,14 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
 - **Undo without reconstruction** (`CommittedFile.fileHash`). Every commit records the blake3 of
   each file as it sat on disk, so `undo_last_commit` rewinds the index from that hash instead of
   rebuilding a whole `.kra` from the store just to hash it. Records from before the field existed
-  still take the rebuild fallback. Restores get the same treatment: `bytes_of` and `restore_bytes`
-  return the hash with the bytes (for a generic blob it is the stream hash, so there's nothing extra
-  to compute).
+  still take the rebuild fallback. A restore records the hash of the file it wrote by reading its
+  temp file back before the rename (`repo::write_file_atomic_with`), since the zip writer seeks back
+  to patch each entry's header and can't be hashed on the way out.
 - **A single-pass tile diff** (`kra::diff_tile_indexes` over borrowed `TileIndexRef`s). The set of
   changed layers and the union change region come out of one pass that builds each entry's old
-  `(x, y) → hash` map once. Two functions used to rebuild the maps separately, and the owned
-  `tile_index()` cloned every 64-character tile hash (megabytes of string churn on a Krita-scale
-  document).
+  `(x, y) → hash` map once. Two functions used to rebuild the maps separately, and an owned
+  `tile_index()` (since removed) cloned every 64-character tile hash (megabytes of string churn on a
+  Krita-scale document).
 - **Rollback without a re-commit** (`commit::rollback_to_commit`). A rollback used to write out the
   target tree and then run a full `commit_snapshot` (rescan, re-read, and re-decompose every restored
   `.kra`) just to rediscover content hashes already recorded in the target tree. The commit is now
@@ -146,9 +176,20 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   for small streams (a chain-walk reconstruct and a suffix sort to save a few KB isn't worth it) and
   for already-compressed payloads (PNG, zip or zstd magic; a patch against compressed bytes comes out
   near full size). Both go straight to a single zstd snapshot.
-- **Manifest reuse.** `kra::load_manifest` rebuilds and parses a `.kra` manifest once per diff
-  request, and every layer, region and composite read reuses the parsed struct instead of walking the
-  patch chain again.
+- **Manifest reuse, within a request and across them.** Every layer, region and composite read of a
+  diff reuses one parsed manifest per side instead of walking the patch chain again, and the parent's
+  is loaded once and handed to both the art diff and the embedded-palette diff (`art_diff_dto`'s
+  `old_manifest`; each used to load it). Parsed manifests are also kept across commands
+  (`kra::load_manifest`, a process-wide cache keyed by store and content hash): a manifest never
+  changes, and a Version Map node's parent manifest is its left neighbour's own, so a screenful of
+  nodes loads each manifest once instead of three times. The cache is bounded by total tile
+  references (400,000, about 65 MB of parsed manifests at the cap), least recently used first, and a
+  repo set to verify its reads (the restore paths) never takes a manifest from it. A manifest
+  stream's patch chain is also capped at five (`delta::MANIFEST_CHAIN_MAX`) rather than the store's
+  20, so a cold load replays at most five patches of a multi-megabyte JSON, for a full snapshot every
+  sixth version (a few MB compressed; see the ceilings below for what that costs). A Version Map
+  node on a 200-version history of a 45,000-tile painting went from 1.13 s to 0.35 s (median of the
+  last 20 nodes, warm raster cache).
 - **GC's manifest memo.** Mark-and-sweep loads every reachable commit's `.kra` manifest to walk the
   streams it references. Plain `reconstruct` replays each manifest version's patch chain from the
   nearest full snapshot independently, redoing the shared prefix every time, which is quadratic in a
@@ -158,8 +199,11 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   pure content hash, so it dedups safely across paths. It's bounded (`delta::ReconstructMemo`: the
   last four patch bases, as `Arc`s): walking oldest first, a version's base is the one just rebuilt,
   so four keep the walk linear, where the old unbounded map held every manifest version it had built
-  (975 MB at 200 versions of a 45,000-tile painting). Marking such a history still takes seconds
-  (11.4 s measured), because each of those manifests is megabytes of JSON to rebuild and parse.
+  (975 MB at 200 versions of a 45,000-tile painting). Marking such a history still takes about 20 s,
+  nearly all of the cleanup's dry run: about two thirds of it rebuilding and parsing 200
+  multi-megabyte manifests, the rest collecting their 9 million stream references into one set.
+  Nothing in the September 2026 fixes shortened it; the manifest cache serves diffs, not this walk,
+  which reads each manifest exactly once anyway.
 - **The crc32 and size skip at commit time.** `commit_kra` compares each zip entry's crc32 and
   uncompressed size (from the central directory, with no inflating) against the previous commit's
   manifest for that path (which `commit_snapshot` passes in). A match reuses the old manifest entry
@@ -172,12 +216,13 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   for layers marked `unchanged` instead of decoding and encoding identical pixels twice.
 - **The per-layer change highlight rides the layer stream.** A modified layer's own mask, outline and
   region (`layer_diff_overlay` → `raster::diff_overlay_full`) is diffed from the before and after
-  capped PNGs the raster path already produced (`kra::LayerRaster` returns the PNG bytes and cache key
-  alongside the URL). It adds one capped-resolution pixel compare and an outline trace of about 200 px
+  capped PNGs the raster path already produced (`kra::LayerRaster` carries the cache key, and the PNG
+  bytes when it has just encoded them; `LayerRaster::png` reads a cache hit's back from disk, only
+  for this). It adds one capped-resolution pixel compare and an outline trace of about 200 px
   per modified layer, which is negligible next to the tile rebuild and PNG encode already paid, and it
   runs inside the same rayon `par_iter`. The mask PNG is cached content-addressed by both layer
   raster keys (`kra::diff_cache_key`), so a repeat view skips the diff.
-- **Palette diffs stay off the raster machinery** (`palette.rs`, `commands::palette_dto`). Palettes
+- **Palette diffs stay off the raster machinery** (`palette.rs`, `commands::palette_dto_from`). Palettes
   are kilobytes and their swatch diff is linear in the swatches, so unlike `.kra` rasters there's
   deliberately no two-stage load, no streaming and no `cache/` entry. The diff is parsed and computed
   inline inside `commit_diff` and `working_diff` (already on the blocking pool); a cache would cost
@@ -191,17 +236,28 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   compressed archive plus per-entry metadata and re-inflates each entry on demand, so peak memory is
   the compressed document plus one decoded entry. It's off by default because the in-memory path is
   faster for interactive diffs, and change detection is identical either way.
-- **`Repo::open_light`** skips the chains entirely (even the legacy monolith parse a store from
-  before sharding would pay) for read paths that never touch storage (`scan_repository`,
-  `list_commits`). With sharded chains a full `Repo::open` is nearly as cheap, because shards load on
-  first touch, but the light open keeps the rule explicit.
-- **Incremental `.kra` writes on switch, merge and rollback.** `kra::materialize_kra` builds the
-  target version out of the working file. Entries identical between the current and target
+- **One parse per Changes refresh** (`commands::parsed_working`). A refresh is two calls,
+  `working_diff` for the metadata and then `working_layers` for the rasters, and each used to read,
+  inflate and hash the whole working painting (255 ms apiece on a 105 MB file). The first now keeps
+  its parse, keyed by path, size, mtime and the `lowMemoryDiff` flag, and the second takes it and
+  lets go of it, so a whole decoded document isn't kept resident between refreshes.
+- **`Repo::open_without_log`** skips `commits.log`, the one part of a store that grows with every
+  version, for the reads that never look at it: `kvc status`, `branches` and `stash-list` (the Krita
+  docker's poll), `scan_repository`, `list_branches`, `list_stashes` and the settings getters. It's
+  read-only by construction: the log's damage check never ran, so every write refuses
+  (`Repo::ensure_writable`). Chains and packs load lazily on every open, so
+  `Repo::open_light` is now plain `open`, kept under its own name to mark the paths that read history
+  but never rebuild content.
+- **Incremental `.kra` writes on switch, merge and rollback.** `kra::materialize_kra_into` builds
+  the target version out of the working file. Entries identical between the current and target
   manifests are copied raw (`raw_copy_file`) from the zip on disk, with no store reads and no
   inflating or deflating, after each one is checked against the manifest's recorded crc32 and size. A
-  changed tiled entry lifts its unchanged tiles from the working copy in memory, and only tiles whose
-  content differs are replayed from the object store. Switch cost follows the difference between the
-  branches, not the document's size. Any mismatch or error falls back to a full `reconstruct_kra`.
+  changed tiled entry lifts its unchanged tiles from the working copy, and only tiles whose content
+  differs are replayed from the object store. Switch cost follows the difference between the
+  branches, not the document's size. It reads the working file through a handle and writes the
+  result into the temp file beside it, so neither is held whole in memory (a switch of the 195 MB A3
+  painting used to peak at 574 MB). Any mismatch or error deletes the temp and falls back to a full
+  rebuild from the store.
 - **Chains skipped when clean.** `Repo::save` only rewrites the chain shards a commit actually
   changed (`ChainStore` tracks dirty shards). Switch, merge and undo only change the index, commits
   and branches, so they never pay for a chains rewrite.
@@ -252,23 +308,33 @@ Four changes, in order of what they bought:
   immediately, and its reuse check compares crc32 and size, computed over uncompressed bytes, so the
   level can't affect what's stored. Level 1 (the same conclusion `kra::opts` reached for restores,
   for the same reason: Krita's tiles are already LZF-compressed) is 3.5 times faster and, as the
-  table shows, stores exactly the same amount.
+  table shows, stores exactly the same amount. (Since superseded by the raw copy below.)
 - **Answer "still dirty" from a `stat`** (`TrackedFile.partial`; see
   [Skipping work entirely](#skipping-work-entirely)). This is the one an artist feels: it had been a
   full read and blake3 of the painting on every scan, and `kvc status` runs on the Krita docker's
   1.5-second poll.
-- **Stop hashing what gets thrown away** (`commit::bytes_of` versus `bytes_and_hash_of`).
-  `bytes_of` returned a blake3 of the whole rebuilt document, and three of its five callers discarded
-  it.
+- **Stop hashing what gets thrown away** (`commit::bytes_of`). `bytes_of` returned a blake3 of the
+  whole rebuilt document, and three of its five callers discarded it.
 
-Still on the table, and now the largest term: `stage_kra` repacks the entire working document (2.3 s
-of the 4.0 s) to change one layer's worth of it, and `commit_kra` then decomposes that archive again.
-The upgrade is manifest-level splicing: commit the surviving working entries as usual and substitute
-the previous manifest's `KraEntry` values for the reverted ones, so no document is ever built. That
-would also retire the roughly three-times-the-document peak memory noted under
+That left `stage_kra`'s repack as the largest term (2.3 s of the 4.0 s): it still inflated every
+entry of the working document and deflated it again, level 1 or not, to change one layer's worth of
+it. The September 2026 audit's fix **raw-copies** every entry but `maindoc.xml` (`raw_copy_file`,
+and `raw_copy_file_rename` for a reverted layer's data files): the compressed bytes, method, crc32
+and size go across as they are, and the crc32 and size `commit_kra` compares describe the
+uncompressed bytes either way, so what gets stored can't change. On the A4 corpus painting (105 MB,
+41 entries) the repack's inflate-and-deflate had been 961 ms against 35 ms for the copy, and saving
+10 of its 11 top-level layers went from about 3.56 s to 2.45 s (two runs each, old and new binaries
+alternated). `merge::repackage`, which brings set-aside work back onto an edited file, copies the
+same way, where it had been deflating every entry at level 6, and writes straight into the temp file
+beside the artwork (`merge::merge_layers_into`): 15.8 s and 624 MB became about 6 s and 440 MB.
+
+Still on the table: `commit_kra` then decomposes the synthesized archive again. The upgrade is
+manifest-level splicing: commit the surviving working entries as usual and substitute the previous
+manifest's `KraEntry` values for the reverted ones, so no document is ever built. That would also
+retire the roughly three-times-the-document peak memory noted under
 [Ceilings and deferred work](#ceilings-and-deferred-work). It isn't built, because the measured gap
-no longer justifies how much it would touch. A plain-language write-up of this audit is kept with
-the site copy, in the local (gitignored) `content/PERFORMANCE_AUDIT.md`.
+no longer justifies how much it would touch. A plain-language write-up of the first staging audit
+is kept with the site copy, in the local (gitignored) `content/PERFORMANCE_AUDIT.md`.
 
 ## Output size and encode cost
 
@@ -283,6 +349,13 @@ the site copy, in the local (gitignored) `content/PERFORMANCE_AUDIT.md`.
 - **Fast PNG encoding** (`raster::rgba_to_png`): `Compression::Fast` with `FilterType::NoFilter`.
   These PNGs are cached previews read once by the webview, so encode speed matters and byte size
   doesn't.
+- **Layer-list thumbnails** (`raster::thumb_png`, `THUMB_DIM = 128`). The layer navigator draws
+  36 × 28 px thumbnails, and it used to point them at the full capped raster, so the webview decoded
+  up to 2048 × 2048 (16 MB of bitmap) per layer to draw each row. The raster path now writes a 128 px
+  thumbnail beside each capped raster while it has the pixels, cached under a key derived from the
+  raster's, and `LayerDto.beforeThumb`/`afterThumb` carry its URL; the list falls back to the full
+  raster where there's none. A raster cached before thumbnails existed gets one made the next time
+  it's served.
 - **The changed-pixel diff runs at capped resolution** (`raster::changed_grid`). The mask caps each
   composite to `MAX_RASTER_DIM` right after decoding, before comparing pixels. Holding two
   full-resolution RGBA composites at once was a transient spike of 2 × (w · h · 4) bytes that stacked
@@ -301,6 +374,11 @@ the site copy, in the local (gitignored) `content/PERFORMANCE_AUDIT.md`.
   level 1 for tile streams and anything that looks already compressed (Krita's tiles are already
   LZF; level 3 over them bought almost nothing while being the largest single CPU cost of a
   whole-document commit), and keep level 3 only for diff-friendly text like the JSON manifests.
+- **Backups store what's already compressed** (`repo::zip_file`). The `.kra` is a zip, and objects,
+  packs and chain shards are zstd, so the backup archive stores them as they are and deflates only
+  the JSON state files and logs; each file streams from its handle instead of being read whole
+  first. Deflating everything at level 6 was 7.2 s of a 7.6 s backup of a 105 MB painting and its
+  store, to make the archive 13% smaller.
 
 ## Raster delivery (`kvcimg` URI scheme)
 
@@ -376,23 +454,37 @@ header is parsed when the index loads, and dozens of small packs from mid-sized 
 
 ## Caching across requests
 
-- **A content-addressed disk cache** (`<store>/cache/`, `raster::cache_read` and `cache_write`).
-  Every capped PNG, composite or per-layer, is keyed by a hash of everything that determines its
-  pixels (tile positions and hashes, the dimensions and the resolution cap, or the composite entry's
-  content hash). Keys never need invalidating, unchanged layers share one entry across commits and
-  across the committed and working diff paths, and a repeat view, even after an app restart, skips
-  rebuilding, decoding and encoding entirely.
-- **Frontend session caches** (`repoData.ts`). `diffCache` (commit-diff results) and `layerCache`
-  (streamed layer sets) are small LRU maps (up to 20 entries) keyed by the request. Committed entries
+- **A content-addressed disk cache** (`<store>/cache/`, `raster::cache_hit`, `cache_read` and
+  `cache_write`). Every capped PNG, composite or per-layer, is keyed by a hash of everything that
+  determines its pixels (tile positions and hashes, the dimensions and the resolution cap, or the
+  composite entry's content hash). Keys never need invalidating, unchanged layers share one entry
+  across commits and across the committed and working diff paths, and a repeat view, even after an
+  app restart, skips rebuilding, decoding and encoding entirely.
+- **A cache hit is a `stat`, not a read** (`raster::cache_hit`). Most hits only need the entry's
+  URL, which the webview then fetches through `kvcimg` anyway, and reading a 2048 px composite just to
+  print its URL cost several MB per call, two or three calls per Version Map node. Only the callers
+  that need pixels read the file (`LayerRaster::png`: a modified layer's own change highlight, the
+  stacked composite), and the base64 fallback reads it when it builds its data URL.
+- **Change masks carry their outline and box** (`raster::mask_meta`). The changed-pixel mask is
+  cached as a PNG with its outline path and normalized bounding box in `tEXt` chunks (`kvc-outline`,
+  `kvc-bbox`) ahead of the pixels, so a hit answers both from the header without decoding the mask
+  and tracing it again, which every Version Map node paid on a warm cache only to throw the result
+  away. A mask cached before the chunks existed is decoded as before.
+- **Frontend session caches** (`repoData.ts`). `diffCache` (commit-diff results) is an LRU of up to
+  300 entries, a few KB each now that rasters travel as `kvcimg` URLs, and `layerCache` (streamed
+  layer sets) one of 20, both keyed by the request. An in-flight `commit_diff` is shared
+  (`diffInflight`, like `useWorkingDiff`'s), so opening a Version Map node whose thumbnail is still
+  loading doesn't send the same heavy call twice. Committed entries
   key on `path|commitId` only, because a commit never changes, so a write (commit, rollback, undo)
   doesn't cold-start every diff viewed before it; only the working layer key includes the refresh
   nonce, since the working copy really does change. Cancelled or partial layer requests are never
   cached, because a torn-down effect's `received` map may be incomplete and caching it would poison
   the key for later visits.
 - **A bounded raster cache** (`raster::cache_prune`). `cache/` used to grow for the life of the
-  store. It now has a size budget (`Config.cacheMaxBytes`, default 256 MB; a config v1 to v2
-  migration lowers old 512 MB defaults), which Settings exposes as "Preview cache size" (128 MB to
-  2 GB). Reads touch an entry's mtime so hot entries survive, an oldest-first prune runs after layer
+  store. It now has a size budget (`Config.cacheMaxBytes`, default 256 MB), which Settings exposes as
+  "Preview cache size" (128 MB to 2 GB). A hit touches the entry's mtime, at most once a day, so hot
+  entries survive (pruning only has to tell this week's entries from last month's, and a touch per
+  hit was a file open for write per raster per view), an oldest-first prune runs after layer
   streaming (rate-limited by a marker file, `cache_prune_throttled`), and "Clean up storage" prunes
   unconditionally. A pruned entry is regenerated when needed, never an error.
 
@@ -405,37 +497,46 @@ header is parsed when the index loads, and dozens of small packs from mid-sized 
   chains sharding removed). History now lives in `<store>/commits.log` as JSON lines: a normal commit
   is one append, and only undo and GC, which truncate history, rewrite it. `branches.json` is written
   after the log, so a torn append is always an unreachable orphan record, never a dangling branch tip,
-  and reads drop a torn last line that the next save cleans up. Legacy `commits.json` stores migrate
-  on first save (the old file is then retired), following the chains pattern.
+  and reads drop a torn last line that the next save cleans up.
 - **Slim chain versions (`KVCC2`)** (`repo.rs::Version::object_name`). Each chain version used to
   store its object filename, which can be derived from `hash` and `base`, duplicating a 64-character
   hash per version forever. Bincode isn't self-describing, so the fix rides on an explicit format tag:
-  `KVCC2`-prefixed shards hold the slim shape, and bare-zstd files are older and decode through a
-  legacy struct, upgrading the next time they change (or all at once in GC's `rewrite_all`). Old
-  monolithic `chains.bin` and `chains.json` files decode through the same dual path.
-- **Per-file chain shards, loaded lazily** (`repo.rs::ChainStore`). The chains store (every version
-  of every delta stream) used to be one file, rewritten in full on every commit and parsed in full on
-  every `Repo::open`, the one cost that grew with the whole history instead of with the change at
-  hand. It is now one shard per tracked file (`<store>/chains/<blake3(relpath)[..16]>.bin`, the same
-  zstd-bincode encoding), loaded on first touch and flushed per dirty shard. A commit rewrites exactly
-  the shards of the files it touched, and an open parses nothing up front. Stores still carrying a
-  monolithic `chains.bin` (or the older `chains.json`) are read transparently and split on their next
-  save, which then retires the monolith. Until that delete the monolith stays the source of truth, so
-  a crash halfway through the split just runs it again.
+  `KVCC2`-prefixed shards hold the slim shape. The readers for the older untagged shards, and for
+  the monolithic `chains.bin` and `chains.json` before them, are gone: every one of those formats
+  predates per-document stores, and v2.0.0 shipped with no migration from v1.
+- **Chain shards per layer entry, loaded lazily** (`repo.rs::ChainStore`, `shard_of`). The chains
+  store (every version of every delta stream) used to be one file, rewritten in full on every commit
+  and parsed in full on every `Repo::open`. Sharding it per tracked file fixed that for a folder of
+  paintings, but with one document per store it meant one shard again: every version of every tile,
+  rewritten and fsynced on each commit and decoded whole by the first chain lookup of every command
+  (4.3 MB at 200 versions of a 45,000-tile painting, 125 to 185 ms to re-encode per commit, 40 to
+  57 ms to decode). Now each tiled entry (a layer's tiles, or the composite's blocks) has its own
+  shard, and the manifest and small entries share the document's
+  (`<store>/chains/<blake3(shard name)[..16]>.bin`, the same zstd-bincode encoding), loaded on first
+  touch and flushed per dirty shard. A commit that edits two layers rewrites those two shards and the
+  document's. The price is an fsync per shard a commit touches rather than one per commit, which a
+  commit that edits only a tile or two pays for without the shard size to win it back. A store
+  written before this keeps every chain in its document shard; that shard is split in memory when it
+  loads, and the split persists with the next save, which writes the tile shards before the shrunken
+  document shard, so a crash in between only means splitting again (see
+  [data-integrity.md](data-integrity.md)).
 - **A sharded objects folder** (`delta.rs::write_loose` and `read_loose`). Loose objects go into
   `objects/<hash[..2]>/` (256 subfolders) instead of one flat folder, because 100,000 or more tiny
-  files in one folder slow down NTFS lookups and multiply Defender scans. Reads fall back to the flat
-  path, so older stores never need to migrate.
+  files in one folder slow down NTFS lookups and multiply Defender scans. The fallback that read the
+  flat layout is gone, since no per-document store ever used it, and with it a failed file open per
+  object lookup.
 - **One pack file per commit** (`delta.rs::Packs`, `commit_prepared_batch`). A batch of 32 or more
   distinct new objects (the whole-document first commit, or an edit touching many tiles) is written as
   one `objects/pack/<hash>.pack` file (a header, a compressed index, then the payloads back to back)
   instead of one file per object. Measured on Windows, the cost of creating each file (Defender's
   real-time scanning, worst for a freshly installed app with no reputation yet) was about 28 s of a
   33 s first commit on a large canvas, and parallelism can't hide it, because the cost is in the create
-  itself. Reads try the loose paths (sharded, then legacy flat) and then an in-memory index over all
-  pack headers, built lazily, with thread-safe positional reads, so parallel tile rebuilds can hit one
-  pack at once. Small batches stay loose, so per-object dedup stays visible and tiny commits pay no
-  pack indirection.
+  itself. Reads ask an in-memory index over all pack headers first (built lazily; after the first
+  commit nearly every tile lives in a pack), and only then the loose path, and each pack stays open
+  behind one handle for positional reads, which share no cursor, so parallel tile rebuilds can hit one
+  pack at once. The old order paid two failed loose-path opens and a fresh open of the pack for every
+  packed object, about 88 µs a read against 9.4 µs. Small batches stay loose, so per-object dedup
+  stays visible and tiny commits pay no pack indirection.
 
 ## Build configuration
 
@@ -469,8 +570,33 @@ The shortcuts with known limits, collected in one place:
 
 - The commit-time entry skip uses crc32 and size to detect changes, which has about a 2⁻³² chance of
   a false match per changed entry. The upgrade is hashing the compressed bytes.
-- The delta patch and snapshot thresholds (64 KB, a chain length of 20) are untuned constants.
-  Revisit them if storage size ever matters more than it does now.
+- The delta patch and snapshot thresholds (64 KB, a chain length of 20, five for manifests) are
+  untuned constants. Revisit them if storage size ever matters more than it does now. The manifest
+  cap has a measured price: a full manifest snapshot every six versions instead of every 21, which
+  took a synthetic 200-version history of a 45,000-tile painting from 37 MB to 79 MB, about 0.2 MB
+  more per version. Its tiles are 49 bytes, so the manifest is an unusually large share there; next
+  to a version that stores a few hundred real 16 KB tiles it's a few percent, but an edit that
+  changes only a handful of tiles pays proportionally more.
+- The parsed-manifest cache (`kra::load_manifest`) is bounded by tile references, not bytes
+  (400,000, about 65 MB at the cap). A byte-exact budget is the upgrade if it ever matters. It lives
+  for the process, so in the `kvc` CLI, one command per process, it's filled for nothing, though
+  only for as long as the command runs.
+- `commands::parsed_working` keys on size and mtime, like the scan's fast path, so a rewrite inside
+  one timestamp tick is missed for one refresh of a diff view (never stored data). If
+  `working_layers` never follows `working_diff`, one parsed document stays in memory until the next
+  refresh replaces it. `worktree.json` has the index's racy-clean ceiling for the same reason.
+- Chain shards per layer entry cost one fsync per shard a commit touches, where one shard cost one.
+  A commit that edits a few tiles of one layer pays two where it paid one, without a big shard to
+  win it back.
+- A set-aside merge still holds three whole documents in memory while it runs: the set-aside
+  version, the working file and the ancestor (its output streams to the temp file). The ancestor is
+  rebuilt from only the layers the set-aside version shares with it, which is usually all of them,
+  so for a 105 MB painting the merge still peaks around 440 MB.
+- A version's recorded `storedBytes` counts only the objects that commit wrote. Content first
+  stored by set-aside work, or by a version that was later undone, is already on disk when a commit
+  reuses it, so the storage report attributes it to no version (it's still in the store total).
+- Backups store the `.kra` and the store's already-compressed objects instead of deflating them, so
+  an archive is about 13% larger than it was.
 - Raster downscaling is an area-average box filter in premultiplied alpha, crisp at the viewer's
   zoom. Truly pixel-accurate deep zoom would need a higher 2048 px cap, which costs cache disk space,
   and that's deliberately not done so storage stays flat.

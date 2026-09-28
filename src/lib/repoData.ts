@@ -1,4 +1,4 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   ArtLayer,
@@ -223,10 +223,19 @@ export interface DiffResult {
  * Session cache of `commit_diff` results, so re-clicking a commit renders instantly instead of
  * re-running the backend diff. Commits are immutable by id (and so is their parent tree), so
  * entries never invalidate — mutations don't touch the key, and a commit removed by undo just
- * ages out of the LRU. Same LRU pattern/cap as `layerCache` below.
+ * ages out of the LRU. Same LRU pattern as `layerCache` below, but a much larger cap: an entry is
+ * a few KB now that rasters travel as `kvcimg` URLs rather than base64, and at the old 20 panning
+ * the Version Map back and forth across a long history refetched nodes it had just drawn.
  */
 const diffCache = new Map<string, DiffEntry[]>();
-const DIFF_CACHE_MAX = 20;
+const DIFF_CACHE_MAX = 300;
+
+/**
+ * In-flight `commit_diff` calls by `path|commitId`, shared the way `workingDiffInflight` shares
+ * `working_diff`: opening a Version Map node whose thumbnail is still loading asks for the very
+ * same diff, and `commit_diff` is one of only two heavy permits.
+ */
+const diffInflight = new Map<string, Promise<DiffEntry[]>>();
 
 export function useCommitDiff(path: string, commitId: string | null): DiffResult {
   const [result, setResult] = useState<DiffResult>({ entries: [], error: null, loading: false });
@@ -250,9 +259,17 @@ export function useCommitDiff(path: string, commitId: string | null): DiffResult
     }
     let cancelled = false;
     setResult({ entries: [], error: null, loading: true });
-    timed(path, "diff", invoke<DiffEntry[]>("commit_diff", { path, commitId }), () => ({
-      commitId,
-    }))
+    let request = diffInflight.get(key);
+    if (!request) {
+      request = timed(path, "diff", invoke<DiffEntry[]>("commit_diff", { path, commitId }), () => ({
+        commitId,
+      }));
+      diffInflight.set(key, request);
+      // `then(clear, clear)`, not `finally` — see `workingDiffInflight`.
+      const clear = () => diffInflight.delete(key);
+      request.then(clear, clear);
+    }
+    request
       .then((entries) => {
         diffCache.set(key, entries);
         while (diffCache.size > DIFF_CACHE_MAX) {
@@ -448,13 +465,21 @@ export interface StorageStats {
  * plain browser (no backend) — `loading` distinguishes the first case so callers can render a
  * skeleton instead of an empty state. `nonce` refetches after a mutation (e.g. a new commit
  * grows the numbers), and `loading` goes true again on that refetch too.
+ *
+ * Fetched only while `active` (the Performance view is showing), and only when `path`/`nonce`
+ * moved since the last answer — so switching back is instant. It used to run at startup and after
+ * every version, undo, switch and focus refresh in every view, and on a long history of a large
+ * painting the report is a heavy job (27 s at 200 versions before per-version sizes were recorded).
  */
 export function useStorageStats(
   path: string,
-  nonce = 0
+  nonce = 0,
+  active = true
 ): { stats: StorageStats | null; loading: boolean } {
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [loading, setLoading] = useState(false);
+  // The `path|nonce` the current `stats` answers.
+  const answered = useRef<string | null>(null);
 
   useEffect(() => {
     if (!inTauri()) {
@@ -462,11 +487,17 @@ export function useStorageStats(
       setLoading(false);
       return;
     }
+    const key = `${path}|${nonce}`;
+    if (!active || answered.current === key) return;
+    // Another artwork's numbers must not stand in while this one's load.
+    if (!answered.current?.startsWith(`${path}|`)) setStats(null);
     let cancelled = false;
     setLoading(true);
     invoke<StorageStats>("repo_storage_stats", { path })
       .then((s) => {
-        if (!cancelled) setStats(s);
+        if (cancelled) return;
+        setStats(s);
+        answered.current = key;
       })
       .catch(() => {
         if (!cancelled) setStats(null);
@@ -476,8 +507,10 @@ export function useStorageStats(
       });
     return () => {
       cancelled = true;
+      // Left mid-fetch: the answer never landed, so nothing is showing a stale "loading".
+      setLoading(false);
     };
-  }, [path, nonce]);
+  }, [path, nonce, active]);
 
   return { stats, loading };
 }

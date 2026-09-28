@@ -42,25 +42,28 @@ and `store`, the history laid out below.
   doc.json       which document this store tracks: { relpath, displayName, createdAt }. Kept
                  apart from index.json, which only knows files already committed, so a fresh
                  store has an empty index but a defined document
-  config.json    engine settings: the delta-chain threshold (default 20), the tile size (64), the
-                 raster cache budget (cacheMaxBytes, default 256 MB; a v1 to v2 config migration
-                 lowers old 512 MB defaults), the opt-in tilePixelDeltas flag, and the opt-in
-                 lowMemoryDiff flag. The last three can be edited in Settings
-                 (get_repo_config and set_repo_config)
+  config.json    engine settings: the delta-chain threshold (default 20; manifests are capped at
+                 5 whatever it says), the tile size (64), the raster cache budget (cacheMaxBytes,
+                 default 256 MB), the opt-in tilePixelDeltas flag, and the opt-in lowMemoryDiff
+                 flag. The last three can be edited in Settings (get_repo_config and
+                 set_repo_config)
   kvc.lock       an OS-level advisory lock (File::try_lock: LockFileEx or flock), held only while
                  a write runs. Its contents don't matter and it is never deleted; only the OS
                  lock state does (see Concurrency and locking)
   kvc.lock.info  a best-effort note naming the current holder's operation ("committing",
                  "switching branches"), rewritten on every acquire and never itself locked
   index.json     the committed head of each tracked file; drives the scanner
-  chains/        one shard per tracked file, holding every stored version of that file's delta
-                 streams (KVCC2-tagged zstd bincode, named <blake3(relpath)[..16]>.bin, loaded on
-                 first touch). Older untagged shards decode and upgrade the next time they
-                 change, and a legacy monolithic chains.bin (or older chains.json) is read and
-                 split into shards on the next save
+  worktree.json  a cache: the size, mtime and hash of the saved-but-unversioned document as the
+                 last scan read it, so the next scans needn't read it again (see performance.md).
+                 Best-effort, never backed up; missing just means the next scan reads the file
+  chains/        every stored version of every delta stream (KVCC2-tagged zstd bincode, loaded on
+                 first touch): one shard per tiled entry (a layer's tiles, or the composite's
+                 blocks), and one for the document's manifest and small entries, each named
+                 <blake3(shard name)[..16]>.bin. A store from before per-entry shards keeps
+                 everything in the document shard, which is split on the next save
   commits.log    the commit log as JSON lines, oldest first (append order is topological order).
-                 A commit appends one line; only undo and GC rewrite it. A legacy commits.json
-                 migrates on first save
+                 A commit appends one line; only undo and GC rewrite it. Each line records the
+                 bytes of new objects that version wrote (storedBytes), for the storage report
   branches.json  branch name → tip commit id, the current branch, and a `generation` counter
                  bumped on every write. Written after the log, so a torn append is never a
                  dangling tip
@@ -76,15 +79,17 @@ and `store`, the history laid out below.
                  what "Clean up storage" swept, moved here instead of deleted and pruned after 14
                  days on the next real cleanup
   objects/       content-addressed blobs: <hash>.full (zstd) or <hash>.patch (bsdiff), sharded
-                 256 ways (objects/<hash[..2]>/; flat legacy paths are still read). A commit with
-                 32 or more new objects writes them as one objects/pack/<hash>.pack instead
+                 256 ways (objects/<hash[..2]>/). A commit with 32 or more new objects writes
+                 them as one objects/pack/<hash>.pack instead, and reads ask the packs first
   cache/         content-addressed PNG rasters for the diff viewer, served straight from disk
                  (see performance.md); size-budgeted with LRU pruning, and wiped whole when the
                  downscale filter's .filter-version marker changes
 ```
 
-A store from before branching existed (no `branches.json`) migrates on open: everything is treated as
-`main`, with its tip at the newest commit, and the next save persists that.
+None of the formats from before per-document stores (the `chains.bin` and `chains.json` monoliths,
+untagged chain shards, `commits.json`, `KVCP1` packs, flat loose objects, a v1 `config.json`, a
+store with no `branches.json`) is read any more: v2.0.0 shipped with no migration from v1, so no
+store it can open was ever written in them.
 
 Nothing on the hot path ever deletes stored data. Undo and branch delete only drop a reference and
 leave orphaned commits, chain versions and objects behind, which is harmless because objects are
@@ -187,28 +192,30 @@ entry `TrackedFile.partial`, and the scanner reports it as `"M"` straight from t
 `commit_snapshot` is `commit_selected(.., None)`), then routes each change:
 
 - A deletion is dropped from the index and recorded as a `D` file entry with no content.
-- A `.kra` goes to `kra::commit_kra`, which decomposes the archive (see below) and returns its
-  manifest hash. With a `layers` argument it first goes through layer-subset staging
-  ([layer-staging.md](layer-staging.md)).
-- Anything else goes to `Repo::store_stream("file:<path>", bytes)`, which returns the blob's
-  content hash. New stores can't reach this (only `.kra` can be tracked), but it stays because it's
-  the generic path every non-`.kra` stream still goes through.
+- A change to the document goes to `kra::commit_kra`, which decomposes the archive (see below) and
+  returns its manifest hash. With a `layers` argument it first goes through layer-subset staging
+  ([layer-staging.md](layer-staging.md)). A store tracks one `.kra` and `Repo::init` refuses
+  anything else, so there is no generic path for other files; the one that stored whole blobs under
+  `file:<path>` streams is gone.
 
 Each stored file's blake3, size and mtime are written back into the index (the scan hands the bytes
 it already read to the commit, so a big `.kra` is read once per commit). A `Commit` is recorded with
 `parents` set to the current branch tip (the first parent is the mainline; a merge commit has two),
 the branch name stamped on it (cosmetic; the frontend uses it for labels and colors), and each
 file's on-disk blake3 as `fileHash`, which lets `undo` rewind the index without reconstructing files
-just to hash them. Older records without it fall back to reconstructing. The branch tip then moves to
+just to hash them. Older records without it fall back to reconstructing. It also records
+`storedBytes`, the bytes of the new objects the commit wrote (counted as `commit_prepared_batch` and
+`commit_prepared` write them), which is what the storage report sums. The branch tip then moves to
 the new commit. A clean tree returns `KvcError::Nothing`. The commit id is the first 12 hex
-characters of a blake3 over the timestamp, message, parents and each file's content hash.
+characters of a blake3 over the timestamp, message, parents and each file's content hash
+(`commit::record_id`, which a stash's id shares).
 
 `Repo::save` flushes the state: `index.json` and `branches.json` as compact JSON, the commit as one
 appended line of `commits.log` (constant time, never a rewrite that grows with history), and only
 the chain shards the commit actually changed (`ChainStore` tracks dirty shards), as KVCC2-tagged
-zstd bincode. A commit's chain-write cost scales with the files it touched, not with the total
-history, and `save` skips shards entirely when no new stream version was stored, so switch, merge
-and undo never rewrite chains. A batch of 32 or more new objects is written as one pack file instead
+zstd bincode. Tiles are sharded per layer entry, so a commit's chain-write cost scales with the
+layers it touched, not with the total history, and `save` skips shards entirely when no new stream
+version was stored, so switch, merge and undo never rewrite chains. A batch of 32 or more new objects is written as one pack file instead
 of one loose file each, because creating files one by one dominated large commits on Windows (see
 [performance.md](performance.md#state-file-writes)).
 
@@ -223,18 +230,20 @@ first-parent depth) even though the commit log interleaves branches.
 
 ## Delta-chain storage
 
-In [`delta.rs`](../src-tauri/src/delta.rs), a stream is any versioned byte sequence (a generic
-file, a `.kra` manifest, a layer entry or a single tile) with a string key. `store_stream` does one
-of three things:
+In [`delta.rs`](../src-tauri/src/delta.rs), a stream is any versioned byte sequence (a `.kra`
+manifest, an archive entry or a single tile) with a string key. `store_stream` does one of three
+things:
 
 1. **Dedup.** If the content hash already exists in the stream's chain, it returns that hash and
    stores nothing.
 2. **Patch.** If the content is at least 64 KB, isn't already compressed (PNG, zip or zstd magic),
    and the chain is shorter than `delta_chain_max` (20), it stores a bsdiff patch against the chain
    head (`<hash>.patch`). Patching only pays off for large, diff-friendly data, which in practice
-   means the `.kra` manifests. For small streams such as tiles, the chain-walk reconstruct plus a
-   bsdiff suffix sort costs more than the couple of KB it saves, and patches against compressed
-   payloads come out close to full size.
+   means the `.kra` manifests. Those are capped at five patches whatever the config says
+   (`delta::MANIFEST_CHAIN_MAX`): every diff, restore and commit loads a manifest by replaying its
+   chain, and at 20 that was up to 250 ms a load on a long history. For small streams such as tiles,
+   the chain-walk reconstruct plus a bsdiff suffix sort costs more than the couple of KB it saves, and
+   patches against compressed payloads come out close to full size.
 3. **Snapshot.** Otherwise (a first version, small or compressed content, or the chain limit
    reached) it stores a fresh zstd snapshot (`<hash>.full`) and resets the chain length.
 
@@ -287,10 +296,12 @@ A `.kra` is a zip archive. [`kra.rs`](../src-tauri/src/kra.rs) and
   same position. A restore reassembles the blocks and re-encodes a valid PNG: the pixels are exact,
   the bytes aren't Krita's original encoding. Composites that don't qualify stay byte-exact `Raw`,
   `preview.png` stays `Raw` on purpose (it's tens of KB), and old manifests still rebuild unchanged.
-- **Rebuilding is parallel and bounded in memory.** `reconstruct_kra` resolves entries' bytes
+- **Rebuilding is parallel and bounded in memory.** `kra::write_kra_from` resolves entries' bytes
   (replaying each tile's patch chain) with rayon's `par_iter` in 64 MB chunks, writing each chunk to
-  the zip in manifest order before building the next, so peak memory is the output plus one chunk,
-  not the whole decompressed document. Rebuilt tile blocks and other uncompressed entries are written
+  the zip in manifest order before building the next. The restore paths point it at the temp file
+  beside the artwork (`kra::write_kra`), so peak memory is one chunk, not the whole decompressed
+  document; `reconstruct_kra`, for the callers that want the bytes in memory, writes into a `Vec`.
+  Rebuilt tile blocks and other uncompressed entries are written
   with fast deflate (Krita deflates them too; storing them uncompressed left restored files several
   times larger), and entries that already look compressed (`delta::looks_compressed`: PNG, zip or
   zstd magic) are stored as they are, since compressing them again buys nothing.
@@ -331,10 +342,11 @@ this goes out on `ArtDiffDto` and `LayerDto` and appears in the Inspector's Sele
 
 ## Restoring, rollback and undo
 
-`commit::file_at_commit` rebuilds a file's exact bytes as of any commit: from the manifest
-(`reconstruct_kra`) for a `.kra`, otherwise from its blob stream. The `restore_file` command writes
-those bytes back into the working tree. Two higher-level operations build on it in
-[`commit.rs`](../src-tauri/src/commit.rs).
+`commit::file_at_commit` rebuilds the document's bytes as of any commit from its manifest
+(`reconstruct_kra`). The `restore_file` command and the other restores write straight into the temp
+file beside the artwork instead (`commit::write_committed`, `kra::write_kra`), then rename it into
+place, so the rebuilt document is never held whole in memory. Two higher-level operations build on
+this in [`commit.rs`](../src-tauri/src/commit.rs).
 
 - **Rollback** (`rollback_to_commit`, "Restore this version" in the UI). For a historical commit
   (not the tip), it computes that commit's tree through `tree_at_commit`, writes it into the working
@@ -385,12 +397,13 @@ across branches for free.
   untracked file can be clobbered). It computes both branch trees and calls `materialize_tree`, which
   rewrites only files whose committed content hash differs. Unchanged files are never read,
   reconstructed or rewritten, and their index entries carry over, so the scanner's fast path stays
-  warm. A differing `.kra` is rebuilt incrementally (`kra::materialize_kra`): entries identical in
-  the two manifests are raw-copied out of the working file on disk (each checked against the
-  manifest's recorded crc32 and size), a changed tiled entry lifts its unchanged tiles from the
-  working copy in memory, and only tiles whose content differs are replayed from the object store.
-  Switch cost follows what differs between the branches, not the size of the document, and a full
-  `reconstruct_kra` remains the fallback. The index and working tree end up exactly on the target
+  warm. A differing `.kra` is rebuilt incrementally (`kra::materialize_kra_into`): entries
+  identical in the two manifests are raw-copied out of the working file on disk (each checked against
+  the manifest's recorded crc32 and size), a changed tiled entry lifts its unchanged tiles from the
+  working copy, and only tiles whose content differs are replayed from the object store. It reads
+  the working file through a handle and writes into the temp file beside it, so neither document is
+  held whole in memory. Switch cost follows what differs between the branches, not the size of the
+  document, and a full rebuild from the store remains the fallback. The index and working tree end up exactly on the target
   branch, and the chains aren't rewritten, because nothing new was stored.
 - **Merge** (`merge_branch`, source into current). Fast-forwards when the current tip is an ancestor
   of the source tip (the tip moves, with no new commit). Otherwise it does a per-file three-way merge

@@ -33,11 +33,21 @@ So the engine runs on its own pool ([`cpu.rs`](../src-tauri/src/cpu.rs)), not on
 The engine builds its own pool instead of calling `build_global()` because the global pool can only
 be initialized once, and the budget is a live setting.
 
-The integration is one line. Every Tauri command goes through `commands::run`, and nested
-`par_iter`s inherit the pool that installed them, so wrapping that one closure in `cpu::install`
-puts the whole engine inside the budget: all three nesting levels, blake3's `update_rayon`
-included. No call site knows the budget exists. A unit test in `cpu.rs` pins that inheritance,
-because everything depends on it.
+The integration is one line. Every command that does parallel work goes through
+`commands::run_heavy`, and nested `par_iter`s inherit the pool that installed them, so wrapping that
+one closure in `cpu::install` puts the whole engine inside the budget: all three nesting levels,
+blake3's `update_rayon` included. No call site knows the budget exists. A unit test in `cpu.rs` pins
+that inheritance, because everything depends on it.
+
+The cheap reads (`commands::run`: history, branches, the shelf, a scan, the settings) run on their
+blocking thread directly, outside the pool. None of them does parallel work, and the pool can be a
+single worker: at the default 75%, a 2-core, 2-thread laptop gets one. A command holds its worker for
+its whole closure, and rayon only picks up queued work when a worker is idle or waiting inside a
+parallel section, so a `list_commits` queued behind any serial stretch of a diff or a commit (reading
+a file, walking a zip, an fsync) used to wait it out: 1.9 s behind a 2-second one, measured with the
+pool forced to one worker. `repo::hash_bytes`, the one parallel step a scan can reach, hashes on a
+single thread when it isn't on a pool worker, rather than spilling onto rayon's global pool (every
+core, normal priority).
 
 ## What it costs
 
@@ -79,17 +89,17 @@ the end. So clicking quickly through history used to stack up unbounded work.
 `cpu::heavy_permit` is a two-permit `tokio::sync::Semaphore`. `commands::run_heavy` takes one and
 holds it for the call. Two covers the normal case of one view in flight and one arriving, with no
 added latency. Cheap reads (`list_commits`, `list_branches`, the config getters) deliberately stay
-on plain `run`, so they never queue behind a diff. The permit is always taken outside `RepoLock`, so
+on plain `run`, so they never queue behind a diff: not for a permit, and not for a pool worker (see
+above). The permit is always taken outside `RepoLock`, so
 there is no lock-ordering hazard, and two commits queued in the app now run one after the other
 instead of the second failing with `Locked`.
 
-## The plugin's poll spawns one process, not two
+## The plugin's poll: at most one process, usually none
 
 `vc_docker.py`'s 1.5-second timer used to call both `kvc status` and `kvc branches`, each a
 synchronous `subprocess.run` on Krita's GUI thread. On Windows the process spawn dominates the cost,
-and the second call was pure duplication: both run `Repo::open_light`, which parses the whole
-`commits.log`, and `run_status` already had `repo.branches` in memory. It printed
-`branches.current`, and the docker threw it away.
+and the second call was pure duplication: both parsed the whole `commits.log`, and `run_status`
+already had `repo.branches` in memory. It printed `branches.current`, and the docker threw it away.
 
 `run_status` now prints the whole branch list too, at no extra I/O, through a `branch_list` helper
 it shares with `run_branches` so the two shapes can't drift (`kvc_cli.rs` asserts they match). That
@@ -98,6 +108,31 @@ from the one result. `refresh()` also returns early when the docker isn't visibl
 page-selection code so switching documents stays instant. It's the only early exit that needs no
 correctness argument; one based on `doc.modified()` would be wrong, because a document becomes
 unmodified exactly when a save creates the change the poll has to notice.
+
+Three more cuts came out of the September audit, because the tick was still expensive in the state
+it spends most of its time in: saved, but not yet a version.
+
+- **No spawn while nothing changed.** Everything `status` reports comes from the document and three
+  state files in its store (`index.json`, `branches.json`, `stashes.json`), and `status` names the
+  store. `kvc_client.status_cached` stats those four and reuses the last answer while all four
+  `(mtime, size)` pairs match: four `os.stat` calls a tick instead of a process. The key is taken
+  before the spawn, so a save landing mid-status shows up on the next tick, and the docker forgets
+  the answer after any operation it runs itself (`forget_status`, from `_set_busy`).
+- **No re-hash of a painting it has already read.** When the scan has to read a saved-but-unversioned
+  file, it records its size, mtime and hash in `<store>/worktree.json`, and later scans answer from
+  that while the size and mtime still match, with the same racy-clean guard as the index. The
+  saved-but-unversioned state used to cost a full read and blake3 of the painting on every tick
+  (78 ms at 105 MB, 136 ms at 195 MB, seconds from a cold hard drive). A document with no versions
+  yet is `U` whatever it holds, so it isn't read at all.
+- **No commit log.** `status`, `branches` and `stash-list` open the store with
+  `Repo::open_without_log`: nothing they report comes from `commits.log`, the one part of a store
+  that grows with every version.
+
+And the commit itself no longer freezes Krita: the docker runs it through `QProcess`
+(`_run_kvc_async`) with its buttons disabled and the poll paused by the existing busy state, where
+`subprocess.run` held Krita's UI for the whole commit (about 3 s for a 105 MB painting). The other
+writes (discard, set aside, bring back, switch) stay synchronous, because the document has to be
+reopened after them before Krita can be used again anyway.
 
 See also: [history/07](history/07-cpu-headroom-v1.1.md) for how this came about, and
 [performance.md](performance.md#streamed-layers-dont-re-render-everything) for the frontend

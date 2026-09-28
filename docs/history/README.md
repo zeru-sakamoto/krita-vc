@@ -2,7 +2,7 @@
 
 The docs in the folder above describe how the app works today. These describe how it got there: the
 decisions, rewrites and course corrections behind the current architecture, drawn from the full
-commit history (`git log --all --reverse`, 93 commits from 2026-06-18 to 2026-09-13) and
+commit history (`git log --all --reverse`, 96 commits from 2026-06-18 to 2026-09-26) and
 cross-checked against [`CLAUDE.md`](../../CLAUDE.md) and the release notes. The notes are
 published on [GitHub Releases](https://github.com/zeru-sakamoto/krita-vc/releases), written from
 `content/RELEASE_NOTES.md`, a local file that isn't in git (`content/` is gitignored). The release
@@ -26,6 +26,7 @@ Read them in order for the whole story, or jump to an era:
 | [11. Backup and restore overhaul](11-backup-restore-overhaul.md) | 08-28 to 08-29 | `655b992` to `af73620` | Several artworks in one archive, and restore with a version comparison. |
 | [12. Layer-subset staging](12-layer-subset-staging.md) | 09-01 to 09-03 | `c686231` to `e5b02ea` | Saving only the ticked layers, made three times faster, plus a doc audit. |
 | [13. The welcome screen, a license change, and v2.1.0](13-welcome-license-and-v2.1.md) | 09-05 to 09-13 | `5fccb88` to `b324391` | This series, the first-launch welcome, MIT to GPL-3.0, and the 2.1.0 release. |
+| [14. The September audit and its fixes](14-the-september-audit-and-its-fixes.md) | 09-25 to 09-26 | `38bf63a` to `TODO` | The docs reorganized by feature, an audit of v2.1.0, and fixes for its 18 stability and 16 performance findings. |
 
 All dates are 2026. Some eras overlap instead of following one another. Eras 09, 10 and 11 were
 worked on in the same week at the end of August, which is why v2.0.0 ships the redesign, the
@@ -60,7 +61,7 @@ doesn't contain it.
 ## Coverage
 
 Every commit in the repository is cited by at least one chapter. Every hash, date and quoted commit
-message in these files was checked against `git log --all` on 2026-09-25.
+message in these files was checked against `git log --all` on 2026-09-26.
 
 See also: [`../README.md`](../README.md) for the docs on the current architecture that these files
 go with.

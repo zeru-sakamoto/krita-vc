@@ -163,8 +163,22 @@ const LayerRow = memo(function LayerRow({
 }) {
   const state = layer.after != null ? "after" : "before";
   const status = CHANGE_STATUS[layer.change];
+  // The backend's small thumbnail when there is one: pointing a 36x28 row at the full raster had
+  // the webview decode up to 2048x2048 per layer just to draw it.
   const svg = useMemo(
-    () => compositeSvg([layer], state, width, height),
+    () =>
+      compositeSvg(
+        [
+          {
+            ...layer,
+            before: layer.beforeThumb ?? layer.before,
+            after: layer.afterThumb ?? layer.after,
+          },
+        ],
+        state,
+        width,
+        height
+      ),
     [layer, state, width, height]
   );
   return (

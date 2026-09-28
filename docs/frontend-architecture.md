@@ -97,18 +97,22 @@ screen (a sibling in `AppShell`, not inside either): a full-screen block that ca
 shown whenever `busyMessage` on the repository context is set. Every write operation (commit,
 branch create, switch, merge and delete, rollback, undo, cleanup) sets a readable label before the
 call and clears it in a `finally`. It renders nothing when idle.
-[`OnboardingOverlay`](../src/components/shell/OnboardingOverlay.tsx) renders beside it, and
-[`TourOverlay`](../src/components/shell/TourOverlay.tsx) is the last child of `RepoShell`'s root
-(`fixed inset-0`, so it still covers all four zones). Both are described in
-[onboarding-and-tour.md](onboarding-and-tour.md).
+[`OnboardingOverlay`](../src/components/shell/OnboardingOverlay.tsx) renders beside it while the
+welcome is showing, and [`TourOverlay`](../src/components/shell/TourOverlay.tsx) is the last child
+of `RepoShell`'s root while the tour runs (`fixed inset-0`, so it still covers all four zones). Both
+are described in [onboarding-and-tour.md](onboarding-and-tour.md). They load on first use
+(`React.lazy`, behind a `Suspense` with no fallback), and so do `SettingsModal` and `RestoreModal`:
+all four open rarely, so they stay out of the startup chunk, which is 54 kB smaller for it.
 
 `RepoShell` listens for the DOM `window` `"focus"` event (a plain `addEventListener`, no Tauri
 capability needed) and calls the repository context's `refresh()`, the same bump the "Rescan for
 changes" button uses. So switching back from Krita after a save shows the change without a click.
 DOM `window` focus tracks the OS window regaining focus, not focus moving between elements, so
 clicking between panels doesn't fire it. It is throttled to `FOCUS_REFRESH_THROTTLE_MS` (30 s, in
-`AppShell.tsx`). The scan itself is cheap (one `stat`), so the throttle is there to avoid spinner
-churn in a quick save-and-switch-back loop, not for backend cost, and it's skipped while `scanning`
+`AppShell.tsx`). The scan itself is cheap (a `stat`, plus one read of the painting per save it
+hasn't seen yet, since it remembers the hash of a saved-but-unversioned file), so the throttle is
+there to avoid spinner churn in a quick save-and-switch-back loop, not for backend cost, and it's
+skipped while `scanning`
 is already true (read through a ref, so the listener is created once and never goes stale).
 
 [`DockerPanel`](../src/components/shell/DockerPanel.tsx) is the reusable bento card (a 40 px title
@@ -144,7 +148,10 @@ tips), `useWorkingChanges` (the real `scan_repository` result, which has at most
 tracked painting), `useWorkingDiff` (visual diffs of the working tree) and `useArtLayers` (streamed
 per-layer rasters). All of them key on the selected painting's path and the shared `refreshNonce`.
 `useCommitDiff` keys only on the path and the commit id: a version's diff never changes once it
-exists, so it never needs a nonce-driven refetch. Only `useWorkingDiff` and the working side of
+exists, so it never needs a nonce-driven refetch. Its session cache (`diffCache`) keeps 300 results,
+a few KB each now that rasters travel as `kvcimg` URLs, so panning the Version Map back and forth
+doesn't refetch nodes it just drew, and a call already in flight is shared (`diffInflight`): opening
+a node whose thumbnail is still loading asks for the very same diff. Only `useWorkingDiff` and the working side of
 `useArtLayers` do, because the working copy really changes. `useWorkingDiff` also keeps a small
 stale-while-revalidate cache (`workingDiffCache`, keyed on path and file, not the nonce), so
 refocusing a file, for example after a trip to the Version Map and back, repaints the last known diff
@@ -190,9 +197,12 @@ their result, and passed down as props:
 - `useWorkingChanges`. The Changes panel and the Version Map both need the one dirty-tree scan, and
   `Sidebar` unmounts in map view, so a second call anywhere below would rescan on every view switch
   and race the one `scanning` flag.
-- `useStorageStats`. `PerformancePanel` only mounts while `activeView === "performance"`, so calling
-  it there would recompute `repo_storage_stats` on every visit instead of once per `refreshNonce`
-  bump (see [performance-report.md](performance-report.md)).
+- `useStorageStats`. `PerformancePanel` only mounts while `activeView === "performance"`, so the
+  hook lives above it to keep its last answer across view switches. It only fetches while that view
+  is showing (its `active` argument), and only when the painting or `refreshNonce` moved since the
+  answer it holds, so switching back is instant. It used to fetch at startup and after every write
+  and focus refresh in every view, and on a long history of a large painting the report is a heavy
+  job (see [performance-report.md](performance-report.md)).
 
 Both drag-resizable sizes use the shared [`useResize`](../src/lib/useResize.ts) hook (a
 pointer-capture drag, clamped, persisted under a `krita-vc:` key).
@@ -310,11 +320,12 @@ navigator on them. The selected entry routes by `kind`:
   stopped being tracked. The header uses `paletteName`, not `assetName`: Krita's raw palette
   filenames carry an internal resource-version segment (`<name>.<NNNN>.<ext>`, for example
   `sun-set.0006.kpl`) that `assetName` wouldn't strip.
-- `kind: "text"` (a malformed palette degrades to one):
-  - Artist Mode on (the default) → `FriendlyFileDiff`: no code, no hunks, no line numbers, just a
-    one-line summary built from `assetKind` and `statusVerb` in
-    [`src/lib/friendly.ts`](../src/lib/friendly.ts).
-  - Artist Mode off → `DiffFileBlock`, the code-style renderer (line numbers, + and −, hunk headers).
+- `kind: "text"`, which is only ever a deleted `.kra` or one that couldn't be rasterized →
+  `FriendlyFileDiff` in both modes: no code, no hunks, no line numbers, just a one-line summary built
+  from `assetKind` and `statusVerb` in [`src/lib/friendly.ts`](../src/lib/friendly.ts). The backend
+  sends no lines for it, so the code-style renderer that Artist Mode off used to pick
+  (`DiffFileBlock`) only ever drew an empty list, and is gone. An embedded palette that won't parse
+  on either side is left out of the diff rather than degraded to text.
 
 ## Artist Mode
 
@@ -327,7 +338,6 @@ is "Artist view" in Settings → Appearance. The label helpers live in
 
 | Surface | Artist Mode on | Artist Mode off |
 |---------|----------------|-----------------|
-| Non-art diff | One-line summary (`FriendlyFileDiff`) | Code-style line diff (`DiffFileBlock`) |
 | Commit hash (cards, toolbar, Inspector) | `Version N` (`versionLabel`) | Short hash |
 | File paths (Inspector, status bar, art header) | Asset name (`assetName`, no folder or extension) | Full path |
 | Palette paths (palette headers, Inspector palette rows) | Palette name (`paletteName`, which also strips Krita's `.NNNN` resource-version segment) | Full path |
@@ -417,8 +427,7 @@ AppShell (the start screen with no painting, otherwise RepoShell)
 │                         │          (+ palettes)   ├─ ArtCanvas        (side by side)
 │                         │                         └─ CompareSlider ─ ArtCanvas (swipe)
 │                         ├─ palette → PaletteDiffView
-│                         └─ text  ──┬─ FriendlyFileDiff (Artist Mode on)
-│                                    └─ DiffFileBlock     (Artist Mode off)
+│                         └─ text    → FriendlyFileDiff
 ├─ Inspector ─ DockerPanel ─ FileStatusChip
 └─ StatusBar
 
@@ -426,6 +435,7 @@ AppShell (the start screen with no painting, otherwise RepoShell)
 
 BusyOverlay and OnboardingOverlay: siblings of the above, not nested
 TourOverlay: RepoShell's last child
+(SettingsModal, RestoreModal, OnboardingOverlay and TourOverlay load on first use)
 ```
 
 On the Map tab, and on Performance without Legacy, `VersionMapPanel` replaces the main panel and

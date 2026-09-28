@@ -1,5 +1,5 @@
 import { Palette as PaletteIcon } from "@phosphor-icons/react";
-import type { ArtDiff, DiffEntry, DiffLine, PaletteDiff, TextDiff } from "../../types";
+import type { ArtDiff, DiffEntry, PaletteDiff, TextDiff } from "../../types";
 import { FileStatusChip } from "./FileStatusChip";
 import { ArtDiffView } from "./ArtDiffView";
 import { PaletteDiffView } from "./PaletteDiffView";
@@ -8,59 +8,6 @@ import { useArtistMode } from "../../lib/artistMode";
 import { assetKind, assetName, paletteName, statusVerb } from "../../lib/friendly";
 import { useState } from "react";
 import { ICON } from "../../lib/iconSize";
-
-/** Per-line background/foreground per DESIGN.md → Diff Colors. */
-function lineClasses(kind: DiffLine["kind"]): string {
-  switch (kind) {
-    case "add":
-      return "bg-diff-add text-diff-add-fg";
-    case "del":
-      return "bg-diff-del text-diff-del-fg";
-    case "hunk":
-      return "bg-surface-3 text-text-muted";
-    default:
-      return "bg-bg text-text-muted";
-  }
-}
-
-function gutter(n?: number) {
-  return (
-    <span className="w-10 shrink-0 select-none pr-2 text-right text-caption text-text-muted/70">
-      {n ?? ""}
-    </span>
-  );
-}
-
-function DiffFileBlock({ file }: { file: TextDiff }) {
-  return (
-    <div>
-      {/* File path header */}
-      <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-y border-border bg-surface px-3 py-1.5">
-        <FileStatusChip status={file.status} />
-        <span className="selectable font-mono text-dense text-text">{file.path}</span>
-      </div>
-
-      {/* Diff lines */}
-      <div className="font-mono text-dense leading-[1.6]">
-        {file.lines.map((line, i) => {
-          const isHunk = line.kind === "hunk";
-          return (
-            <div key={i} className={["flex", lineClasses(line.kind)].join(" ")}>
-              {!isHunk && gutter(line.oldLine)}
-              {!isHunk && gutter(line.newLine)}
-              <span className="w-4 shrink-0 select-none text-center text-text-muted/60">
-                {line.kind === "add" ? "+" : line.kind === "del" ? "−" : ""}
-              </span>
-              <span className="selectable whitespace-pre pr-3">
-                {isHunk ? `      ${line.text}` : line.text}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
 
 function GenericSummary({ file }: { file: TextDiff }) {
   const added = file.lines.filter((l) => l.kind === "add").length;
@@ -78,7 +25,7 @@ function GenericSummary({ file }: { file: TextDiff }) {
   );
 }
 
-/** Artist-friendly view of a non-art, non-palette file: no code, no hunks, no line numbers. */
+/** Artist-friendly view of a file with no visual diff: no code, no hunks, no line numbers. */
 function FriendlyFileDiff({ file }: { file: TextDiff }) {
   const kind = assetKind(file.path);
   const Icon = kind.icon;
@@ -169,8 +116,6 @@ export function DiffView({
   onFocus,
   onOpenInspector,
 }: DiffViewProps) {
-  const { artistMode } = useArtistMode();
-
   // Embedded palettes (`<kra>::<palette-file>`) aren't independently selectable — they're
   // reached via their parent .kra's own view instead.
   const topLevel = entries.filter((e) => !(e.kind === "palette" && e.path.includes("::")));
@@ -210,13 +155,11 @@ export function DiffView({
     );
   }
 
+  // The one text entry left is a `.kra` that couldn't be rasterized (or a deleted one); the
+  // backend sends no lines for it, so there's no raw line diff to offer outside Artist Mode.
   return (
     <div className="h-full flex flex-col overflow-auto bg-bg">
-      {artistMode ? (
-        <FriendlyFileDiff key={selected.path} file={selected} />
-      ) : (
-        <DiffFileBlock key={selected.path} file={selected} />
-      )}
+      <FriendlyFileDiff key={selected.path} file={selected} />
     </div>
   );
 }

@@ -48,15 +48,30 @@ document palettes are still parsed and diffed off the `.kra` itself, which is wh
 and the observation that motivated the whole change. `is_supported` no longer gates a walk —
 **there is no walk**: a store tracks one designated document, so `scan_detailed` stats one path
 (keeping the racy-clean guard against the index's own mtime). Scanning an art folder holding fifty
-400 MB `.kra` files costs one `stat`.
+400 MB `.kra` files costs one `stat`. A **saved-but-unversioned** document fails that fast path by
+definition, and it's the normal state while painting, so it's read and hashed **once per save, not
+once per scan**: the scan records size+mtime+hash in `<store>/worktree.json` and answers `"M"` from
+it while both still match (the same racy-clean guard, against the sidecar's own mtime; a
+best-effort cache — never backed up, a missing one only means the next scan reads). A document with
+no versions yet is `U` without a read. Only `keep_bytes == false` scans use it; the commit path reads.
 
-Storage layout inside one store: chains are **sharded per tracked file**
-(`chains/`, lazy-loaded, `KVCC2`-tagged bincode — pre-KVCC2 shards and legacy monolithic
-`chains.bin`/`chains.json` migrate transparently), the commit log is **append-only JSON-lines**
-(`commits.log`; a commit appends one line), stashes live in `stashes.json` (absent = empty shelf),
-loose objects are sharded 256-way (`objects/<xx>/`, flat legacy stays readable), and a
+Storage layout inside one store: chains are **sharded per tiled entry** (`chains/`, lazy-loaded,
+`KVCC2`-tagged bincode; `repo::shard_of`: one shard per layer's tiles or the composite's blocks,
+one for the manifest + small entries), so a commit rewrites the shards of the layers it touched
+and a command decodes only what it reads — sharding per tracked *file* meant one shard per store,
+every tile version rewritten + fsynced each commit. A store from before keeps everything in its
+document shard; `ChainStore::load` splits it in memory and the next save persists the split, tile
+shards **before** the shrunken document shard (a crash in between just splits again; a key in both
+files is taken from its own shard). The commit log is **append-only JSON-lines**
+(`commits.log`; a commit appends one line, recording the `storedBytes` it wrote), stashes live in
+`stashes.json` (absent = empty shelf), loose objects are sharded 256-way (`objects/<xx>/`), and a
 commit with ≥32 new objects writes **one pack file** (`objects/pack/*.pack`) instead of loose
-files — per-file creates dominated large commits on Windows. **Stashing** ("Set aside" in Artist
+files — per-file creates dominated large commits on Windows. Reads ask the in-memory pack index
+**first** and keep **one handle per pack** (`delta::PackFile`, positional reads): loose-first cost two
+failed opens plus a fresh pack open per packed object (~88 µs vs 9.4 µs). **No v1 format is
+readable** — monolithic `chains.bin`/`chains.json`, untagged shards, `commits.json`, `KVCP1` packs,
+flat loose objects, the v1 config and the missing-`branches.json` migration were all deleted, since
+v2.0.0 shipped with no migration from v1. **Stashing** ("Set aside" in Artist
 Mode) parks working-tree changes off to the side of history and reverts the files on disk
 (`stash.rs`, records in `stashes.json` — deliberately *not* `commits.log`, which would put
 spurious version rows in the Performance tab and block undo). Stash content reuses the commit
@@ -64,8 +79,10 @@ path's relpath-keyed streams via the shared `commit::store_change`, so a stashed
 its tiles against history for free; three orderings are load-bearing and each has a test —
 a stash must **not** write `repo.index` (else the revert scans clean and silently keeps the
 tree dirty), `create` must save **before** reverting (else a crash erases the work with no
-record), and `pop` must write files **before** dropping the record (and computes every file's
-bytes **before** the first write, so a failed merge leaves the tree + shelf untouched). On a pop
+record), and `pop` must write files **before** dropping the record (it gathers every input first,
+then builds the merged or restored document **straight into the `.kvctmp`** —
+`merge::merge_layers_into` / `commit::write_committed` — so a failed merge deletes its temp and
+leaves the tree + shelf untouched; all-or-nothing because a stash holds at most one file). On a pop
 **conflict** (a stashed path edited since), a conflicting **`.kra` is merged** — only the layers the
 set-aside version actually **added or modified** are folded into the working file (`merge_layers`
 takes the committed **ancestor** and skips incoming top-level layers unchanged since, matched by
@@ -78,7 +95,9 @@ reshuffles tile order every save, so either would fold *every* layer in — the 
 ancestor folds all; an obscure metadata attr off the list is at worst not folded, never spuriously
 duplicated), clashing top-level layer names suffixed ` [2]`, folded data
 files + uuids remapped to fresh ids (`merge.rs`, `merge::merge_layers`, dep-free `roxmltree`-range +
-string-token `.kra` surgery) — so the artist reconciles by hand in Krita; it refuses (`MergeFailed`,
+string-token `.kra` surgery; every entry but `maindoc.xml` is **raw-copied**, and the ancestor is
+rebuilt from `maindoc.xml` + the shared top-level layers' data files only, `stash::merge_ancestor`)
+— so the artist reconciles by hand in Krita; it refuses (`MergeFailed`,
 nothing written) on a different color space, or when the set-aside change is only outside the layer
 stack (nothing to fold). **Any other conflict** still
 hard-refuses the whole pop with `StashConflict` (prefix `"stash conflict"`, distinct from the
@@ -103,12 +122,12 @@ The committed side comes from **`stage::committed_subset`, not a full `reconstru
 rebuilds `maindoc.xml` alone, plans the stack against it (`stage::plan_pieces`, shared with
 `stage_kra` so the two can't disagree), then reconstructs only the reverted layers' data files via
 `kra::reconstruct_kra_from`'s entry filter — one or two layers instead of the whole document plus a
-`mergedimage.png` re-encode, nearly all of which was discarded. The synthesized archive is written
-**deflate level 1** (`stage::out_opts`), not `merge::opts`' library-default level 6: it is never
-written to disk and crc32+size are computed over uncompressed bytes, so the level cannot change
-what gets stored. Together with the scan fix below these took a partial commit from 14x the cost of
-saving the whole artwork to ~7x (13.3s → 4.1s on a 235 MB fixture); see
-[`docs/performance.md`](docs/performance.md#layer-subset-staging). Changes
+`mergedimage.png` re-encode, nearly all of which was discarded. Every entry of the synthesized
+archive but `maindoc.xml` is **raw-copied** (`raw_copy_file`/`raw_copy_file_rename`: compressed
+bytes, crc32 and size carried over) — it is never written to disk and `commit_kra`'s reuse check
+compares crc32+size of the *uncompressed* bytes, so recompressing (961 ms on a 105 MB painting, vs
+35 ms to copy) could never change what gets stored; `maindoc.xml` alone is written, deflate level 1
+(`stage::out_opts`). See [`docs/performance.md`](docs/performance.md#layer-subset-staging). Changes
 outside the layer stack always come from the working file. **Two traps, each with a test in
 `tests/staging.rs`.** The index must mark a partial commit **`TrackedFile.partial`**
 (`ScanChange::partial` → `store_change`): the committed content isn't what's on disk, so the
@@ -134,7 +153,12 @@ data, which is why that gap is acceptable. The `.kra` composite
 (`KraEntry::CompositePng`) instead of a full PNG per commit — the store's former dominant cost;
 restores re-encode a valid PNG (pixels exact, bytes not Krita's original; ineligible PNGs stay
 byte-exact `Raw`). Restored `.kra` files write tile entries **deflate-fast** (Stored left them
-several× larger on disk), and restores are memory-bounded (64 MB build chunks). An opt-in
+several× larger on disk), and restores **stream to disk**: switch/rollback (`kra::materialize_kra_into`,
+reading the working file through a handle), discard, restore-file and a plain stash bring-back
+(`kra::write_kra`) all build the zip straight into the `.kvctmp` beside the artwork through
+`repo::write_file_atomic_with`, which fsyncs, then hashes it by **reading it back** (the zip writer
+seeks back to patch headers, so it can't be hashed on the way out) and renames; builds run in 64 MB
+chunks, so the peak is one chunk, never the whole document. An opt-in
 `tilePixelDeltas` config flag (off by default) stores decoded tile pixels that bsdiff
 across versions — mixed histories are safe via a per-ref `raw` flag. A user-facing **"Clean up
 storage"** action (`cleanup_repository`, mark-and-sweep in `gc.rs`, dry-run powered confirm
@@ -156,7 +180,14 @@ payloads** are **fsynced** before the rename: an fsync makes only its own file d
 it the fsynced chain shard/log line could survive a power cut that the object they name did not.
 The same restore paths set `Repo::verify_reads`, which makes `reconstruct`
 re-hash every object it rebuilds and refuse with `KvcError::Corrupt` — deliberately **off** for
-diffs/previews, the hot loop, and a test pins both halves. **History holes are refused, not
+diffs/previews, the hot loop, and a test pins both halves. The process-wide **parsed-manifest
+cache** (`kra::load_manifest` → `Arc<KraManifest>`, keyed by store + content hash, LRU bounded at
+400,000 tile references ≈ 65 MB; a manifest never changes, and a Version Map node's parent manifest
+is its left neighbour's own) is **never read** by a `verify_reads` repo, since the diff path filled
+it unverified (`manifests_are_cached_except_for_verified_reads`). Manifest patch chains are capped
+at `delta::MANIFEST_CHAIN_MAX` (5, not the config's 20): a full snapshot every five versions costs
+store space (it doubled the synthetic 200-version probe store, whose tiles are 49 bytes; real tiles
+dwarf it) to bound a cold load. **History holes are refused, not
 papered over** (each with a reproduction test in `tests/engine.rs`): `repo::parse_commit_log`
 treats only an undecodable *last* line as a torn append; a bad line with good ones after it is
 damage in place, so the store opens with every line that decodes and **every write refuses** with
@@ -223,7 +254,10 @@ the safer default for a safety feature) that writes **one** archive via `backupR
 `<dir>/` per artwork holding `<name>.kra` + `.kvc/<slug>/`, i.e. N copies of the single-document
 on-disk shape, so plain extraction still yields tracked documents. `skip_in_backup` drops
 `cache/` (regenerable, budgeted 256 MB *per store* — the largest disposable chunk), `trash/`,
-`kvc.lock*` and `*.tmp`. Each artwork is zipped **under its `RepoLock`** ("backing up") — the
+`kvc.lock*`, `worktree.json` and `*.tmp`. The `.kra` (a zip) and `objects/`/`chains/` (zstd) are
+**stored**, not deflated, and every file streams from its handle (`repo::zip_file`): deflating
+already-compressed bytes at level 6 was 7.2 s of a 7.6 s backup for a 13% smaller archive. Only
+JSON state and logs deflate. Each artwork is zipped **under its `RepoLock`** ("backing up") — the
 Krita docker's `kvc` can write mid-backup, and a busy artwork lands in the failed list — and the
 archive is written as `<dest>.partial`, renamed over `dest` only once verified, so a failed run
 never destroys the same-day backup it would replace. This **replaced** the old one-zip-per-artwork "back up all"
@@ -308,9 +342,16 @@ triggered the commit via the plugin. So we build **our own pool**: workers are b
 below-normal priority (`start_handler` → `SetThreadPriority`, Windows-only via `windows-sys`, no-op
 elsewhere — this is the part that actually keeps the desktop responsive), sized to a user-set
 percentage of logical cores (default 75%, min 1). The integration is **one line** —
-`commands::run` is the single funnel for every command and nested `par_iter`s inherit the
-installing pool, so wrapping that closure in `cpu::install` covers the entire engine; a unit test
-pins that inheritance because everything depends on it. The budget is app-global (the pool is
+`commands::run_heavy` is the funnel for every command that does parallel work (writes, diffs,
+layer streams, the storage report) and nested `par_iter`s inherit the installing pool, so wrapping
+that closure in `cpu::install` covers the entire engine; a unit test pins that inheritance because
+everything depends on it. The cheap reads (`commands::run`: history, branches, the shelf, a scan,
+settings) deliberately run **outside** the pool on their blocking thread: at the default budget a
+2-core laptop's pool is **one worker**, a command holds its worker for its whole closure, so a
+`list_commits` queued behind any serial stretch of a diff (a file read, a zip walk, an fsync) waited
+it out — 1.9 s behind a 2 s job. `repo::hash_bytes` (the one parallel step a scan reaches) hashes
+single-threaded when it isn't on a pool worker (`rayon::current_thread_index()`), rather than spill
+onto rayon's unbudgeted global pool. The budget is app-global (the pool is
 process-wide), so it lives in `localStorage` via `src/lib/cpuBudget.tsx` → `set_cpu_budget`, **not**
 in the per-repo `Config`. Changing it swaps in a fresh pool with no restart. `cpu_budget_sweep` in
 `tests/bench.rs` measures what the cap costs. Three things ride along with it:
@@ -318,11 +359,16 @@ the **`kvc` CLI** calls `cpu::lower_process_priority` (`SetPriorityClass`) and i
 too — it needs it *more* than the app, since the plugin spawns it inside Krita's process tree
 mid-paint; **concurrent heavy ops are capped at two** (`cpu::heavy_permit`, a
 `tokio::sync::Semaphore`, taken by `commands::run_heavy` — cheap reads keep plain `run` so they
-never queue behind a diff), because cancelling a diff in the UI does *not* cancel the backend and
-rapid history clicking otherwise stacked unbounded 64 MB decode buffers; and the **plugin poll
-spawns one process per tick, not two** — `kvc status` now also emits the branch list, free because
-`open_light` already parsed `branches.json` (shared `branch_list` helper with `run_branches`,
-pinned equal by `kvc_cli.rs`), and `refresh()` returns early when the docker isn't visible.
+never queue behind a diff, for a permit or a worker), because cancelling a diff in the UI does *not*
+cancel the backend and rapid history clicking otherwise stacked unbounded 64 MB decode buffers; and
+the **plugin poll spawns at most one process per tick, usually none** — `kvc status` also emits the
+branch list, free because the open already parsed `branches.json` (shared `branch_list` helper
+with `run_branches`, pinned equal by `kvc_cli.rs`), and names its `store`, so
+`kvc_client.status_cached` reuses the last answer while the document and the store's
+`index.json`/`branches.json`/`stashes.json` keep their `(mtime, size)` (key taken *before* the
+spawn; `forget_status` after any op the docker runs itself); `status`/`branches`/`stash-list` open
+with `Repo::open_without_log` (never reads `commits.log`; read-only — `commits` is empty, so every
+write refuses); and `refresh()` returns early when the docker isn't visible.
 On the frontend, three memo dep arrays are deliberately *narrower* than the values they close over
 (`ArtDiffView`'s composite layer, `ArtCanvas`'s `compositeSvg`, `LayerStackPanel`'s
 `compositeThumb`) — streamed layers reallocate `diff`/`diff.layers` every arrival while the fields
@@ -396,12 +442,12 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 
 - **Frontend** (`src/`): standard Vite + React 19 + TypeScript app. Entry point `src/main.tsx` mounts `App.tsx` into `index.html`. Built output goes to `dist/`, which `src-tauri/tauri.conf.json` (`build.frontendDist`) points at for packaged builds.
 - **Backend** (`src-tauri/`): Rust crate `krita_vc_lib`. `src-tauri/src/main.rs` is the binary entry point and just calls `krita_vc_lib::run()` defined in `src-tauri/src/lib.rs`, where the `tauri::Builder` is configured, plugins are registered, and Tauri commands are wired up via `invoke_handler(tauri::generate_handler![...])`.
-- **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Ten subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`, `discard`, `stash`, `stash-pop`, `stash-list`, `check`) taking `--repo <path to a .kra>` plus scalars (the flag name is unchanged — the plugin passes whatever it has, and the engine resolves the store from the document path), each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit — a panic is caught in `main` (`catch_unwind` + a silenced panic hook) and reported as `{"error":...}` JSON too, since the plugin parses stdout/stderr as JSON and a bare Rust backtrace would break it). The optional file-subset flag (`--paths` on `commit`/`discard`/`stash`) is a **JSON array** — the hand-rolled parser is a map, so a repeated flag would overwrite, and paths can contain commas; omitting it means "everything". Every mutating subcommand takes a real OS-level advisory lock (`<store>/kvc.lock`, `File::try_lock` — `LockFileEx`/`flock`, released automatically by the OS when the process's handle closes, even on a crash — tagged via a `kvc.lock.info` sidecar with a present-participle label like `"switching branches"` so a caller blocked by `KvcError::Locked` sees what's holding it and for how long) so it can't race a concurrent desktop-app write — the engine itself has no locking; reads (`status`, `branches`, `stash-list`, `check`) take none, so the plugin's 1.5s poll never contends. `status` carries a `stashes` count so that poll needn't spawn a third process, plus the tracked `document`. The **no-args usage line is load-bearing**: the plugin's "Locate kvc…" picker identifies the binary by its literal `"usage: kvc"` prefix, so widen the command list freely but never change that prefix. `stash-list` reuses `commands::stash_dtos` for its **newest-first** order, which "bring back latest" depends on. Contract tests: `src-tauri/tests/kvc_cli.rs` (spawns the real binary). Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
+- **`kvc` CLI** (`src-tauri/src/bin/kvc.rs`): a second, Tauri-free binary target over the same `krita_vc_lib` engine (the crate builds `rlib` for exactly this). Ten subcommands (`status`, `commit`, `branches`, `switch`, `create-branch`, `discard`, `stash`, `stash-pop`, `stash-list`, `check`) taking `--repo <path to a .kra>` plus scalars (the flag name is unchanged — the plugin passes whatever it has, and the engine resolves the store from the document path), each printing one JSON object to stdout (or `{"error": "..."}` to stderr, non-zero exit — a panic is caught in `main` (`catch_unwind` + a silenced panic hook) and reported as `{"error":...}` JSON too, since the plugin parses stdout/stderr as JSON and a bare Rust backtrace would break it). The optional file-subset flag (`--paths` on `commit`/`discard`/`stash`) is a **JSON array** — the hand-rolled parser is a map, so a repeated flag would overwrite, and paths can contain commas; omitting it means "everything". Every mutating subcommand takes a real OS-level advisory lock (`<store>/kvc.lock`, `File::try_lock` — `LockFileEx`/`flock`, released automatically by the OS when the process's handle closes, even on a crash — tagged via a `kvc.lock.info` sidecar with a present-participle label like `"switching branches"` so a caller blocked by `KvcError::Locked` sees what's holding it and for how long) so it can't race a concurrent desktop-app write — the engine itself has no locking; reads (`status`, `branches`, `stash-list`, `check`) take none, so the plugin's 1.5s poll never contends. `status` carries a `stashes` count so that poll needn't spawn a third process, plus the tracked `document` and its `store` path (what the docker stats to skip the spawn). The **no-args usage line is load-bearing**: the plugin's "Locate kvc…" picker identifies the binary by its literal `"usage: kvc"` prefix, so widen the command list freely but never change that prefix. `stash-list` reuses `commands::stash_dtos` for its **newest-first** order, which "bring back latest" depends on. Contract tests: `src-tauri/tests/kvc_cli.rs` (spawns the real binary). Two `[[bin]]` targets means bare `cargo run` is ambiguous without `Cargo.toml`'s `default-run = "krita-vc"`.
 - **Krita plugin** (`krita-plugin/`, kept out of the npm/Cargo build): a PyKrita "Version Control" docker — commit, discard, set-aside/bring-back, save-and-rescan (⟳), and branch switch/create from inside Krita, via `kvc_client.py` shelling out to the `kvc` CLI above (the old one-tap "⚡ Checkpoint" button was removed in `af689cd`). It scopes to the **active document**: `find_doc` replaced the old `find_repo` (which walked up looking for a `.kvc/` directory) and `is_tracked_document` replaced `in_repo` (a folder-prefix test that would have said yes to a *neighbouring* artwork — a different history entirely). Known gap: `find_doc` still requires a `.kvc/` folder beside the document, which a custom store root never creates, so the docker reports such an artwork as untracked; the fix is to ask `kvc` instead. Every installer ships `kvc` beside the app (`kvc.exe`, `/usr/bin/kvc`, `Contents/MacOS/kvc`), and `get_binary_path` auto-finds it on `PATH` and at `%LOCALAPPDATA%\krita-vc\kvc.exe` or `%PROGRAMFILES%\krita-vc\kvc.exe`; the release's `kritavc-plugin.zip` holds only the plugin. Deliberately does not do tracking setup, history browsing/restore, undo, branch merge/delete, or anything remote — those stay desktop-app-only. The engine only sees the disk, Krita's canvas only memory, so the docker moves both ways and **both directions are load-bearing**:
   - **memory → disk** (`_save_tracked`, the tracked `.kra` when modified — `.kra` only, since Krita may raise an export dialog on a `.png` and hang the UI thread it's saving on). Driven by focus entering the docker (`QApplication.focusChanged` — not an event filter; focus lands on child widgets and `FocusIn` won't reach the dock), the ⟳ button, and `_commit_with_message`. Two traps: commit **must `refresh()` between the save and `_selected_paths()`** or it skips the very work just written (a doc clean *before* the save isn't in `_shown_paths`/`checked`); and `_save_tracked` sets `busy` because `doc.save()` spins the event loop, which would let the 1.5s poll `kvc status` a half-written `.kra`.
   - **disk → memory** (`_rebuild_docs`, wrapping switch/discard/stash/pop). Refuses while any open doc is unsaved, then **closes and reopens** each doc whose file changed (mtime/size snapshot — `switch` doesn't report what it rewrote). Drop the reopen and Krita keeps serving the pre-op copy, so the next Ctrl+S silently reverts the operation; drop the refusal and that reopen eats real work — the engine's dirty-tree guard never sees Krita's memory. The reopen sits in a `finally`: a two-step op ("set aside & switch") can fail after its first step rewrote the file, and the error still propagates after the reopen (`test_kvc_client.py` pins it against stub Qt modules).
 
-  Consequence to preserve: auto-save makes that refusal rare, so **Discard's confirm is the only thing standing between the artist and losing saved-but-uncommitted work** — saving isn't committing, and the reopen takes the undo history too. Also: checkbox state lives in `VcDocker.checked`, **not** the widget (the poll rebuilds the list and would wipe a tick mid-edit; the rebuild is skipped when the path list is unchanged). `kvc_client.py` blocks the UI thread by design (see its header). See [`krita-plugin/README.md`](krita-plugin/README.md).
+  Consequence to preserve: auto-save makes that refusal rare, so **Discard's confirm is the only thing standing between the artist and losing saved-but-uncommitted work** — saving isn't committing, and the reopen takes the undo history too. Also: checkbox state lives in `VcDocker.checked`, **not** the widget (the poll rebuilds the list and would wipe a tick mid-edit; the rebuild is skipped when the path list is unchanged). `kvc_client.py` blocks the UI thread by design (see its header) — except the **commit**, which the docker runs through `QProcess` (`_run_kvc_async`, argv from the shared `kvc_client.commit_args`) under its busy state, because `subprocess.run` froze Krita for the whole commit (~3 s at 105 MB); the other writes stay synchronous since the document must be reopened after them anyway. See [`krita-plugin/README.md`](krita-plugin/README.md).
 - **Frontend ↔ backend IPC**: Rust functions annotated `#[tauri::command]` (all 39 live in `commands.rs`, e.g. `list_commits`) are exposed to the frontend and called via `invoke("command_name", { args })` from `@tauri-apps/api/core`. New backend functionality should be added as a `#[tauri::command]` in `commands.rs` and registered in `lib.rs`'s `generate_handler!`. The full list is in [`docs/backend-architecture.md`](docs/backend-architecture.md#tauri-command-reference).
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `dialog:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.
@@ -433,6 +479,14 @@ because timing is per-machine and belongs with the browser, not the repo).
   full-screen, non-dismissible block rendered by `AppShell` alongside the shell (not inside it)
   during any write op (commit, branch switch/merge/create/delete, rollback, undo, cleanup),
   driven by `busyMessage` on the repository context — stops a stray click racing a file rewrite.
+  `SettingsModal`, `RestoreModal`, `OnboardingOverlay` and `TourOverlay` load on first use
+  (`React.lazy` + `Suspense fallback={null}`; the two overlays now mount only while active) — all
+  rare, and it took the startup chunk from 721 to 667 kB. `useStorageStats` is hoisted into
+  `RepoShell` to keep its answer across view switches but **fetches only while the Performance
+  view shows**, and only when path/nonce moved since its answer (`repo_storage_stats` is
+  `run_heavy`; a version records its own `storedBytes` at commit, so the report is a sum over the
+  log — 27 s → 34 ms at 200 versions of a 45,000-tile painting — and only pre-field versions
+  replay manifests).
   `TopBar` doubles as a **custom title bar** (`src-tauri/tauri.conf.json`'s window has
   `decorations: false` by default): when the Settings "Custom title bar" toggle
   (`lib/windowChrome.tsx`, `WindowChromeProvider`/`useWindowChrome`, default on) is active and
@@ -531,8 +585,20 @@ because timing is per-machine and belongs with the browser, not the repo).
   layer's raster comes as SVG `<image>` markup so the SVG-compositing viewer is unchanged, and
   the Composite view uses the `.kra`'s `mergedimage.png` (downscaled to the raster cap via an
   area-average box filter — `raster::box_downscale`, premultiplied-alpha; sharper than the old
-  nearest-neighbour under the viewer's zoom). Capped PNGs are cached content-addressed in
-  `cache/` (keys carry a `box1` filter-version token), so repeat views skip rasterization.
+  nearest-neighbour under the viewer's zoom). A layer's pixels are accumulated **straight into the
+  capped size** (`raster::rasterize_tiles`: the premultiplied box sums from the tiles directly, bit
+  for bit what full canvas + `cap_rgba` gave — a unit test pins it — so no `w×h×4` canvas exists,
+  278 MB per 600 dpi A3 layer; off-grid/overlapping tiles and within-cap layers take the canvas
+  path). Capped PNGs are cached content-addressed in `cache/` (keys carry a `box1` filter-version
+  token), so repeat views skip rasterization; a **hit is a `stat`** (`raster::cache_hit`, LRU touch at
+  most once a day), only callers that need pixels read the file (`LayerRaster::png`). Each layer
+  raster gets a **128 px thumbnail** beside it (`raster::thumb_png`, `LayerDto.beforeThumb`/
+  `afterThumb`) that `LayerStackPanel`'s 36×28 rows use instead of decoding the 2048 px raster; a
+  raster cached before thumbnails gets one made on its next serve. A change mask carries its
+  outline + normalized bbox in PNG `tEXt` chunks (`raster::mask_meta`), so a hit never decodes or
+  retraces it. A Changes refresh parses the working file **once** (`commands::parsed_working`,
+  keyed path+size+mtime+`lowMemoryDiff`: `working_diff` keeps its parse, `working_layers` takes and
+  drops it).
   The viewer has **shared zoom/pan** (`useZoomPan`, wheel-to-cursor zoom + left-drag/middle-mouse pan)
   applied identically to both side-by-side panes and the swipe slider so before/after and the
   slider divider stay pixel-aligned; zoom/pan and the slider drag are rAF-coalesced (one state
@@ -562,22 +628,24 @@ because timing is per-machine and belongs with the browser, not the repo).
   bug `merge.rs` avoids by collecting data files filename-independently. **Region boxes are
   normalized 0..1** of the viewBox (composite tile-bbox and per-layer alike) — `boxOverlay` scales
   by width/height, so a region must not be pre-scaled to
-  pixels or it overflows past the canvas' bottom-right. Palette files (`.gpl`, `.kpl`, `.aco`,
-  `.ase`) have `kind: "palette"` and always render
-  as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
-  `LayerStackPanel` navigator; standalone palettes get their own panel. This route is **not**
+  pixels or it overflows past the canvas' bottom-right. Palettes have `kind: "palette"` and always
+  render as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
+  `LayerStackPanel` navigator (`StandalonePaletteDiff` in `DiffView.tsx` is the unused route for
+  standalone palette files, which aren't tracked). This route is **not**
   Artist Mode gated. The swatch diff is computed **in the backend** (`src-tauri/src/palette.rs`):
   each format is parsed to a flat list of named sRGB swatches (`.gpl` text, `.kpl` = zip +
   `colorset.xml` via roxmltree, `.aco`/`.ase` = hand-rolled big-endian binary readers), then
-  `palette::diff` matches swatches by name (recolor = "modified", not remove+add) and
-  `commands::palette_dto` serializes it as the `Palette` `DiffEntryDto` variant from `commit_diff`/
-  `working_diff`. A malformed palette degrades to a plain text entry. A `.kra` diff also emits a
-  `Palette` entry per **embedded document palette** that changed — Krita stores document palettes
-  as `.kpl` blobs under `<image>/palettes/` inside the archive; `commands::kra_palette_dtos`
+  `palette::diff` matches swatches by name (recolor = "modified", not remove+add). A `.kra` diff
+  emits a `Palette` entry per **embedded document palette** that changed — Krita stores document
+  palettes as `.kpl` blobs under `<image>/palettes/` inside the archive; `commands::kra_palette_dtos`
   enumerates them via `KraSource::palette_entry_names`, skips unchanged ones by content hash, and
-  runs them through the same `palette_dto` (so one `.kra` yields its `Art` entry plus zero-or-more
-  `Palette` entries, keyed `<kra>::<palette-file>`). Generic text files (`kind: "text"`) depend on Artist Mode: `FriendlyFileDiff`
-  (one-line summary) on, `DiffFileBlock` (raw line diff with +/− and line numbers) off. Layer
+  runs them through `commands::palette_dto_from` (so one `.kra` yields its `Art` entry plus
+  zero-or-more `Palette` entries, keyed `<kra>::<palette-file>`; one that parses on neither side is
+  left out). The only `kind: "text"` entries left are a deleted `.kra` or one that couldn't be
+  rasterized, and they render as `FriendlyFileDiff` (one-line summary) in both modes — the backend
+  sends no lines, so the Artist-Mode-off `DiffFileBlock` only ever drew an empty list and was
+  deleted, along with every backend `file:` stream path (`store_change`, `bytes_of`,
+  `file_at_commit`, GC, the standalone-palette arm of `diff_entry`). Layer
   imagery is composited from **inline SVG markup strings** (`src/lib/svgArt.ts` — `layersBody`/
   `wrapSvg`/`compositeSvg`), which is how the backend's base64-PNG rasters render with no raster
   pipeline in the viewer. See [`docs/visual-diff-viewer.md`](docs/visual-diff-viewer.md).
@@ -735,7 +803,7 @@ because timing is per-machine and belongs with the browser, not the repo).
     composite and no per-layer chips deliberately — both need `working_diff`, which is `run_heavy`,
     uncached, and (because the map is mounted for the shell's lifetime, below) would refire on
     every `refreshNonce` bump in every view; the dirty flag instead comes from the shell's single
-    `scan_repository`, which is one `stat`. That scan is **hoisted into `RepoShell`** and passed to
+    `scan_repository`, which is one `stat` (plus one read per save, see `worktree.json`). That scan is **hoisted into `RepoShell`** and passed to
     both `Sidebar` and the map — `Sidebar` isn't mounted in map view, and a second
     `useWorkingChanges` in the always-mounted map would rescan everywhere and race the one
     `setScanning` boolean. It counts as a map citizen for fit-view, the minimap (so its `data`
@@ -756,11 +824,16 @@ because timing is per-machine and belongs with the browser, not the repo).
   viewer does, which already returns exactly what a node needs (`afterImage` = the capped,
   content-addressed `mergedimage.png` as a `kvcimg://` URL, plus `layers[]` with `change`/
   `layerType`) and *not* the expensive per-layer rasters (`with_rasters = false`). So opening a
-  node's drilldown is a `diffCache` hit, not a second round trip. `commit_diff` is `run_heavy`
-  (2 concurrent) and also builds a changed-pixel mask the node discards, so the count of heavy
+  node's drilldown is a `diffCache` hit (300 entries), not a second round trip, and a drilldown
+  opened while the node's own call is still in flight shares it (`diffInflight`). `commit_diff` is
+  `run_heavy` (2 concurrent) and on a cold cache also builds a changed-pixel mask the node discards
+  (warm, the mask's outline/bbox come from its PNG text chunks, no decode), so the count of heavy
   calls is bounded by `onlyRenderVisibleElements` — an off-viewport node isn't mounted, so it
-  never fetches. If that stops being enough the upgrade is a dedicated
-  `commit_thumbnails(path, ids)`; don't reach for it before then.
+  never fetches. Neighbouring nodes share parsed manifests through `kra::load_manifest`'s cache,
+  and a diff loads its parent's manifest once for both the art and palette diffs (`art_diff_dto`
+  takes `old_manifest`): a warm node on a 200-version history went 1.13 s → 0.35 s. If that stops
+  being enough the upgrade is a dedicated `commit_thumbnails(path, ids)`; don't reach for it before
+  then.
   The old **History** and **Branches** tabs are still there but hidden behind Settings →
   Appearance → **"Legacy version history"** (`lib/legacyHistory.tsx`, same context-plus-
   `localStorage` shape as Artist Mode, default **off**). `ActivityBar` filters those two items on

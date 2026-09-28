@@ -86,7 +86,7 @@ commands.rs #[tauri::command]      bin/kvc.rs main()
                      ▼
        RepoLock::acquire(op)    (writes only; both share <store>/kvc.lock)
                      ▼
-       Repo::open / open_light  →  engine function (commit.rs, branch.rs, stash.rs, …)
+       Repo::open / open_light / open_without_log  →  engine function (commit.rs, branch.rs, …)
                      ▼
        Repo::save (atomic *.tmp plus rename)  →  RepoLock dropped (file handle closed)
 ```
@@ -103,13 +103,16 @@ stderr as JSON and a bare Rust backtrace would break it.
 
 `commands.rs`'s `run` and `run_heavy` are the single funnel every Tauri command goes through:
 
-- `run(f)` is `tauri::async_runtime::spawn_blocking(move || cpu::install(f))`. It moves the blocking
-  I/O and CPU work off the async runtime, so the webview stays responsive, and runs it inside the
-  budgeted rayon pool in the same step. Every nested `par_iter` under `f` inherits that pool, which
-  is why the CPU budget covers the whole engine from one call site.
-- `run_heavy(f)` is `run(f)` plus a permit from `cpu::heavy_permit()`, held for the call. Writes and
-  full-document decodes (diffs, layer streams) use it. Cheap reads (`list_commits`, `status`) stay on
-  plain `run`, so they never queue behind a diff.
+- `run(f)` is `tauri::async_runtime::spawn_blocking(f)`: the cheap reads (`list_commits`,
+  `list_branches`, `scan_repository`, the settings), off the async runtime so the webview stays
+  responsive, and deliberately *not* on the budgeted pool. None of them does parallel work, and on a
+  2-core laptop the pool is one worker, which a diff or commit holds for its whole run — so a read
+  queued on it waited out every serial stretch of that job (see
+  [cpu-headroom.md](cpu-headroom.md#its-own-pool)).
+- `run_heavy(f)` is a permit from `cpu::heavy_permit()`, held for the call, plus
+  `spawn_blocking(move || cpu::install(f))`: writes, full-document decodes (diffs, layer streams)
+  and the storage report run inside the budgeted rayon pool. Every nested `par_iter` under `f`
+  inherits that pool, which is why the CPU budget covers the whole engine from one call site.
 
 ## Concurrency model
 
@@ -217,8 +220,8 @@ See [stashes.md](stashes.md#commands) for the details.
 |---------|--------------|
 | `cleanup_repository(path, dryRun)` | Mark-and-sweep GC of everything in this document's store unreachable from any of its branch tips or stashes. Stores share nothing, so the sweep can never reach another painting's history. Victims go to `<store>/trash/` (pruned after 14 days, along with histories a restore replaced and old commit-log copies). `dryRun` reports what would be freed without touching anything. Both refuse with `DamagedHistory` when the walk from a tip reaches a version the log doesn't have, since everything behind that gap would otherwise be swept. |
 | `check_repository(path, scrub)` | The read-only integrity check: missing objects, broken chains, dangling branch tips, versions whose parent is missing, commit-log lines that won't decode, chain shards that won't decode, packs that won't read. Takes no lock and writes nothing; findings come back in the report, not as an error. `scrub` (off by default) also re-hashes every live version's content. |
-| `repo_storage_stats(path)` | The Performance tab's storage figures: stored bytes against a full copy per version (see [performance-report.md](performance-report.md)). |
-| `get_repo_config(path)` | The editable `<store>/config.json` settings (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`), through `Repo::open_light`. |
+| `repo_storage_stats(path)` | The Performance tab's storage figures: stored bytes against a full copy per version (see [performance-report.md](performance-report.md)). On `run_heavy`: versions from before each commit recorded its own `storedBytes` have their manifests replayed. |
+| `get_repo_config(path)` | The editable `<store>/config.json` settings (`cacheMaxBytes`, `tilePixelDeltas`, `lowMemoryDiff`), through `Repo::open_without_log`. |
 | `set_repo_config(path, cacheMaxBytes, tilePixelDeltas, lowMemoryDiff)` | Save those settings through `Repo::save_config`, a config-only write. |
 | `set_cpu_budget(percent)` | Rebuild the engine's worker pool at a new share of the cores (see [cpu-headroom.md](cpu-headroom.md)). |
 
@@ -251,7 +254,10 @@ map (a repeated flag would overwrite) and paths can contain commas. Leaving a li
 | `check` | `--repo [--scrub true]` | none (read) |
 
 `status` returns the changes, the current `branch`, the full `branches` list (so the plugin's poll
-needs one process per tick, not two), a `stashes` count and the tracked `document`. `stash-list`
+needs one process per tick, not two), a `stashes` count, the tracked `document`, and its `store`
+path, which lets the plugin skip the spawn altogether while the document and the store's
+`index.json`, `branches.json` and `stashes.json` are unchanged. `status`, `branches` and
+`stash-list` open the store without reading `commits.log` (`Repo::open_without_log`). `stash-list`
 reuses `commands::stash_dtos` for its newest-first order, which the plugin's "Bring back latest"
 relies on. `check` reports problems as a successful run; `{"error": …}` means the check itself
 failed. `create_branch_at` is deliberately not exposed, because the plugin has no version picker.
@@ -290,8 +296,9 @@ licensed; there's no GPL or other copyleft dependency in the tree.
 | [tokio](https://github.com/tokio-rs/tokio) | 1.52.3 | MIT | The `sync` feature only, for the heavy-operation `Semaphore` (the async runtime is Tauri's) |
 | [windows-sys](https://github.com/microsoft/windows-rs) | 0.59.0 | MIT OR Apache-2.0 | Windows only: thread and process priority, the free-space check, and hiding the `.kvc` container |
 
-Dev-only (tests and benchmarks, not shipped): `tempfile` (3.27.0, MIT OR Apache-2.0), plus `zip`,
-`serde_json`, `bincode` and `zstd` again, for building test fixtures such as legacy chain files.
+Dev-only (tests and benchmarks, not shipped): `tempfile` (3.27.0, MIT OR Apache-2.0). The
+integration tests also use the normal dependencies above (`zip`, `serde_json`, `bincode`, `zstd`,
+`blake3`) to build fixtures such as a chain shard in an older layout.
 
 ### Frontend-side Tauri packages
 

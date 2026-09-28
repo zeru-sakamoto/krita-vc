@@ -46,7 +46,12 @@ MANIFEST.json
 Each folder is the single-document on-disk shape, so plain extraction still produces tracked
 paintings (with the caveat under [Restoring](#restoring)). `skip_in_backup` leaves out `cache/`
 (regenerable, and budgeted at 256 MB per store, the largest disposable chunk), `trash/`,
-`kvc.lock*` and `*.tmp`.
+`kvc.lock*`, `worktree.json` (the scan's cache of the saved file's hash) and `*.tmp`.
+
+The `.kra` (already a zip) and the store's objects, packs and chain shards (already zstd) are stored
+in the archive as they are; only the JSON state files and logs are deflated. Every file streams from
+its handle into the archive rather than being read whole first. Deflating everything at level 6 was
+7.2 s of a 7.6 s backup of a 105 MB painting and its store, for an archive 13% smaller.
 
 A backup that hasn't been checked isn't a backup. `MANIFEST.json` is versioned and records, per
 painting, its folder, document, original directory, branch and tip commit, plus a timestamp and the
@@ -113,9 +118,12 @@ set-aside confirms are siblings of `SettingsModal`).
   is 3 ahead" rather than noise.
 - Both sides are scoped to their own branch tip, the same default scope as `list_commits`, so the
   two counts mean the same thing. `Repo::backup_versions` reads `commits.log` straight out of the
-  zip, finding it by shape (`<dir>/.kvc/<slug>/commits.log`; the slug is payload, as everywhere else),
-  through the shared `parse_commit_log`, scoped to the manifest's `tipCommit` with
-  `commit::ancestors`. The comparison opens the local side with `open_light`. Nothing is extracted.
+  zip, finding it by shape (`<dir>/.kvc/<slug>/commits.log`; the slug is payload, as everywhere else)
+  among the names the central directory already holds in memory, rather than opening every entry to
+  read its name, then parses it through the shared `parse_commit_log`, scoped to the manifest's
+  `tipCommit` with `commit::ancestors`. The comparison opens the local side with `open_light`.
+  Nothing is extracted. Unpacking a store on import filters entries by name the same way, so only
+  that painting's entries are opened.
 
 ### Where restored history goes
 

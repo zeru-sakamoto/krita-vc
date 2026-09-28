@@ -18,10 +18,10 @@ stores older than stashing.
 
 Storage is borrowed entirely from the commit path. `commit::store_change`, shared with
 `commit_selected`, stores each changed file through the same relpath-keyed streams a commit uses
-(`kra:{rel}:*`, or `file:{rel}` for anything that isn't a `.kra`). So a stashed `.kra` dedups its
-unchanged tiles against committed history, and setting aside a lightly edited painting costs almost
-nothing. It also means `gc.rs` marks a stash's content with the same walk it uses for commits, and
-`commit::bytes_of` restores it with no new code. Stashes are GC roots: nothing in `commits.log`
+(`kra:{rel}:*`). So a stashed `.kra` dedups its unchanged tiles against committed history, and
+setting aside a lightly edited painting costs almost nothing. It also means `gc.rs` marks a stash's
+content with the same walk it uses for commits, and the commit path's restore
+(`commit::write_committed`) writes it back with no new code. Stashes are GC roots: nothing in `commits.log`
 refers to them, so without that rule "Clean up storage" would collect the shelf.
 
 ## Three orderings that matter
@@ -51,9 +51,9 @@ Each of these has a test that fails without it.
   record. Popping onto a different branch is allowed: `branch` is recorded for display only and
   nothing is ever looked up by it, so a stash outlives the branch it came from.
 - **Drop and drop all** (`stash::drop_one`, `drop_all`). Take a stash off the shelf without
-  restoring it. These run on an `open_light` repo, so they must use `save_stashes()` and never
-  `save()`, which would rewrite the index and commit log from partial state (the same hazard
-  documented on `save_branches`). The content stays until the next "Clean up storage".
+  restoring it. They write `stashes.json` alone (`save_stashes()`), never the full `save()`, the
+  same narrow flush `save_branches` gives branch edits. The content stays until the next "Clean up
+  storage".
 
 ## Conflicts when bringing work back
 
@@ -67,8 +67,23 @@ A conflict is a stashed path that has been edited since it was set aside.
   work. Overwriting either would destroy the current work with no way back. The error's stable
   `"stash conflict"` prefix is distinct from the branch commands' `"unsaved changes"` prefix, and
   the frontend and the plugin both match on it.
-- The bytes for every file are computed before the first write, so a merge that can't be done
-  cleanly (`MergeFailed`) leaves both the working tree and the stash untouched.
+- Every file's inputs (the set-aside version and the merge's ancestor) are gathered before the
+  first write, and the result, merged or plain, is built straight into the temp file beside the
+  artwork (`merge::merge_layers_into`, `commit::write_committed`) rather than held whole in memory.
+  A merge that can't be done cleanly (`MergeFailed`) fails there and deletes its temp, so the
+  working tree and the stash stay untouched. That's all-or-nothing because a store tracks one
+  document, so a stash holds at most one file.
+- The merge's ancestor is rebuilt from only what `merge_layers` compares against it: `maindoc.xml`
+  and the data files of the top-level layers the set-aside version also has
+  (`stash::merge_ancestor`, via `merge::shared_layer_files`), not the whole committed document. The
+  merged archive raw-copies every entry but `maindoc.xml` (compressed bytes, crc32 and size carried
+  over), where it used to inflate and deflate the whole painting again at level 6. Bringing set-aside
+  work back onto an edited 105 MB painting went from 15.8 s to about 6 s, and its peak memory from
+  624 MB to 440 MB: the merged output, bigger than any of its inputs, now goes straight to the temp
+  file, and the ancestor's decompressed layers are let go before the repack. The set-aside version,
+  the working file and the ancestor are still whole documents in memory while it runs, and when the
+  set-aside version shares every layer with the ancestor, as it usually does, the ancestor subset is
+  nearly the whole painting anyway.
 
 No frontend or CLI change was needed for merging: a merged pop returns normally through `pop_stash`
 or `kvc stash-pop`, so the ordinary "brought back" path applies, and the artist sees the merged

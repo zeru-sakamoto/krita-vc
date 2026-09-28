@@ -561,3 +561,62 @@ fn a_partial_version_still_has_a_composite_for_the_map() {
         "a partial version must still get a composite, or its Version Map node is blank"
     );
 }
+
+/// The compressed bytes of one archive entry, with its method, crc32 and size.
+fn raw_entry(kra_bytes: &[u8], entry: &str) -> (zip::CompressionMethod, u32, u64, Vec<u8>) {
+    use std::io::Read;
+    let mut za = zip::ZipArchive::new(std::io::Cursor::new(kra_bytes)).unwrap();
+    let i = za.index_for_name(entry).unwrap();
+    let mut f = za.by_index_raw(i).unwrap();
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).unwrap();
+    (f.compression(), f.crc32(), f.size(), data)
+}
+
+/// Every entry the synthesized archive takes from an archive as it is — ticked layers and the
+/// rest of the document from the working file, reverted layers from the committed version — is
+/// raw-copied: the same compressed bytes, method, crc32 and size, never inflated and deflated
+/// again (961 ms of a partial commit on a 105 MB painting, against 35 ms for the copy).
+#[test]
+fn kept_entries_are_copied_compressed() {
+    // Stored rather than deflated on the way in, so a re-deflate would show.
+    let stored = |entries: &[(&str, Vec<u8>)]| {
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for (name, data) in entries {
+                zw.start_file(
+                    *name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        out
+    };
+    let doc = |bg: &[u8], lines: &[u8], opacity: i64| {
+        stored(&[
+            ("mimetype", b"application/x-krita".to_vec()),
+            ("maindoc.xml", common::maindoc_layered(opacity, opacity)),
+            ("img/layers/layer1", tiled(&[(0, 0, bg)])),
+            ("img/layers/layer2", tiled(&[(0, 0, lines)])),
+            ("annotations/icc", vec![7u8; 4096]),
+        ])
+    };
+    let committed = doc(&[1u8; 3000], &[2u8; 3000], 10);
+    let working = doc(&[3u8; 3000], &[4u8; 3000], 20);
+
+    let out = stage::stage_kra(&working, &committed, &keep(&[LINES])).unwrap();
+    for (entry, from) in [
+        ("img/layers/layer2", &working),
+        ("annotations/icc", &working),
+        ("mimetype", &working),
+        ("img/layers/layer1", &committed),
+    ] {
+        assert_eq!(raw_entry(&out, entry), raw_entry(from, entry), "{entry}");
+    }
+}

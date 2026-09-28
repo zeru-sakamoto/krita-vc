@@ -1,11 +1,12 @@
-//! Commit orchestration and file restoration. `commit_snapshot` scans the working tree,
-//! routes each change through the .kra engine or the generic blob store, records a commit,
-//! and flushes state. `file_at_commit` rebuilds a file's exact bytes from any commit.
+//! Commit orchestration and file restoration. `commit_snapshot` scans the working tree, stores
+//! each change through the .kra engine, records a commit, and flushes state. `file_at_commit`
+//! rebuilds a file's exact bytes from any commit.
 
 use crate::error::{io_at, KvcError, Result};
 use crate::repo::{hash_bytes, safe_join, Commit, CommittedFile, Repo, TrackedFile};
 use crate::{kra, scan};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 /// Commit every working-tree change. Returns the new commit (or `Nothing` if clean).
 pub fn commit_snapshot(repo: &mut Repo, message: &str, author: &str) -> Result<Commit> {
@@ -52,6 +53,8 @@ pub fn commit_selected(
     // No free-space precheck here: a commit writes only the objects that changed, often a few
     // MB of a 1 GB painting, so it's sized where those are known (`commit_prepared_batch`).
 
+    // Counted as objects are written, for the storage report (`Commit::stored_bytes`).
+    repo.added_bytes = 0;
     let mut files = Vec::new();
     for change in changes {
         let rel = change.rel.clone();
@@ -101,6 +104,7 @@ pub fn commit_selected(
         branch: repo.branches.current.clone(),
         files,
         restored_from: None,
+        stored_bytes: Some(repo.added_bytes),
     };
     repo.commits.push(commit.clone());
     repo.branches.set_tip(&id);
@@ -215,18 +219,13 @@ pub(crate) fn store_change(
         Some(b) => b,
         None => std::fs::read(&abs).map_err(|e| io_at(&abs, e))?,
     };
-    let is_kra = rel.to_lowercase().ends_with(".kra");
-
-    let content = if is_kra {
-        let prev = prev_tree
-            .get(&rel)
-            .filter(|f| f.is_kra)
-            .and_then(|f| f.content.as_deref())
-            .and_then(|h| kra::load_manifest(repo, &rel, h).ok());
-        kra::commit_kra(repo, &rel, &bytes, prev.as_ref())?
-    } else {
-        repo.store_stream(&format!("file:{rel}"), &bytes)?
-    };
+    // A store tracks one `.kra` (`Repo::init` refuses anything else), so every change is one.
+    let is_kra = true;
+    let prev = prev_tree
+        .get(&rel)
+        .and_then(|f| f.content.as_deref())
+        .and_then(|h| kra::load_manifest(repo, &rel, h).ok());
+    let content = kra::commit_kra(repo, &rel, &bytes, prev.as_deref())?;
     drop(bytes);
 
     // On a partial (layer-subset) commit the committed content is *not* what's on disk, so the
@@ -270,6 +269,11 @@ pub(crate) fn store_change(
 
 /// Reconstruct the exact bytes of `relpath` as recorded in commit `commit_id`.
 pub fn file_at_commit(repo: &Repo, relpath: &str, commit_id: &str) -> Result<Vec<u8>> {
+    kra::reconstruct_kra(repo, relpath, content_at_commit(repo, relpath, commit_id)?)
+}
+
+/// The content (manifest) hash `relpath` had in commit `commit_id`.
+pub fn content_at_commit<'a>(repo: &'a Repo, relpath: &str, commit_id: &str) -> Result<&'a str> {
     let commit = repo
         .commits
         .iter()
@@ -280,16 +284,9 @@ pub fn file_at_commit(repo: &Repo, relpath: &str, commit_id: &str) -> Result<Vec
         .iter()
         .find(|f| f.path == relpath)
         .ok_or_else(|| KvcError::NotTracked(relpath.to_string()))?;
-    let content = file
-        .content
-        .as_ref()
-        .ok_or_else(|| KvcError::NotTracked(format!("{relpath} (deleted in this commit)")))?;
-
-    if file.is_kra {
-        kra::reconstruct_kra(repo, relpath, content)
-    } else {
-        repo.reconstruct(&format!("file:{relpath}"), content)
-    }
+    file.content
+        .as_deref()
+        .ok_or_else(|| KvcError::NotTracked(format!("{relpath} (deleted in this commit)")))
 }
 
 /// Effective tree state (path -> committed entry) as of `commit_id`, or `None` if unknown.
@@ -349,63 +346,56 @@ pub fn current_tree(repo: &Repo) -> BTreeMap<String, CommittedFile> {
         .unwrap_or_default()
 }
 
-/// Reconstruct a committed file's exact bytes from its stored entry (kra manifest or blob),
-/// plus the blake3 of those bytes for the index. A generic blob's stream hash *is* blake3 of
-/// its exact bytes (write-time verified), so only a rebuilt `.kra` pays a hash pass.
-pub(crate) fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
-    let content = f
-        .content
+/// The content (manifest) hash a committed file entry records.
+fn content_of(f: &CommittedFile) -> Result<&str> {
+    f.content
         .as_deref()
-        .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))?;
-    if f.is_kra {
-        kra::reconstruct_kra(repo, &f.path, content)
-    } else {
-        repo.reconstruct(&format!("file:{}", f.path), content)
-    }
+        .ok_or_else(|| KvcError::NotTracked(format!("{} (no content)", f.path)))
 }
 
-/// [`bytes_of`] plus the file hash, for the callers that record one in the index.
-///
-/// Split out because the hash is a full blake3 pass over the rebuilt document — hundreds of MB on
-/// a real painting — and three of the five callers were throwing it away, the staging path on the
-/// commit hot loop among them.
-fn bytes_and_hash_of(repo: &Repo, f: &CommittedFile) -> Result<(Vec<u8>, String)> {
-    let bytes = bytes_of(repo, f)?;
-    // A `.kra`'s stored `content` is its *manifest* hash, not the archive's, so it has to be
-    // hashed; a plain file's content hash already is the blake3 of these bytes.
-    let hash = match (f.is_kra, f.content.as_deref()) {
-        (false, Some(c)) => c.to_string(),
-        _ => hash_bytes(&bytes),
-    };
-    Ok((bytes, hash))
+/// Reconstruct a committed file's exact bytes from its manifest.
+pub(crate) fn bytes_of(repo: &Repo, f: &CommittedFile) -> Result<Vec<u8>> {
+    kra::reconstruct_kra(repo, &f.path, content_of(f)?)
 }
 
-/// Reconstruct `target`'s bytes for one file, incrementally when possible: for a `.kra` whose
+/// Rebuild a committed file straight into `abs` (atomically, never held whole in memory) and
+/// return the blake3 of what landed, for the index — a `.kra`'s stored `content` is its manifest's
+/// hash, not the archive's.
+pub(crate) fn write_committed(repo: &Repo, f: &CommittedFile, abs: &Path) -> Result<String> {
+    let content = content_of(f)?;
+    crate::repo::write_file_atomic_with(abs, |out| {
+        kra::write_kra(repo, &f.path, content, out)?;
+        Ok(())
+    })
+}
+
+/// Write `target`'s bytes for one file into `abs`, incrementally when possible: for a `.kra` whose
 /// current committed version is on disk (materialize runs only on a clean tree), unchanged
 /// entries/tiles are lifted straight from the working file instead of replayed from the object
-/// store ([`kra::materialize_kra`]). Any failure falls back to the full store rebuild.
-fn restore_bytes(
+/// store ([`kra::materialize_kra_into`]). Any failure falls back to the full store rebuild — the
+/// failed attempt's temp is gone by then and the working file untouched. Returns the new file's
+/// hash.
+fn write_restored(
     repo: &Repo,
     target: &CommittedFile,
     current: Option<&CommittedFile>,
-) -> Result<(Vec<u8>, String)> {
-    if target.is_kra {
-        if let (Some(th), Some(ch)) = (
-            target.content.as_deref(),
-            current
-                .filter(|c| c.is_kra)
-                .and_then(|c| c.content.as_deref()),
-        ) {
-            let working_path = safe_join(&repo.root, &target.path)?;
-            if let Ok(working) = std::fs::read(&working_path) {
-                if let Ok(bytes) = kra::materialize_kra(repo, &target.path, th, ch, &working) {
-                    let hash = hash_bytes(&bytes);
-                    return Ok((bytes, hash));
-                }
-            }
+    abs: &Path,
+) -> Result<String> {
+    if let (Some(th), Some(ch)) = (
+        target.content.as_deref(),
+        current.and_then(|c| c.content.as_deref()),
+    ) {
+        let incremental = crate::repo::write_file_atomic_with(abs, |out| {
+            // Read through a handle that closes before the temp is renamed over the file.
+            let working = std::fs::File::open(abs).map_err(|e| io_at(abs, e))?;
+            kra::materialize_kra_into(repo, &target.path, th, ch, working, out)?;
+            Ok(())
+        });
+        if let Ok(hash) = incremental {
+            return Ok(hash);
         }
     }
-    bytes_and_hash_of(repo, target)
+    write_committed(repo, target, abs)
 }
 
 /// Make the working tree **and index** match `target`, rewriting only files whose committed
@@ -434,12 +424,11 @@ pub fn materialize_tree(
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
         let abs = safe_join(&repo.root, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        crate::repo::write_file_atomic(&abs, &bytes)?;
+        let hash = write_restored(repo, f, current.get(path), &abs)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
@@ -504,12 +493,11 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         if current.get(path).map(|c| &c.content) == Some(&f.content) {
             continue;
         }
-        let (bytes, hash) = restore_bytes(repo, f, current.get(path))?;
         let abs = safe_join(&repo.root, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        crate::repo::write_file_atomic(&abs, &bytes)?;
+        let hash = write_restored(repo, f, current.get(path), &abs)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
@@ -582,6 +570,8 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
         branch: repo.branches.current.clone(),
         files,
         restored_from: Some(commit_id.to_string()),
+        // Everything a rollback records is already stored.
+        stored_bytes: Some(0),
     };
     repo.commits.push(commit.clone());
     repo.branches.set_tip(&id);
@@ -596,7 +586,7 @@ pub fn rollback_to_commit(repo: &mut Repo, commit_id: &str, author: &str) -> Res
 ///
 /// Uses the real on-disk scan ([`scan::scan_detailed`]), unlike `current_tree` above which is
 /// derived from committed history and would trivially equal `tip_id`'s own tree. Rewrites go
-/// through [`bytes_of`] (full store rebuild), not the incremental [`restore_bytes`] path — that
+/// through [`write_committed`] (full store rebuild), not the incremental [`write_restored`] path — that
 /// path trusts the on-disk file as a diff base, which doesn't hold for the dirty file being
 /// discarded.
 pub fn discard_working_changes(
@@ -635,11 +625,10 @@ pub fn discard_working_changes(
         let f = target
             .get(&change.rel)
             .ok_or_else(|| KvcError::NotTracked(change.rel.clone()))?;
-        let (bytes, hash) = bytes_and_hash_of(repo, f)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        crate::repo::write_file_atomic(&abs, &bytes)?;
+        let hash = write_committed(repo, f, &abs)?;
         let (size, mtime) = std::fs::metadata(&abs)
             .map(|m| crate::repo::size_mtime(&m))
             .unwrap_or((0, 0));
@@ -750,14 +739,11 @@ pub fn undo_last_commit(repo: &mut Repo) -> Result<Option<Commit>> {
     }
     for pf in restores {
         // The hash the index needs is blake3 of the file as it sat on disk at the new tip:
-        // recorded in `file_hash` since that field existed; a non-kra's `content` is already
-        // that hash; only old .kra records pay the full reconstruct-to-hash fallback.
-        let hash = if let Some(h) = &pf.file_hash {
-            h.clone()
-        } else if !pf.is_kra {
-            pf.content.clone().expect("restores keep content")
-        } else {
-            bytes_and_hash_of(repo, &pf)?.1
+        // recorded in `file_hash` since that field existed; only older records pay the full
+        // reconstruct-to-hash fallback.
+        let hash = match &pf.file_hash {
+            Some(h) => h.clone(),
+            None => hash_bytes(&bytes_of(repo, &pf)?),
         };
         // size/mtime left 0: the working-tree file is untouched by a soft undo, so its real mtime
         // is unknown here — 0 never matches, forcing the next scan to re-hash (correct, conservative).
@@ -794,7 +780,16 @@ pub(crate) fn commit_id(
     parents: &[String],
     files: &[CommittedFile],
 ) -> String {
-    let mut seed = format!("{timestamp}\n{message}\n{}\n", parents.join(","));
+    record_id(
+        &format!("{timestamp}\n{message}\n{}\n", parents.join(",")),
+        files,
+    )
+}
+
+/// A 12-hex id for a record: `head` (what tells it apart — a commit's time, message and parents)
+/// followed by every file's path and content hash. Commits and stashes both use it.
+pub(crate) fn record_id(head: &str, files: &[CommittedFile]) -> String {
+    let mut seed = head.to_string();
     for f in files {
         seed.push_str(&format!(
             "{}:{}\n",

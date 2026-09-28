@@ -1,5 +1,5 @@
 //! Content-addressed delta-chain storage. A "stream" is any versioned byte sequence
-//! (a generic file, a .kra manifest, a layer entry, or a single tile). Each new version
+//! (a .kra manifest, an archive entry, or a single tile). Each new version
 //! is stored either as a full zstd snapshot or a bsdiff patch against the previous head;
 //! a configurable threshold caps consecutive patches so restores stay fast.
 
@@ -31,6 +31,10 @@ impl Prepared {
         }
     }
 }
+
+/// Longest patch chain a `.kra` manifest stream may grow before a full snapshot — see
+/// [`Repo::prepare_stream_opts`].
+pub const MANIFEST_CHAIN_MAX: usize = 5;
 
 /// Per-stream storage knobs. `zstd_level` applies to full snapshots; `patch_floor` is the
 /// minimum byte size for bsdiff patching (streams below it always store as fulls).
@@ -88,7 +92,16 @@ impl Repo {
         opts: StoreOpts,
     ) -> Result<Prepared> {
         let hash = hash_bytes(bytes);
-        let max = self.config.delta_chain_max;
+        // A manifest is a multi-megabyte JSON that every diff, restore and commit loads, and a
+        // load replays every patch back to the last full snapshot: at the default 20 that was
+        // 250 ms a load on a long history, three loads per Version Map node. Five caps a load at
+        // five patches, for a full snapshot (a few MB compressed) every five versions instead of
+        // every twenty — small next to the tiles a version stores.
+        let max = if key.ends_with(":manifest") {
+            self.config.delta_chain_max.min(MANIFEST_CHAIN_MAX)
+        } else {
+            self.config.delta_chain_max
+        };
 
         let (dedup, head) = match self.chains.chain(key) {
             Some(v) => (v.iter().any(|x| x.hash == hash), v.last().cloned()),
@@ -168,6 +181,7 @@ impl Repo {
             Prepared::New { version, object } => {
                 if !self.object_exists(&object.0) {
                     write_loose(&self.objects_dir(), &object.0, &object.1)?;
+                    self.added_bytes += object.1.len() as u64;
                 }
                 Ok(self.push_version(key.to_string(), version))
             }
@@ -199,20 +213,17 @@ impl Repo {
             .filter(|o| seen.insert(o.0.as_str()))
             .collect();
         // Existence probes in parallel (thousands of serial stats hurt on cold HDDs), cheapest
-        // first: the in-memory pack index, then the sharded loose path, then the legacy flat one.
+        // first: the in-memory pack index, then the loose path.
         let pack_index = self.packs.index(&objects);
         let new_objs: Vec<&(String, Vec<u8>)> = candidates
             .into_par_iter()
-            .filter(|o| {
-                !pack_index.contains_key(&o.0)
-                    && !objects.join(&o.0[..2]).join(&o.0).exists()
-                    && !objects.join(&o.0).exists()
-            })
+            .filter(|o| !pack_index.contains_key(&o.0) && !loose_path(&objects, &o.0).exists())
             .collect();
 
         // What this commit actually adds — usually a few MB, however large the painting.
         let adding: u64 = new_objs.iter().map(|o| o.1.len() as u64).sum();
         crate::diskspace::check_available(&self.store, adding)?;
+        self.added_bytes += adding;
         if new_objs.len() >= PACK_MIN_OBJECTS {
             self.packs.write_pack(&objects, &new_objs)?;
         } else {
@@ -229,19 +240,19 @@ impl Repo {
             .collect())
     }
 
-    /// Whether `name` already exists in the store, loose (sharded or legacy flat) or packed.
+    /// Whether `name` already exists in the store, packed or loose.
     pub(crate) fn object_exists(&self, name: &str) -> bool {
         let objects = self.objects_dir();
-        objects.join(&name[..2]).join(name).exists()
-            || objects.join(name).exists()
-            || self.packs.contains(&objects, name)
+        self.packs.contains(&objects, name) || loose_path(&objects, name).exists()
     }
 
-    /// Read an object's raw bytes: loose sharded, legacy flat, then packs.
+    /// Read an object's raw bytes. Packs first: any commit of 32 or more new objects is one, so
+    /// after the first commit nearly every tile lives in a pack, and asking the in-memory index
+    /// costs nothing — probing the loose path first cost a failed file open per packed read.
     fn read_object_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let objects = self.objects_dir();
-        match read_loose(&objects, name) {
-            Err(KvcError::MissingObject(_)) => self.packs.read(&objects, name),
+        match self.packs.read(&objects, name) {
+            Err(KvcError::MissingObject(_)) => read_loose(&objects, name),
             other => other,
         }
     }
@@ -407,13 +418,17 @@ pub(crate) fn looks_compressed(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
 }
 
-/// Content-addressed loose write into a 256-way sharded layout (`objects/<hash[..2]>/<name>`) —
-/// a flat directory with 100k+ tiny files degrades NTFS lookups and amplifies Defender scans.
-/// Names are hashes, so an existing file (sharded or legacy flat) is identical — skip it.
+/// Where a loose object lives: a 256-way sharded layout (`objects/<hash[..2]>/<name>`) — a flat
+/// directory with 100k+ tiny files degrades NTFS lookups and amplifies Defender scans.
+fn loose_path(objects: &Path, name: &str) -> std::path::PathBuf {
+    objects.join(&name[..2]).join(name)
+}
+
+/// Content-addressed loose write. Names are hashes, so an existing file is identical — skip it.
 pub(crate) fn write_loose(objects: &Path, name: &str, data: &[u8]) -> Result<()> {
+    let path = loose_path(objects, name);
     let dir = objects.join(&name[..2]);
-    let path = dir.join(name);
-    if path.exists() || objects.join(name).exists() {
+    if path.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
@@ -440,24 +455,16 @@ pub(crate) fn write_loose(objects: &Path, name: &str, data: &[u8]) -> Result<()>
     Ok(())
 }
 
-/// Read a loose object, preferring the sharded path; repos from before sharding keep their flat
-/// objects readable forever (no migration needed — content-addressed files never change).
+/// Read a loose object.
 fn read_loose(objects: &Path, name: &str) -> Result<Vec<u8>> {
-    let sharded = objects.join(&name[..2]).join(name);
-    match std::fs::read(&sharded) {
-        Ok(bytes) => Ok(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let flat = objects.join(name);
-            std::fs::read(&flat).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    KvcError::MissingObject(name.to_string())
-                } else {
-                    io_at(&flat, e)
-                }
-            })
+    let path = loose_path(objects, name);
+    std::fs::read(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            KvcError::MissingObject(name.to_string())
+        } else {
+            io_at(&path, e)
         }
-        Err(e) => Err(io_at(&sharded, e)),
-    }
+    })
 }
 
 // --- pack files ---------------------------------------------------------------------------
@@ -469,22 +476,30 @@ fn read_loose(objects: &Path, name: &str) -> Result<Vec<u8>> {
 // `body_len` is a self-check: it lets a truncated pack (interrupted copy, bad backup restore)
 // be recognized as corrupt at header-parse time instead of surfacing as garbage bytes — or a
 // `MissingObject` for every entry after it — when something later tries to read out of it.
-// `KVCP1` (no body length) is still read as before, unchecked — old packs are never rewritten.
 
 /// Batches below this stay loose — dedup behavior stays file-observable for small commits and
 /// tests, and a pack of three tiles wouldn't pay for its indirection.
 pub const PACK_MIN_OBJECTS: usize = 32;
 
-const PACK_MAGIC: &[u8; 5] = b"KVCP1";
-const PACK_MAGIC_V2: &[u8; 5] = b"KVCP2";
+const PACK_MAGIC: &[u8; 5] = b"KVCP2";
 
 pub(crate) fn pack_dir(objects: &Path) -> std::path::PathBuf {
     objects.join("pack")
 }
 
-type PackIndex = std::collections::HashMap<String, (std::path::PathBuf, u64, u32)>;
+/// One pack, open for reading. Every object read out of it goes through this one handle,
+/// positionally (`FileExt`'s positional reads share no cursor, so parallel reads are fine):
+/// reopening the pack per object was 42 µs of a packed read's 88 µs. Held only as long as the
+/// `Repo` whose index holds it; Rust opens files with delete sharing on Windows, so a cleanup can
+/// still move a pack aside while one is open.
+pub(crate) struct PackFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
 
-/// Lazily-loaded index over every pack file: object name -> (pack path, absolute offset, len).
+type PackIndex = std::collections::HashMap<String, (std::sync::Arc<PackFile>, u64, u32)>;
+
+/// Lazily-loaded index over every pack file: object name -> (pack, absolute offset, len).
 /// Interior mutability so reconstruct paths can fault it in from behind `&Repo` (rayon included).
 /// The index is handed out as an `Arc` snapshot so parallel lookups (dedup filter, tile
 /// reconstructs) never hold the mutex during their probes.
@@ -515,12 +530,12 @@ impl Packs {
     }
 
     pub(crate) fn read(&self, objects: &Path, name: &str) -> Result<Vec<u8>> {
-        let (path, off, len) = self
+        let (pack, off, len) = self
             .index(objects)
             .get(name)
             .cloned()
             .ok_or_else(|| KvcError::MissingObject(name.to_string()))?;
-        read_exact_at(&path, off, len as usize)
+        read_exact_at(&pack.file, &pack.path, off, len as usize)
     }
 
     /// Write `objs` as one pack file and register its entries in the loaded index.
@@ -557,7 +572,7 @@ impl Packs {
             {
                 let file = std::fs::File::create(&tmp).map_err(at_tmp)?;
                 let mut w = std::io::BufWriter::new(file);
-                w.write_all(PACK_MAGIC_V2).map_err(at_tmp)?;
+                w.write_all(PACK_MAGIC).map_err(at_tmp)?;
                 w.write_all(&too_big(idx_bytes.len())?.to_le_bytes())
                     .map_err(at_tmp)?;
                 w.write_all(&idx_bytes).map_err(at_tmp)?;
@@ -579,20 +594,25 @@ impl Packs {
         // copy-on-writes if a reader still holds a snapshot Arc (stale snapshots are safe:
         // they just miss the objects this pack added, same as before it was written).
         let payload_base = (PACK_MAGIC.len() + 4 + idx_bytes.len() + 8) as u64;
+        let pack = std::sync::Arc::new(PackFile {
+            file: std::fs::File::open(&path).map_err(|e| io_at(&path, e))?,
+            path,
+        });
         {
             let mut guard = self.0.lock().unwrap();
             let arc = guard.get_or_insert_with(|| std::sync::Arc::new(load_pack_indexes(objects)));
             let idx = std::sync::Arc::make_mut(arc);
             for (name, off, len) in index {
-                idx.insert(name, (path.clone(), payload_base + off, len));
+                idx.insert(name, (pack.clone(), payload_base + off, len));
             }
         }
         Ok(())
     }
 }
 
-/// Scan `objects/pack/*.pack` headers into one name -> location map. Corrupt or truncated
-/// packs are skipped (their objects then read as missing, surfacing as `MissingObject`).
+/// Scan `objects/pack/*.pack` headers into one name -> location map, keeping each pack open for
+/// the reads to come. Corrupt or truncated packs are skipped (their objects then read as missing,
+/// surfacing as `MissingObject`).
 fn load_pack_indexes(objects: &Path) -> PackIndex {
     let mut map = PackIndex::new();
     let Ok(rd) = std::fs::read_dir(pack_dir(objects)) else {
@@ -603,30 +623,35 @@ fn load_pack_indexes(objects: &Path) -> PackIndex {
         if path.extension().is_none_or(|x| x != "pack") {
             continue;
         }
-        let Some(entries) = read_pack_header(&path) else {
+        let Ok(mut file) = std::fs::File::open(&path) else {
             continue;
         };
+        let Some(entries) = pack_header(&mut file) else {
+            continue;
+        };
+        let pack = std::sync::Arc::new(PackFile { path, file });
         for (name, off, len) in entries {
-            map.insert(name, (path.clone(), off, len));
+            map.insert(name, (pack.clone(), off, len));
         }
     }
     map
 }
 
-/// Parse one pack's header, returning entries with **absolute** file offsets. `KVCP2` packs
-/// additionally get their declared body length checked against the file's real length — a
-/// truncated pack is rejected here (skipped, same as any other unparseable header) rather than
-/// surfacing later as `MissingObject`/garbage bytes for whatever it happened to still contain.
+/// Parse one pack's header, returning entries with **absolute** file offsets. The declared body
+/// length is checked against the file's real length — a truncated pack is rejected here (skipped,
+/// same as any other unparseable header) rather than surfacing later as `MissingObject`/garbage
+/// bytes for whatever it happened to still contain.
 pub(crate) fn read_pack_header(path: &Path) -> Option<Vec<(String, u64, u32)>> {
+    pack_header(&mut std::fs::File::open(path).ok()?)
+}
+
+fn pack_header(f: &mut std::fs::File) -> Option<Vec<(String, u64, u32)>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 9];
     f.read_exact(&mut head).ok()?;
-    let v2 = match &head[..5] {
-        m if m == PACK_MAGIC => false,
-        m if m == PACK_MAGIC_V2 => true,
-        _ => return None,
-    };
+    if &head[..5] != PACK_MAGIC {
+        return None;
+    }
     let idx_len = u32::from_le_bytes(head[5..9].try_into().unwrap()) as usize;
     let file_len = f.metadata().ok()?.len();
     // A corrupt header could claim a multi-GB index; the index bytes live in this same file, so
@@ -638,30 +663,30 @@ pub(crate) fn read_pack_header(path: &Path) -> Option<Vec<(String, u64, u32)>> {
     f.read_exact(&mut idx_bytes).ok()?;
     let plain = zstd::decode_all(&idx_bytes[..]).ok()?;
     let entries: Vec<(String, u64, u32)> = bincode::deserialize(&plain).ok()?;
-    let base = if v2 {
-        let mut body_len_bytes = [0u8; 8];
-        f.read_exact(&mut body_len_bytes).ok()?;
-        let body_len = u64::from_le_bytes(body_len_bytes);
-        let header_len = 9 + idx_len as u64 + 8;
-        if file_len - header_len != body_len {
-            return None;
-        }
-        header_len
-    } else {
-        (9 + idx_len) as u64
-    };
+    let mut body_len_bytes = [0u8; 8];
+    f.read_exact(&mut body_len_bytes).ok()?;
+    let body_len = u64::from_le_bytes(body_len_bytes);
+    let header_len = 9 + idx_len as u64 + 8;
+    if file_len.checked_sub(header_len) != Some(body_len) {
+        return None;
+    }
     Some(
         entries
             .into_iter()
-            .map(|(n, off, len)| (n, base + off, len))
+            .map(|(n, off, len)| (n, header_len + off, len))
             .collect(),
     )
 }
 
-/// Positional read of exactly `len` bytes at `off` — thread-safe (no shared seek cursor), so
-/// parallel tile reconstructs can hit one pack concurrently.
-pub(crate) fn read_exact_at(path: &Path, off: u64, len: usize) -> Result<Vec<u8>> {
-    let f = std::fs::File::open(path).map_err(|e| io_at(path, e))?;
+/// Positional read of exactly `len` bytes at `off` of `f` (opened from `path`, which only names
+/// it in errors) — thread-safe (no shared seek cursor), so parallel tile reconstructs can hit one
+/// pack concurrently.
+pub(crate) fn read_exact_at(
+    f: &std::fs::File,
+    path: &Path,
+    off: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let mut read = 0usize;
     while read < len {

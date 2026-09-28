@@ -257,6 +257,41 @@ def test_rebuild_docs_reopens_when_a_later_step_fails():
     assert reopened == ["art.kra"], reopened
 
 
+def test_status_poll_skips_the_spawn_while_nothing_changed():
+    # The docker polls every 1.5 s on Krita's UI thread. While the document and the store's
+    # state files are as they were at the last answer, that answer stands — no process.
+    spawns = []
+    disk = {"doc": 1}
+    real_status, real_stat = kvc.status, kvc.stat_key
+    kvc.status = lambda repo: spawns.append(repo) or {"store": "S", "changes": []}
+    kvc.stat_key = lambda path: (disk["doc"] if path == "D" else 0, 1)
+    try:
+        kvc._status_cache.clear()
+        for _ in range(5):
+            kvc.status_cached("D")
+        # First call learns the store; second takes the key; the rest are free.
+        assert len(spawns) == 2, spawns
+        disk["doc"] = 2  # a save
+        kvc.status_cached("D")
+        kvc.status_cached("D")
+        assert len(spawns) == 3, spawns
+        kvc.forget_status()  # the docker ran an operation itself
+        kvc.status_cached("D")
+        kvc.status_cached("D")
+        assert len(spawns) == 4, spawns
+    finally:
+        kvc.status, kvc.stat_key = real_status, real_stat
+        kvc._status_cache.clear()
+
+
+def test_async_commit_builds_the_same_argv():
+    # The docker runs the commit through QProcess with `commit_args`; the blocking `commit`
+    # must keep building the very same command line.
+    seen = capture_args()
+    kvc.commit("R", "m", "me", ["a.kra"])
+    assert seen[0] == kvc.commit_args("R", "m", "me", ["a.kra"]), seen[0]
+
+
 def test_autodiscovered_binary_must_verify():
     # An auto-discovered kvc is identity-checked before use: a failing check isn't trusted, and
     # a passing one is cached (verified once) so the poll doesn't respawn kvc every 1.5s.

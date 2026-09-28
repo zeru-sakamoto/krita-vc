@@ -20,8 +20,9 @@ SETTINGS_GROUP = "kritavc"
 _EXE = "kvc.exe" if os.name == "nt" else "kvc"
 
 # Reads are near-instant. A commit hashes and stores a whole .kra, so it gets minutes;
-# past that something is wrong and a message beats a frozen Krita. Both calls block the
-# UI thread — move to QProcess if the freeze during commit ever gets noticed.
+# past that something is wrong and a message beats a frozen Krita. Everything here blocks the
+# UI thread, which is why the docker runs the commit itself through QProcess instead (with
+# `commit_args`) — the other writes have to finish before the docker can reopen the document.
 READ_TIMEOUT = 30
 WRITE_TIMEOUT = 300
 
@@ -200,12 +201,56 @@ def status(repo):
     return _run(["status", "--repo", repo])
 
 
+# Everything `kvc status` reports comes from the document and three files in its store, so while
+# none of the four has changed since the last answer, that answer still stands: four os.stat
+# calls a poll instead of a process on Krita's UI thread.
+_STATUS_INPUTS = ("index.json", "branches.json", "stashes.json")
+_status_cache = {}  # repo -> [result, key the result is good for]
+
+
+def _status_key(repo, store):
+    if not store:
+        return None
+    paths = [repo] + [os.path.join(store, name) for name in _STATUS_INPUTS]
+    return tuple(stat_key(p) for p in paths)
+
+
+def status_cached(repo):
+    """`status`, reusing the last answer while nothing it depends on has changed.
+
+    The key is taken *before* the spawn, so a save landing mid-status shows up as a changed key on
+    the next poll instead of hiding behind an answer that predates it. Until an answer has named
+    the store there is nothing to stat, so the first call always spawns."""
+    hit = _status_cache.get(repo)
+    store = hit[0].get("store") if hit else None
+    key = _status_key(repo, store)
+    if key is not None and key == hit[1]:
+        return hit[0]
+    result = status(repo)
+    _status_cache[repo] = [result, key if result.get("store") == store else None]
+    return result
+
+
+def forget_status():
+    """Make the next `status_cached` spawn — after an operation this docker ran itself."""
+    for entry in _status_cache.values():
+        entry[1] = None
+
+
+def commit_args(repo, message, author, paths=None):
+    return [
+        "commit",
+        "--repo",
+        repo,
+        "--message",
+        message,
+        "--author",
+        author,
+    ] + _paths_flag(paths)
+
+
 def commit(repo, message, author, paths=None):
-    return _run(
-        ["commit", "--repo", repo, "--message", message, "--author", author]
-        + _paths_flag(paths),
-        WRITE_TIMEOUT,
-    )
+    return _run(commit_args(repo, message, author, paths), WRITE_TIMEOUT)
 
 
 def discard(repo, paths=None):
