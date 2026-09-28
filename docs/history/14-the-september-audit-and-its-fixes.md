@@ -1,6 +1,6 @@
 # The September audit and its fixes
 
-Dates: 2026-09-25 to 2026-09-28. Commits: `38bf63a` to `TODO`.
+Dates: 2026-09-25 to 2026-09-28. Commits: `38bf63a` to `d3b353a`.
 
 `38bf63a` ("Reorganize the docs by feature and correct them against the code") splits the three
 long reference docs (`frontend-architecture.md`, `version-control.md` and `performance.md`) into one
@@ -142,7 +142,7 @@ touches (59 ms to 63 ms), and backups are 13% bigger. Marking a long history for
 reference docs and `CLAUDE.md` were brought up to the new behavior in the same work, including the
 places the audit had found them disagreeing with the code.
 
-A review of the finished work left four issues, and `TODO` fixes them, each with a test that fails
+A review of the finished work left four issues, and `d3b353a` fixes them, each with a test that fails
 without it. One mattered: a release up to v2.1.0 that writes to a store the new code has split looks
 for every chain in the document shard, so it records its tile chains there, and when the new code
 split the store again it kept the tile shards' copies and dropped those records. The versions the
