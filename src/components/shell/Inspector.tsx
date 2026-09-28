@@ -13,7 +13,7 @@ import { Modal } from "../ui/Modal";
 import { Tooltip } from "../ui/Tooltip";
 import { FileStatusChip } from "../vcs/FileStatusChip";
 import { COMPOSITE_ID, PALETTE_ID } from "../vcs/LayerStackPanel";
-import type { ArtDiff, ArtLayer, Commit, DiffEntry, FileChange, PaletteDiff } from "../../types";
+import type { ArtDiff, ArtLayer, Commit, DiffEntry, PaletteDiff } from "../../types";
 import { fullTimestamp } from "../../lib/format";
 import { ICON } from "../../lib/iconSize";
 import {
@@ -125,24 +125,18 @@ export function Inspector({
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Split the commit's changed files into selectable rows: regular files (each carrying its
-  // embedded palette, if any, per `<kra>::<palette-file>`-keyed entries) and standalone palettes.
-  const { fileChanges, paletteChanges } = useMemo(() => {
-    const files: { change: FileChange; embeddedPalette: PaletteDiff | undefined }[] = [];
-    const palettes: FileChange[] = [];
-    for (const c of commit?.changes ?? []) {
-      const entry = entries.find((e) => e.path === c.path);
-      if (entry?.kind === "palette") {
-        palettes.push(c);
-      } else {
-        const embeddedPalette = entries.find(
-          (e): e is PaletteDiff => e.kind === "palette" && e.path.startsWith(`${c.path}::`)
-        );
-        files.push({ change: c, embeddedPalette });
-      }
-    }
-    return { fileChanges: files, paletteChanges: palettes };
-  }, [commit, entries]);
+  // The commit's changed files as selectable rows, each carrying its embedded palette, if any
+  // (the `<kra>::<palette-file>`-keyed entry).
+  const fileChanges = useMemo(
+    () =>
+      (commit?.changes ?? []).map((change) => ({
+        change,
+        embeddedPalette: entries.find(
+          (e): e is PaletteDiff => e.kind === "palette" && e.path.startsWith(`${change.path}::`)
+        ),
+      })),
+    [commit, entries]
+  );
 
   // Resolve the navigator selection against the current diff. A stale focus (e.g. the next
   // commit is text-only, or a palette is selected) resolves to nothing and the section hides —
@@ -306,39 +300,6 @@ export function Inspector({
                   </li>
                 ))}
               </ul>
-
-              {paletteChanges.length > 0 && (
-                <>
-                  <h3 className="mb-1.5 mt-2 text-body font-medium text-text">
-                    Palettes ({paletteChanges.length})
-                  </h3>
-                  <ul className="flex flex-col">
-                    {paletteChanges.map((c) => (
-                      <li key={c.path}>
-                        <button
-                          type="button"
-                          onClick={() => onSelectFile(c.path, undefined)}
-                          className={[
-                            "flex w-full items-center gap-2 rounded-button px-2 py-1 text-left transition-colors duration-(--dur-fast) ease-(--ease-out)",
-                            selectedFile === c.path ? "row-selected" : "hover:bg-state-hover",
-                          ].join(" ")}
-                        >
-                          <FileStatusChip status={c.status} />
-                          <PaletteIcon size={ICON.inline} className="shrink-0 text-text-muted" />
-                          <span
-                            className={[
-                              "selectable truncate text-dense text-text",
-                              artistMode ? "" : "font-mono",
-                            ].join(" ")}
-                          >
-                            {artistMode ? paletteName(c.path) : c.path}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </>
-              )}
             </div>
 
             {showSelected && focusedArt && (

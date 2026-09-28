@@ -1,6 +1,6 @@
 # The September audit and its fixes
 
-Dates: 2026-09-25 to 2026-09-26. Commits: `38bf63a` to `TODO`.
+Dates: 2026-09-25 to 2026-09-28. Commits: `38bf63a` to `TODO`.
 
 `38bf63a` ("Reorganize the docs by feature and correct them against the code") splits the three
 long reference docs (`frontend-architecture.md`, `version-control.md` and `performance.md`) into one
@@ -79,7 +79,7 @@ and the plugin self-check pass.
 
 ## The performance fixes
 
-`TODO` works through all 16 performance findings and the complexity cuts, each measured before and
+`11354fb` works through all 16 performance findings and the complexity cuts, each measured before and
 after with the audit's probe on the same laptop, with the old and new builds run alternately where
 single runs were too noisy to tell apart. Most of the gains are in two states the benchmarks never
 reached: a painting saved but not yet a version, and a history hundreds of versions long.
@@ -142,14 +142,15 @@ touches (59 ms to 63 ms), and backups are 13% bigger. Marking a long history for
 reference docs and `CLAUDE.md` were brought up to the new behavior in the same work, including the
 places the audit had found them disagreeing with the code.
 
-A review of the finished work left four issues open. One matters: a release up to v2.1.0 that
-writes to a store the new code has split looks for every chain in the document shard, so it records
-its tile chains there, and when the new code splits the store again it keeps the tile shards' copies
-and drops those records. The versions the older release committed then can't be rebuilt, and a
-cleanup would sweep their tiles. Merging the two copies instead of preferring one fixes it. The
-other three are minor: a parsed painting, about its file size, can stay in memory between visits to
-the Changes view; a raster-cache hit can race a prune and show a blank image until the next
-refresh; and two standalone-palette views in the frontend are unreachable.
+A review of the finished work left four issues, and `TODO` fixes them, each with a test that fails
+without it. One mattered: a release up to v2.1.0 that writes to a store the new code has split looks
+for every chain in the document shard, so it records its tile chains there, and when the new code
+split the store again it kept the tile shards' copies and dropped those records. The versions the
+older release committed then couldn't be rebuilt, and a cleanup would sweep their tiles. The two
+copies are merged now instead of one being preferred. The other three were minor: a parsed
+painting, about its file size, could stay in memory between visits to the Changes view, and now
+goes after ten seconds; a raster-cache hit could race a prune and show a blank image, and is a miss
+now; and two unreachable standalone-palette views in the frontend are gone.
 
 See also: [`data-integrity.md`](../data-integrity.md) for the rules these fixes added,
 [`backup-and-restore.md`](../backup-and-restore.md) for how Replace works now, and

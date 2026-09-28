@@ -1105,7 +1105,7 @@ pub fn cache_path(cache_dir: &std::path::Path, key: &str) -> std::path::PathBuf 
 }
 
 /// Read a cached capped PNG, or `None` on miss/any error — for the callers that need its pixels.
-/// A hit counts as a use for pruning, like [`cache_hit`].
+/// A hit counts as a use for pruning, like [`cached_url`].
 pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
     let path = cache_path(cache_dir, key);
     let meta = std::fs::metadata(&path).ok()?;
@@ -1114,19 +1114,26 @@ pub fn cache_read(cache_dir: &std::path::Path, key: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Whether `key` is cached, from a `stat` — for the callers that only build its URL, which the
-/// webview then fetches through `kvcimg` anyway. Reading a 2048 px composite just to print its URL
-/// cost several MB per call, two or three calls per Version Map node. A hit counts as a use for
-/// pruning.
-pub fn cache_hit(cache_dir: &std::path::Path, key: &str) -> bool {
+/// The URL for a cached raster, or `None` on a miss — for the callers that only build its URL,
+/// which the webview then fetches through `kvcimg` anyway, so a hit is a `stat`: reading a 2048 px
+/// composite just to print its URL cost several MB per call, two or three calls per Version Map
+/// node. Outside the shell the URL inlines the file, and an entry pruned between the `stat` and
+/// that read (a prune from the other heavy command) is a miss too; it used to come back as an
+/// empty data URL, a blank image. A hit counts as a use for pruning.
+pub fn cached_url(
+    store: &std::path::Path,
+    cache_dir: &std::path::Path,
+    key: &str,
+) -> Option<String> {
     let path = cache_path(cache_dir, key);
-    match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => {
-            touch_if_stale(&path, &meta);
-            true
-        }
-        _ => false,
+    let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+    touch_if_stale(&path, &meta);
+    if img_protocol_enabled() {
+        return Some(img_url(store, key));
     }
+    std::fs::read(&path)
+        .ok()
+        .map(|png| png_bytes_to_data_url(&png))
 }
 
 /// Write a capped PNG into the cache (creating the dir for pre-cache repos).
@@ -1245,33 +1252,33 @@ fn img_protocol_enabled() -> bool {
     IMG_PROTOCOL.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// URL for a cached raster PNG: a `kvcimg` URL when the scheme is live and the cache file is
-/// really on disk (the handler serves exactly that file), else an inline data URL of `png` — or,
-/// when the caller didn't have the bytes in hand (a cache hit), of the cached file.
-/// The repo root rides in the URL hex-encoded; the handler only serves roots that commands
-/// have registered (`commands::register_served_repo`), so the scheme can't read arbitrary paths.
-/// `store` is the document store — the kvcimg handler resolves `<store>/cache/<key>.png` from
-/// the hex-encoded path in the URL, so it must be the folder that actually holds `cache/`.
+/// URL for a raster PNG the caller has in hand, just written to the cache as `key`: a `kvcimg` URL
+/// when the scheme is live and the write landed (the handler serves exactly that file), else an
+/// inline data URL of `png`. A cache hit goes through [`cached_url`] instead.
 pub fn raster_url(
     store: &std::path::Path,
     cache_dir: &std::path::Path,
     key: &str,
-    png: Option<&[u8]>,
+    png: &[u8],
 ) -> String {
     if img_protocol_enabled() && cache_path(cache_dir, key).is_file() {
-        let root_hex = hex(store.to_string_lossy().as_bytes());
-        // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
-        // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
-        #[cfg(windows)]
-        return format!("http://kvcimg.localhost/{root_hex}/{key}.png");
-        #[cfg(not(windows))]
-        return format!("kvcimg://localhost/{root_hex}/{key}.png");
+        return img_url(store, key);
     }
-    match png {
-        Some(png) => png_bytes_to_data_url(png),
-        None => {
-            png_bytes_to_data_url(&std::fs::read(cache_path(cache_dir, key)).unwrap_or_default())
-        }
+    png_bytes_to_data_url(png)
+}
+
+/// The `kvcimg` URL for a cache entry. The store rides in it hex-encoded; the handler only serves
+/// stores that commands have registered (`commands::register_served_repo`), so the scheme can't
+/// read arbitrary paths. It resolves `<store>/cache/<key>.png`, so `store` must be the folder that
+/// actually holds `cache/`.
+fn img_url(store: &std::path::Path, key: &str) -> String {
+    let root_hex = hex(store.to_string_lossy().as_bytes());
+    // WebView2 maps custom schemes to http://<scheme>.localhost/; WebKit/GTK keep the
+    // scheme itself. Build the final URL here so the frontend stays platform-agnostic.
+    if cfg!(windows) {
+        format!("http://kvcimg.localhost/{root_hex}/{key}.png")
+    } else {
+        format!("kvcimg://localhost/{root_hex}/{key}.png")
     }
 }
 

@@ -1009,6 +1009,22 @@ fn shard_of(key: &str) -> &str {
     }
 }
 
+/// Fold a second copy of one key's chain, found outside its own shard, into `own`: every version
+/// `own` lacks, in order, after its own. A split interrupted before the document shard was
+/// rewritten leaves the document's copy a prefix of the tile shard's, so that adds nothing. But
+/// every release up to v2.1.0 looks for all of a document's chains in the document shard, so on a
+/// store this one split it finds no tile chains and starts each tile it commits afresh there.
+/// Keeping both lines keeps every version findable by hash, with the older release's last, so the
+/// next patch is made against it; taking one copy dropped the other's versions, and a cleanup then
+/// swept their objects.
+fn merge_versions(own: &mut Vec<Version>, other: Vec<Version>) {
+    for v in other {
+        if own.iter().all(|o| o.hash != v.hash) {
+            own.push(v);
+        }
+    }
+}
+
 fn shard_file(dir: &Path, shard: &str) -> PathBuf {
     dir.join(format!(
         "{}.bin",
@@ -1024,6 +1040,7 @@ fn shard_file(dir: &Path, shard: &str) -> PathBuf {
 /// in memory the first time that shard loads, and the split persists with the next save, which
 /// writes the tile shards before the shrunken document shard: until that last write lands, the
 /// document shard still holds every key, so a crash anywhere in between only means splitting again.
+/// A key found in both files is merged, not chosen ([`merge_versions`]).
 ///
 /// Interior mutability (`RwLock`) lets read paths fault shards in from behind `&Repo` (rayon
 /// `par_iter` reconstructs included); pushes come only from the serial commit folds.
@@ -1110,9 +1127,7 @@ impl ChainStore {
                         Chains::default()
                     }))
                 });
-                // A copy already in its own shard was written by an earlier, interrupted save
-                // of this same split, and is never older than the one left behind here.
-                Arc::make_mut(shard).0.entry(key).or_insert(versions);
+                merge_versions(Arc::make_mut(shard).0.entry(key).or_default(), versions);
                 dirty.insert(target);
             }
             dirty.insert(name.to_string());
@@ -1262,11 +1277,10 @@ impl ChainStore {
     /// Every chain across every shard, on-disk and in-memory merged (in-memory wins — it is
     /// never older). Loads the whole store: tests, GC and the check only, never a hot path.
     ///
-    /// A key can sit in two files: its own shard, and the document shard of a store whose split
-    /// was interrupted before the document shard was rewritten. Its own shard's copy wins, as in
-    /// [`ChainStore::load`].
+    /// A key can sit in two files, its own shard and its document shard; the copies are merged as
+    /// [`ChainStore::load`] merges them ([`merge_versions`]).
     pub fn export_all(&self) -> Chains {
-        let mut all = Chains::default();
+        let (mut all, mut strays) = (Chains::default(), Vec::new());
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
                 let path = e.path();
@@ -1280,10 +1294,13 @@ impl ChainStore {
                     if shard_file(&self.dir, shard_of(&key)) == path {
                         all.0.insert(key, versions);
                     } else {
-                        all.0.entry(key).or_insert(versions);
+                        strays.push((key, versions));
                     }
                 }
             }
+        }
+        for (key, versions) in strays {
+            merge_versions(all.0.entry(key).or_default(), versions);
         }
         for shard in self.shards.read().unwrap().values() {
             all.0

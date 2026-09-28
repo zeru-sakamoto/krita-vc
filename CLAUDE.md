@@ -61,8 +61,11 @@ one for the manifest + small entries), so a commit rewrites the shards of the la
 and a command decodes only what it reads — sharding per tracked *file* meant one shard per store,
 every tile version rewritten + fsynced each commit. A store from before keeps everything in its
 document shard; `ChainStore::load` splits it in memory and the next save persists the split, tile
-shards **before** the shrunken document shard (a crash in between just splits again; a key in both
-files is taken from its own shard). The commit log is **append-only JSON-lines**
+shards **before** the shrunken document shard (a crash in between just splits again). A key in both
+files is **merged, not chosen** (`repo::merge_versions`: its own shard's versions, then any the
+document shard adds): a release up to v2.1.0 looks for every chain in the document shard, so
+committing to a split store it records tile chains there, and taking one copy dropped those
+versions for good. The commit log is **append-only JSON-lines**
 (`commits.log`; a commit appends one line, recording the `storedBytes` it wrote), stashes live in
 `stashes.json` (absent = empty shelf), loose objects are sharded 256-way (`objects/<xx>/`), and a
 commit with ≥32 new objects writes **one pack file** (`objects/pack/*.pack`) instead of loose
@@ -590,15 +593,16 @@ because timing is per-machine and belongs with the browser, not the repo).
   for bit what full canvas + `cap_rgba` gave — a unit test pins it — so no `w×h×4` canvas exists,
   278 MB per 600 dpi A3 layer; off-grid/overlapping tiles and within-cap layers take the canvas
   path). Capped PNGs are cached content-addressed in `cache/` (keys carry a `box1` filter-version
-  token), so repeat views skip rasterization; a **hit is a `stat`** (`raster::cache_hit`, LRU touch at
-  most once a day), only callers that need pixels read the file (`LayerRaster::png`). Each layer
+  token), so repeat views skip rasterization; a **hit is a `stat`** (`raster::cached_url`, LRU touch
+  at most once a day; an entry pruned before its data-URL read is a miss, never an empty image), only
+  callers that need pixels read the file (`LayerRaster::png`). Each layer
   raster gets a **128 px thumbnail** beside it (`raster::thumb_png`, `LayerDto.beforeThumb`/
   `afterThumb`) that `LayerStackPanel`'s 36×28 rows use instead of decoding the 2048 px raster; a
   raster cached before thumbnails gets one made on its next serve. A change mask carries its
   outline + normalized bbox in PNG `tEXt` chunks (`raster::mask_meta`), so a hit never decodes or
   retraces it. A Changes refresh parses the working file **once** (`commands::parsed_working`,
   keyed path+size+mtime+`lowMemoryDiff`: `working_diff` keeps its parse, `working_layers` takes and
-  drops it).
+  drops it, and one nothing takes expires after `WORKING_PARSE_TTL`, 10 s).
   The viewer has **shared zoom/pan** (`useZoomPan`, wheel-to-cursor zoom + left-drag/middle-mouse pan)
   applied identically to both side-by-side panes and the swipe slider so before/after and the
   slider divider stay pixel-aligned; zoom/pan and the slider drag are rAF-coalesced (one state
@@ -630,8 +634,8 @@ because timing is per-machine and belongs with the browser, not the repo).
   by width/height, so a region must not be pre-scaled to
   pixels or it overflows past the canvas' bottom-right. Palettes have `kind: "palette"` and always
   render as **color swatches** (`PaletteDiffView`) — the first palette is embedded in the art diff's
-  `LayerStackPanel` navigator (`StandalonePaletteDiff` in `DiffView.tsx` is the unused route for
-  standalone palette files, which aren't tracked). This route is **not**
+  `LayerStackPanel` navigator (standalone palette files aren't tracked, so every palette entry is an
+  embedded one). This route is **not**
   Artist Mode gated. The swatch diff is computed **in the backend** (`src-tauri/src/palette.rs`):
   each format is parsed to a flat list of named sRGB swatches (`.gpl` text, `.kpl` = zip +
   `colorset.xml` via roxmltree, `.aco`/`.ase` = hand-rolled big-endian binary readers), then

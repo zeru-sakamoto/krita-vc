@@ -1311,15 +1311,11 @@ fn composite_data_url(
 ) -> Result<Option<String>> {
     let cache_dir = repo.cache_dir();
     let key = content_hash.map(|h| kra::composite_cache_key(&h));
-    if let Some(k) = &key {
-        if crate::raster::cache_hit(&cache_dir, k) {
-            return Ok(Some(crate::raster::raster_url(
-                &repo.store,
-                &cache_dir,
-                k,
-                None,
-            )));
-        }
+    if let Some(url) = key
+        .as_deref()
+        .and_then(|k| crate::raster::cached_url(&repo.store, &cache_dir, k))
+    {
+        return Ok(Some(url));
     }
     let Some(b) = bytes()? else { return Ok(None) };
     let capped = crate::raster::cap_png(&b);
@@ -1329,7 +1325,7 @@ fn composite_data_url(
             &repo.store,
             &cache_dir,
             k,
-            Some(&capped),
+            &capped,
         )));
     }
     Ok(Some(crate::raster::png_bytes_to_data_url(&capped)))
@@ -1364,13 +1360,8 @@ fn stacked_composite_url(
     };
     let key = kra::stack_cache_key(&manifest.version_key());
     let cache_dir = repo.cache_dir();
-    if crate::raster::cache_hit(&cache_dir, &key) {
-        return Ok(Some(crate::raster::raster_url(
-            &repo.store,
-            &cache_dir,
-            &key,
-            None,
-        )));
+    if let Some(url) = crate::raster::cached_url(&repo.store, &cache_dir, &key) {
+        return Ok(Some(url));
     }
 
     let (w, h) = (meta.width, meta.height);
@@ -1435,7 +1426,7 @@ fn stacked_composite_url(
         &repo.store,
         &cache_dir,
         &key,
-        Some(&png),
+        &png,
     )))
 }
 
@@ -1448,10 +1439,7 @@ fn cached_overlay(
     key: &str,
 ) -> Option<(String, Option<String>, Option<(f64, f64, f64, f64)>)> {
     let cache_dir = repo.cache_dir();
-    if !crate::raster::cache_hit(&cache_dir, key) {
-        return None;
-    }
-    let url = crate::raster::raster_url(&repo.store, &cache_dir, key, None);
+    let url = crate::raster::cached_url(&repo.store, &cache_dir, key)?;
     let (outline, bbox) =
         match crate::raster::mask_meta(&crate::raster::cache_path(&cache_dir, key)) {
             Some(meta) => meta,
@@ -1493,7 +1481,7 @@ fn diff_overlay_parts(
         return Ok((None, None));
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
-    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, Some(&mask));
+    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
     Ok((Some(url), outline))
 }
 
@@ -1536,7 +1524,7 @@ fn layer_diff_overlay(
         return (None, None, Vec::new());
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
-    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, Some(&mask));
+    let url = crate::raster::raster_url(&repo.store, &cache_dir, &key, &mask);
     (Some(url), outline, region(bbox))
 }
 
@@ -2047,6 +2035,10 @@ struct ParsedWorking {
 
 static WORKING: std::sync::Mutex<Option<ParsedWorking>> = std::sync::Mutex::new(None);
 
+/// How long a parse kept for `working_layers` waits to be taken. It normally is within
+/// milliseconds; this leaves room for a wait behind the other heavy commands.
+pub const WORKING_PARSE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The working `.kra` at `abs`, parsed — shared between the two commands a Changes refresh makes:
 /// `working_diff`, then `working_layers`. Each read the painting, inflated every entry and hashed
 /// every tile on its own, back to back (255 ms apiece on a 105 MB painting). `last` is the second
@@ -2055,8 +2047,10 @@ static WORKING: std::sync::Mutex<Option<ParsedWorking>> = std::sync::Mutex::new(
 ///
 /// Keyed by size + mtime as stat'ed before the read, the scan's own fast-path rule: a rewrite
 /// inside the same timestamp tick would be missed, at worst for one refresh of a diff view, never
-/// stored data. If `working_layers` never follows, one parse stays until the next refresh
-/// replaces it.
+/// stored data. `working_layers` doesn't always follow — returning to Changes serves the layers
+/// from the frontend's cache, and a painting that can't be diffed never asks for them — so an
+/// untaken parse goes after [`WORKING_PARSE_TTL`] rather than staying, a painting's worth of
+/// memory, until the next refresh.
 fn parsed_working(
     abs: &Path,
     low_memory: bool,
@@ -2087,6 +2081,22 @@ fn parsed_working(
         low_memory,
         kra: parsed.clone(),
     });
+    if !last {
+        // A `Weak`, so waiting doesn't keep alive a parse `working_layers` took and dropped. It
+        // does keep the allocation, so no later parse can land at the address compared below.
+        // A thread that can't be spawned only means the parse stays until the next refresh.
+        let kept = std::sync::Arc::downgrade(&parsed);
+        let _ = std::thread::Builder::new().spawn(move || {
+            std::thread::sleep(WORKING_PARSE_TTL);
+            let mut slot = WORKING.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|p| std::ptr::eq(std::sync::Arc::as_ptr(&p.kra), kept.as_ptr()))
+            {
+                *slot = None;
+            }
+        });
+    }
     Ok(parsed)
 }
 

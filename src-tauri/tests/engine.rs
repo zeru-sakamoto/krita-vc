@@ -2618,8 +2618,8 @@ fn read_shard(path: &std::path::Path) -> repo::Chains {
 
 /// A store from before per-entry sharding keeps every chain in its document shard. It reads as
 /// it always did, and the next save splits it — the tile shards first, the document shard only
-/// once they're on disk. A split interrupted between the two leaves tile keys in both files, and
-/// then the tile shard's copy (never the older one) is the one that counts.
+/// once they're on disk. A split interrupted between the two leaves tile keys in both files, the
+/// document shard's copy a prefix of the tile shard's, so merging the two adds nothing.
 #[test]
 fn single_shard_store_splits_on_the_next_save() {
     let dir = tempfile::tempdir().unwrap();
@@ -2680,13 +2680,55 @@ fn single_shard_store_splits_on_the_next_save() {
             assert_eq!(
                 versions.len(),
                 split.0[&key].len(),
-                "{key}: the tile shard's copy wins"
+                "{key}: the document shard's copy adds nothing"
             );
         }
     }
     std::fs::write(tracked_doc(root), kra_bytes(10)).unwrap();
     commit::commit_snapshot(&mut r, "c5 again", "t").unwrap();
     rebuilt(&repo::Repo::open(&tracked_doc(root)).unwrap());
+}
+
+/// Every release up to v2.1.0 looks for all of a document's chains in its document shard, so on a
+/// store this one has split it finds no tile chains, and its commit starts each changed tile afresh
+/// there, as a full snapshot. Back here the key is in both files, and taking the tile shard's copy
+/// (right for an interrupted split) dropped what the older release recorded: its versions no longer
+/// rebuilt, and a cleanup swept their objects. Both lines are kept, the older release's last.
+#[test]
+fn an_older_releases_tile_versions_survive_the_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let all = four_versions(&dir).chains.export_all();
+    let (key, own) = all.0.iter().find(|(k, _)| k.contains(":tile:")).unwrap();
+    // Another tile's full snapshot, so the object is on disk and the version rebuilds.
+    let older = all
+        .0
+        .values()
+        .flatten()
+        .find(|v| v.base.is_none() && own.iter().all(|o| o.hash != v.hash))
+        .unwrap()
+        .clone();
+    let mut doc = read_shard(&doc_shard(root));
+    doc.0.insert(key.clone(), vec![older.clone()]);
+    write_shard(&doc_shard(root), &doc);
+
+    let hashes = |vs: &[repo::Version]| vs.iter().map(|v| v.hash.clone()).collect::<Vec<_>>();
+    let mut both = hashes(own);
+    both.push(older.hash.clone());
+    let mut r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    assert_eq!(
+        hashes(&r.chains.export_all().0[key]),
+        both,
+        "what the cleanup and the check see"
+    );
+    assert_eq!(hashes(&r.chains.chain(key).unwrap()), both, "a lookup");
+    r.reconstruct(key, &older.hash).unwrap();
+
+    // And the save that persists the split keeps it.
+    std::fs::write(tracked_doc(root), kra_bytes(9)).unwrap();
+    commit::commit_snapshot(&mut r, "c5", "t").unwrap();
+    let r = repo::Repo::open(&tracked_doc(root)).unwrap();
+    r.reconstruct(key, &older.hash).unwrap();
 }
 
 // --- garbage collection -------------------------------------------------------------------
@@ -5025,7 +5067,10 @@ fn backup_stores_what_is_already_compressed() {
 
 /// A Changes refresh is `working_diff` then `working_layers`, and each used to read and parse the
 /// whole working painting. The second takes the first's parse — shown by making the file
-/// unreadable in between — and lets go of it, so the one after that reads again.
+/// unreadable in between — and lets go of it, so the one after that reads again. When nothing
+/// takes it (returning to Changes serves the layers from the frontend's cache), the parse goes
+/// after a few seconds rather than staying, a painting's worth of memory, until the next refresh.
+/// One test for both, since both go through the one process-wide slot.
 #[cfg(windows)]
 #[test]
 fn a_changes_refresh_parses_the_working_file_once() {
@@ -5035,6 +5080,10 @@ fn a_changes_refresh_parses_the_working_file_once() {
     let doc = tracked_doc(dir.path());
     std::fs::write(&doc, kra_bytes(2)).unwrap();
     let path = doc.to_string_lossy().into_owned();
+    let diff = || {
+        tauri::async_runtime::block_on(commands::working_diff(path.clone(), "art.kra".into()))
+            .unwrap()
+    };
     let layers = || {
         tauri::async_runtime::block_on(commands::working_layers(
             path.clone(),
@@ -5042,16 +5091,24 @@ fn a_changes_refresh_parses_the_working_file_once() {
             tauri::ipc::Channel::new(|_| Ok(())),
         ))
     };
-    tauri::async_runtime::block_on(commands::working_diff(path.clone(), "art.kra".into())).unwrap();
-    let held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&doc)
-        .unwrap();
+    let hold = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&doc)
+            .unwrap()
+    };
+    diff();
+    let held = hold();
     layers().expect("the diff's parse serves the layers");
     assert!(layers().is_err(), "and is let go of after");
     drop(held);
     layers().unwrap();
+
+    diff();
+    std::thread::sleep(commands::WORKING_PARSE_TTL + std::time::Duration::from_secs(1));
+    let _held = hold();
+    assert!(layers().is_err(), "a parse nothing took expires");
 }
 
 /// Each layer raster comes with a small thumbnail for the layer list, on a fresh raster and on a
@@ -5098,6 +5155,48 @@ fn layer_rasters_come_with_a_thumbnail() {
         }
     }
     assert!(raster(&r).thumb.is_some());
+}
+
+/// A cache hit is a `stat`, and the entry's bytes are read after it. An entry pruned in between (a
+/// prune from the other heavy command) used to come back as an empty data URL, a blank image; it's
+/// a miss now, and rebuilt. The prune is stood in for by holding the file, which the `stat` gets
+/// past and the read doesn't.
+#[cfg(windows)]
+#[test]
+fn a_cache_entry_gone_after_its_stat_is_rebuilt_not_blank() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let doc = init_doc(dir.path());
+    let mut r = repo::Repo::open(&doc).unwrap();
+    std::fs::write(
+        &doc,
+        common::kra_painted([200, 0, 0, 255], [0, 0, 200, 255]),
+    )
+    .unwrap();
+    let c = commit::commit_snapshot(&mut r, "v1", "t").unwrap();
+    let manifest =
+        kra::load_manifest(&r, "art.kra", c.files[0].content.as_deref().unwrap()).unwrap();
+    let raster = || {
+        kra::layer_raster(
+            &r,
+            "art.kra",
+            &manifest,
+            "img",
+            "layer1",
+            128,
+            128,
+            &delta::TileCache::new(),
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let fresh = raster();
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(raster::cache_path(&r.cache_dir(), &fresh.key))
+        .unwrap();
+    assert!(raster().url == fresh.url, "rebuilt, not an empty data URL");
 }
 
 /// Every entry of a `.kra`, decompressed, in archive order — what a restore must reproduce. (Not

@@ -1363,27 +1363,27 @@ fn thumb_cache_key(raster_key: &str) -> String {
         .to_string()
 }
 
-/// The [`LayerRaster`] for `key`, which is cached already — nothing decoded, nothing read unless
-/// the thumbnail is missing (a raster cached before thumbnails existed), which is made once here.
+/// The [`LayerRaster`] for `key` if it's cached, `None` on a miss — nothing decoded, nothing read
+/// unless the thumbnail is missing (a raster cached before thumbnails existed), which is made once
+/// here.
 fn cached_layer_raster(
     store: &std::path::Path,
     cache_dir: &std::path::Path,
-    key: String,
-) -> LayerRaster {
-    let tkey = thumb_cache_key(&key);
-    let thumb_ready = crate::raster::cache_hit(cache_dir, &tkey)
-        || crate::raster::cache_read(cache_dir, &key)
-            .and_then(|png| crate::raster::thumb_from_png(&png))
-            .is_some_and(|thumb| {
-                crate::raster::cache_write(cache_dir, &tkey, &thumb);
-                true
-            });
-    LayerRaster {
-        url: crate::raster::raster_url(store, cache_dir, &key, None),
-        thumb: thumb_ready.then(|| crate::raster::raster_url(store, cache_dir, &tkey, None)),
-        key,
+    key: &str,
+) -> Option<LayerRaster> {
+    let url = crate::raster::cached_url(store, cache_dir, key)?;
+    let tkey = thumb_cache_key(key);
+    let thumb = crate::raster::cached_url(store, cache_dir, &tkey).or_else(|| {
+        let thumb = crate::raster::thumb_from_png(&crate::raster::cache_read(cache_dir, key)?)?;
+        crate::raster::cache_write(cache_dir, &tkey, &thumb);
+        Some(crate::raster::raster_url(store, cache_dir, &tkey, &thumb))
+    });
+    Some(LayerRaster {
+        url,
+        thumb,
+        key: key.to_string(),
         png: None,
-    }
+    })
 }
 
 /// Encode, cache and wrap a freshly rasterized layer (capped RGBA) and its thumbnail.
@@ -1400,10 +1400,10 @@ fn new_layer_raster(
     let thumb = crate::raster::thumb_png(rgba, w, h).map(|thumb| {
         let tkey = thumb_cache_key(&key);
         crate::raster::cache_write(cache_dir, &tkey, &thumb);
-        crate::raster::raster_url(store, cache_dir, &tkey, Some(&thumb))
+        crate::raster::raster_url(store, cache_dir, &tkey, &thumb)
     });
     Ok(LayerRaster {
-        url: crate::raster::raster_url(store, cache_dir, &key, Some(&png)),
+        url: crate::raster::raster_url(store, cache_dir, &key, &png),
         thumb,
         key,
         png: Some(png),
@@ -1475,8 +1475,8 @@ pub fn layer_raster(
     let mut key_tiles: Vec<(i64, i64, &str)> =
         refs.iter().map(|t| (t.x, t.y, t.hash.as_str())).collect();
     let key = raster_cache_key(&entry_path, &mut key_tiles, width, height, default_pixel);
-    if crate::raster::cache_hit(&cache_dir, &key) {
-        return Ok(Some(cached_layer_raster(&repo.store, &cache_dir, key)));
+    if let Some(cached) = cached_layer_raster(&repo.store, &cache_dir, &key) {
+        return Ok(Some(cached));
     }
     // Reconstruct + LZF-decode tiles in parallel batches (nested rayon inside the per-layer
     // par_iter is fine — one work-stealing pool), straight into the capped raster — a diff preview
@@ -1967,8 +1967,8 @@ fn rasterize_working_tiles(
         .map(|(t, h)| (t.x, t.y, h.as_str()))
         .collect();
     let key = raster_cache_key(entry_path, &mut key_tiles, width, height, default_pixel);
-    if crate::raster::cache_hit(cache_dir, &key) {
-        return Ok(Some(cached_layer_raster(store, cache_dir, key)));
+    if let Some(cached) = cached_layer_raster(store, cache_dir, &key) {
+        return Ok(Some(cached));
     }
     // Same pipeline as the committed path, the tiles already in hand.
     let (rgba, cw, ch) = crate::raster::rasterize_tiles(

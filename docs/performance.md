@@ -240,7 +240,9 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   `working_diff` for the metadata and then `working_layers` for the rasters, and each used to read,
   inflate and hash the whole working painting (255 ms apiece on a 105 MB file). The first now keeps
   its parse, keyed by path, size, mtime and the `lowMemoryDiff` flag, and the second takes it and
-  lets go of it, so a whole decoded document isn't kept resident between refreshes.
+  lets go of it, so a whole decoded document isn't kept resident between refreshes. The second
+  doesn't always come (returning to Changes serves the layers from the frontend's cache), so an
+  untaken parse goes after ten seconds (`commands::WORKING_PARSE_TTL`).
 - **`Repo::open_without_log`** skips `commits.log`, the one part of a store that grows with every
   version, for the reads that never look at it: `kvc status`, `branches` and `stash-list` (the Krita
   docker's poll), `scan_repository`, `list_branches`, `list_stashes` and the settings getters. It's
@@ -454,17 +456,18 @@ header is parsed when the index loads, and dozens of small packs from mid-sized 
 
 ## Caching across requests
 
-- **A content-addressed disk cache** (`<store>/cache/`, `raster::cache_hit`, `cache_read` and
+- **A content-addressed disk cache** (`<store>/cache/`, `raster::cached_url`, `cache_read` and
   `cache_write`). Every capped PNG, composite or per-layer, is keyed by a hash of everything that
   determines its pixels (tile positions and hashes, the dimensions and the resolution cap, or the
   composite entry's content hash). Keys never need invalidating, unchanged layers share one entry
   across commits and across the committed and working diff paths, and a repeat view, even after an
   app restart, skips rebuilding, decoding and encoding entirely.
-- **A cache hit is a `stat`, not a read** (`raster::cache_hit`). Most hits only need the entry's
+- **A cache hit is a `stat`, not a read** (`raster::cached_url`). Most hits only need the entry's
   URL, which the webview then fetches through `kvcimg` anyway, and reading a 2048 px composite just to
   print its URL cost several MB per call, two or three calls per Version Map node. Only the callers
   that need pixels read the file (`LayerRaster::png`: a modified layer's own change highlight, the
-  stacked composite), and the base64 fallback reads it when it builds its data URL.
+  stacked composite), and the base64 fallback reads it when it builds its data URL. An entry pruned
+  between the `stat` and that read is a miss, and rebuilt; it used to come back as an empty data URL.
 - **Change masks carry their outline and box** (`raster::mask_meta`). The changed-pixel mask is
   cached as a PNG with its outline path and normalized bounding box in `tEXt` chunks (`kvc-outline`,
   `kvc-bbox`) ahead of the pixels, so a hit answers both from the header without decoding the mask
@@ -518,8 +521,8 @@ header is parsed when the index loads, and dozens of small packs from mid-sized 
   commit that edits only a tile or two pays for without the shard size to win it back. A store
   written before this keeps every chain in its document shard; that shard is split in memory when it
   loads, and the split persists with the next save, which writes the tile shards before the shrunken
-  document shard, so a crash in between only means splitting again (see
-  [data-integrity.md](data-integrity.md)).
+  document shard, so a crash in between only means splitting again; a key found in both files is
+  merged, not chosen (see [data-integrity.md](data-integrity.md)).
 - **A sharded objects folder** (`delta.rs::write_loose` and `read_loose`). Loose objects go into
   `objects/<hash[..2]>/` (256 subfolders) instead of one flat folder, because 100,000 or more tiny
   files in one folder slow down NTFS lookups and multiply Defender scans. The fallback that read the
@@ -583,8 +586,9 @@ The shortcuts with known limits, collected in one place:
   only for as long as the command runs.
 - `commands::parsed_working` keys on size and mtime, like the scan's fast path, so a rewrite inside
   one timestamp tick is missed for one refresh of a diff view (never stored data). If
-  `working_layers` never follows `working_diff`, one parsed document stays in memory until the next
-  refresh replaces it. `worktree.json` has the index's racy-clean ceiling for the same reason.
+  `working_layers` never follows `working_diff`, the parsed document stays in memory for ten seconds,
+  and a `working_layers` held up longer than that behind the other heavy commands parses again.
+  `worktree.json` has the index's racy-clean ceiling for the same reason.
 - Chain shards per layer entry cost one fsync per shard a commit touches, where one shard cost one.
   A commit that edits a few tiles of one layer pays two where it paid one, without a big shard to
   win it back.

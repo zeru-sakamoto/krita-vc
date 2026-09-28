@@ -86,9 +86,6 @@ serves both places.
 | Inspector | [`Inspector`](../src/components/shell/Inspector.tsx) | Toggleable. On History: the selected version's number or hash, author, date, note, and "Restore this version". On Changes it never shows a History version; a focused working file gets an "Unsaved changes" header, and a clean tree gets a neutral "No changes to show" placeholder. In both modes its changed-files list doubles as the main panel's selector: click a row to show that entry, and a `.kra` row with an embedded palette gets a sub-row that jumps straight to that palette (`focusId`). A **Selected** section mirrors the diff navigator's pick: a layer's type, visibility, opacity, blend mode, change and painted bounds, or the composite's size, DPI, color space and layer count. |
 | Status bar | [`StatusBar`](../src/components/shell/StatusBar.tsx) | Active file, branch, and version count, plus a progress bar while a version saves. |
 
-The Inspector code still groups standalone palette files under a heading of their own. Only `.kra`
-files have been tracked since the per-document rewrite, so that branch is never reached today.
-
 The center toolbar (in `AppShell`) holds the Inspector's show and hide button. The Artist view toggle
 lives in Settings (see [Artist Mode](#artist-mode)).
 
@@ -315,11 +312,10 @@ navigator on them. The selected entry routes by `kind`:
 - `"palette"` → [`PaletteDiffView`](../src/components/vcs/PaletteDiffView.tsx): color swatches
   grouped by change (Modified, Added, Removed), each showing before and after colors with hex codes.
   Not gated by Artist Mode. The `swatches[]` are computed in the backend (`palette.rs`) and rendered
-  as they arrive. A standalone palette gets its own pane through `StandalonePaletteDiff` (defined in
-  `DiffView.tsx`), a route that only standalone palette files reach and that is unused since those
-  stopped being tracked. The header uses `paletteName`, not `assetName`: Krita's raw palette
-  filenames carry an internal resource-version segment (`<name>.<NNNN>.<ext>`, for example
-  `sun-set.0006.kpl`) that `assetName` wouldn't strip.
+  as they arrive. Every palette entry is one embedded in a `.kra`, since standalone palette files
+  aren't tracked, so `DiffView` never selects one on its own. The header uses `paletteName`, not
+  `assetName`: Krita's raw palette filenames carry an internal resource-version segment
+  (`<name>.<NNNN>.<ext>`, for example `sun-set.0006.kpl`) that `assetName` wouldn't strip.
 - `kind: "text"`, which is only ever a deleted `.kra` or one that couldn't be rasterized →
   `FriendlyFileDiff` in both modes: no code, no hunks, no line numbers, just a one-line summary built
   from `assetKind` and `statusVerb` in [`src/lib/friendly.ts`](../src/lib/friendly.ts). The backend
