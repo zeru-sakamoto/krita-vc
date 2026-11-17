@@ -1155,6 +1155,10 @@ pub struct LayerNode {
     /// which has to apply a group's opacity to its children. An index rather than an id keeps the
     /// "uuid, or name when there's no uuid" rule in one place (`commands::layer_id`).
     pub top: Option<usize>,
+    /// Index into the same flat `ImageMeta::layers` of the group this layer sits directly inside,
+    /// or `None` for a top-level layer. `top` only says which top-level row a layer rolls up to;
+    /// this is the real tree, which the diff needs to tell when a layer moved between groups.
+    pub parent: Option<usize>,
 }
 
 /// Upper bound on a parsed canvas dimension. Canvas dims come from maindoc.xml unchecked and
@@ -1222,6 +1226,12 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
             kind: n.attribute("nodetype").unwrap_or("").to_string(),
             filename: n.attribute("filename").unwrap_or("").to_string(),
             top: top_of(*n),
+            // A nested `<layer>` sits in its group's own `<layers>`, so the group is two levels
+            // up. A top-level one's grandparent is `<IMAGE>`, which isn't in `nodes`.
+            parent: n
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|g| nodes.iter().position(|m| *m == g)),
         })
         .collect();
     Ok(ImageMeta {

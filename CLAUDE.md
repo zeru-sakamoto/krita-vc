@@ -550,7 +550,9 @@ because timing is per-machine and belongs with the browser, not the repo).
   "on top". Everything is **pre-ticked**, so doing nothing saves the whole artwork
   exactly as before and the panel tracks what's been *un*ticked. And changes **outside** the layer
   stack (canvas size, animation, document settings) always ride along — there's no row for them,
-  and the copy says so once a selection is partial. `commit_snapshot`'s `paths` arg
+  and the copy says so once a selection is partial. So does **layer order**: a partial version keeps
+  the working file's stacking order (`stage::plan_pieces`), so a row whose only change is `moved`
+  is shown with a checkbox that can't be unticked. `commit_snapshot`'s `paths` arg
   (`commit::commit_selected`) is unrelated and survives for the CLI.
   While a commit is in flight the commit button spins and the `StatusBar` shows a progress
   bar, via the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
@@ -626,7 +628,13 @@ because timing is per-machine and belongs with the browser, not the repo).
   path**: layers pair by `commands::layer_id` (uuid, name when absent), and the tile comparison
   looks the old side up under that matched layer's own `<image name>/layers/<filename>` — hence the
   `pair` map (new entry path -> old entry path, `""` for no counterpart) that
-  `kra::diff_tile_pixels` takes. **`modified` means a pixel inside the canvas changed**:
+  `kra::diff_tile_pixels` takes. A layer is `modified` when its `LayerDto.changes` list is non-empty:
+  any of `pixels`, `visibility`, `moved`, `opacity`, `blend`, `renamed`, several at once, with the
+  old property values in `LayerDto.prev` (the top-level fields are always the new side, which is
+  why a visibility toggle used to show only the new state). `moved` comes from
+  `commands::moved_layers` (changed group, or outside the longest in-order run of siblings, so one
+  drag flags one layer). Only `pixels` fetches a before raster and a highlight. Tests:
+  `tests/layer_props.rs`. **The `pixels` change means a pixel inside the canvas changed**:
   `diff_tile_pixels` uses tile hashes only to pre-filter, then decodes the differing tiles and
   compares pixels within the canvas (missing tile = `.defaultpixel`), because byte-level comparison
   flagged off-canvas tiles, transparent tiles appearing and re-encoded tiles as edits with nothing to

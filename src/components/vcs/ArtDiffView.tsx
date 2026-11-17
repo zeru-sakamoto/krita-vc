@@ -17,7 +17,7 @@ import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
 import { useZoomPan } from "../../lib/useZoomPan";
-import { assetName } from "../../lib/friendly";
+import { assetName, layerChangeTexts } from "../../lib/friendly";
 import { groupAsLayer, isGroupLayer } from "../../lib/svgArt";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
@@ -212,6 +212,17 @@ export function ArtDiffView({
     };
   }, [effectiveDiff, selectedId]);
 
+  const propertyCaption = useMemo(() => {
+    const found = effectiveDiff.layers.find((l) => l.id === selectedId);
+    if (!found?.changes) return null;
+    const props = layerChangeTexts(found, effectiveDiff.layers).filter(
+      (_, i) => found.changes?.[i] !== "pixels"
+    );
+    if (props.length === 0) return null;
+    const list = props.map((t) => t.full).join(" · ");
+    return found.changes.includes("pixels") ? `Also: ${list}` : `No pixels changed. ${list}`;
+  }, [effectiveDiff.layers, selectedId]);
+
   const showPalette = selectedId === PALETTE_ID && palette != null;
 
   return (
@@ -374,6 +385,13 @@ export function ArtDiffView({
                   </div>
                 )}
               </div>
+              {/* Property changes the pixel highlight can't show. Without pixel changes this is
+                  the only sign anything happened, since both panes draw the same pixels. */}
+              {propertyCaption && (
+                <p className="selectable shrink-0 border-t border-border px-3 py-1.5 text-caption text-warning-fg">
+                  {propertyCaption}
+                </p>
+              )}
             </>
           )}
         </div>
