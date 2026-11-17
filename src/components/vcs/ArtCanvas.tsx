@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useId, useMemo } from "react";
 import type { ArtDiff, ArtLayer, ChangeRegion, DiffState } from "../../types";
 import { layersBody, wrapSvg } from "../../lib/svgArt";
 
@@ -89,14 +89,13 @@ function boxOverlay(diff: ArtDiff, regions: ChangeRegion[]): string {
  */
 function pixelOverlay(
   diff: ArtDiff,
+  uid: string,
   diffImage?: string | null,
   diffOutline?: string | null
 ): string {
   const img = diffImage;
   if (!img) return "";
   const { width: W, height: H } = diff;
-  // Unique ids per file so two inline SVGs on screen don't cross-reference each other's defs.
-  const uid = diff.path.replace(/[^a-zA-Z0-9]/g, "-");
   const tile = Math.max(6, Math.min(W, H) * 0.014);
   const defs =
     `<defs>` +
@@ -144,6 +143,12 @@ export const ArtCanvas = memo(function ArtCanvas({
   transform,
   className = "",
 }: ArtCanvasProps) {
+  // The overlay's `<mask>`/`<pattern>` ids must be unique per *canvas*, not per file: `url(#id)`
+  // resolves document-wide to the first match, and the Version Map stays mounted under
+  // `display: none` with its drilldown open. When it held a canvas for the same file, the Changes
+  // view's overlay resolved to that hidden mask, which can't render, so the accent rect painted
+  // unmasked and the whole After pane turned solid accent.
+  const uid = "c" + useId().replace(/[^a-zA-Z0-9]/g, "");
   const svg = useMemo(() => {
     let body = layersBody(layers, state);
     if (overlay) {
@@ -153,13 +158,13 @@ export const ArtCanvas = memo(function ArtCanvas({
       // never shows the whole-file composite highlight.
       body +=
         highlightMode === "pixels"
-          ? pixelOverlay(diff, diffImage, diffOutline)
+          ? pixelOverlay(diff, uid, diffImage, diffOutline)
           : boxOverlay(diff, regions ?? []);
     }
     return wrapSvg(body, diff.width, diff.height);
-    // `diff` is destructured into the three scalars actually read (path, width, height — see
+    // `diff` is destructured into the two scalars actually read (width, height — see
     // pixelOverlay/boxOverlay/wrapSvg) rather than listed whole. The object identity changes on
-    // every streamed layer while those three never do, and depending on it rebuilt this
+    // every streamed layer while those two never do, and depending on it rebuilt this
     // multi-MB string — and forced React to replace the whole inline-SVG subtree, re-decoding
     // its base64 rasters — once per arriving layer, per canvas.
   }, [
@@ -167,7 +172,7 @@ export const ArtCanvas = memo(function ArtCanvas({
     state,
     overlay,
     highlightMode,
-    diff.path,
+    uid,
     diff.width,
     diff.height,
     diffImage,

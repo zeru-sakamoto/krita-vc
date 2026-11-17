@@ -18,6 +18,7 @@ import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
 import { useZoomPan } from "../../lib/useZoomPan";
 import { assetName } from "../../lib/friendly";
+import { groupAsLayer, isGroupLayer } from "../../lib/svgArt";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
 import { LayerStackPanel, COMPOSITE_ID, PALETTE_ID } from "./LayerStackPanel";
@@ -184,7 +185,9 @@ export function ArtDiffView({
       return effectiveDiff.layers;
     }
     const found = effectiveDiff.layers.find((l) => l.id === selectedId);
-    return found ? [found] : effectiveDiff.layers;
+    if (!found) return effectiveDiff.layers;
+    // A group has no raster of its own: show what's inside it.
+    return [isGroupLayer(found) ? groupAsLayer(effectiveDiff.layers, found) : found];
   }, [compositeLayers, effectiveDiff.layers, selectedId]);
 
   // The change-highlight source follows the selection: the whole-file composite highlight for the

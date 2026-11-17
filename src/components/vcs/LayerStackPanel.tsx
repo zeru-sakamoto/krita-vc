@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CircleNotchIcon, InfoIcon } from "@phosphor-icons/react";
 import type { ArtDiff, ArtLayer, FileStatus, PaletteDiff } from "../../types";
-import { compositeSvg } from "../../lib/svgArt";
+import { compositeSvg, groupAsLayer, isGroupLayer } from "../../lib/svgArt";
 import { ICON } from "../../lib/iconSize";
 import { paletteName } from "../../lib/friendly";
 import { useArtistMode } from "../../lib/artistMode";
@@ -273,6 +273,17 @@ export const LayerStackPanel = memo(function LayerStackPanel({
 
   const compositeThumb = imageThumb ?? stackThumb!;
 
+  // Rows top-first. A group has no pixels of its own, so its row shows its contents stacked
+  // (`groupAsLayer`, from the children's thumbnails) instead of a blank thumb. Memoized so a
+  // group row keeps its object identity, and LayerRow's memo holds, until a layer streams in.
+  const rows = useMemo(
+    () =>
+      [...diff.layers]
+        .reverse()
+        .map((l) => (isGroupLayer(l) ? groupAsLayer(diff.layers, l, true) : l)),
+    [diff.layers]
+  );
+
   return (
     <div className="flex w-50 shrink-0 flex-col border-r border-border bg-surface">
       <div className="min-h-0 flex-1 overflow-auto">
@@ -292,7 +303,7 @@ export const LayerStackPanel = memo(function LayerStackPanel({
         </Row>
 
         {/* Layers, top-first */}
-        {[...diff.layers].reverse().map((l) => (
+        {rows.map((l) => (
           <LayerRow
             key={l.id}
             layer={l}

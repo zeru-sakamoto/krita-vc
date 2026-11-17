@@ -49,3 +49,40 @@ export function compositeSvg(
 ): string {
   return wrapSvg(layersBody(layers, state), width, height);
 }
+
+/** True for a Krita group layer, which carries no pixels of its own. */
+export function isGroupLayer(layer: ArtLayer): boolean {
+  return layer.layerType === "grouplayer";
+}
+
+/**
+ * The visible layers inside a group, bottom→top in `layers`' order, for drawing the group as
+ * the composite of its contents (a group has no raster of its own, so drawn alone it is blank).
+ *
+ * Matched on `topLevelId`, which records only a layer's *top-level* ancestor. A top-level group
+ * therefore gets everything nested under it, but a group nested inside another one finds no
+ * children and stays blank, and the nested group's own opacity isn't applied. That's acceptable
+ * for a thumbnail and a preview. Switch to a real parent chain once `LayerDto` carries one.
+ */
+export function groupChildren(layers: ArtLayer[], group: ArtLayer): ArtLayer[] {
+  return layers.filter(
+    (l) => l.id !== group.id && l.topLevelId === group.id && l.visible !== false && !isGroupLayer(l)
+  );
+}
+
+/**
+ * A group drawn as the composite of its contents: the group's own metadata, with `before`/`after`
+ * markup stacked from its children's. Fed back through `layersBody`, the group's opacity and
+ * blend mode then apply to the stacked whole, the way Krita composites a (non-pass-through)
+ * group. `thumbs` uses the children's small thumbnails, for the navigator's row.
+ */
+export function groupAsLayer(layers: ArtLayer[], group: ArtLayer, thumbs = false): ArtLayer {
+  const children = groupChildren(layers, group).map((l) =>
+    thumbs ? { ...l, before: l.beforeThumb ?? l.before, after: l.afterThumb ?? l.after } : l
+  );
+  const side = (state: DiffState) => {
+    const body = layersBody(children, state);
+    return body === "" ? null : body;
+  };
+  return { ...group, before: side("before"), after: side("after") };
+}

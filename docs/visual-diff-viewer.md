@@ -129,6 +129,17 @@ Composite view, or the selected layer's own highlight when a single layer is foc
 added, removed, or still streaming) gets empty props, and the overlay simply doesn't draw. Only
 `diff.width` and `diff.height` (the viewBox) still come from `diff`.
 
+The overlay's `<mask>`/`<pattern>` ids are unique per **canvas** (`useId`), not per file. `url(#…)`
+resolves document-wide to the first match. The Version Map stays mounted under `display: none`
+with its drilldown open, so a per-file id let the Changes view resolve to that hidden mask. A mask
+inside a hidden subtree doesn't render, so the accent rect painted unmasked and the whole After
+pane went solid accent.
+
+A **group layer** has no raster of its own. Its navigator row, and the canvas when it's selected,
+draw the group as the stack of its visible children (`svgArt.ts`'s `groupAsLayer`, with the
+group's opacity and blend applied to the whole). Children are found by `topLevelId`, so only
+top-level groups get this. A nested group's row stays blank.
+
 - **Pixels mode** (the default) uses the changed-pixel mask (`diffImage`, an `<image>` sized to the
   viewBox), which is transparent except where before and after differ. The backend bakes a
   placeholder color into that raster, but the frontend (`pixelOverlay`) only ever reads its alpha
