@@ -626,7 +626,15 @@ because timing is per-machine and belongs with the browser, not the repo).
   path**: layers pair by `commands::layer_id` (uuid, name when absent), and the tile comparison
   looks the old side up under that matched layer's own `<image name>/layers/<filename>` — hence the
   `pair` map (new entry path -> old entry path, `""` for no counterpart) that
-  `kra::diff_tile_indexes` takes. Krita renumbers `layerN` whenever the stack changes, so pairing
+  `kra::diff_tile_pixels` takes. **`modified` means a pixel inside the canvas changed**:
+  `diff_tile_pixels` uses tile hashes only to pre-filter, then decodes the differing tiles and
+  compares pixels within the canvas (missing tile = `.defaultpixel`), because byte-level comparison
+  flagged off-canvas tiles, transparent tiles appearing and re-encoded tiles as edits with nothing to
+  show. Layer masks have no threshold (`raster::LAYER_DIFF_THRESHOLD`, own cache key
+  `kra::layer_diff_cache_key`), and every region (per layer and composite) comes from the
+  full-resolution boxes grown by `kra::region_with_min_size`, never from the downscaled mask, so a
+  modified layer always has a visible region. Regression tests: `tests/diff_visibility.rs`; story:
+  `docs/history/15-bugs-found-in-evaluation-testing.md`. Krita renumbers `layerN` whenever the stack changes, so pairing
   by path made every layer above an inserted one report `modified` with byte-identical tiles — in
   the diff navigator *and* the Changes panel, whose rows roll up this same `change`. Same class of
   bug `merge.rs` avoids by collecting data files filename-independently. **Region boxes are

@@ -1511,7 +1511,7 @@ fn layer_diff_overlay(
         }
     };
     let cache_dir = repo.cache_dir();
-    let key = kra::diff_cache_key(&before.key, &after.key);
+    let key = kra::layer_diff_cache_key(&before.key, &after.key);
     if let Some((url, outline, bbox)) = cached_overlay(repo, &key) {
         return (Some(url), outline, region(bbox));
     }
@@ -1519,8 +1519,11 @@ fn layer_diff_overlay(
     else {
         return (None, None, Vec::new());
     };
-    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full(&before_png, &after_png)
-    else {
+    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full_with(
+        &before_png,
+        &after_png,
+        crate::raster::LAYER_DIFF_THRESHOLD,
+    ) else {
         return (None, None, Vec::new());
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
@@ -1596,25 +1599,35 @@ pub fn art_diff_dto(
         .iter()
         .map(|(n, o)| (n.as_str(), o.as_str()))
         .collect();
-    // One pass over borrowed tile indexes yields both the changed-layer set and the union
-    // region — no per-tile hash clones, no duplicate map builds.
-    let (changed_entries, changed_region) = old_manifest
-        .as_ref()
-        .map(|m| {
-            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_index, &entry_pairs, w, h);
-            (d.changed_paths, d.region)
-        })
-        .unwrap_or_default();
+    // One tile cache for the whole request: before/after sides of a modified layer share most
+    // tiles by content hash, so each shared tile reconstructs once — and the pixel comparison
+    // below warms it for the layer rasters that follow.
+    let tile_cache = crate::delta::TileCache::new();
+
+    // Which layers changed *visibly*, and where, at full resolution. Tile hashes only pre-filter:
+    // a layer counts as modified when a pixel inside the canvas differs, so a tap past the canvas
+    // edge, a transparent tile appearing, or the same pixels stored differently no longer read as
+    // an edit with nothing to show.
+    let pixel_diff = match &old_manifest {
+        Some(m) => kra::diff_tile_pixels(
+            repo,
+            path,
+            &kra::KraSource::Committed(m),
+            new_src,
+            &entry_pairs,
+            w,
+            h,
+            &tile_cache,
+        ),
+        None => kra::PixelDiff::default(),
+    };
+    let changed_entries = &pixel_diff.changed_paths;
 
     // "meet" (not "none"): rasters keep their own aspect ratio, letterboxed inside the document
     // box — a before-side from a version with different canvas dimensions must not stretch.
     let img = |url: String| {
         format!("<image href=\"{url}\" x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"xMidYMid meet\"/>")
     };
-
-    // One tile cache for the whole request: before/after sides of a modified layer share most
-    // tiles by content hash, so each shared tile reconstructs once.
-    let tile_cache = crate::delta::TileCache::new();
 
     // Rasterize layers in parallel — each layer's decode/blit/PNG-encode is independent and only
     // reads &Repo. Order is preserved by par_iter's indexed collect.
@@ -1678,6 +1691,22 @@ pub fn art_diff_dto(
                     (mask_url.map(&img), outline, regions)
                 }
                 _ => (None, None, Vec::new()),
+            };
+            // The region comes from the full-resolution comparison, not the downscaled mask: a
+            // one-pixel edit on an A4 canvas can average away below 2048 px, and must still be
+            // marked, at a size that can be seen.
+            let regions = match pixel_diff.bounds.get(&entry_path) {
+                Some(b) if change == "modified" => {
+                    let (x, y, rw, rh) = kra::region_with_min_size(*b, w, h);
+                    vec![RegionDto {
+                        x,
+                        y,
+                        w: rw,
+                        h: rh,
+                        label: None,
+                    }]
+                }
+                _ => regions,
             };
             let dto = LayerDto {
                 id: layer_id(nl),
@@ -1806,7 +1835,7 @@ pub fn art_diff_dto(
     )?;
     let diff_image = mask_url.map(&img);
     let mut regions = Vec::new();
-    if let Some((x, y, rw, rh)) = changed_region {
+    if let Some((x, y, rw, rh)) = pixel_diff.region {
         regions.push(RegionDto {
             x,
             y,

@@ -549,9 +549,14 @@ pub fn encode_composite_png(
 /// read — the frontend (`ArtCanvas.tsx`) uses this raster purely as an alpha mask and recolors it
 /// with the active theme's `--color-accent`, so the RGB here is otherwise unused.
 const HIGHLIGHT_RGBA: [u8; 4] = [0xE0, 0x7B, 0x39, 128];
-/// Per-channel delta (0..255) above which a pixel counts as changed. Small enough to catch real
-/// edits, large enough to ignore encode/rounding noise.
+/// Per-channel delta (0..255) above which a *composite* pixel counts as changed. Small enough to
+/// catch real edits, large enough to ignore encode/rounding noise in `mergedimage.png`.
 const DIFF_THRESHOLD: i32 = 16;
+/// The same for a single layer's before/after rasters: none. Layer tiles are lossless and both
+/// sides go through the identical decode and downscale, so any difference is a real edit; a
+/// threshold here hid faint strokes and low-opacity washes behind a "modified" label with no
+/// highlight.
+pub const LAYER_DIFF_THRESHOLD: i32 = 0;
 /// Longest side of the coarse grid the change outline is traced on. Bounds the traced path's size
 /// (and its on-screen blockiness) independent of canvas resolution.
 const OUTLINE_GRID_MAX: usize = 200;
@@ -561,7 +566,11 @@ const OUTLINE_EDGE_CAP: usize = 8000;
 
 /// Per-pixel "changed" grid of the after-composite (index-sampling the before when dims differ).
 /// `true` = the two composites differ at that pixel. Shared by the mask raster and the outline.
-fn changed_grid(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<bool>, usize, usize)> {
+fn changed_grid(
+    before_png: &[u8],
+    after_png: &[u8],
+    threshold: i32,
+) -> Option<(Vec<bool>, usize, usize)> {
     // Cap each side to MAX_RASTER_DIM right after decode: two full-resolution composite RGBA
     // buffers held at once was a transient 2×(w·h·4) spike that stacked with per-layer streaming.
     // The mask is capped to the same bound afterwards anyway, so comparing at capped resolution
@@ -592,8 +601,8 @@ fn changed_grid(before_png: &[u8], after_png: &[u8]) -> Option<(Vec<bool>, usize
                 (x * bwu / w).min(bwu - 1)
             };
             let bi = (by * bwu + bx) * 4;
-            grid[y * w + x] = (0..4)
-                .any(|c| (after[ai + c] as i32 - before[bi + c] as i32).abs() > DIFF_THRESHOLD);
+            grid[y * w + x] =
+                (0..4).any(|c| (after[ai + c] as i32 - before[bi + c] as i32).abs() > threshold);
         }
     }
     Some((grid, w, h))
@@ -781,7 +790,18 @@ pub fn diff_overlay_full(
     before_png: &[u8],
     after_png: &[u8],
 ) -> Option<(Vec<u8>, Option<String>, Option<(f64, f64, f64, f64)>)> {
-    let (grid, w, h) = changed_grid(before_png, after_png)?;
+    diff_overlay_full_with(before_png, after_png, DIFF_THRESHOLD)
+}
+
+/// [`diff_overlay_full`] with an explicit per-channel threshold: [`LAYER_DIFF_THRESHOLD`] for a
+/// layer's rasters, the composite default otherwise.
+#[allow(clippy::type_complexity)]
+pub fn diff_overlay_full_with(
+    before_png: &[u8],
+    after_png: &[u8],
+    threshold: i32,
+) -> Option<(Vec<u8>, Option<String>, Option<(f64, f64, f64, f64)>)> {
+    let (grid, w, h) = changed_grid(before_png, after_png, threshold)?;
     let outline = outline_from_grid(&grid, w, h);
     let bbox = bbox_from_grid(&grid, w, h);
     let png = mask_png_from_grid(&grid, w, h, outline.as_deref(), bbox)?;

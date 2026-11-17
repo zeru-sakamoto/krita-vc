@@ -167,6 +167,14 @@ stream from the capped PNGs the raster path just encoded (read back from the ras
 rasters were cache hits), and the mask PNG is cached content-addressed by both layer raster keys,
 so a repeat view reads neither raster. Added, removed and unchanged layers carry none.
 
+Unlike the composite's, a layer's mask has **no threshold** (`raster::LAYER_DIFF_THRESHOLD` = 0,
+through `raster::diff_overlay_full_with`): layer tiles are lossless and both sides go through the
+same decode and downscale, so any difference is a real edit, and the old shared threshold of 16 hid
+faint strokes and low-opacity washes. Its cache key is `kra::layer_diff_cache_key`, separate from the
+composite's, so masks cached under the old threshold are never served. A layer's `regions` don't
+come from this mask at all but from the full-resolution comparison described under "Each layer's
+`change`" below, so an edit too small to survive the downscale is still marked.
+
 ### CompareSlider
 
 The swipe comparison ([`src/components/vcs/CompareSlider.tsx`](../src/components/vcs/CompareSlider.tsx)).
@@ -225,14 +233,27 @@ parent; the working tree is compared with its last commit.
      capped, cached (`kra::diff_cache_key`) and served over `kvcimg://`. The outline is a vector path
      tracing the changed pixels' shape. Together they drive the default "pixels" highlight, and since
      they're computed from the composite, they don't need the layer stream.
-   - **Change regions.** One normalized bounding box over the tiles that differ between the two
-     commits (no pixel decoding, just comparing tile hashes), for the coarse box highlight.
+   - **Change regions.** One normalized box over every pixel that changed inside the canvas, for
+     the coarse box highlight, and one per modified layer over that layer's changed pixels. Both
+     come from `kra::diff_tile_pixels` at full resolution and are grown to a minimum size
+     (`kra::region_with_min_size`: 1.5% of the canvas's longer side, at least 8 px, kept inside the
+     canvas), since a one-pixel edit on an A4 canvas is otherwise far below one screen pixel in the
+     pane. No visible change means no region, rather than an empty box.
    - **Each layer's `change`** (`added`, `removed`, `modified` or `unchanged`). A layer is
-     `modified` when its curated metadata moved (`opacity`, `compositeop`, `name`) or its tiles
-     differ. Both are decided per matched layer, never per archive path. Layers are paired by
+     `modified` when its curated metadata moved (`opacity`, `compositeop`, `name`) or **a pixel
+     inside the canvas differs**. `kra::diff_tile_pixels` compares tile hashes first, so unchanged
+     tiles are never decoded, then decodes only the tiles that differ and compares their pixels
+     exactly, within the canvas, with a missing tile read as the side's `.defaultpixel` (else
+     transparent). Comparing stored bytes alone, as `kra::diff_tile_indexes` still does for its
+     other callers, marked layers modified with nothing to show in three ways: tiles Krita keeps past
+     the canvas edge (a tap outside it), a transparent tile appearing over a transparent default, and
+     the same pixels stored differently (raw against LZF, or a pixel-delta ref against a working
+     tile). A tile that can't be decoded (not RGBA8) counts as changed over its in-canvas area, so
+     nothing is hidden. See [history 15](history/15-bugs-found-in-evaluation-testing.md). Both are
+     decided per matched layer, never per archive path. Layers are paired by
      `commands::layer_id` (the uuid, or the name when there is none), and the tile comparison looks
      up the old side under that matched layer's own `<image name>/layers/<filename>`. That's why
-     `kra::diff_tile_indexes` takes a `pair` map from each new-side entry path to its old-side entry
+     `kra::diff_tile_pixels` (and `kra::diff_tile_indexes`) take a `pair` map from each new-side entry path to its old-side entry
      path (`""` for a layer with no counterpart, since no entry path is empty, so an added layer's
      tiles all count as new and it still contributes to the change region).
 
