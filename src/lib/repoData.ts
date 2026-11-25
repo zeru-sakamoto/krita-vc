@@ -12,6 +12,7 @@ import type {
 import { inTauri } from "./tauri";
 import { timed } from "./perf";
 import { mockBranches, mockCommits, mockDiff, mockEnabled } from "./mockRepo";
+import { sameValue } from "./sameValue";
 
 /** Shape returned by the `list_commits` Tauri command (serde camelCase). */
 interface BackendCommit {
@@ -315,7 +316,13 @@ const workingDiffInflight = new Map<string, Promise<DiffEntry[]>>();
  * `nonce` forces a refetch after a rescan/commit.
  */
 export function useWorkingDiff(path: string, file: string | null, nonce = 0): DiffResult {
-  const [result, setResult] = useState<DiffResult>({ entries: [], error: null, loading: false });
+  // Loading from the first render when there is a file to diff: starting at `false` let the
+  // effect's own `true` arrive a frame late, and that frame drew the empty-diff state.
+  const [result, setResult] = useState<DiffResult>({
+    entries: [],
+    error: null,
+    loading: Boolean(file) && inTauri(),
+  });
 
   useEffect(() => {
     if (!file || !inTauri()) {
@@ -340,7 +347,12 @@ export function useWorkingDiff(path: string, file: string | null, nonce = 0): Di
       request.then(clear, clear);
     }
     request
-      .then((entries) => {
+      .then((fresh) => {
+        // Same answer as the one on screen: keep that object, so everything memoized on it (the
+        // row list, the layer navigator, the canvas) sees no change at all. Compared against this
+        // caller's own previous result, not the shared cache, which the other caller of this
+        // hook may already have overwritten with `fresh`.
+        const entries = stale && sameValue(stale, fresh) ? stale : fresh;
         workingDiffCache.set(key, entries);
         while (workingDiffCache.size > WORKING_DIFF_CACHE_MAX) {
           workingDiffCache.delete(workingDiffCache.keys().next().value!);
@@ -515,34 +527,50 @@ export function useStorageStats(
   return { stats, loading };
 }
 
+export interface ArtLayersState {
+  layers: Map<string, ArtLayer> | null;
+  loading: boolean;
+  /**
+   * `layers` is the *previous* answer for this same file, kept on screen while a refresh runs so
+   * the layer list doesn't drop to spinners for the length of the fetch. Only its rasters are
+   * safe to use — its metadata (opacity, changes, prev…) may be out of date.
+   */
+  stale?: boolean;
+}
+
 export function useArtLayers(
   path: string,
   file: string,
   opts: { commitId: string | null; working: boolean; nonce?: number }
-): { layers: Map<string, ArtLayer> | null; loading: boolean } {
+): ArtLayersState {
   const { commitId, working, nonce = 0 } = opts;
-  const [state, setState] = useState<{ layers: Map<string, ArtLayer> | null; loading: boolean }>({
-    layers: null,
-    loading: false,
-  });
+  const [state, setState] = useState<ArtLayersState>({ layers: null, loading: false });
+  // The last completed answer, and which file it was for. A refresh of the same file (new nonce)
+  // starts from it; another file or version never does.
+  const lastDone = useRef<{ ident: string; layers: Map<string, ArtLayer> } | null>(null);
 
   useEffect(() => {
     if (!inTauri() || !file || (!working && !commitId)) {
       setState({ layers: null, loading: false });
       return;
     }
+    const ident = `${path}|${file}|${working ? "working" : commitId}`;
     const key = working ? `${path}|${file}|working|${nonce}` : `${path}|${file}|${commitId}`;
     const cached = layerCache.get(key);
     if (cached) {
       // Refresh insertion order so hot entries survive eviction (Map iterates oldest-first).
       layerCache.delete(key);
       layerCache.set(key, cached);
+      lastDone.current = { ident, layers: cached };
       setState({ layers: cached, loading: false });
       return;
     }
     let cancelled = false;
     const received = new Map<string, ArtLayer>();
-    setState({ layers: null, loading: true });
+    const previous = lastDone.current?.ident === ident ? lastDone.current.layers : null;
+    setState(
+      previous ? { layers: previous, loading: true, stale: true } : { layers: null, loading: true }
+    );
     // Layers arrive one at a time as the backend finishes them. Fast layers can burst far
     // above frame rate, and every setState re-renders the whole diff viewer — coalesce
     // arrivals into one state flush per animation frame so they still pop in progressively
@@ -550,7 +578,15 @@ export function useArtLayers(
     let frame: number | null = null;
     const flush = () => {
       frame = null;
-      if (!cancelled) setState({ layers: new Map(received), loading: true });
+      // Layers already streamed replace the old ones one by one; the rest keep their old raster
+      // until theirs lands (the consumer only trusts a stale layer's pixels).
+      if (!cancelled) {
+        setState(
+          previous
+            ? { layers: new Map([...previous, ...received]), loading: true, stale: true }
+            : { layers: new Map(received), loading: true }
+        );
+      }
     };
     const onLayer = new Channel<ArtLayer>();
     onLayer.onmessage = (layer) => {
@@ -571,11 +607,22 @@ export function useArtLayers(
           cancelAnimationFrame(frame);
           frame = null;
         }
-        layerCache.set(key, received);
+        // A refresh that comes back identical keeps the previous layer objects (and the previous
+        // map when nothing differs at all), so the navigator's memoized rows and the canvas see
+        // no change instead of re-rendering every thumbnail with the same pixels.
+        let identical = previous != null && previous.size === received.size;
+        for (const [id, layer] of received) {
+          const before = previous?.get(id);
+          if (before && sameValue(before, layer)) received.set(id, before);
+          else identical = false;
+        }
+        const done = identical && previous ? previous : received;
+        layerCache.set(key, done);
         while (layerCache.size > LAYER_CACHE_MAX) {
           layerCache.delete(layerCache.keys().next().value!);
         }
-        setState({ layers: new Map(received), loading: false });
+        lastDone.current = { ident, layers: done };
+        setState({ layers: done, loading: false });
       })
       .catch(() => {
         if (!cancelled) setState((s) => ({ ...s, loading: false }));

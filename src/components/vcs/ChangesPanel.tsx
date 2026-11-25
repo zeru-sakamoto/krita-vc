@@ -10,6 +10,7 @@ import { Modal } from "../ui/Modal";
 import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWorkingDiff } from "../../lib/repoData";
+import { useDelayedFlag } from "../../lib/useDelayedFlag";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
 import { ICON } from "../../lib/iconSize";
 import { layerChangeSummary, layerTypeIcon } from "../../lib/friendly";
@@ -225,6 +226,8 @@ export function ChangesPanel({
   const rows = useMemo(() => layerRows(entries), [entries]);
   // Either kind of "checking" leaves the diff this button reverts in flux.
   const checking = scanning || loading;
+  // The rows stay up while a refresh runs; this only says so once it is slow enough to notice.
+  const showLoading = useDelayedFlag(checking);
 
   // Ticks are only meaningful against the diff they were made on: a new scan, a different artwork
   // or a branch switch all replace the rows underneath them.
@@ -247,7 +250,7 @@ export function ChangesPanel({
     });
 
   const doCommit = async () => {
-    if (!message.trim() || saving || !path || nothingPicked) return;
+    if (!message.trim() || saving || checking || !path || nothingPicked) return;
     setSaving(true);
     setBusyMessage("Saving this version — please wait…");
     setCommitError(null);
@@ -310,6 +313,13 @@ export function ChangesPanel({
                 {partial ? `${included.length}/${rows.length}` : rows.length}
               </span>
             )}
+            {showLoading && rows.length > 0 && (
+              <CircleNotch
+                size={ICON.inline}
+                className="animate-spin"
+                aria-label="Checking for changes"
+              />
+            )}
           </span>
           {changed && (
             <Tooltip
@@ -336,10 +346,17 @@ export function ChangesPanel({
           <p className="px-3 pb-2 text-dense text-text-muted">
             This artwork is missing from its folder. Undo to bring the latest version back.
           </p>
-        ) : loading ? (
-          <p className="flex items-center gap-1.5 px-3 pb-2 text-dense text-text-muted">
-            <CircleNotch size={ICON.inline} className="animate-spin" />
-            Looking at what changed…
+        ) : loading && rows.length === 0 ? (
+          // Nothing to show yet. Hold the line for a moment so a fast check never flashes it, but
+          // keep the space (and never fall through to the "outside the layer stack" note below,
+          // which only means something once the rows have been looked for).
+          <p className="flex h-6 items-center gap-1.5 px-3 pb-2 text-dense text-text-muted">
+            {showLoading && (
+              <>
+                <CircleNotch size={ICON.inline} className="animate-spin" />
+                Looking at what changed…
+              </>
+            )}
           </p>
         ) : rows.length > 0 ? (
           <>
@@ -408,17 +425,19 @@ export function ChangesPanel({
           <Button
             variant="primary"
             onClick={doCommit}
-            disabled={!message.trim() || !changed || saving || nothingPicked}
+            disabled={!message.trim() || !changed || saving || checking || nothingPicked}
             data-tour-id="commit-button"
           >
-            {saving && <CircleNotch size={ICON.inline} className="animate-spin" />}
+            {(saving || checking) && <CircleNotch size={ICON.inline} className="animate-spin" />}
             {saving
               ? "Saving version…"
-              : nothingPicked
-                ? "Choose at least one layer"
-                : partial
-                  ? `Save ${included.length} of ${rows.length} layers`
-                  : "Save this version"}
+              : checking
+                ? "Checking changes…"
+                : nothingPicked
+                  ? "Choose at least one layer"
+                  : partial
+                    ? `Save ${included.length} of ${rows.length} layers`
+                    : "Save this version"}
           </Button>
         </div>
       )}

@@ -120,7 +120,7 @@ function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null 
       <div className="border-t border-border px-3 py-2">
         <h3 className="mb-1.5 text-body font-medium text-text">Selected layer</h3>
         <div className="flex flex-col">
-          <MetaRow label="Name">{layer.name}</MetaRow>
+          <PropRow label="Name" was={p?.name} now={layer.name} />
           {layer.layerType && <MetaRow label="Type">{layerTypeLabel(layer.layerType)}</MetaRow>}
           {/* Each property shows was → now, highlighted, when it changed in this version. */}
           <PropRow

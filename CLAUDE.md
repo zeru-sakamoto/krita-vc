@@ -455,6 +455,7 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `dialog:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.
 - **App identity/config**: window size, app identifier (`com.zeru-sakamoto.krita-vc`), and bundle/icon settings live in `src-tauri/tauri.conf.json`.
+- **Single instance**: `tauri-plugin-single-instance` is registered first in `lib.rs` (desktop targets only). A second launch exits at once and the running app unminimizes, shows and focuses its `main` window; the identifier above is what the plugin keys on.
 
 Recommended editor setup (from README): VS Code with the Tauri and rust-analyzer extensions (already listed in `.vscode/extensions.json`).
 
@@ -579,6 +580,13 @@ because timing is per-machine and belongs with the browser, not the repo).
 - **Main panel** (`src/components/MainPanel.tsx`): thin wrapper between `AppShell` and `DiffView`;
   handles the empty-state when no commit is selected, and shows an "Analyzing changes…" spinner
   while the diff loads (the `loading` flag from `useCommitDiff`/`useWorkingDiff`).
+  **Refreshes don't flash.** A refresh keeps the previous content on screen (stale-while-
+  revalidate): `useWorkingDiff` keeps its entries, and `useArtLayers` returns the previous layers
+  with `stale: true`, which `ArtDiffView` may use for **pixels only** (`withRasters`) — their
+  metadata (`changes`, `prev`, opacity…) can be out of date and must come from the fresh diff.
+  Spinners and "Looking at what changed…" wait `useDelayedFlag` (180 ms) so a fast refresh shows
+  none, and a refresh that returns identical data (`sameValue`) keeps the old objects so memoized
+  consumers see no change.
 - **Diff viewer** — `DiffView` routes each `DiffEntry` by `kind`: art (`.kra`) files render as a
   **visual layer diff** (`ArtDiffView` → `LayerStackPanel` + `ArtCanvas`/`CompareSlider`) inside a
   **drag-resizable region** (vertical handle on its bottom edge; height persisted via `useResize`,
