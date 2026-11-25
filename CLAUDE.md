@@ -455,6 +455,7 @@ This is a Tauri 2 app: a React/TypeScript frontend rendered in a native webview,
 - **Permissions/capabilities**: `src-tauri/capabilities/default.json` declares which Tauri permissions (e.g. `core:default`, `dialog:default`) the main window is allowed to use. Any new Tauri plugin or privileged API needs its permission added here or the call will be rejected at runtime.
 - **Dev server coupling**: `vite.config.ts` hardcodes port `1420` (`strictPort: true`) and `src-tauri/tauri.conf.json`'s `build.devUrl` points at `http://localhost:1420`. These must stay in sync — Tauri's dev shell loads the app from that fixed URL. `src-tauri/` is excluded from Vite's file watcher.
 - **App identity/config**: window size, app identifier (`com.zeru-sakamoto.krita-vc`), and bundle/icon settings live in `src-tauri/tauri.conf.json`.
+- **Single instance**: `tauri-plugin-single-instance` is registered first in `lib.rs` (desktop targets only). A second launch exits at once and the running app unminimizes, shows and focuses its `main` window; the identifier above is what the plugin keys on.
 
 Recommended editor setup (from README): VS Code with the Tauri and rust-analyzer extensions (already listed in `.vscode/extensions.json`).
 
@@ -550,7 +551,9 @@ because timing is per-machine and belongs with the browser, not the repo).
   "on top". Everything is **pre-ticked**, so doing nothing saves the whole artwork
   exactly as before and the panel tracks what's been *un*ticked. And changes **outside** the layer
   stack (canvas size, animation, document settings) always ride along — there's no row for them,
-  and the copy says so once a selection is partial. `commit_snapshot`'s `paths` arg
+  and the copy says so once a selection is partial. So does **layer order**: a partial version keeps
+  the working file's stacking order (`stage::plan_pieces`), so a row whose only change is `moved`
+  is shown with a checkbox that can't be unticked. `commit_snapshot`'s `paths` arg
   (`commit::commit_selected`) is unrelated and survives for the CLI.
   While a commit is in flight the commit button spins and the `StatusBar` shows a progress
   bar, via the shared `saving`/`scanning` flags on the repository context — `BranchesPanel` is local
@@ -577,6 +580,13 @@ because timing is per-machine and belongs with the browser, not the repo).
 - **Main panel** (`src/components/MainPanel.tsx`): thin wrapper between `AppShell` and `DiffView`;
   handles the empty-state when no commit is selected, and shows an "Analyzing changes…" spinner
   while the diff loads (the `loading` flag from `useCommitDiff`/`useWorkingDiff`).
+  **Refreshes don't flash.** A refresh keeps the previous content on screen (stale-while-
+  revalidate): `useWorkingDiff` keeps its entries, and `useArtLayers` returns the previous layers
+  with `stale: true`, which `ArtDiffView` may use for **pixels only** (`withRasters`) — their
+  metadata (`changes`, `prev`, opacity…) can be out of date and must come from the fresh diff.
+  Spinners and "Looking at what changed…" wait `useDelayedFlag` (180 ms) so a fast refresh shows
+  none, and a refresh that returns identical data (`sameValue`) keeps the old objects so memoized
+  consumers see no change.
 - **Diff viewer** — `DiffView` routes each `DiffEntry` by `kind`: art (`.kra`) files render as a
   **visual layer diff** (`ArtDiffView` → `LayerStackPanel` + `ArtCanvas`/`CompareSlider`) inside a
   **drag-resizable region** (vertical handle on its bottom edge; height persisted via `useResize`,
@@ -626,7 +636,21 @@ because timing is per-machine and belongs with the browser, not the repo).
   path**: layers pair by `commands::layer_id` (uuid, name when absent), and the tile comparison
   looks the old side up under that matched layer's own `<image name>/layers/<filename>` — hence the
   `pair` map (new entry path -> old entry path, `""` for no counterpart) that
-  `kra::diff_tile_indexes` takes. Krita renumbers `layerN` whenever the stack changes, so pairing
+  `kra::diff_tile_pixels` takes. A layer is `modified` when its `LayerDto.changes` list is non-empty:
+  any of `pixels`, `visibility`, `moved`, `opacity`, `blend`, `renamed`, several at once, with the
+  old property values in `LayerDto.prev` (the top-level fields are always the new side, which is
+  why a visibility toggle used to show only the new state). `moved` comes from
+  `commands::moved_layers` (changed group, or outside the longest in-order run of siblings, so one
+  drag flags one layer). Only `pixels` fetches a before raster and a highlight. Tests:
+  `tests/layer_props.rs`. **The `pixels` change means a pixel inside the canvas changed**:
+  `diff_tile_pixels` uses tile hashes only to pre-filter, then decodes the differing tiles and
+  compares pixels within the canvas (missing tile = `.defaultpixel`), because byte-level comparison
+  flagged off-canvas tiles, transparent tiles appearing and re-encoded tiles as edits with nothing to
+  show. Layer masks have no threshold (`raster::LAYER_DIFF_THRESHOLD`, own cache key
+  `kra::layer_diff_cache_key`), and every region (per layer and composite) comes from the
+  full-resolution boxes grown by `kra::region_with_min_size`, never from the downscaled mask, so a
+  modified layer always has a visible region. Regression tests: `tests/diff_visibility.rs`; story:
+  `docs/history/15-bugs-found-in-evaluation-testing.md`. Krita renumbers `layerN` whenever the stack changes, so pairing
   by path made every layer above an inserted one report `modified` with byte-identical tiles — in
   the diff navigator *and* the Changes panel, whose rows roll up this same `change`. Same class of
   bug `merge.rs` avoids by collecting data files filename-independently. **Region boxes are

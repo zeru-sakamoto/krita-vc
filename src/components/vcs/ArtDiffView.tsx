@@ -7,7 +7,7 @@ import {
   Columns,
   Sparkle,
 } from "@phosphor-icons/react";
-import type { ArtDiff, ChangeRegion, DiffState, PaletteDiff } from "../../types";
+import type { ArtDiff, ArtLayer, ChangeRegion, DiffState, PaletteDiff } from "../../types";
 import { IconButton } from "../ui/IconButton";
 import { Switch } from "../ui/Switch";
 import { Tooltip } from "../ui/Tooltip";
@@ -17,13 +17,36 @@ import { ICON } from "../../lib/iconSize";
 import { useArtistMode } from "../../lib/artistMode";
 import { useArtLayers } from "../../lib/repoData";
 import { useZoomPan } from "../../lib/useZoomPan";
-import { assetName } from "../../lib/friendly";
+import { useDelayedFlag } from "../../lib/useDelayedFlag";
+import { assetName, layerChangeTexts } from "../../lib/friendly";
+import { groupAsLayer, isGroupLayer } from "../../lib/svgArt";
 import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
 import { LayerStackPanel, COMPOSITE_ID, PALETTE_ID } from "./LayerStackPanel";
 import { PaletteDiffView } from "./PaletteDiffView";
 
 type ViewMode = "split" | "slider";
+
+/**
+ * `l` (current metadata from the diff) wearing the pixels of `old`, a layer from the previous
+ * answer for this file. Mirrors how the backend fills a layer's sides: a modified layer's before
+ * is its own old raster only when pixels changed, otherwise it matches the after; the changed-
+ * pixel highlight belongs to a pixel change alone.
+ */
+function withRasters(l: ArtLayer, old: ArtLayer): ArtLayer {
+  const pixels = l.changes?.includes("pixels") ?? false;
+  const modified = l.change === "modified";
+  return {
+    ...l,
+    before: modified && !pixels ? old.after : old.before,
+    beforeThumb: modified && !pixels ? old.afterThumb : old.beforeThumb,
+    after: old.after,
+    afterThumb: old.afterThumb,
+    diffImage: pixels ? old.diffImage : undefined,
+    diffOutline: pixels ? old.diffOutline : undefined,
+    regions: pixels ? old.regions : undefined,
+  };
+}
 
 const Pane = memo(function Pane({
   label,
@@ -134,24 +157,35 @@ export function ArtDiffView({
   // in one at a time (keyed by layer id) and merge over the metadata as they land. Until a
   // layer arrives its metadata row still renders, and the composite (mergedimage.png) is
   // available from the start.
-  const { layers: fetchedLayers, loading: layersLoading } = useArtLayers(
-    repoPath ?? "",
-    diff.path,
-    {
-      commitId: commitId ?? null,
-      working: working ?? false,
-      nonce,
-    }
-  );
+  const {
+    layers: fetchedLayers,
+    loading: layersLoading,
+    stale: layersStale,
+  } = useArtLayers(repoPath ?? "", diff.path, {
+    commitId: commitId ?? null,
+    working: working ?? false,
+    nonce,
+  });
   const effectiveDiff = useMemo<ArtDiff>(() => {
     if (!fetchedLayers || fetchedLayers.size === 0) return diff;
-    return { ...diff, layers: diff.layers.map((l) => fetchedLayers.get(l.id) ?? l) };
-  }, [diff, fetchedLayers]);
-  // Layers whose rasters haven't streamed in yet — spinners in the navigator and canvas.
+    return {
+      ...diff,
+      layers: diff.layers.map((l) => {
+        const f = fetchedLayers.get(l.id);
+        if (!f) return l;
+        // A refresh's previous answer lends only its pixels: the diff's own metadata is the
+        // current one, and a stale `changes`/`prev` would hide what the refresh just found.
+        return layersStale ? withRasters(l, f) : f;
+      }),
+    };
+  }, [diff, fetchedLayers, layersStale]);
+  // Layers whose rasters haven't streamed in yet — spinners in the navigator and canvas. Only
+  // once the wait is long enough to notice: a fast refresh finishes first and shows no spinner.
+  const showLayersLoading = useDelayedFlag(layersLoading);
   const pendingIds = useMemo(() => {
-    if (!layersLoading) return new Set<string>();
+    if (!showLayersLoading) return new Set<string>();
     return new Set(diff.layers.filter((l) => !fetchedLayers?.has(l.id)).map((l) => l.id));
-  }, [diff, fetchedLayers, layersLoading]);
+  }, [diff, fetchedLayers, showLayersLoading]);
 
   // Keyed on `diff`, not `effectiveDiff`: the composite images ship with the first commit_diff
   // and never stream, so this object must keep its identity while layers arrive. Built from
@@ -184,7 +218,9 @@ export function ArtDiffView({
       return effectiveDiff.layers;
     }
     const found = effectiveDiff.layers.find((l) => l.id === selectedId);
-    return found ? [found] : effectiveDiff.layers;
+    if (!found) return effectiveDiff.layers;
+    // A group has no raster of its own: show what's inside it.
+    return [isGroupLayer(found) ? groupAsLayer(effectiveDiff.layers, found) : found];
   }, [compositeLayers, effectiveDiff.layers, selectedId]);
 
   // The change-highlight source follows the selection: the whole-file composite highlight for the
@@ -209,6 +245,17 @@ export function ArtDiffView({
     };
   }, [effectiveDiff, selectedId]);
 
+  const propertyCaption = useMemo(() => {
+    const found = effectiveDiff.layers.find((l) => l.id === selectedId);
+    if (!found?.changes) return null;
+    const props = layerChangeTexts(found, effectiveDiff.layers).filter(
+      (_, i) => found.changes?.[i] !== "pixels"
+    );
+    if (props.length === 0) return null;
+    const list = props.map((t) => t.full).join(" · ");
+    return found.changes.includes("pixels") ? `Also: ${list}` : `No pixels changed. ${list}`;
+  }, [effectiveDiff.layers, selectedId]);
+
   const showPalette = selectedId === PALETTE_ID && palette != null;
 
   return (
@@ -224,7 +271,7 @@ export function ArtDiffView({
         >
           {artistMode ? assetName(diff.path) : diff.path}
         </span>
-        {layersLoading && (
+        {showLayersLoading && (
           <span className="ml-auto flex items-center gap-1 text-caption text-text-muted">
             <CircleNotchIcon size={ICON.inline} className="animate-spin" />
             Loading layers…
@@ -371,6 +418,13 @@ export function ArtDiffView({
                   </div>
                 )}
               </div>
+              {/* Property changes the pixel highlight can't show. Without pixel changes this is
+                  the only sign anything happened, since both panes draw the same pixels. */}
+              {propertyCaption && (
+                <p className="selectable shrink-0 border-t border-border px-3 py-1.5 text-caption text-warning-fg">
+                  {propertyCaption}
+                </p>
+              )}
             </>
           )}
         </div>

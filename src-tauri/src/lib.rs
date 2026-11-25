@@ -23,7 +23,19 @@ pub fn run() {
     // Cached diff rasters are served straight from `.kvc/cache/` over this scheme — no base64,
     // no multi-MB IPC strings, browser-cacheable (see raster::raster_url / commands::serve_raster).
     raster::enable_img_protocol();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be the first plugin registered. A second launch exits immediately and this callback
+    // runs in the already-running instance, which brings its window forward instead.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        use tauri::Manager;
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .register_asynchronous_uri_scheme_protocol("kvcimg", |_ctx, request, responder| {

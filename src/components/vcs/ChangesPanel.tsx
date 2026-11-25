@@ -10,9 +10,10 @@ import { Modal } from "../ui/Modal";
 import { Tooltip } from "../ui/Tooltip";
 import { useRepository } from "../../lib/repository";
 import { useWorkingDiff } from "../../lib/repoData";
+import { useDelayedFlag } from "../../lib/useDelayedFlag";
 import { resolvedAuthor, useAuthorName } from "../../lib/authorName";
 import { ICON } from "../../lib/iconSize";
-import { layerTypeIcon } from "../../lib/friendly";
+import { layerChangeSummary, layerTypeIcon } from "../../lib/friendly";
 import { inTauri } from "../../lib/tauri";
 import { timed } from "../../lib/perf";
 
@@ -46,6 +47,14 @@ interface LayerRow {
   layerType?: string;
   /** Changed descendants folded into this row (groups only). */
   nested: number;
+  /** What changed on the layer itself ("Hidden · Renamed"), and every change in full. */
+  summary: { text: string; title: string };
+  /**
+   * The only change is the layer's place in the stack. Leaving it out can't undo that: a partial
+   * version keeps the working file's layer order (`stage::plan_pieces`), so the row is shown but
+   * can't be unticked.
+   */
+  orderOnly: boolean;
 }
 
 const CHANGE_STATUS: Record<string, FileStatus> = {
@@ -84,11 +93,23 @@ function layerRows(entries: DiffEntry[]): LayerRow[] {
           change: owner.change === "unchanged" ? "modified" : owner.change,
           layerType: owner.layerType,
           nested: 0,
+          summary: layerChangeSummary(owner, entry.layers),
+          orderOnly: false,
         };
         byId.set(top, row);
         order.push(top);
       }
       if (layer.id !== top) row.nested += 1;
+    }
+    // Decided once every nested change is in: a group whose own record only moved still needs
+    // its checkbox if anything inside it changed too.
+    for (const row of byId.values()) {
+      const owner = entry.layers.find((l) => l.id === row.id);
+      row.orderOnly =
+        row.nested === 0 &&
+        owner?.change === "modified" &&
+        owner.changes?.length === 1 &&
+        owner.changes[0] === "moved";
     }
   }
   // Backend order is bottom-to-top (raw `.kra` stacking order); the diff navigator
@@ -111,16 +132,34 @@ function LayerRowItem({
   return (
     <li>
       <label className="flex cursor-pointer items-center gap-2 px-3 py-1 hover:bg-state-hover">
-        <Checkbox
-          checked={checked}
-          disabled={disabled}
-          onChange={onToggle}
-          aria-label={`Include ${row.name} in this version`}
-        />
+        {row.orderOnly ? (
+          <Tooltip label="Layer order is always saved with the version">
+            <span>
+              <Checkbox
+                checked
+                disabled
+                onChange={() => {}}
+                aria-label={`${row.name} moved; layer order is always saved`}
+              />
+            </span>
+          </Tooltip>
+        ) : (
+          <Checkbox
+            checked={checked}
+            disabled={disabled}
+            onChange={onToggle}
+            aria-label={`Include ${row.name} in this version`}
+          />
+        )}
         <FileStatusChip status={CHANGE_STATUS[row.change] ?? "M"} />
         <Icon size={ICON.dense} weight="regular" className="shrink-0 text-text-muted" />
-        <Tooltip label={row.name}>
-          <span className="min-w-0 flex-1 truncate text-dense text-text">{row.name}</span>
+        <Tooltip label={row.summary.title ? `${row.name}: ${row.summary.title}` : row.name}>
+          <span className="min-w-0 flex-1 truncate text-dense text-text">
+            {row.name}
+            {row.summary.text && (
+              <span className="ml-1.5 text-micro text-text-muted">{row.summary.text}</span>
+            )}
+          </span>
         </Tooltip>
         {row.nested > 0 && (
           <span className="shrink-0 text-micro text-text-muted">+{row.nested} inside</span>
@@ -187,12 +226,17 @@ export function ChangesPanel({
   const rows = useMemo(() => layerRows(entries), [entries]);
   // Either kind of "checking" leaves the diff this button reverts in flux.
   const checking = scanning || loading;
+  // The rows stay up while a refresh runs; this only says so once it is slow enough to notice.
+  const showLoading = useDelayedFlag(checking);
 
   // Ticks are only meaningful against the diff they were made on: a new scan, a different artwork
   // or a branch switch all replace the rows underneath them.
   useEffect(() => setExcluded(new Set()), [docPath, currentBranch.name, refreshNonce]);
 
-  const included = useMemo(() => rows.filter((r) => !excluded.has(r.id)), [rows, excluded]);
+  const included = useMemo(
+    () => rows.filter((r) => r.orderOnly || !excluded.has(r.id)),
+    [rows, excluded]
+  );
   // A subset only exists once something is unticked *and* there are rows to untick. With no rows
   // (a change outside the layer stack) there's nothing to choose, so it's a whole-artwork save.
   const partial = rows.length > 0 && included.length < rows.length;
@@ -206,7 +250,7 @@ export function ChangesPanel({
     });
 
   const doCommit = async () => {
-    if (!message.trim() || saving || !path || nothingPicked) return;
+    if (!message.trim() || saving || checking || !path || nothingPicked) return;
     setSaving(true);
     setBusyMessage("Saving this version — please wait…");
     setCommitError(null);
@@ -269,6 +313,13 @@ export function ChangesPanel({
                 {partial ? `${included.length}/${rows.length}` : rows.length}
               </span>
             )}
+            {showLoading && rows.length > 0 && (
+              <CircleNotch
+                size={ICON.inline}
+                className="animate-spin"
+                aria-label="Checking for changes"
+              />
+            )}
           </span>
           {changed && (
             <Tooltip
@@ -295,10 +346,17 @@ export function ChangesPanel({
           <p className="px-3 pb-2 text-dense text-text-muted">
             This artwork is missing from its folder. Undo to bring the latest version back.
           </p>
-        ) : loading ? (
-          <p className="flex items-center gap-1.5 px-3 pb-2 text-dense text-text-muted">
-            <CircleNotch size={ICON.inline} className="animate-spin" />
-            Looking at what changed…
+        ) : loading && rows.length === 0 ? (
+          // Nothing to show yet. Hold the line for a moment so a fast check never flashes it, but
+          // keep the space (and never fall through to the "outside the layer stack" note below,
+          // which only means something once the rows have been looked for).
+          <p className="flex h-6 items-center gap-1.5 px-3 pb-2 text-dense text-text-muted">
+            {showLoading && (
+              <>
+                <CircleNotch size={ICON.inline} className="animate-spin" />
+                Looking at what changed…
+              </>
+            )}
           </p>
         ) : rows.length > 0 ? (
           <>
@@ -306,7 +364,13 @@ export function ChangesPanel({
               <div className="flex justify-end px-3 pb-1">
                 <button
                   type="button"
-                  onClick={() => setExcluded(partial ? new Set() : new Set(rows.map((r) => r.id)))}
+                  onClick={() =>
+                    setExcluded(
+                      partial
+                        ? new Set()
+                        : new Set(rows.filter((r) => !r.orderOnly).map((r) => r.id))
+                    )
+                  }
                   disabled={saving || checking}
                   className="rounded-button px-1 py-0.5 text-micro text-text-muted hover:bg-state-hover hover:text-text disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                 >
@@ -327,8 +391,8 @@ export function ChangesPanel({
             </ul>
             {partial && (
               <p className="px-3 pb-2 text-micro leading-relaxed text-text-muted">
-                The layers you leave out stay unsaved, ready for a later version. Canvas size and
-                document settings are always included.
+                The layers you leave out stay unsaved, ready for a later version. Canvas size, layer
+                order and document settings are always included.
               </p>
             )}
           </>
@@ -361,17 +425,19 @@ export function ChangesPanel({
           <Button
             variant="primary"
             onClick={doCommit}
-            disabled={!message.trim() || !changed || saving || nothingPicked}
+            disabled={!message.trim() || !changed || saving || checking || nothingPicked}
             data-tour-id="commit-button"
           >
-            {saving && <CircleNotch size={ICON.inline} className="animate-spin" />}
+            {(saving || checking) && <CircleNotch size={ICON.inline} className="animate-spin" />}
             {saving
               ? "Saving version…"
-              : nothingPicked
-                ? "Choose at least one layer"
-                : partial
-                  ? `Save ${included.length} of ${rows.length} layers`
-                  : "Save this version"}
+              : checking
+                ? "Checking changes…"
+                : nothingPicked
+                  ? "Choose at least one layer"
+                  : partial
+                    ? `Save ${included.length} of ${rows.length} layers`
+                    : "Save this version"}
           </Button>
         </div>
       )}

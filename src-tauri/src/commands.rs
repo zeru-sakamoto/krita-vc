@@ -8,6 +8,7 @@ use crate::repo::{Commit, CommittedFile, Config, Repo, RepoLock};
 use crate::{commit, scan};
 use rayon::prelude::*;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
@@ -1035,10 +1036,28 @@ pub struct LayerDto {
     /// read-only; it is not fine now that a row is a checkbox deciding what gets saved, since
     /// layer-subset staging acts on top-level layers only (`stage::stage_kra`).
     pub top_level_id: String,
+    /// The id of the group this layer sits directly inside; omitted for a top-level layer. Unlike
+    /// `top_level_id` this is the real tree, so nested groups resolve to their own parent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     pub name: String,
     pub opacity: i64,
     pub blend_mode: String,
+    /// Krita's own `compositeop` (e.g. "darken", "svg:multiply"). `blend_mode` folds every op the
+    /// canvas can't draw into "normal", which is fine for rendering but would turn "Darken to
+    /// Lighten" into "normal to normal" in a property diff, so the UI labels from this one.
+    pub blend_op: String,
     pub change: String,
+    /// What changed on a `modified` layer, most important first: any of "pixels", "visibility",
+    /// "moved", "opacity", "blend", "renamed". Several can apply at once. Empty for every other
+    /// `change`, since added and removed already say everything.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<String>,
+    /// The layer's properties in the parent version, present when any of them changed (anything
+    /// in `changes` besides "pixels"). The top-level fields always describe the new side, so
+    /// without this the diff could show what a property became but never what it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev: Option<PrevLayerDto>,
     /// `<layer visible>` — false for a Krita-hidden layer.
     pub visible: bool,
     /// Krita nodetype (e.g. "paintlayer", "grouplayer"); the UI maps it to a friendly label.
@@ -1065,6 +1084,24 @@ pub struct LayerDto {
     pub diff_outline: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<RegionDto>,
+}
+
+/// A modified layer's properties as they were in the parent version. See `LayerDto::prev`.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PrevLayerDto {
+    pub name: String,
+    pub opacity: i64,
+    pub blend_mode: String,
+    pub blend_op: String,
+    pub visible: bool,
+    /// The group it sat directly inside then; omitted when it was top-level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// That group's name, carried here because the group may no longer exist in the new version,
+    /// so the UI can't look it up in the layer list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1300,6 +1337,71 @@ fn top_level_id(meta: &kra::ImageMeta, l: &LayerNode) -> String {
         .map_or_else(|| layer_id(l), layer_id)
 }
 
+/// The id of the group `l` sits directly inside, or `None` when it is top-level.
+fn parent_id(meta: &kra::ImageMeta, l: &LayerNode) -> Option<String> {
+    l.parent.and_then(|p| meta.layers.get(p)).map(layer_id)
+}
+
+/// Ids of the layers that **moved** in the stack between `old` and `new`: into a different group,
+/// or to a different place among their siblings.
+///
+/// Comparing each layer's position is not enough, because dragging one layer up shifts every
+/// layer it passed, and adding or deleting a layer shifts everything above it. So within each
+/// group, the layers present on both sides are lined up in new order by their old position, and
+/// the longest run already in order counts as having stayed. Everything outside that run moved.
+/// Dragging one layer then flags that layer alone. A plain swap of two flags one of them, since
+/// either reading is equally true.
+fn moved_layers(old: &kra::ImageMeta, new: &kra::ImageMeta) -> HashSet<String> {
+    let old_pos: HashMap<String, (usize, Option<String>)> = old
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (layer_id(l), (i, parent_id(old, l))))
+        .collect();
+    let mut moved = HashSet::new();
+    // Per group (None = top level): old positions of the siblings that stayed in it, new order.
+    let mut groups: HashMap<Option<String>, Vec<(String, usize)>> = HashMap::new();
+    for l in &new.layers {
+        let id = layer_id(l);
+        let Some((at, old_parent)) = old_pos.get(&id) else {
+            continue; // added
+        };
+        let parent = parent_id(new, l);
+        if *old_parent != parent {
+            moved.insert(id);
+        } else {
+            groups.entry(parent).or_default().push((id, *at));
+        }
+    }
+    for siblings in groups.values() {
+        // Longest increasing run of old positions. A Krita group holds tens of layers, so the
+        // quadratic version is plenty and much easier to check than the n log n one.
+        let n = siblings.len();
+        let mut len = vec![1usize; n];
+        let mut prev = vec![usize::MAX; n];
+        for i in 0..n {
+            for j in 0..i {
+                if siblings[j].1 < siblings[i].1 && len[j] + 1 > len[i] {
+                    len[i] = len[j] + 1;
+                    prev[i] = j;
+                }
+            }
+        }
+        let mut kept = vec![false; n];
+        let mut at = (0..n).max_by_key(|&i| len[i]);
+        while let Some(i) = at {
+            kept[i] = true;
+            at = (prev[i] != usize::MAX).then_some(prev[i]);
+        }
+        for (i, (id, _)) in siblings.iter().enumerate() {
+            if !kept[i] {
+                moved.insert(id.clone());
+            }
+        }
+    }
+    moved
+}
+
 /// Composite (mergedimage.png) as a capped PNG data URL. The decode/resize/encode runs once per
 /// unique composite — the result is disk-cached in `.kvc/cache/` keyed by the entry's content
 /// hash, and on a hit `bytes` is never called (no reconstruct at all) and the cached file isn't
@@ -1511,7 +1613,7 @@ fn layer_diff_overlay(
         }
     };
     let cache_dir = repo.cache_dir();
-    let key = kra::diff_cache_key(&before.key, &after.key);
+    let key = kra::layer_diff_cache_key(&before.key, &after.key);
     if let Some((url, outline, bbox)) = cached_overlay(repo, &key) {
         return (Some(url), outline, region(bbox));
     }
@@ -1519,8 +1621,11 @@ fn layer_diff_overlay(
     else {
         return (None, None, Vec::new());
     };
-    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full(&before_png, &after_png)
-    else {
+    let Some((mask, outline, bbox)) = crate::raster::diff_overlay_full_with(
+        &before_png,
+        &after_png,
+        crate::raster::LAYER_DIFF_THRESHOLD,
+    ) else {
         return (None, None, Vec::new());
     };
     crate::raster::cache_write(&cache_dir, &key, &mask);
@@ -1596,15 +1701,29 @@ pub fn art_diff_dto(
         .iter()
         .map(|(n, o)| (n.as_str(), o.as_str()))
         .collect();
-    // One pass over borrowed tile indexes yields both the changed-layer set and the union
-    // region — no per-tile hash clones, no duplicate map builds.
-    let (changed_entries, changed_region) = old_manifest
-        .as_ref()
-        .map(|m| {
-            let d = kra::diff_tile_indexes(&m.tile_index_ref(), &new_index, &entry_pairs, w, h);
-            (d.changed_paths, d.region)
-        })
-        .unwrap_or_default();
+    // One tile cache for the whole request: before/after sides of a modified layer share most
+    // tiles by content hash, so each shared tile reconstructs once — and the pixel comparison
+    // below warms it for the layer rasters that follow.
+    let tile_cache = crate::delta::TileCache::new();
+
+    // Which layers changed *visibly*, and where, at full resolution. Tile hashes only pre-filter:
+    // a layer counts as modified when a pixel inside the canvas differs, so a tap past the canvas
+    // edge, a transparent tile appearing, or the same pixels stored differently no longer read as
+    // an edit with nothing to show.
+    let pixel_diff = match &old_manifest {
+        Some(m) => kra::diff_tile_pixels(
+            repo,
+            path,
+            &kra::KraSource::Committed(m),
+            new_src,
+            &entry_pairs,
+            w,
+            h,
+            &tile_cache,
+        ),
+        None => kra::PixelDiff::default(),
+    };
+    let changed_entries = &pixel_diff.changed_paths;
 
     // "meet" (not "none"): rasters keep their own aspect ratio, letterboxed inside the document
     // box — a before-side from a version with different canvas dimensions must not stretch.
@@ -1612,12 +1731,12 @@ pub fn art_diff_dto(
         format!("<image href=\"{url}\" x=\"0\" y=\"0\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"xMidYMid meet\"/>")
     };
 
-    // One tile cache for the whole request: before/after sides of a modified layer share most
-    // tiles by content hash, so each shared tile reconstructs once.
-    let tile_cache = crate::delta::TileCache::new();
-
     // Rasterize layers in parallel — each layer's decode/blit/PNG-encode is independent and only
     // reads &Repo. Order is preserved by par_iter's indexed collect.
+    let moved = match &old_meta {
+        Some(om) => moved_layers(om, &new_meta),
+        None => HashSet::new(),
+    };
     let mut layers: Vec<LayerDto> = new_meta
         .layers
         .par_iter()
@@ -1626,17 +1745,46 @@ pub fn art_diff_dto(
             let ol = old_meta
                 .as_ref()
                 .and_then(|m| m.layers.iter().find(|o| layer_id(o) == layer_id(nl)));
+            // Every kind of change a matched layer has, in the order the UI ranks them. A layer
+            // can have any mix, so this is a list rather than one value.
+            let mut changes: Vec<String> = Vec::new();
+            let pixels_changed = changed_entries.contains(&entry_path);
+            if let Some(o) = ol {
+                let id = layer_id(nl);
+                for (hit, kind) in [
+                    (pixels_changed, "pixels"),
+                    (o.visible != nl.visible, "visibility"),
+                    (moved.contains(&id), "moved"),
+                    (o.opacity != nl.opacity, "opacity"),
+                    (o.blend != nl.blend, "blend"),
+                    (o.name != nl.name, "renamed"),
+                ] {
+                    if hit {
+                        changes.push(kind.into());
+                    }
+                }
+            }
             let change = if old_meta.is_none() || ol.is_none() {
                 "added"
+            } else if changes.is_empty() {
+                "unchanged"
             } else {
-                let meta_changed = ol
-                    .map(|o| o.opacity != nl.opacity || o.blend != nl.blend || o.name != nl.name)
-                    .unwrap_or(false);
-                if meta_changed || changed_entries.contains(&entry_path) {
-                    "modified"
-                } else {
-                    "unchanged"
+                "modified"
+            };
+            let prev = match (&old_meta, ol) {
+                (Some(om), Some(o)) if changes.iter().any(|c| c != "pixels") => {
+                    let parent = o.parent.and_then(|p| om.layers.get(p));
+                    Some(PrevLayerDto {
+                        name: o.name.clone(),
+                        opacity: to_percent(o.opacity),
+                        blend_mode: blend_mode(&o.blend),
+                        blend_op: o.blend.clone(),
+                        visible: o.visible,
+                        parent_id: parent.map(layer_id),
+                        parent_name: parent.map(|p| p.name.clone()),
+                    })
                 }
+                _ => None,
             };
             // Keep the raster structs (URL + cache key + the PNG when freshly made) around: a
             // modified layer's before/after pixels feed its own change highlight below.
@@ -1645,10 +1793,11 @@ pub fn art_diff_dto(
             } else {
                 None
             };
-            // An unchanged layer's pixels are identical on both sides — no separate before raster
-            // (its `before` markup reuses `after`, and no diff is needed).
-            let before_r = match (with_rasters, change, &old_manifest, &old_meta, ol) {
-                (true, "modified", Some(om_manifest), Some(om), Some(o)) => kra::layer_raster(
+            // A layer whose pixels didn't change looks identical on both sides, even when its
+            // visibility or opacity did (the canvas applies those per state, from `prev`). So no
+            // separate before raster: its `before` markup reuses `after`, and no diff is needed.
+            let before_r = match (with_rasters, pixels_changed, &old_manifest, &old_meta, ol) {
+                (true, true, Some(om_manifest), Some(om), Some(o)) => kra::layer_raster(
                     repo,
                     path,
                     om_manifest,
@@ -1664,7 +1813,7 @@ pub fn art_diff_dto(
             let after_thumb = after_r.as_ref().and_then(|r| r.thumb.clone()).map(&img);
             let (before, before_thumb) = match change {
                 "added" => (None, None),
-                "unchanged" => (after.clone(), after_thumb.clone()),
+                _ if !pixels_changed => (after.clone(), after_thumb.clone()),
                 _ => (
                     before_r.as_ref().map(|r| img(r.url.clone())),
                     before_r.as_ref().and_then(|r| r.thumb.clone()).map(&img),
@@ -1679,13 +1828,33 @@ pub fn art_diff_dto(
                 }
                 _ => (None, None, Vec::new()),
             };
+            // The region comes from the full-resolution comparison, not the downscaled mask: a
+            // one-pixel edit on an A4 canvas can average away below 2048 px, and must still be
+            // marked, at a size that can be seen.
+            let regions = match pixel_diff.bounds.get(&entry_path) {
+                Some(b) if pixels_changed => {
+                    let (x, y, rw, rh) = kra::region_with_min_size(*b, w, h);
+                    vec![RegionDto {
+                        x,
+                        y,
+                        w: rw,
+                        h: rh,
+                        label: None,
+                    }]
+                }
+                _ => regions,
+            };
             let dto = LayerDto {
                 id: layer_id(nl),
                 top_level_id: top_level_id(&new_meta, nl),
+                parent_id: parent_id(&new_meta, nl),
                 name: nl.name.clone(),
                 opacity: to_percent(nl.opacity),
                 blend_mode: blend_mode(&nl.blend),
+                blend_op: nl.blend.clone(),
                 change: change.into(),
+                changes,
+                prev,
                 visible: nl.visible,
                 layer_type: nl.kind.clone(),
                 bounds: kra::layer_bounds(&new_index, &entry_path, w, h)
@@ -1731,10 +1900,14 @@ pub fn art_diff_dto(
                 let dto = LayerDto {
                     id: layer_id(ol),
                     top_level_id: top_level_id(om, ol),
+                    parent_id: parent_id(om, ol),
                     name: ol.name.clone(),
                     opacity: to_percent(ol.opacity),
                     blend_mode: blend_mode(&ol.blend),
+                    blend_op: ol.blend.clone(),
                     change: "removed".into(),
+                    changes: Vec::new(),
+                    prev: None,
                     visible: ol.visible,
                     layer_type: ol.kind.clone(),
                     bounds: kra::layer_bounds(&old_index, &entry_path, w, h)
@@ -1806,7 +1979,7 @@ pub fn art_diff_dto(
     )?;
     let diff_image = mask_url.map(&img);
     let mut regions = Vec::new();
-    if let Some((x, y, rw, rh)) = changed_region {
+    if let Some((x, y, rw, rh)) = pixel_diff.region {
         regions.push(RegionDto {
             x,
             y,

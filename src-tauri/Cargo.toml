@@ -1,6 +1,6 @@
 [package]
 name = "krita-vc"
-version = "2.2.0"
+version = "2.3.0"
 description = "Krita Version Control"
 authors = ["Zeru Sakamoto"]
 edition = "2021"
@@ -63,6 +63,11 @@ tokio = { version = "1", features = ["sync"] }
 # SetThreadPriority (src/cpu.rs, the stdlib has no thread-priority API) and GetDiskFreeSpaceExW
 # (src/diskspace.rs, the stdlib has no free-space API either), plus SetFileAttributesW
 # (src/repo.rs, to hide the `.kvc/` container).
+# Desktop-only: a second launch hands off to the running window instead of opening another
+# (lib.rs). The plugin doesn't compile for mobile targets.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Storage_FileSystem"] }
 

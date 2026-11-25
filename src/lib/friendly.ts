@@ -160,6 +160,109 @@ export function layerChangeLabel(change: ArtLayer["change"]): string {
   }
 }
 
+/**
+ * Krita `compositeop` → a readable name: "svg:multiply" → "Multiply", "color_dodge" →
+ * "Color dodge". Krita has dozens of ops; spelling out its own id beats a table that drifts.
+ */
+export function blendLabel(op: string | undefined): string {
+  const bare = (op || "normal").replace(/^svg:/, "").replace(/[_-]+/g, " ");
+  return bare.charAt(0).toUpperCase() + bare.slice(1);
+}
+
+/** One change on a layer, as a short label for tight spots and a full before → after line. */
+export interface LayerChangeText {
+  /** "Hidden", "Repainted", "Opacity 40%". Fits a layer row. */
+  short: string;
+  /** "Shown → Hidden", "Opacity 100% → 40%". For the inspector and tooltips. */
+  full: string;
+}
+
+/**
+ * Label every change on a layer, most important first (the order `changes` arrives in). `layers`
+ * is the diff's layer list, used to name the group a layer moved into.
+ */
+export function layerChangeTexts(layer: ArtLayer, layers: ArtLayer[] = []): LayerChangeText[] {
+  const p = layer.prev;
+  return (layer.changes ?? []).map((kind): LayerChangeText => {
+    switch (kind) {
+      case "pixels":
+        return { short: "Repainted", full: "Repainted" };
+      case "visibility": {
+        const now = layer.visible === false ? "Hidden" : "Shown";
+        return { short: now, full: `${p?.visible === false ? "Hidden" : "Shown"} → ${now}` };
+      }
+      case "moved": {
+        if (p && p.parentId !== layer.parentId) {
+          if (layer.parentId) {
+            const to = layers.find((l) => l.id === layer.parentId)?.name;
+            return { short: "Moved", full: to ? `Moved into ${to}` : "Moved into a group" };
+          }
+          return {
+            short: "Moved",
+            full: p.parentName ? `Moved out of ${p.parentName}` : "Moved out of its group",
+          };
+        }
+        return { short: "Reordered", full: "Moved up or down the stack" };
+      }
+      case "opacity":
+        return {
+          short: `Opacity ${layer.opacity}%`,
+          full: `Opacity ${p?.opacity ?? "?"}% → ${layer.opacity}%`,
+        };
+      case "blend":
+        return {
+          short: blendLabel(layer.blendOp),
+          full: `Blend ${blendLabel(p?.blendOp)} → ${blendLabel(layer.blendOp)}`,
+        };
+      case "renamed":
+        return { short: "Renamed", full: `Renamed from ${p?.name ?? "?"}` };
+    }
+  });
+}
+
+/**
+ * The Inspector's Change row: what kinds of change a layer has ("Blend", "Repainted"), with no
+ * values, since the property rows above it already show those as was → now. Renamed and moved
+ * have no property row of their own, so they keep their detail ("Renamed from Sketch").
+ */
+export function layerChangeKinds(layer: ArtLayer, layers: ArtLayer[] = []): string[] {
+  const texts = layerChangeTexts(layer, layers);
+  return (layer.changes ?? []).map((kind, i) => {
+    switch (kind) {
+      case "pixels":
+        return "Repainted";
+      case "visibility":
+        return "Visibility";
+      case "opacity":
+        return "Opacity";
+      case "blend":
+        return "Blend";
+      case "renamed":
+      case "moved":
+        return texts[i].full;
+    }
+  });
+}
+
+/**
+ * A layer row's change summary: the most important change, and a count for the rest
+ * ("Repainted · +1"). Two short ones fit side by side and show in full ("Hidden · Renamed").
+ * `title` lists every change in full, for a tooltip. Empty `text` when nothing is listed.
+ */
+export function layerChangeSummary(
+  layer: ArtLayer,
+  layers: ArtLayer[] = []
+): { text: string; title: string } {
+  const texts = layerChangeTexts(layer, layers);
+  // One line: the Tooltip doesn't wrap on newlines.
+  const title = texts.map((t) => t.full).join(", ");
+  if (texts.length === 0) return { text: "", title };
+  if (texts.length === 2 && texts[0].short.length + texts[1].short.length <= 18)
+    return { text: `${texts[0].short} · ${texts[1].short}`, title };
+  const rest = texts.length - 1;
+  return { text: rest > 0 ? `${texts[0].short} · +${rest}` : texts[0].short, title };
+}
+
 /** Map of commit id → version number, newest commit = highest number. */
 export function versionNumbers(commits: Commit[]): Map<string, number> {
   const total = commits.length;

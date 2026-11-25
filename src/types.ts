@@ -71,6 +71,27 @@ export interface TextDiff {
 export type BlendMode = "normal" | "multiply" | "screen" | "overlay" | "add";
 export type LayerChange = "added" | "removed" | "modified" | "unchanged";
 
+/**
+ * One kind of change on a `modified` layer. A layer can have several, so `ArtLayer.changes` is a
+ * list, ordered most important first (the backend sends them in this order).
+ */
+export type LayerChangeKind = "pixels" | "visibility" | "moved" | "opacity" | "blend" | "renamed";
+
+/** A modified layer's properties in the parent version. See `ArtLayer.prev`. */
+export interface PrevLayerProps {
+  name: string;
+  /** 0..100 */
+  opacity: number;
+  blendMode: BlendMode;
+  /** Krita's raw `compositeop`; see `ArtLayer.blendOp`. */
+  blendOp: string;
+  visible: boolean;
+  /** The group it sat directly inside; absent when it was top-level. */
+  parentId?: string;
+  /** That group's name, kept because the group may be gone from the new version. */
+  parentName?: string;
+}
+
 /** Which artwork state a canvas should render. */
 export type DiffState = "before" | "after";
 
@@ -92,11 +113,28 @@ export interface ArtLayer {
    * only, so a checkbox binds to this, never to `id`.
    */
   topLevelId?: string;
+  /**
+   * The group this layer sits **directly** inside; absent for a top-level layer. Unlike
+   * `topLevelId` it follows the real tree, so a layer in a nested group points at that group.
+   */
+  parentId?: string;
   name: string;
   /** 0..100 */
   opacity: number;
   blendMode: BlendMode;
+  /**
+   * Krita's raw `compositeop` (e.g. "darken"). `blendMode` folds everything the canvas can't draw
+   * into "normal"; label blend modes from this one so "Darken → Lighten" doesn't read as no change.
+   */
+  blendOp?: string;
   change: LayerChange;
+  /** What changed on a `modified` layer, most important first. Absent otherwise. */
+  changes?: LayerChangeKind[];
+  /**
+   * The layer's properties in the parent version, present when any of them changed. The fields
+   * above always describe the new side; draw and label the "before" state from this.
+   */
+  prev?: PrevLayerProps;
   /** `<layer visible>` — false for a Krita-hidden layer. */
   visible?: boolean;
   /** Krita nodetype (e.g. "paintlayer", "grouplayer"); see `layerTypeLabel`. */

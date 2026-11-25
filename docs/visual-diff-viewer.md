@@ -45,10 +45,14 @@ interface ArtDiff {
 interface ArtLayer {
   id: string;
   topLevelId?: string;        // the top-level layer this one sits under (for the Changes panel)
+  parentId?: string;          // the group it sits directly inside; absent at the top level
   name: string;
   opacity: number;            // 0..100
   blendMode: BlendMode;       // normal | multiply | screen | overlay | add
+  blendOp?: string;           // Krita's raw compositeop, for labels ("darken", "svg:multiply")
   change: LayerChange;        // added | removed | modified | unchanged
+  changes?: LayerChangeKind[]; // on a modified layer: pixels | visibility | moved | opacity | blend | renamed
+  prev?: PrevLayerProps;      // name, opacity, blend, visibility and group in the parent version
   visible?: boolean;
   layerType?: string;         // Krita node type, e.g. "paintlayer", "grouplayer"
   bounds?: { x: number; y: number; w: number; h: number };  // painted area, tile-granular
@@ -62,14 +66,25 @@ interface ArtLayer {
 }
 ```
 
-A layer's pixels at each state are SVG markup strings. `before` and `after` differ for a modified
-layer, and one side is `null` for an added or removed layer.
+A layer's pixels at each state are SVG markup strings. `before` and `after` differ for a layer
+whose pixels changed, and one side is `null` for an added or removed layer.
+
+The layer's other fields always describe the **new** version. When any of its properties changed,
+`prev` holds them as they were, so the diff can show what a property was as well as what it
+became. A layer can change in several ways at once, so `changes` is a list, ordered most important
+first: pixels, visibility, moved, opacity, blend, renamed. "moved" means the layer went into a
+different group or changed place among its siblings. Within a group, the backend lines the layers up
+in new order by their old position and keeps the longest run that is already in order, so dragging
+one layer flags only that layer, and adding or deleting a layer moves nothing else
+(`commands::moved_layers`). `blendMode` folds every op the canvas can't draw into "normal", so
+labels use `blendOp`, which keeps "Darken → Lighten" from reading as no change.
 
 ## SVG compositing helpers (`src/lib/svgArt.ts`)
 
 | Helper | What it does |
 |--------|---------|
-| `layersBody(layers, state)` | The inner markup for the layers at one state. Each layer is wrapped in a `<g>` with `opacity` and `mix-blend-mode` (`blendCss` maps `BlendMode` to CSS), and `null` markup is skipped. |
+| `layerPropsAt(layer, state)` | A layer's opacity, blend mode, visibility and group at one state: from `prev` on the before side when present, otherwise the layer's own fields. |
+| `layersBody(layers, state)` | The inner markup for the layers at one state. Each layer is wrapped in a `<g>` with that state's `opacity` and `mix-blend-mode` (`blendCss` maps `BlendMode` to CSS), and `null` markup is skipped. Visibility isn't applied here, so a hidden layer selected on its own still draws. |
 | `wrapSvg(body, w, h)` | Wraps markup in a scalable, self-contained `<svg>` (`viewBox`, `preserveAspectRatio`). |
 | `compositeSvg(layers, state, w, h)` | `wrapSvg(layersBody(...))`, used for thumbnails and the slider. |
 
@@ -106,8 +121,13 @@ A Krita-style layer list ([`src/components/vcs/LayerStackPanel.tsx`](../src/comp
 shown top first (layers are stored bottom to top). Each row has a small SVG thumbnail
 (`compositeSvg` of that one layer, pointed at `beforeThumb`/`afterThumb`, the backend's 128 px
 thumbnail, and at the full raster only where there's none: a 36 × 28 px row used to make the webview
-decode up to 2048 × 2048 per layer), the name, `opacity% · blendMode`, and a change marker that reuses
-`FileStatusChip` (added is A, removed is D, modified is M, unchanged shows nothing). A Composite row
+decode up to 2048 × 2048 per layer), the name, a second line, and a change marker that reuses
+`FileStatusChip` (added is A, removed is D, modified is M, unchanged shows nothing). On a modified
+layer the second line says what changed (`friendly.ts`'s `layerChangeSummary`): the most important
+change and a count for the rest ("Repainted · +1"), or both when two short ones fit ("Hidden ·
+Renamed"), with every change in full in its tooltip. A layer edited while hidden adds "(hidden)",
+since the composite won't show the edit. Otherwise the line is `opacity% · blend`, starting with
+"Hidden" for a hidden layer. A Composite row
 at the top selects the full stack, and a "Color Palette" section below the layers shows an embedded
 palette that changed. It shows one palette only: `DiffView` passes the first matching `<kra>::`
 entry (`entries.find`), so when several embedded palettes changed in one version, the rest are
@@ -128,6 +148,28 @@ Composite view, or the selected layer's own highlight when a single layer is foc
 [Per-layer highlights](#per-layer-highlights)). A layer without a highlight of its own (unchanged,
 added, removed, or still streaming) gets empty props, and the overlay simply doesn't draw. Only
 `diff.width` and `diff.height` (the viewBox) still come from `diff`.
+
+The overlay's `<mask>`/`<pattern>` ids are unique per **canvas** (`useId`), not per file. `url(#…)`
+resolves document-wide to the first match. The Version Map stays mounted under `display: none`
+with its drilldown open, so a per-file id let the Changes view resolve to that hidden mask. A mask
+inside a hidden subtree doesn't render, so the accent rect painted unmasked and the whole After
+pane went solid accent.
+
+A **group layer** has no raster of its own. Its navigator row, and the canvas when it's selected,
+draw the group as the stack of its visible children (`svgArt.ts`'s `groupAsLayer`, with the
+group's opacity and blend applied to the whole). Children are found by `parentId`, separately for
+each state, so a layer that moved into the group or was shown only counts on the after side, and a
+nested group is drawn from its own children with its own opacity. The browser build's mock data
+has no `parentId` and falls back to `topLevelId`, where nested groups stay flat.
+
+Below the canvas, a selected layer whose properties changed gets a one-line caption listing them
+("Opacity 100% → 40% · Shown → Hidden"), in the modified yellow of the M chip. When its pixels
+didn't change, both panes draw the same pixels (at each side's own opacity and blend), and the
+caption says so. In the Inspector a changed property row reads like a line diff: the old value
+struck through in the removed red, the new one in the added green, and a yellow bar and label on
+the row so it can be found at a glance. The rows keep their usual order. The Change row only names
+the kinds of change ("Blend · Repainted"), since the rows above already show the values; renamed
+and moved, which have no row of their own, keep their detail ("Renamed from Sketch").
 
 - **Pixels mode** (the default) uses the changed-pixel mask (`diffImage`, an `<image>` sized to the
   viewBox), which is transparent except where before and after differ. The backend bakes a
@@ -166,6 +208,14 @@ not the whole file's silhouette painted on every layer. These are computed durin
 stream from the capped PNGs the raster path just encoded (read back from the raster cache when the
 rasters were cache hits), and the mask PNG is cached content-addressed by both layer raster keys,
 so a repeat view reads neither raster. Added, removed and unchanged layers carry none.
+
+Unlike the composite's, a layer's mask has **no threshold** (`raster::LAYER_DIFF_THRESHOLD` = 0,
+through `raster::diff_overlay_full_with`): layer tiles are lossless and both sides go through the
+same decode and downscale, so any difference is a real edit, and the old shared threshold of 16 hid
+faint strokes and low-opacity washes. Its cache key is `kra::layer_diff_cache_key`, separate from the
+composite's, so masks cached under the old threshold are never served. A layer's `regions` don't
+come from this mask at all but from the full-resolution comparison described under "Each layer's
+`change`" below, so an edit too small to survive the downscale is still marked.
 
 ### CompareSlider
 
@@ -225,14 +275,30 @@ parent; the working tree is compared with its last commit.
      capped, cached (`kra::diff_cache_key`) and served over `kvcimg://`. The outline is a vector path
      tracing the changed pixels' shape. Together they drive the default "pixels" highlight, and since
      they're computed from the composite, they don't need the layer stream.
-   - **Change regions.** One normalized bounding box over the tiles that differ between the two
-     commits (no pixel decoding, just comparing tile hashes), for the coarse box highlight.
+   - **Change regions.** One normalized box over every pixel that changed inside the canvas, for
+     the coarse box highlight, and one per modified layer over that layer's changed pixels. Both
+     come from `kra::diff_tile_pixels` at full resolution and are grown to a minimum size
+     (`kra::region_with_min_size`: 1.5% of the canvas's longer side, at least 8 px, kept inside the
+     canvas), since a one-pixel edit on an A4 canvas is otherwise far below one screen pixel in the
+     pane. No visible change means no region, rather than an empty box.
    - **Each layer's `change`** (`added`, `removed`, `modified` or `unchanged`). A layer is
-     `modified` when its curated metadata moved (`opacity`, `compositeop`, `name`) or its tiles
-     differ. Both are decided per matched layer, never per archive path. Layers are paired by
+     `modified` when any entry in its `changes` list applies: one of its properties changed
+     (`visible`, `opacity`, `compositeop`, `name`, its group or its place in the stack) or **a pixel
+     inside the canvas differs**. Only a pixel change fetches a separate before raster and a
+     highlight, since a property change leaves the pixels identical. Hiding a group flags the group
+     alone: Krita stores visibility on the group, not on its children. `kra::diff_tile_pixels` compares tile hashes first, so unchanged
+     tiles are never decoded, then decodes only the tiles that differ and compares their pixels
+     exactly, within the canvas, with a missing tile read as the side's `.defaultpixel` (else
+     transparent). Comparing stored bytes alone, as `kra::diff_tile_indexes` still does for its
+     other callers, marked layers modified with nothing to show in three ways: tiles Krita keeps past
+     the canvas edge (a tap outside it), a transparent tile appearing over a transparent default, and
+     the same pixels stored differently (raw against LZF, or a pixel-delta ref against a working
+     tile). A tile that can't be decoded (not RGBA8) counts as changed over its in-canvas area, so
+     nothing is hidden. See [history 15](history/15-bugs-found-in-evaluation-testing.md). Both are
+     decided per matched layer, never per archive path. Layers are paired by
      `commands::layer_id` (the uuid, or the name when there is none), and the tile comparison looks
      up the old side under that matched layer's own `<image name>/layers/<filename>`. That's why
-     `kra::diff_tile_indexes` takes a `pair` map from each new-side entry path to its old-side entry
+     `kra::diff_tile_pixels` (and `kra::diff_tile_indexes`) take a `pair` map from each new-side entry path to its old-side entry
      path (`""` for a layer with no counterpart, since no entry path is empty, so an added layer's
      tiles all count as new and it still contributes to the change region).
 

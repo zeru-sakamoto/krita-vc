@@ -2,6 +2,7 @@ import { CircleNotchIcon, FilesIcon, WarningIcon } from "@phosphor-icons/react";
 import { DiffView } from "./vcs/DiffView";
 import type { DiffEntry } from "../types";
 import { ICON } from "../lib/iconSize";
+import { useDelayedFlag } from "../lib/useDelayedFlag";
 
 interface MainPanelProps {
   diff: DiffEntry[];
@@ -45,6 +46,8 @@ export function MainPanel({
   selectedFile,
   focusId,
 }: MainPanelProps) {
+  // Before the early return: hooks can't follow it.
+  const showLoading = useDelayedFlag(Boolean(loading));
   if (diff.length > 0) {
     return (
       // min-h-0 is load-bearing: without it this flex column can inflate to fit its content
@@ -72,10 +75,14 @@ export function MainPanel({
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg">
       <div className="grid flex-1 place-items-center text-text-muted">
         {loading ? (
-          <div className="flex flex-col items-center gap-2">
-            <CircleNotchIcon size={ICON.display} className="animate-spin text-accent" />
-            <p className="text-body">Analyzing changes…</p>
-          </div>
+          // Empty until the wait is long enough to notice, rather than flashing the empty-state
+          // hint (wrong: something is coming) or a spinner that is gone a frame later.
+          showLoading && (
+            <div className="flex flex-col items-center gap-2">
+              <CircleNotchIcon size={ICON.display} className="animate-spin text-accent" />
+              <p className="text-body">Analyzing changes…</p>
+            </div>
+          )
         ) : error ? (
           <div className="flex max-w-sm flex-col items-center gap-2 px-4 text-center">
             <WarningIcon size={ICON.display} weight="regular" className="text-danger" />

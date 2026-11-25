@@ -166,7 +166,14 @@ the dependencies hold, it buys nothing and makes layers appear in visibly bigger
   changed layers and the union change region come out of one pass that builds each entry's old
   `(x, y) → hash` map once. Two functions used to rebuild the maps separately, and an owned
   `tile_index()` (since removed) cloned every 64-character tile hash (megabytes of string churn on a
-  Krita-scale document).
+  Krita-scale document). The diff viewer now goes through `kra::diff_tile_pixels`, which keeps this
+  hash comparison as a pre-filter and then decodes **only the tiles whose hashes differ** to compare
+  their pixels inside the canvas (in parallel, sharing the request's `TileCache` with the layer
+  rasters that follow). That runs in the first, cheap stage of a diff too, since the `modified`
+  label is part of it, so its cost scales with the size of the edit, not of the painting: a stroke
+  decodes a handful of tiles, a full-layer fill every tile of that layer. To be measured in the BSc
+  evaluation (PF-5, PF-6) on the fixed build; see
+  [history 15](history/15-bugs-found-in-evaluation-testing.md).
 - **Rollback without a re-commit** (`commit::rollback_to_commit`). A rollback used to write out the
   target tree and then run a full `commit_snapshot` (rescan, re-read, and re-decompose every restored
   `.kra`) just to rediscover content hashes already recorded in the target tree. The commit is now

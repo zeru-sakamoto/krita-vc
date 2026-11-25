@@ -1155,6 +1155,10 @@ pub struct LayerNode {
     /// which has to apply a group's opacity to its children. An index rather than an id keeps the
     /// "uuid, or name when there's no uuid" rule in one place (`commands::layer_id`).
     pub top: Option<usize>,
+    /// Index into the same flat `ImageMeta::layers` of the group this layer sits directly inside,
+    /// or `None` for a top-level layer. `top` only says which top-level row a layer rolls up to;
+    /// this is the real tree, which the diff needs to tell when a layer moved between groups.
+    pub parent: Option<usize>,
 }
 
 /// Upper bound on a parsed canvas dimension. Canvas dims come from maindoc.xml unchecked and
@@ -1222,6 +1226,12 @@ pub fn parse_image_meta(xml: &[u8]) -> Result<ImageMeta> {
             kind: n.attribute("nodetype").unwrap_or("").to_string(),
             filename: n.attribute("filename").unwrap_or("").to_string(),
             top: top_of(*n),
+            // A nested `<layer>` sits in its group's own `<layers>`, so the group is two levels
+            // up. A top-level one's grandparent is `<IMAGE>`, which isn't in `nodes`.
+            parent: n
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|g| nodes.iter().position(|m| *m == g)),
         })
         .collect();
     Ok(ImageMeta {
@@ -1311,6 +1321,21 @@ pub fn composite_cache_key(content_hash: &str) -> String {
             "composite\0{content_hash}\0{}\0{}",
             crate::raster::MAX_RASTER_DIM,
             crate::raster::FILTER_VERSION
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
+/// Cache key for one layer's changed-pixel mask. Separate from [`diff_cache_key`] because layer
+/// masks use [`crate::raster::LAYER_DIFF_THRESHOLD`]: masks cached under the old shared threshold
+/// must not be served for it.
+pub fn layer_diff_cache_key(before_key: &str, after_key: &str) -> String {
+    blake3::hash(
+        format!(
+            "layerdiff\0t{}\0{before_key}\0{after_key}",
+            crate::raster::LAYER_DIFF_THRESHOLD
         )
         .as_bytes(),
     )
@@ -1593,7 +1618,9 @@ pub fn diff_tile_indexes(
         let y = (min.1.max(0) as f64) / height as f64;
         let w = ((max.0.min(width) - min.0.max(0)) as f64 / width as f64).clamp(0.0, 1.0);
         let h = ((max.1.min(height) - min.1.max(0)) as f64 / height as f64).clamp(0.0, 1.0);
-        Some((x, y, w, h))
+        // Every changed tile outside the canvas clamps to an empty box: no region, not a
+        // zero-width one.
+        (w > 0.0 && h > 0.0).then_some((x, y, w, h))
     } else {
         None
     };
@@ -1628,6 +1655,325 @@ pub fn layer_bounds(
     let w = (max.0.min(width) - x).max(0);
     let h = (max.1.min(height) - y).max(0);
     (w > 0 && h > 0).then_some((x, y, w, h))
+}
+
+// --- pixel-level change detection ---------------------------------------------------------
+
+/// What [`diff_tile_pixels`] found: the layer entries whose **visible pixels** changed, and where.
+#[derive(Debug, Default)]
+pub struct PixelDiff {
+    /// Entries with at least one pixel inside the canvas that differs between the two sides.
+    pub changed_paths: std::collections::HashSet<String>,
+    /// Per changed entry, the full-resolution box `(x, y, w, h)` of its differing pixels, in
+    /// canvas pixels.
+    pub bounds: std::collections::HashMap<String, (i64, i64, i64, i64)>,
+    /// The union of every entry's box, as [`region_with_min_size`] gives it. `None` when no
+    /// visible pixel changed.
+    pub region: Option<(f64, f64, f64, f64)>,
+}
+
+/// Smallest side, as a share of the canvas's longer side, that a change region is drawn at. A
+/// one-pixel edit on an A4 canvas would otherwise be a box well under one screen pixel in the
+/// preview pane, which reads as no highlight at all.
+pub const MIN_REGION_FRACTION: f64 = 0.015;
+/// Floor for [`MIN_REGION_FRACTION`] on small canvases, in canvas pixels.
+pub const MIN_REGION_PX: i64 = 8;
+
+/// A pixel box `(x, y, w, h)` normalized to 0..1 of the canvas, grown about its centre to at least
+/// [`MIN_REGION_FRACTION`] of the longer side (and [`MIN_REGION_PX`]) and kept inside the canvas.
+pub fn region_with_min_size(
+    b: (i64, i64, i64, i64),
+    width: i64,
+    height: i64,
+) -> (f64, f64, f64, f64) {
+    let min = ((width.max(height) as f64 * MIN_REGION_FRACTION).ceil() as i64).max(MIN_REGION_PX);
+    let grow = |start: i64, len: i64, extent: i64| -> (i64, i64) {
+        let len2 = len.max(min.min(extent));
+        let start2 = (start - (len2 - len) / 2).clamp(0, (extent - len2).max(0));
+        (start2, len2.min(extent))
+    };
+    let (x, w) = grow(b.0, b.2, width);
+    let (y, h) = grow(b.1, b.3, height);
+    (
+        x as f64 / width as f64,
+        y as f64 / height as f64,
+        w as f64 / width as f64,
+        h as f64 / height as f64,
+    )
+}
+
+/// One side's tiles for a single layer entry, ready to decode by grid position.
+struct SideTiles<'a> {
+    tw: i64,
+    th: i64,
+    ps: usize,
+    /// RGBA of every pixel no tile covers (the `.defaultpixel` entry, else transparent).
+    default: [u8; 4],
+    kind: SideKind<'a>,
+}
+
+enum SideKind<'a> {
+    Committed {
+        repo: &'a Repo,
+        relpath: &'a str,
+        entry: String,
+        refs: std::collections::HashMap<(i64, i64), &'a TileRef>,
+    },
+    Working(std::collections::HashMap<(i64, i64), &'a Tile>),
+    /// Low-memory working file: the one entry re-inflated for this comparison.
+    Owned {
+        tiles: Vec<Tile>,
+        at: std::collections::HashMap<(i64, i64), usize>,
+    },
+}
+
+/// A tile's decoded pixels, or why there are none.
+enum TilePx {
+    Absent,
+    Pixels(Vec<u8>),
+    /// Unsupported pixel format or a failed read: compared conservatively, as changed.
+    Undecodable,
+}
+
+impl SideTiles<'_> {
+    fn pixels(&self, x: i64, y: i64, cache: &crate::delta::TileCache) -> TilePx {
+        let (tw, th) = (self.tw as usize, self.th as usize);
+        let decoded = match &self.kind {
+            SideKind::Committed {
+                repo,
+                relpath,
+                entry,
+                refs,
+            } => {
+                let Some(tr) = refs.get(&(x, y)) else {
+                    return TilePx::Absent;
+                };
+                match cache.get_or_reconstruct(repo, &tile_key(relpath, entry, x, y), &tr.hash) {
+                    Ok(data) if tr.raw => crate::raster::planar_to_rgba(&data, tw, th),
+                    Ok(data) => crate::raster::tile_to_rgba(&data, tw, th, self.ps),
+                    Err(_) => None,
+                }
+            }
+            SideKind::Working(tiles) => match tiles.get(&(x, y)) {
+                Some(t) => crate::raster::tile_to_rgba(&t.data, tw, th, self.ps),
+                None => return TilePx::Absent,
+            },
+            SideKind::Owned { tiles, at } => match at.get(&(x, y)) {
+                Some(i) => crate::raster::tile_to_rgba(&tiles[*i].data, tw, th, self.ps),
+                None => return TilePx::Absent,
+            },
+        };
+        match decoded {
+            Some(px) if px.len() == tw * th * 4 => TilePx::Pixels(px),
+            _ => TilePx::Undecodable,
+        }
+    }
+}
+
+impl<'a> KraSource<'a> {
+    /// The tiles of one layer entry on this side, or `None` if the entry isn't here.
+    fn side_tiles(
+        &self,
+        repo: &'a Repo,
+        relpath: &'a str,
+        entry_path: &str,
+    ) -> Option<SideTiles<'a>> {
+        match *self {
+            KraSource::Committed(m) => {
+                let (header, tiles) = m.entries.iter().find_map(|e| match e {
+                    KraEntry::Tiled {
+                        path,
+                        header,
+                        tiles,
+                        ..
+                    } if path == entry_path => Some((header, tiles)),
+                    _ => None,
+                })?;
+                let (tw, th, ps) = tile_dims(header);
+                Some(SideTiles {
+                    tw,
+                    th,
+                    ps,
+                    default: default_pixel_rgba(repo, relpath, m, entry_path).unwrap_or([0; 4]),
+                    kind: SideKind::Committed {
+                        repo,
+                        relpath,
+                        entry: entry_path.to_string(),
+                        refs: tiles.iter().map(|t| ((t.x, t.y), t)).collect(),
+                    },
+                })
+            }
+            KraSource::Working(w) => {
+                let (header, tiles) = w.entries.iter().find_map(|e| match e {
+                    WorkingEntry::Tiled {
+                        path,
+                        header,
+                        tiles,
+                        ..
+                    } if path == entry_path => Some((header, tiles)),
+                    _ => None,
+                })?;
+                let (tw, th, ps) = tile_dims(header);
+                let default = w
+                    .entry_bytes(&format!("{entry_path}.defaultpixel"))
+                    .and_then(|b| decode_default_pixel(&b))
+                    .unwrap_or([0; 4]);
+                let kind = match &w.source {
+                    None => SideKind::Working(tiles.iter().map(|t| ((t.x, t.y), t)).collect()),
+                    Some(src) => {
+                        let block = read_entry(src, entry_path)
+                            .ok()
+                            .filter(|b| tiles::is_tiled(b))
+                            .and_then(|b| tiles::parse(&b).ok());
+                        let tiles = block.map(|b| b.tiles).unwrap_or_default();
+                        let at = tiles
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| ((t.x, t.y), i))
+                            .collect();
+                        SideKind::Owned { tiles, at }
+                    }
+                };
+                Some(SideTiles {
+                    tw,
+                    th,
+                    ps,
+                    default,
+                    kind,
+                })
+            }
+        }
+    }
+}
+
+/// Which layer entries changed **visibly** between `old` and `new`, and where, at full resolution.
+///
+/// [`diff_tile_indexes`] compares stored tile bytes, which over-reports in three ways, each
+/// leaving a layer marked modified with nothing to highlight: tiles Krita keeps outside the canvas
+/// (a tap past the edge), a tile that appears or goes without its pixels changing (a fully
+/// transparent tile over a transparent default), and the same pixels stored differently (a raw vs
+/// LZF tile, or a pixel-delta ref against a working tile). This keeps that tile-hash comparison as
+/// a cheap pre-filter, so unchanged tiles are never decoded, then decodes only the tiles that
+/// differ and compares their pixels exactly, inside the canvas only. A missing tile reads as the
+/// side's default pixel. A tile that can't be decoded (not RGBA8) counts as changed over its
+/// in-canvas area, so nothing is ever hidden.
+///
+/// `pair` maps a new-side entry path to the same layer's old-side path, as for
+/// [`diff_tile_indexes`].
+#[allow(clippy::too_many_arguments)]
+pub fn diff_tile_pixels(
+    repo: &Repo,
+    relpath: &str,
+    old: &KraSource,
+    new: &KraSource,
+    pair: &std::collections::HashMap<&str, &str>,
+    width: i64,
+    height: i64,
+    cache: &crate::delta::TileCache,
+) -> PixelDiff {
+    let mut out = PixelDiff::default();
+    if width <= 0 || height <= 0 {
+        return out;
+    }
+    let old_index = old.tile_index_ref();
+    let new_index = new.tile_index_ref();
+    let mut union: Option<(i64, i64, i64, i64)> = None;
+
+    for (path, (tw, th, tiles)) in &new_index {
+        let (tw, th) = (*tw, *th);
+        if tw <= 0 || th <= 0 {
+            continue;
+        }
+        let old_path = pair.get(path).copied().unwrap_or(path);
+        let old_hashes: std::collections::HashMap<(i64, i64), &str> = old_index
+            .get(old_path)
+            .map(|(_, _, ts)| ts.iter().map(|(x, y, h)| ((*x, *y), *h)).collect())
+            .unwrap_or_default();
+        let new_hashes: std::collections::HashMap<(i64, i64), &str> =
+            tiles.iter().map(|(x, y, h)| ((*x, *y), *h)).collect();
+        let on_canvas = |&(x, y): &(i64, i64)| x < width && x + tw > 0 && y < height && y + th > 0;
+        // Tiles whose bytes differ (or exist on one side only) and that touch the canvas.
+        let mut candidates: Vec<(i64, i64)> = new_hashes
+            .iter()
+            .filter(|(p, h)| old_hashes.get(*p) != Some(*h))
+            .map(|(p, _)| *p)
+            .chain(
+                old_hashes
+                    .keys()
+                    .filter(|p| !new_hashes.contains_key(*p))
+                    .copied(),
+            )
+            .filter(on_canvas)
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_unstable();
+
+        let new_side = new.side_tiles(repo, relpath, path);
+        let old_side = old.side_tiles(repo, relpath, old_path);
+        let dims_ok = new_side.as_ref().is_some_and(|s| s.tw == tw && s.th == th)
+            && old_side.as_ref().is_none_or(|s| s.tw == tw && s.th == th);
+
+        // Per candidate tile: the box of its differing in-canvas pixels, if any.
+        let boxes: Vec<(i64, i64, i64, i64)> = candidates
+            .par_iter()
+            .filter_map(|&(x, y)| {
+                // In-canvas part of this tile, in tile-local coordinates.
+                let (lx0, ly0) = ((-x).max(0), (-y).max(0));
+                let (lx1, ly1) = ((width - x).min(tw), (height - y).min(th));
+                let whole = Some((x + lx0, y + ly0, lx1 - lx0, ly1 - ly0));
+                if !dims_ok {
+                    return whole;
+                }
+                let fill = |d: [u8; 4]| d.repeat((tw * th) as usize);
+                let px = |side: &Option<SideTiles>| match side {
+                    None => TilePx::Absent,
+                    Some(s) => s.pixels(x, y, cache),
+                };
+                let before = match px(&old_side) {
+                    TilePx::Pixels(p) => p,
+                    TilePx::Absent => fill(old_side.as_ref().map_or([0; 4], |s| s.default)),
+                    TilePx::Undecodable => return whole,
+                };
+                let after = match px(&new_side) {
+                    TilePx::Pixels(p) => p,
+                    TilePx::Absent => fill(new_side.as_ref().map_or([0; 4], |s| s.default)),
+                    TilePx::Undecodable => return whole,
+                };
+                let (mut min, mut max) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
+                for ly in ly0..ly1 {
+                    for lx in lx0..lx1 {
+                        let i = ((ly * tw + lx) * 4) as usize;
+                        if before[i..i + 4] != after[i..i + 4] {
+                            min = (min.0.min(lx), min.1.min(ly));
+                            max = (max.0.max(lx), max.1.max(ly));
+                        }
+                    }
+                }
+                (min.0 != i64::MAX)
+                    .then(|| (x + min.0, y + min.1, max.0 - min.0 + 1, max.1 - min.1 + 1))
+            })
+            .collect();
+
+        let Some(entry_box) = boxes.into_iter().reduce(union_box) else {
+            continue;
+        };
+        out.changed_paths.insert(path.to_string());
+        out.bounds.insert(path.to_string(), entry_box);
+        union = Some(match union {
+            Some(u) => union_box(u, entry_box),
+            None => entry_box,
+        });
+    }
+    out.region = union.map(|b| region_with_min_size(b, width, height));
+    out
+}
+
+fn union_box(a: (i64, i64, i64, i64), b: (i64, i64, i64, i64)) -> (i64, i64, i64, i64) {
+    let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+    let (x1, y1) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+    (x0, y0, x1 - x0, y1 - y0)
 }
 
 impl KraManifest {

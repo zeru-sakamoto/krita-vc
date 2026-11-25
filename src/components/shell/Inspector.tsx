@@ -18,6 +18,8 @@ import { fullTimestamp } from "../../lib/format";
 import { ICON } from "../../lib/iconSize";
 import {
   assetName,
+  blendLabel,
+  layerChangeKinds,
   layerChangeLabel,
   layerTypeLabel,
   paletteName,
@@ -49,10 +51,61 @@ interface InspectorProps {
   onSelectFile: (path: string, focusId?: string) => void;
 }
 
-function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
+/**
+ * A property that changed in this version, styled like a diff so it stands out from the ones
+ * that didn't: the old value struck through in the removed color, the new one in the added color.
+ * `<del>`/`<ins>` keep the meaning for screen readers, which don't announce color or strikethrough.
+ */
+function FromTo({ was, now }: { was: string; now: string }) {
   return (
-    <div className="grid grid-cols-[64px_1fr] items-baseline gap-2 px-3 py-1.5">
-      <span className="text-caption font-medium uppercase text-text-muted">{label}</span>
+    <>
+      <del className="text-diff-del-fg">{was}</del>
+      <span aria-hidden className="text-text-muted">
+        {" → "}
+      </span>
+      <ins className="text-diff-add-fg no-underline">{now}</ins>
+    </>
+  );
+}
+
+/**
+ * A property row: `now` alone, or was → now when `was` is given and differs. A changed row also
+ * gets a modified-yellow bar on its left edge, matching the M chip, so it's findable at a glance.
+ * The bar is an inset shadow rather than a border so the row's text doesn't shift.
+ */
+function PropRow({ label, was, now }: { label: string; was?: string; now: string }) {
+  const changed = was !== undefined && was !== now;
+  return (
+    <MetaRow label={label} changed={changed}>
+      {changed ? <FromTo was={was} now={now} /> : now}
+    </MetaRow>
+  );
+}
+
+function MetaRow({
+  label,
+  changed = false,
+  children,
+}: {
+  label: string;
+  changed?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={[
+        "grid grid-cols-[64px_1fr] items-baseline gap-2 px-3 py-1.5",
+        changed ? "shadow-[inset_2px_0_0_var(--color-warning-fg)]" : "",
+      ].join(" ")}
+    >
+      <span
+        className={[
+          "text-caption font-medium uppercase",
+          changed ? "text-warning-fg" : "text-text-muted",
+        ].join(" ")}
+      >
+        {label}
+      </span>
       <span className="selectable text-body text-text">{children}</span>
     </div>
   );
@@ -61,16 +114,29 @@ function MetaRow({ label, children }: { label: string; children: React.ReactNode
 /** The "Selected" section: details for the layer or composite picked in the diff navigator. */
 function SelectedDetails({ art, layer }: { art: ArtDiff; layer: ArtLayer | null }) {
   if (layer) {
+    const changeKinds = layerChangeKinds(layer, art.layers);
+    const p = layer.prev;
     return (
       <div className="border-t border-border px-3 py-2">
         <h3 className="mb-1.5 text-body font-medium text-text">Selected layer</h3>
         <div className="flex flex-col">
-          <MetaRow label="Name">{layer.name}</MetaRow>
+          <PropRow label="Name" was={p?.name} now={layer.name} />
           {layer.layerType && <MetaRow label="Type">{layerTypeLabel(layer.layerType)}</MetaRow>}
-          <MetaRow label="Visible">{layer.visible === false ? "Hidden" : "Visible"}</MetaRow>
-          <MetaRow label="Opacity">{layer.opacity}%</MetaRow>
-          <MetaRow label="Blend">{layer.blendMode}</MetaRow>
-          <MetaRow label="Change">{layerChangeLabel(layer.change)}</MetaRow>
+          {/* Each property shows was → now, highlighted, when it changed in this version. */}
+          <PropRow
+            label="Visible"
+            was={p && (p.visible ? "Visible" : "Hidden")}
+            now={layer.visible === false ? "Hidden" : "Visible"}
+          />
+          <PropRow label="Opacity" was={p && `${p.opacity}%`} now={`${layer.opacity}%`} />
+          <PropRow
+            label="Blend"
+            was={p && blendLabel(p.blendOp)}
+            now={blendLabel(layer.blendOp ?? layer.blendMode)}
+          />
+          <MetaRow label="Change">
+            {changeKinds.length > 0 ? changeKinds.join(" · ") : layerChangeLabel(layer.change)}
+          </MetaRow>
           {layer.bounds && (
             <MetaRow label="Bounds">
               {layer.bounds.w} × {layer.bounds.h} at ({layer.bounds.x}, {layer.bounds.y})
