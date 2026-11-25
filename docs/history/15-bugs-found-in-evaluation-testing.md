@@ -1,7 +1,9 @@
 # Bugs found and fixed during evaluation testing
 
-Dates: 2026-11-04 to 2026-11-09. Commits: none yet. The changes below are uncommitted on top of
-`3bb1cbf` ("Merge branch 'staging'").
+Dates: 2026-11-04 to 2026-11-26. Commits: `60238c1` (the pixel-comparison fix below), `93ce7c4` and
+`0417d63` (a solid-accent After pane, group layers, and showing a layer's previous properties;
+neither is described in this chapter) and `d9a2078` (the later fixes at the end). All sit on top of
+`36e3060` ("Bump the version to 2.2.0").
 
 This chapter records bugs found while v2.2.0 was evaluated for the BSc project report that the app
 was built for. The evaluation compares the app with Git and Git LFS on repository size, diff
@@ -102,19 +104,62 @@ is part of that stage. Its cost scales with the size of the edit, not of the pai
 decodes a few tiles, and a fill decodes every tile of the layer. It has not been timed on the test
 paintings yet. The evaluation's diff timings (PF-5, PF-6) have to come from this build.
 
-Still open:
-- **Which cases real Krita saves produce.** Comparing two saves from either side of a tap would
-  show this.
-- **Layer-subset staging.** A layer whose only change is off-canvas no longer appears as changed
-  in the Changes panel. How a layer-subset version treats that layer hasn't been checked.
-- **Committing.** None of this is committed. The app version is bumped to 2.3.0 for the build
-  with the fix (`package.json`, `tauri.conf.json`, `Cargo.toml` and both lock files), but there is
-  no release tag or release note yet.
-- **Installing for all users.** Installing the 2.3.0 build showed that the NSIS setup `.exe` could
-  not install into `C:\Program Files`: with no install mode set, Tauri builds a per-user installer
-  that never asks for admin rights. `tauri.conf.json` now sets `bundle.windows.nsis.installMode` to
-  `"both"`, so the installer asks whether to install for the current user or for all users. As a
-  result it now asks for admin rights even for a per-user install. The MSI was already per-machine.
+## Installing for all users
+
+Installing the 2.3.0 build showed that the NSIS setup `.exe` could not install into
+`C:\Program Files`: with no install mode set, Tauri builds a per-user installer that never asks for
+admin rights. `tauri.conf.json` now sets `bundle.windows.nsis.installMode` to `"both"`, so the
+installer asks whether to install for the current user or for all users. The MSI was already
+per-machine.
+
+Checked on 2026-11-26 by building the installer (`tauri build --bundles nsis`) and reading the
+result, without running it, since running it needs a UAC prompt and would replace the installed
+app:
+- The generated `installer.nsi` defines `INSTALLMODE "both"`, includes the install-mode page, and
+  defaults the all-users directory to `$PROGRAMFILES64\Krita-VC`, which is where the installed copy
+  is.
+- The embedded manifest asks for `highestAvailable`, where the 2.2.0 installer's said `asInvoker`.
+  So an administrator gets the UAC prompt as soon as the installer starts, before the page that
+  chooses between current user and all users, and so also for a per-user install. A standard user
+  gets no prompt and can only install for themselves.
+
+Not checked: stepping through both choices in the installer, and the upgrade path from a per-user
+install to an all-users one.
+
+## Later fixes (2026-11-26)
+
+Three more bugs came from using the build on the developer's machine, all in the Changes view and
+the app shell rather than the engine (`d9a2078`).
+
+- **A second launch opened a second window.** Starting the app while it was already running created
+  another instance. `tauri-plugin-single-instance` is now registered first in `lib.rs` (desktop
+  targets only), so the second launch exits at once and the running app restores, shows and focuses
+  its `main` window. The `kvc` CLI is a separate binary and isn't affected.
+- **The save button was usable before the diff had loaded.** The Changes panel already tracked a
+  `checking` state (scan or diff in flight) but the button ignored it, so a version could be saved
+  before the artist had seen what was in it. The button is now disabled while checking and reads
+  "Checking changes…", and the save handler returns early too.
+- **The Changes list and layer list flashed on refresh, most on a fast machine.** A refresh swapped
+  the list for a "Looking at what changed…" line, and reset every layer thumbnail to a spinner, even
+  when the answer arrived a few milliseconds later. Three changes fix it:
+  1. A refresh keeps the previous content on screen. `useArtLayers` returns the previous layers with
+     `stale: true`, and `ArtDiffView` takes only their pixels (`withRasters`), never their metadata,
+     since an old `changes` or `prev` would hide the property edit the refresh just found.
+  2. Spinners and loading text wait 180 ms (`useDelayedFlag`), so a fast refresh shows none and a
+     slow one shows them as before. The cost is a thumbnail that has no pixels yet stays blank for
+     that long on a first load.
+  3. A refresh that returns identical data (`sameValue`) keeps the old objects, so memoized rows and
+     canvases don't re-render.
+
+  `useWorkingDiff` also starts as loading when there is a file to diff. It started as not loading,
+  and its one frame of that drew the "outside the layer stack" note.
+
+A smaller change in the same commit: the Inspector's Name row now shows a renamed layer as a
+highlighted was → now, like Visible, Opacity and Blend, instead of leaving the old name in the
+Change row's sentence, which a new user missed.
+
+None of the three has a regression test, since the frontend has no test runner. They were checked
+with `tsc` and by reading the code, not by running them in the app.
 
 See also: [`visual-diff-viewer.md`](../visual-diff-viewer.md) for how a diff is built now, and
 [`performance.md`](../performance.md) for where the pixel comparison sits in the diff's cost.

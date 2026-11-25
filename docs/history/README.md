@@ -27,7 +27,7 @@ Read them in order for the whole story, or jump to an era:
 | [12. Layer-subset staging](12-layer-subset-staging.md) | 09-01 to 09-03 | `c686231` to `e5b02ea` | Saving only the ticked layers, made three times faster, plus a doc audit. |
 | [13. The welcome screen, a license change, and v2.1.0](13-welcome-license-and-v2.1.md) | 09-05 to 09-13 | `5fccb88` to `b324391` | This series, the first-launch welcome, MIT to GPL-3.0, and the 2.1.0 release. |
 | [14. The September audit and its fixes](14-the-september-audit-and-its-fixes.md) | 09-25 to 09-28 | `38bf63a` to `d3b353a` | The docs reorganized by feature, an audit of v2.1.0, and fixes for its 18 stability and 16 performance findings and the four issues left after them. |
-| [15. Bugs found and fixed during evaluation testing](15-bugs-found-in-evaluation-testing.md) | 11-04 to 11-09 | not yet committed | The BSc evaluation harness, and a diff that marked layers modified with nothing to show, fixed by comparing pixels inside the canvas. |
+| [15. Bugs found and fixed during evaluation testing](15-bugs-found-in-evaluation-testing.md) | 11-04 to 11-26 | `60238c1` to `d9a2078` | The BSc evaluation harness, a diff that marked layers modified with nothing to show (fixed by comparing pixels inside the canvas), and later fixes: one window per app, a save button held until the diff loads, and no flash on refresh. |
 
 All dates are 2026. Some eras overlap instead of following one another. Eras 09, 10 and 11 were
 worked on in the same week at the end of August, which is why v2.0.0 ships the redesign, the
