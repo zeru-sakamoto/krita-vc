@@ -162,3 +162,172 @@ export function bendFraction(dx: number, fork: boolean, pitch: number, gap: numb
   const s = Math.min(Math.max((pitch / 2 - gap) / span, 0), 1);
   return fork ? s : 1 - s;
 }
+
+// --- Wrapping ----------------------------------------------------------------------------------
+//
+// A long history laid out on one spine is a thin ribbon once fit-to-screen zooms out to show it
+// all, with most of the canvas empty above and below. Wrapping cuts the column axis into **bands**
+// stacked top to bottom, every band reading left→right (not a boustrophedon: alternate rows read
+// right-to-left would break "oldest on the left", and every fork/merge bend rule would need
+// mirroring). This is a pure pass over `buildVersionMap`'s (col, lane) grid — it never changes
+// which lane or column a commit has, only where that cell lands on screen.
+
+/** One thing to place: a commit, or the pending-version preview. `time` is epoch ms, optional. */
+export interface WrapCell {
+  id: string;
+  col: number;
+  lane: number;
+  time?: number;
+}
+
+/** A parent→child connection, by column only — all a cut's cost depends on. */
+export interface WrapEdge {
+  fromCol: number;
+  toCol: number;
+}
+
+export interface WrapBand {
+  /** First and last column (inclusive) of the band. */
+  start: number;
+  end: number;
+  /** The lanes with something in this band, ascending — so the trunk is always the top row, and
+   *  a band with no branches in it is one row tall. */
+  lanes: number[];
+  /** Absolute row index of this band's first lane. */
+  rowStart: number;
+}
+
+export interface WrapPlacement {
+  band: number;
+  /** Column within the band, 0-based. */
+  x: number;
+  /** Absolute row, counting every band's rows from the top. */
+  row: number;
+}
+
+export interface WrappedMap {
+  bands: WrapBand[];
+  at: Map<string, WrapPlacement>;
+  /** Total rows across all bands. */
+  rows: number;
+  /** Width in columns of the widest band. */
+  widest: number;
+}
+
+/** A quiet stretch at least this long between two columns counts as a session break, which makes
+ *  that boundary a nicer place to cut: a band then reads as one sitting at the easel. */
+export const SESSION_GAP_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * Cut the columns into bands about `targetCols` wide and give every cell a (band, x, row).
+ *
+ * Bands are cut greedily, left to right. Each cut is picked from a window of widths around the
+ * target (0.7×–1.3×) by cost, cheapest first:
+ * 1. **Edges crossing the cut.** The trunk's own edge always crosses (cost baseline), but any
+ *    other — a branch alive on both sides of the cut — has to be routed through the gap between
+ *    bands, which is the one messy case. Most real histories have plenty of trunk-only boundaries
+ *    (fork, try something, merge back or abandon), so this usually picks one.
+ * 2. **Session breaks** — a cut where the artist stopped for a while is preferred.
+ * 3. **Distance from the target width**, so bands come out evenly sized.
+ * The tail is left as one band once it fits within 1.3× the target, rather than leaving a stub.
+ *
+ * `targetCols <= 0` or non-finite means "don't wrap": one band, which is exactly the unwrapped
+ * layout (row = lane index among the lanes present).
+ */
+export function wrapVersionMap(
+  cells: WrapCell[],
+  edges: WrapEdge[],
+  targetCols: number
+): WrappedMap {
+  if (cells.length === 0) return { bands: [], at: new Map(), rows: 0, widest: 0 };
+
+  let minCol = Infinity;
+  let maxCol = -Infinity;
+  for (const c of cells) {
+    minCol = Math.min(minCol, c.col);
+    maxCol = Math.max(maxCol, c.col);
+  }
+
+  // crossings[c] = edges spanning the boundary between column c and c+1 (difference array).
+  const diff = new Map<number, number>();
+  for (const e of edges) {
+    if (e.toCol <= e.fromCol) continue;
+    diff.set(e.fromCol, (diff.get(e.fromCol) ?? 0) + 1);
+    diff.set(e.toCol, (diff.get(e.toCol) ?? 0) - 1);
+  }
+  const crossings = new Map<number, number>();
+  let run = 0;
+  for (let c = minCol; c <= maxCol; c++) {
+    run += diff.get(c) ?? 0;
+    crossings.set(c, run);
+  }
+
+  // Newest moment in each column and oldest in each, for the session-break test.
+  const latest = new Map<number, number>();
+  const earliest = new Map<number, number>();
+  for (const c of cells) {
+    if (c.time === undefined || !Number.isFinite(c.time)) continue;
+    latest.set(c.col, Math.max(latest.get(c.col) ?? -Infinity, c.time));
+    earliest.set(c.col, Math.min(earliest.get(c.col) ?? Infinity, c.time));
+  }
+  const sessionBreak = (c: number) => {
+    const a = latest.get(c);
+    const b = earliest.get(c + 1);
+    return a !== undefined && b !== undefined && b - a >= SESSION_GAP_MS;
+  };
+
+  const spans: [number, number][] = [];
+  if (!(targetCols > 0) || !Number.isFinite(targetCols)) {
+    spans.push([minCol, maxCol]);
+  } else {
+    const t = Math.max(1, Math.round(targetCols));
+    const minW = Math.max(1, Math.ceil(0.7 * t));
+    const maxW = Math.max(minW, Math.floor(1.3 * t));
+    let start = minCol;
+    while (maxCol - start + 1 > maxW) {
+      let best = start + t - 1;
+      let bestScore = Infinity;
+      for (let w = minW; w <= maxW; w++) {
+        const c = start + w - 1;
+        if (c >= maxCol) break;
+        const extra = Math.max(0, (crossings.get(c) ?? 0) - 1);
+        const score = extra * 4 + Math.abs(w - t) / t - (sessionBreak(c) ? 0.5 : 0);
+        if (score < bestScore) {
+          bestScore = score;
+          best = c;
+        }
+      }
+      spans.push([start, best]);
+      start = best + 1;
+    }
+    spans.push([start, maxCol]);
+  }
+
+  const bandOf = (col: number) => {
+    // Few bands, so a scan is fine; columns between cells still resolve.
+    for (let i = 0; i < spans.length; i++) if (col <= spans[i][1]) return i;
+    return spans.length - 1;
+  };
+
+  const laneSets = spans.map(() => new Set<number>());
+  for (const c of cells) laneSets[bandOf(c.col)].add(c.lane);
+
+  const bands: WrapBand[] = [];
+  let rows = 0;
+  let widest = 0;
+  spans.forEach(([start, end], i) => {
+    const lanes = [...laneSets[i]].sort((a, b) => a - b);
+    bands.push({ start, end, lanes, rowStart: rows });
+    rows += Math.max(1, lanes.length);
+    widest = Math.max(widest, end - start + 1);
+  });
+
+  const at = new Map<string, WrapPlacement>();
+  for (const c of cells) {
+    const band = bandOf(c.col);
+    const b = bands[band];
+    at.set(c.id, { band, x: c.col - b.start, row: b.rowStart + b.lanes.indexOf(c.lane) });
+  }
+
+  return { bands, at, rows, widest };
+}

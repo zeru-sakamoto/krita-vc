@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { Position, getSmoothStepPath } from "@xyflow/system";
-import { bendFraction, buildVersionMap } from "../src/lib/versionMap.ts";
+import { SESSION_GAP_MS, bendFraction, buildVersionMap, wrapVersionMap } from "../src/lib/versionMap.ts";
 
 /** `commits` is newest-first, matching what `useCommits` hands the map. */
 const commit = (id, parents, branch) => ({
@@ -126,4 +126,57 @@ const branch = (name, tip, current) => ({ name, tip, kind: current ? "current" :
   }
 }
 
-console.log("versionMap layout: 5 cases OK");
+// --- 6. Wrapping a straight line: even bands, one row each, every band starting at x 0. -------
+const line = (n) => {
+  const cells = [];
+  const edges = [];
+  for (let c = 1; c <= n; c++) {
+    cells.push({ id: `c${c}`, col: c, lane: 0 });
+    if (c > 1) edges.push({ fromCol: c - 1, toCol: c });
+  }
+  return { cells, edges };
+};
+{
+  const { cells, edges } = line(30);
+  const w = wrapVersionMap(cells, edges, 10);
+  assert.deepEqual(
+    w.bands.map((b) => [b.start, b.end]),
+    [
+      [1, 10],
+      [11, 20],
+      [21, 30],
+    ]
+  );
+  assert.equal(w.rows, 3, "a band with no branches is one row");
+  assert.deepEqual(w.at.get("c11"), { band: 1, x: 0, row: 1 });
+  const flat = wrapVersionMap(cells, edges, 0);
+  assert.equal(flat.bands.length, 1, "0 means don't wrap");
+  assert.deepEqual(flat.at.get("c30"), { band: 0, x: 29, row: 0 });
+}
+
+// --- 7. A cut never lands where a side branch is alive if a trunk-only boundary is in reach. --
+// Branch forks off col 9 and merges back at col 12; the natural cut (after col 10) would sever it.
+{
+  const { cells, edges } = line(24);
+  cells.push({ id: "b10", col: 10, lane: 1 }, { id: "b11", col: 11, lane: 1 });
+  edges.push({ fromCol: 9, toCol: 10 }, { fromCol: 10, toCol: 11 }, { fromCol: 11, toCol: 12 });
+  const w = wrapVersionMap(cells, edges, 10);
+  const first = w.bands[0];
+  assert.ok(first.end < 9 || first.end >= 12, `cut after ${first.end} severs the branch`);
+  const band = w.at.get("b10").band;
+  assert.equal(w.at.get("b11").band, band, "the branch stays in one band");
+  assert.equal(w.at.get("c9").band, band, "with the version it forked from");
+  assert.equal(w.at.get("c12").band, band, "and the version it merged into");
+  assert.equal(w.bands[band].lanes.length, 2, "only that band grows a second row");
+}
+
+// --- 8. Given two equally good cuts, a session break wins. ------------------------------------
+{
+  const { cells, edges } = line(20);
+  const t0 = Date.parse("2026-01-01T09:00:00Z");
+  for (const c of cells) c.time = t0 + c.col * 60_000 + (c.col > 11 ? SESSION_GAP_MS : 0);
+  const w = wrapVersionMap(cells, edges, 10);
+  assert.equal(w.bands[0].end, 11, "the cut lands on the overnight gap, not at exactly 10");
+}
+
+console.log("versionMap layout: 8 cases OK");

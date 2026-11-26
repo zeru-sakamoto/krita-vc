@@ -6,21 +6,26 @@ import {
   Panel,
   ReactFlow,
   ReactFlowProvider,
+  BaseEdge,
   useReactFlow,
   useStore,
+  useStoreApi,
   type BuiltInEdge,
+  type Edge,
+  type EdgeProps,
   type Node,
   type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
   ArrowLeft,
+  ArrowUDownLeft,
   ArrowsClockwise,
   ArrowsOut,
   CaretDown,
-  CaretLineRight,
   GitBranch,
   GitMerge,
+  GpsFix,
   MapTrifold,
   Plus,
   SidebarSimple,
@@ -50,7 +55,14 @@ import { useArtistMode } from "../../lib/artistMode";
 import { useTour } from "../../lib/tour";
 import { assetName, versionLabel } from "../../lib/friendly";
 import { ICON } from "../../lib/iconSize";
-import { bendFraction, buildVersionMap } from "../../lib/versionMap";
+import {
+  bendFraction,
+  buildVersionMap,
+  wrapVersionMap,
+  type WrapCell,
+  type WrapEdge,
+  type WrappedMap,
+} from "../../lib/versionMap";
 import type { Branch, Commit } from "../../types";
 
 /** Horizontal pitch between node columns (node width + gutter). */
@@ -75,6 +87,13 @@ const MINIMAP_OFFSET_SCALE = 1.5;
 /** Whether the map draws every branch or just the one you're on. Map-local, so it's a plain
  *  localStorage read rather than another app-wide context (cf. artistMode/legacyHistory). */
 const SHOW_ALL_KEY = "krita-vc:map-show-all";
+/** Whether a long line wraps into stacked bands (see `wrapVersionMap`). Map-local, like the above. */
+const WRAP_KEY = "krita-vc:map-wrap";
+/** Extra space between two wrapped bands, on top of the normal lane gutter — room for the return
+ *  line, and enough that a band reads as a new row rather than another branch lane. */
+const BAND_GAP = 80;
+/** Most bands the auto-wrap will try. Past this the nodes are big enough anyway. */
+const MAX_BANDS = 12;
 
 // Version Map's own lane palette — separate from graph.ts's LANE_COLORS (whose positional
 // lane-0-is-accent is a fixed convention for the legacy History graph). Reuses theme-tuned status
@@ -98,17 +117,132 @@ function laneColor(lane: number, currentLane: number): string {
 function dimLane(color: string): string {
   return `color-mix(in srgb, ${color} 55%, var(--color-bg))`;
 }
-/** The y a lane's spine runs at, in flow coordinates — shared by the gradient defs below. */
-function laneY(lane: number): number {
-  return lane * LANE_PITCH + SPINE_TOP;
+/** Top edge of a row, in flow coordinates. With wrapping off there's one band and the row is the
+ *  lane's index among the lanes drawn. */
+function rowTop(row: number, band: number): number {
+  return row * LANE_PITCH + band * BAND_GAP;
 }
-/** Gradient id for a connector between two lanes. */
-function laneGradientId(from: number, to: number): string {
-  return `kvc-lane-${from}-${to}`;
+/** A lane-crossing connector's gradient: which two lanes' colors, between which two spine y's.
+ *  Keyed by the y's as well as the lanes because the same lane pair sits at different heights in
+ *  different bands. */
+interface LaneLink {
+  id: string;
+  from: number;
+  to: number;
+  y1: number;
+  y2: number;
+}
+function laneLink(from: number, to: number, y1: number, y2: number): LaneLink {
+  return { id: `kvc-lane-${from}-${to}-${Math.round(y1)}-${Math.round(y2)}`, from, to, y1, y2 };
 }
 
 // Registered once at module scope — a fresh object here would remount every node each render.
 const NODE_TYPES = { version: VersionNode, preview: PreviewNode };
+
+/** A wrap connector's route: which gutter track it runs along between the two bands. */
+interface WrapEdgeData extends Record<string, unknown> {
+  /** y of the horizontal run in the gap below the source's band. */
+  trackY: number;
+  /** Which track in that gap (0 = first). Later tracks also step their vertical runs outward,
+   *  so two lines wrapping through one gap cross once instead of running on top of each other. */
+  track: number;
+}
+
+/**
+ * The line carrying history from the end of one band to the start of the next: out of the source
+ * dot to the middle of the gutter on its right, down into the gap below its band, back left along
+ * the gap to the gutter before the target, down to the target's spine and in. Like a carriage
+ * return, so time keeps reading left→right on every band.
+ */
+function WrapConnector({
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+  style,
+}: EdgeProps<Edge<WrapEdgeData>>) {
+  const step = NODE_PITCH / 2 + (data?.track ?? 0) * 10;
+  const trackY = data?.trackY ?? (sourceY + targetY) / 2;
+  const path = roundedPath(
+    [
+      [sourceX, sourceY],
+      [sourceX + step, sourceY],
+      [sourceX + step, trackY],
+      [targetX - step, trackY],
+      [targetX - step, targetY],
+      [targetX, targetY],
+    ],
+    16
+  );
+  return <BaseEdge path={path} style={style} />;
+}
+
+const EDGE_TYPES = { wrap: WrapConnector };
+/** Ordinary connectors are React Flow's smoothstep; only a line wrapping between bands is ours. */
+type MapEdge = BuiltInEdge | Edge<WrapEdgeData, "wrap">;
+
+/** An orthogonal polyline as an SVG path with every corner rounded to `r` (less where a run is
+ *  too short to fit it). Same quadratic-corner shape `getSmoothStepPath` draws, so wrap lines and
+ *  ordinary connectors bend alike. */
+function roundedPath(pts: [number, number][], r: number): string {
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [px, py] = pts[i - 1];
+    const [cx, cy] = pts[i];
+    const [nx, ny] = pts[i + 1];
+    const inLen = Math.hypot(cx - px, cy - py);
+    const outLen = Math.hypot(nx - cx, ny - cy);
+    const k = Math.min(r, inLen / 2, outLen / 2);
+    if (k <= 0) {
+      d += ` L${cx},${cy}`;
+      continue;
+    }
+    const ax = cx - ((cx - px) / inLen) * k;
+    const ay = cy - ((cy - py) / inLen) * k;
+    const bx = cx + ((nx - cx) / outLen) * k;
+    const by = cy + ((ny - cy) / outLen) * k;
+    d += ` L${ax},${ay} Q${cx},${cy} ${bx},${by}`;
+  }
+  const [lx, ly] = pts[pts.length - 1];
+  return `${d} L${lx},${ly}`;
+}
+
+/**
+ * How many columns a band should be for this canvas: tries 1..MAX_BANDS bands and keeps the one
+ * whose fit-to-screen zoom is largest — i.e. the biggest nodes once the whole history is on
+ * screen. Prefers fewer bands when the gain is marginal, and never wraps a history that already
+ * fits at 100%. Returns 0 for "don't wrap".
+ */
+function chooseWrapCols(
+  cells: WrapCell[],
+  edges: WrapEdge[],
+  view: { w: number; h: number }
+): number {
+  if (cells.length === 0 || view.w <= 0 || view.h <= 0) return 0;
+  const zoomFor = (m: WrappedMap) => {
+    const w = m.widest * NODE_PITCH - (NODE_PITCH - NODE_W);
+    const h = m.rows * LANE_PITCH - (LANE_PITCH - NODE_H) + (m.bands.length - 1) * BAND_GAP;
+    return Math.min(1, view.w / w, view.h / h);
+  };
+  let minCol = Infinity;
+  let maxCol = -Infinity;
+  for (const c of cells) {
+    minCol = Math.min(minCol, c.col);
+    maxCol = Math.max(maxCol, c.col);
+  }
+  const total = maxCol - minCol + 1;
+  const tries: { cols: number; zoom: number }[] = [
+    { cols: 0, zoom: zoomFor(wrapVersionMap(cells, edges, 0)) },
+  ];
+  for (let k = 2; k <= Math.min(MAX_BANDS, total); k++) {
+    const cols = Math.ceil(total / k);
+    tries.push({ cols, zoom: zoomFor(wrapVersionMap(cells, edges, cols)) });
+  }
+  const best = Math.max(...tries.map((t) => t.zoom));
+  // First (fewest bands) within 5% of the best: an extra band that barely helps isn't worth it.
+  return tries.find((t) => t.zoom >= best * 0.95)?.cols ?? 0;
+}
 
 /** Node id of the pending-changes preview. Can never collide with a commit id. */
 const PREVIEW_ID = "__preview__";
@@ -170,6 +304,14 @@ function VersionMap({
   // Pick-a-version mode: the action bar asked for a starting point, so the next node click
   // forks a branch there instead of opening the diff viewer.
   const [picking, setPicking] = useState(false);
+  const [wrap, setWrap] = useState(() => localStorage.getItem(WRAP_KEY) !== "0");
+  // The canvas size the wrap was chosen for. Deliberately a snapshot, not live: re-choosing on
+  // every resize would reflow the whole map under the cursor while you drag a window edge. It's
+  // taken once the canvas is first measured and again whenever "Fit all versions" is pressed.
+  const [wrapView, setWrapView] = useState<{ w: number; h: number } | null>(null);
+  const [fitNonce, setFitNonce] = useState(0);
+  const storeApi = useStoreApi();
+  const measured = useStore((s) => s.width > 0 && s.height > 0);
   const { fitView, setCenter, getViewport } = useReactFlow();
   const actions = useBranchActions({ currentBranch: currentBranch.name, onShowChanges });
   const { active: tourActive } = useTour();
@@ -250,6 +392,71 @@ function VersionMap({
     return { col: col + 1, version: tip.version + 1 };
   }, [dirty, drawn.length, currentBranch.tip, layout]);
 
+  // --- Wrapping: the (col, lane) grid → bands stacked top to bottom (lib/versionMap.ts). ------
+  const wrapInput = useMemo(() => {
+    const cells: WrapCell[] = drawn.map((c) => {
+      const at = layout.placed.get(c.id);
+      return { id: c.id, col: at?.col ?? 1, lane: at?.lane ?? 0, time: Date.parse(c.timestamp) };
+    });
+    const edges: WrapEdge[] = [];
+    for (const c of drawn) {
+      const toCol = layout.placed.get(c.id)?.col ?? 1;
+      for (const p of c.parents) {
+        const from = layout.placed.get(p);
+        if (from) edges.push({ fromCol: from.col, toCol });
+      }
+    }
+    if (preview) {
+      cells.push({ id: PREVIEW_ID, col: preview.col, lane: layout.currentLane });
+      const tip = currentBranch.tip ? layout.placed.get(currentBranch.tip) : undefined;
+      if (tip) edges.push({ fromCol: tip.col, toCol: preview.col });
+    }
+    return { cells, edges };
+  }, [drawn, layout, preview, currentBranch.tip]);
+
+  useEffect(() => {
+    if (!measured || wrapView) return;
+    const { width, height } = storeApi.getState();
+    setWrapView({ w: width, h: height });
+  }, [measured, wrapView, storeApi]);
+
+  const wrapCols = useMemo(
+    () => (wrap && wrapView ? chooseWrapCols(wrapInput.cells, wrapInput.edges, wrapView) : 0),
+    [wrap, wrapView, wrapInput]
+  );
+  const wrapped = useMemo(
+    () => wrapVersionMap(wrapInput.cells, wrapInput.edges, wrapCols),
+    [wrapInput, wrapCols]
+  );
+  const posOf = useCallback(
+    (id: string) => {
+      const w = wrapped.at.get(id);
+      return w ? { x: w.x * NODE_PITCH, y: rowTop(w.row, w.band) } : { x: 0, y: 0 };
+    },
+    [wrapped]
+  );
+
+  // Re-choose the wrap for the canvas as it is *now*, then fit once the new layout is in. The
+  // timeout lets React Flow take the new node positions into its store before fitView reads them.
+  const fitAll = useCallback(() => {
+    const { width, height } = storeApi.getState();
+    if (width > 0 && height > 0) setWrapView({ w: width, h: height });
+    setFitNonce((n) => n + 1);
+  }, [storeApi]);
+  useEffect(() => {
+    if (fitNonce === 0) return;
+    const t = setTimeout(() => void fitView({ padding: FIT_PADDING, duration: 350 }), 30);
+    return () => clearTimeout(t);
+  }, [fitNonce, fitView]);
+
+  const toggleWrap = useCallback(() => {
+    setWrap((v) => {
+      localStorage.setItem(WRAP_KEY, v ? "0" : "1");
+      return !v;
+    });
+    fitAll();
+  }, [fitAll]);
+
   const nodes = useMemo<Node<VersionNodeData | PreviewNodeData>[]>(
     () =>
       drawn.map((commit) => {
@@ -258,7 +465,7 @@ function VersionMap({
         return {
           id: commit.id,
           type: "version",
-          position: { x: (at?.col ?? 1) * NODE_PITCH, y: lane * LANE_PITCH },
+          position: posOf(commit.id),
           // Both dimensions are required: the MiniMap reads them off this object (see NODE_H).
           width: NODE_W,
           height: NODE_H,
@@ -276,7 +483,7 @@ function VersionMap({
           },
         };
       }),
-    [drawn, layout, repoPath, openId, onNodeClick, currentBranch.tip]
+    [drawn, layout, repoPath, openId, onNodeClick, currentBranch.tip, posOf]
   );
 
   const allNodes = useMemo<Node<VersionNodeData | PreviewNodeData>[]>(() => {
@@ -286,7 +493,7 @@ function VersionMap({
       {
         id: PREVIEW_ID,
         type: "preview",
-        position: { x: preview.col * NODE_PITCH, y: layout.currentLane * LANE_PITCH },
+        position: posOf(PREVIEW_ID),
         width: NODE_W,
         height: NODE_H,
         data: {
@@ -298,23 +505,95 @@ function VersionMap({
         },
       },
     ];
-  }, [nodes, preview, layout.currentLane, currentBranch.name, picking, onShowChanges]);
+  }, [nodes, preview, layout.currentLane, currentBranch.name, picking, onShowChanges, posOf]);
 
   // Edges come from `parents`, not from adjacency — so a merge commit's second parent draws its
   // own line into whichever lane it came from. Since both handles sit on the connector dot, one
   // edge is the *entire* line between two versions: through the source node, the gutter, and the
   // target node, with nothing else drawing any part of it.
   const { edges, laneLinks } = useMemo(() => {
-    const out: BuiltInEdge[] = [];
-    const links = new Set<string>(); // "from-to" lane pairs needing a gradient
+    const out: MapEdge[] = [];
+    const links = new Map<string, LaneLink>(); // lane-crossing connectors needing a gradient
+    const spineY = (id: string) => {
+      const w = wrapped.at.get(id);
+      return w ? rowTop(w.row, w.band) + SPINE_TOP : 0;
+    };
+    // Each band's gap gets its own tracks, one per line wrapping through it, so two wrap lines
+    // through the same gap never draw on top of each other. The trunk's is usually the only one.
+    // Tracks go out in source-row order — the trunk (top row) innermost — which is what keeps
+    // the nesting to a single clean crossing.
+    const trackOf = new Map<string, number>();
+    {
+      const crossing: { id: string; band: number; row: number }[] = [];
+      const consider = (source: string, target: string) => {
+        const s = wrapped.at.get(source);
+        const t = wrapped.at.get(target);
+        if (s && t && s.band !== t.band)
+          crossing.push({ id: `${source}->${target}`, band: s.band, row: s.row });
+      };
+      for (const c of drawn) for (const p of c.parents) consider(p, c.id);
+      if (preview && currentBranch.tip) consider(currentBranch.tip, PREVIEW_ID);
+      crossing.sort((x, y) => x.row - y.row);
+      const used = new Map<number, number>();
+      for (const e of crossing) {
+        const n = used.get(e.band) ?? 0;
+        used.set(e.band, n + 1);
+        trackOf.set(e.id, n);
+      }
+    }
+    const nextTrack = (band: number, id: string) => {
+      const b = wrapped.bands[band];
+      const lastRow = b.rowStart + Math.max(1, b.lanes.length) - 1;
+      const track = trackOf.get(id) ?? 0;
+      const trackY =
+        rowTop(lastRow, band) + NODE_H + (LANE_PITCH - NODE_H + BAND_GAP) / 2 + track * 10;
+      return { trackY, track };
+    };
+    /** A line from one band into a later one, drawn as a carriage return through the gap. */
+    const wrapEdge = (
+      id: string,
+      source: string,
+      target: string,
+      fromLane: number,
+      toLane: number,
+      dashed: boolean
+    ): MapEdge | null => {
+      const s = wrapped.at.get(source);
+      const t = wrapped.at.get(target);
+      if (!s || !t || s.band === t.band) return null;
+      let stroke = dimLane(laneColor(toLane, layout.currentLane));
+      if (fromLane !== toLane) {
+        const link = laneLink(fromLane, toLane, spineY(source), spineY(target));
+        links.set(link.id, link);
+        stroke = `url(#${link.id})`;
+      }
+      return {
+        id,
+        source,
+        target,
+        type: "wrap",
+        data: nextTrack(s.band, id),
+        style: { stroke, strokeWidth: 1.5, ...(dashed ? { strokeDasharray: "5 4" } : {}) },
+      };
+    };
     for (const c of drawn) {
       const at = layout.placed.get(c.id);
       for (const p of c.parents) {
         const from = layout.placed.get(p);
         if (!from) continue;
         const toLane = at?.lane ?? 0;
+        const across = wrapEdge(`${p}->${c.id}`, p, c.id, from.lane, toLane, false);
+        if (across) {
+          out.push(across);
+          continue;
+        }
         const crosses = from.lane !== toLane;
-        if (crosses) links.add(`${from.lane}-${toLane}`);
+        let gradient = "";
+        if (crosses) {
+          const link = laneLink(from.lane, toLane, spineY(p), spineY(c.id));
+          links.set(link.id, link);
+          gradient = `url(#${link.id})`;
+        }
         out.push({
           id: `${p}->${c.id}`,
           source: p,
@@ -336,9 +615,7 @@ function VersionMap({
             borderRadius: 16,
           },
           style: {
-            stroke: crosses
-              ? `url(#${laneGradientId(from.lane, toLane)})`
-              : dimLane(laneColor(toLane, layout.currentLane)),
+            stroke: crosses ? gradient : dimLane(laneColor(toLane, layout.currentLane)),
             strokeWidth: 1.5,
           },
         });
@@ -347,43 +624,55 @@ function VersionMap({
     // The dashed run out to the pending-changes preview. Same lane as its parent, so it needs no
     // bend and no lane gradient — just the spine's color, dashed.
     if (preview && currentBranch.tip && layout.placed.has(currentBranch.tip)) {
-      out.push({
-        id: `${currentBranch.tip}->${PREVIEW_ID}`,
-        source: currentBranch.tip,
-        target: PREVIEW_ID,
-        type: "smoothstep",
-        style: {
-          stroke: dimLane(laneColor(layout.currentLane, layout.currentLane)),
-          strokeWidth: 1.5,
-          strokeDasharray: "5 4",
-        },
-      });
+      const lane = layout.currentLane;
+      const tipLane = layout.placed.get(currentBranch.tip)?.lane ?? lane;
+      const across = wrapEdge(
+        `${currentBranch.tip}->${PREVIEW_ID}`,
+        currentBranch.tip,
+        PREVIEW_ID,
+        tipLane,
+        lane,
+        true
+      );
+      if (across) out.push(across);
+      else
+        out.push({
+          id: `${currentBranch.tip}->${PREVIEW_ID}`,
+          source: currentBranch.tip,
+          target: PREVIEW_ID,
+          type: "smoothstep",
+          style: {
+            stroke: dimLane(laneColor(layout.currentLane, layout.currentLane)),
+            strokeWidth: 1.5,
+            strokeDasharray: "5 4",
+          },
+        });
     }
-    return { edges: out, laneLinks: [...links] };
-  }, [drawn, layout, preview, currentBranch.tip]);
+    return { edges: out, laneLinks: [...links.values()] };
+  }, [drawn, layout, preview, currentBranch.tip, wrapped]);
 
-  // The current branch's tip, which with lanes on is no longer just the rightmost node.
-  const tipAt = currentBranch.tip ? (layout.placed.get(currentBranch.tip) ?? null) : null;
-  const tipCol = tipAt?.col ?? null;
-  const tipLane = tipAt?.lane ?? 0;
-  // With unsaved changes the preview node *is* the newest thing on the line, so that's what
-  // "latest" means.
-  const latestCol = preview?.col ?? tipCol;
-  const latestLane = preview ? layout.currentLane : tipLane;
+  // The current branch's tip, which with lanes on is no longer just the rightmost node. With
+  // unsaved changes the preview node *is* the newest thing on the line, so that's what "latest"
+  // means.
+  const latestId = preview
+    ? PREVIEW_ID
+    : currentBranch.tip && layout.placed.has(currentBranch.tip)
+      ? currentBranch.tip
+      : null;
+  const latestPos = latestId ? posOf(latestId) : null;
+  const latestX = latestPos?.x ?? null;
+  const latestY = latestPos?.y ?? null;
   const jumpToLatest = useCallback(() => {
-    if (latestCol == null) return;
-    setCenter(latestCol * NODE_PITCH + NODE_W / 2, latestLane * LANE_PITCH + SPINE_TOP, {
-      zoom: 1,
-      duration: 350,
-    });
-  }, [latestCol, latestLane, setCenter]);
+    if (latestX == null || latestY == null) return;
+    setCenter(latestX + NODE_W / 2, latestY + SPINE_TOP, { zoom: 1, duration: 350 });
+  }, [latestX, latestY, setCenter]);
 
-  // Land on the newest version, and follow it when a new one is committed.
+  // Land on the newest version, and follow it when a new one is committed (or the wrap moves it).
   useEffect(() => {
-    if (latestCol == null) return;
+    if (latestX == null) return;
     const t = setTimeout(jumpToLatest, 0); // after React Flow has measured the nodes
     return () => clearTimeout(t);
-  }, [latestCol, jumpToLatest]);
+  }, [latestX, latestY, jumpToLatest]);
 
   const openCommit = openId ? (drawn.find((c) => c.id === openId) ?? null) : null;
 
@@ -444,6 +733,20 @@ function VersionMap({
                   />
                 </span>
               )}
+              {/* Prototype toggle for the wrapped layout, so it can be compared against the
+                  single line. */}
+              <Switch
+                active={wrap}
+                size="sm"
+                icon={ArrowUDownLeft}
+                text="Wrap"
+                label={
+                  wrap
+                    ? "Lay every version out on one long line"
+                    : "Wrap a long line into rows to fill the screen"
+                }
+                onClick={toggleWrap}
+              />
               <IconButton
                 icon={ArrowsClockwise}
                 label="Rescan for changes"
@@ -456,13 +759,9 @@ function VersionMap({
                   padding, not as teaching. `gap-2` reproduces what the header was giving them. */}
               <span data-tour-id="map-view-controls" className="flex items-center gap-2">
                 <ZoomReadout />
+                <IconButton icon={ArrowsOut} label="Fit all versions" onClick={fitAll} />
                 <IconButton
-                  icon={ArrowsOut}
-                  label="Fit all versions"
-                  onClick={() => void fitView({ padding: FIT_PADDING, duration: 350 })}
-                />
-                <IconButton
-                  icon={CaretLineRight}
+                  icon={GpsFix}
                   label={artistMode ? "Jump to the newest version" : "Jump to the tip"}
                   onClick={jumpToLatest}
                 />
@@ -496,6 +795,7 @@ function VersionMap({
             nodes={allNodes}
             edges={edges}
             nodeTypes={NODE_TYPES}
+            edgeTypes={EDGE_TYPES}
             // Positions are computed; the canvas pans, the nodes never move.
             nodesDraggable={false}
             nodesConnectable={false}
@@ -811,28 +1111,25 @@ function MinimapViewport({ nodes }: { nodes: Node[] }) {
  * shares with the spine before the bend invisible. An `objectBoundingBox` gradient would smear
  * the transition across the entire path and tint that shared stretch.
  */
-function LaneGradients({ links, currentLane }: { links: string[]; currentLane: number }) {
+function LaneGradients({ links, currentLane }: { links: LaneLink[]; currentLane: number }) {
   if (links.length === 0) return null;
   return (
     <svg aria-hidden className="pointer-events-none absolute h-0 w-0">
       <defs>
-        {links.map((key) => {
-          const [from, to] = key.split("-").map(Number);
-          return (
-            <linearGradient
-              key={key}
-              id={laneGradientId(from, to)}
-              gradientUnits="userSpaceOnUse"
-              x1="0"
-              y1={laneY(from)}
-              x2="0"
-              y2={laneY(to)}
-            >
-              <stop offset="0" style={{ stopColor: dimLane(laneColor(from, currentLane)) }} />
-              <stop offset="1" style={{ stopColor: dimLane(laneColor(to, currentLane)) }} />
-            </linearGradient>
-          );
-        })}
+        {links.map(({ id, from, to, y1, y2 }) => (
+          <linearGradient
+            key={id}
+            id={id}
+            gradientUnits="userSpaceOnUse"
+            x1="0"
+            y1={y1}
+            x2="0"
+            y2={y2}
+          >
+            <stop offset="0" style={{ stopColor: dimLane(laneColor(from, currentLane)) }} />
+            <stop offset="1" style={{ stopColor: dimLane(laneColor(to, currentLane)) }} />
+          </linearGradient>
+        ))}
       </defs>
     </svg>
   );
