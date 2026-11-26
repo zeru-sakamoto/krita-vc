@@ -5,6 +5,7 @@ import { useArtistMode } from "../../lib/artistMode";
 import { useRepository } from "../../lib/repository";
 import { inTauri } from "../../lib/tauri";
 import { Tooltip } from "../ui/Tooltip";
+import { shiftLayout } from "../../lib/layoutShift";
 
 interface StatusBarProps {
   /** Currently focused file (left zone) */
@@ -27,7 +28,13 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
   const { artistMode } = useArtistMode();
   const { saving } = useRepository();
   return (
-    <footer className="relative flex h-6 shrink-0 items-center justify-between bg-surface px-3 text-caption text-text-muted">
+    // Tracked as well as the right zone below: the outermost tracked row is the wall glides stop
+    // at (layoutShift.ts), and the zone has no edge of its own — when it shrinks, its items must
+    // be free to glide in from where they were, bounded only by the bar's padding.
+    <footer
+      ref={shiftLayout}
+      className="relative flex h-6 shrink-0 items-center justify-between bg-surface px-3 text-caption text-text-muted"
+    >
       {/* Indeterminate save progress — only while a commit is being written */}
       {saving && (
         <div
@@ -53,7 +60,7 @@ export function StatusBar({ activeFile, dirty, branch, commitCount }: StatusBarP
       </div>
 
       {/* Right zone — browser-preview badge (no backend outside the desktop shell), branch, count */}
-      <div className="flex shrink-0 items-center gap-2.5">
+      <div ref={shiftLayout} className="flex shrink-0 items-center gap-2.5">
         {!inTauri() && (
           <>
             <Tooltip label="No backend in the browser. Run the desktop app to work with real repositories.">

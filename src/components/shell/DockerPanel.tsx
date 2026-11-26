@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { shiftLayout } from "../../lib/layoutShift";
 
 /**
  * Horizontal inset of the header strip.
@@ -75,6 +76,9 @@ const PAD: Record<PanelHeaderPad, string> = {
 export function PanelHeader({ title, leading, meta, actions, pad = "default" }: PanelHeaderProps) {
   return (
     <header
+      // Both levels are tracked so the header's own slots glide as well as the actions inside
+      // `actions`; nested tracked rows are measured as one system (see layoutShift.ts).
+      ref={shiftLayout}
       className={[
         "flex h-10 shrink-0 items-center gap-2 border-b border-border bg-surface-2",
         PAD[pad],
@@ -87,7 +91,11 @@ export function PanelHeader({ title, leading, meta, actions, pad = "default" }: 
         </span>
       )}
       <div className="flex min-w-0 flex-1 items-center gap-2">{meta}</div>
-      {actions && <div className="flex shrink-0 items-center gap-1">{actions}</div>}
+      {actions && (
+        <div ref={shiftLayout} className="flex shrink-0 items-center gap-1">
+          {actions}
+        </div>
+      )}
     </header>
   );
 }

@@ -16,6 +16,7 @@ import { ICON } from "../../lib/iconSize";
 import { layerChangeSummary, layerTypeIcon } from "../../lib/friendly";
 import { inTauri } from "../../lib/tauri";
 import { timed } from "../../lib/perf";
+import { shiftLayout } from "../../lib/layoutShift";
 
 /**
  * Unsaved work on the tracked artwork, described as **which layers changed** rather than which
@@ -305,8 +306,11 @@ export function ChangesPanel({
       </div>
 
       <div data-tour-id="changes-unstaged">
-        <h3 className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-caption font-medium uppercase tracking-wide text-text-muted">
-          <span className="flex items-center gap-2">
+        <h3
+          ref={shiftLayout}
+          className="flex h-8 shrink-0 items-center justify-between gap-2 px-3 text-caption font-medium uppercase tracking-wide text-text-muted"
+        >
+          <span ref={shiftLayout} className="flex items-center gap-2">
             Since your last version
             {rows.length > 0 && (
               <span className="text-text-muted/70">

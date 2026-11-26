@@ -64,6 +64,7 @@ import {
   type WrappedMap,
 } from "../../lib/versionMap";
 import type { Branch, Commit } from "../../types";
+import { shiftLayout } from "../../lib/layoutShift";
 
 /** Horizontal pitch between node columns (node width + gutter). */
 const NODE_PITCH = NODE_W + 72;
@@ -708,7 +709,7 @@ function VersionMap({
           drawn.length > 0 ? (
             // Its own `gap-2` container: PanelHeader's `actions` slot spaces at `gap-1`, and this
             // row's switch + divider + readout + chips need the wider rhythm the header gave them.
-            <div className="flex items-center gap-2">
+            <div ref={shiftLayout} className="flex items-center gap-2">
               {otherBranches > 0 && (
                 // Wrapper rather than a `tourId` prop on Switch: the tour only needs a rect, and
                 // every other map target is a plain `data-tour-id` too.
@@ -902,7 +903,10 @@ function MapActionBar({
     // the bar pans the canvas underneath. Panel itself already re-enables pointer events, which
     // is why MinimapViewport has to opt back *out*.
     <Panel position="top-left" className="nopan !top-3 !left-3">
-      <div className="raised flex items-center gap-1 rounded-panel border border-border bg-surface-2 p-1">
+      <div
+        ref={shiftLayout}
+        className="raised flex items-center gap-1 rounded-panel border border-border bg-surface-2 p-1"
+      >
         {picking ? (
           <>
             <span className="px-2 text-dense text-text">

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "../ui/Button";
 import { useTour } from "../../lib/tour";
 import type { ActivityView } from "./ActivityBar";
+import { shiftLayout } from "../../lib/layoutShift";
 
 const HOLD_MS = 300;
 const RING_R = 9;
@@ -179,13 +180,13 @@ export function TourOverlay({ setActiveView }: { setActiveView: (v: ActivityView
       >
         <h2 className="text-body font-medium text-text">{step.title}</h2>
         <p className="mt-1 text-dense leading-relaxed text-text-muted">{step.body}</p>
-        <div className="mt-3 flex items-center justify-between">
+        <div ref={shiftLayout} className="mt-3 flex items-center justify-between">
           <span className="text-caption text-text-muted">
             Step {stepIndex + 1} of {totalSteps}
           </span>
           {/* The app's two sanctioned button types, at the dense `sm` metric the callout
               already used. `ghost` for Back so the pair doesn't read as two equals. */}
-          <div className="flex gap-1.5">
+          <div ref={shiftLayout} className="flex gap-1.5">
             {stepIndex > 0 && (
               <Button variant="ghost" size="sm" onClick={goBack}>
                 Back

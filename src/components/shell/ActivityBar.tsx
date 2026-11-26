@@ -13,6 +13,7 @@ import { ICON } from "../../lib/iconSize";
 import { BackupModal } from "./BackupModal";
 import { useRepository } from "../../lib/repository";
 import { useLegacyHistory } from "../../lib/legacyHistory";
+import { shiftLayout } from "../../lib/layoutShift";
 
 export type ActivityView = "changes" | "map" | "history" | "branches" | "performance";
 
@@ -48,8 +49,11 @@ export function ActivityBar({ active, onChange }: ActivityBarProps) {
   return (
     // py-2 matches the well's padding, so the first chip's top edge and the last
     // chip's bottom edge land exactly on the card edges across the gutter.
-    <nav className="flex w-12 shrink-0 flex-col items-center bg-surface py-2">
-      <div className="flex flex-col items-center gap-2">
+    // Tracked as well as the item group: the outermost tracked row is the wall glides stop at
+    // (layoutShift.ts), and the group has no edge of its own — when a legacy tab is hidden it
+    // shrinks, and the icons below must glide up from where they were.
+    <nav ref={shiftLayout} className="flex w-12 shrink-0 flex-col items-center bg-surface py-2">
+      <div ref={shiftLayout} className="flex flex-col items-center gap-2">
         {ITEMS.filter((i) => legacy || !i.legacy).map(({ view, icon, label }) => (
           <IconButton
             key={view}

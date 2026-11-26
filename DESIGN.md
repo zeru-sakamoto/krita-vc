@@ -308,12 +308,13 @@ Specific to the commit/layer diff view:
 
 ```css
 --ease-out:     cubic-bezier(0.23, 1, 0.32, 1);    /* UI interactions, enter animations */
---ease-in-out:  cubic-bezier(0.77, 0, 0.175, 1);   /* on-screen element movement — reserved, see ‡ */
+--ease-in-out:  cubic-bezier(0.77, 0, 0.175, 1);   /* on-screen element movement (layout shift) */
 --ease-drawer:  cubic-bezier(0.32, 0.72, 0, 1);    /* panel slide-in — reserved, see ‡ */
 ```
 
-`--ease-out` is the working curve; the other two are reserved for interactions the app does not yet
-have (marked ‡ in the timing table below).
+`--ease-out` is the working curve. `--ease-in-out` moves things that are already on screen — a
+button gliding aside when another appears beside it (§ Layout shift below). `--ease-drawer` is
+reserved for an interaction the app does not yet have (marked ‡ in the timing table below).
 
 Never use `ease-in` on UI elements — it starts slow and makes the interface feel unresponsive.
 
@@ -335,6 +336,9 @@ Never use `ease-in` on UI elements — it starts slow and makes the interface fe
 | Dropdown / menu   | `--dur-normal` | `--ease-out` | `scale(0.95)` + `opacity: 0→1` |
 | Modal open        | `--dur-slow`   | `--ease-out` | `scale(0.97)` + `opacity: 0→1` |
 | **Any of the three closing** | `--dur-fast` | `--ease-out` | reverse of its open |
+| Layout shift — a sibling moves | `--dur-normal` | `--ease-in-out` | `translate(old − new) → 0` |
+| Layout shift — a child appears | `--dur-fast` | `--ease-out` | `scale(0.97)` + `opacity: 0→1` |
+| Modal resize (content changed) | `--dur-normal` | `--ease-in-out` | `height` old → new — the one sanctioned layout animation, see § Layout shift |
 | *Panel slide-in* ‡ | `280ms`       | `--ease-drawer` | `translateX(-100%)→0`       |
 | *Diff row expand* ‡ | `--dur-normal` | `--ease-in-out` | height + `opacity: 0→1`   |
 
@@ -361,12 +365,50 @@ dialog is finished, not dismissed.
 While exiting, a surface is still in the DOM. It must be `pointer-events-none` so it cannot swallow
 a click aimed at what is behind it.
 
-‡ **Aspirational — no shipped surface uses these two rows**, and `--ease-drawer` / `--ease-in-out`
-are consequently defined in `global.css` and referenced nowhere. They are kept because both
+‡ **Aspirational — no shipped surface uses these two rows**, and `--ease-drawer` is consequently
+defined in `global.css` and referenced nowhere (`--ease-in-out` is used by layout shift, but not
+for a row expand). They are kept because both
 interactions are plausible additions and the curves should be decided once rather than improvised at
 the moment one is needed. Treat them as reserved, not as describing current behaviour: don't cite
 either row as precedent, and if a panel slide-in or a row expand actually lands, that is the moment
 to confirm the curve is right rather than inherit it unexamined.
+
+### Layout shift
+
+When something appears, disappears or changes width in a row, its neighbours **glide** to their
+new spot instead of jumping: a button sliding aside as another appears beside it, the Next button
+holding still while Back fades in next to it. One primitive does it everywhere —
+`shiftLayout` (`src/lib/layoutShift.ts`), a ref callback put on the row
+(`<div ref={shiftLayout}>`) that animates that row's direct children. It is FLIP on
+`transform` only, so it never animates layout properties, and it is applied to `PanelHeader`
+(both the header and its `actions` slot, so every card header and docker title bar gets it),
+`Modal`'s footer, the status bar, the activity bar, the top bar, the Version Map's header controls
+and floating action bar, the Changes header, the diff file header and the tour callout's buttons.
+
+- A removed child just vanishes (React has already dropped it); only its neighbours glide.
+- A row resized **from outside** (sidebar drag, window resize) doesn't animate — children follow
+  the drag 1:1. A change *inside* the row always animates.
+- Nested tracked rows are **one system**: everything is measured against the outermost tracked
+  row, and a resized item moves by its steadiest edge. A flush-right button stays against the
+  container's wall when something to its left widens. Gliding each level as a rigid block
+  composed wrongly whenever a box resized, and it pushed the map header's last button into the
+  padding.
+- **The outermost tracked row is a wall.** No glide starts outside its content box (inside the
+  padding or past the border); an item that would is clamped and glides along the edge. So that
+  row has to be the one with the *visible* edge. The status bar and activity bar track their
+  outer `footer`/`nav` as well as the inner group for exactly this reason: the inner groups have
+  no edge of their own, and as the root they would clamp a legitimate glide whenever they shrank.
+- Not for long or virtualized lists (every check measures each child), and not inside React Flow
+  nodes.
+- Reduced motion: neighbours land instantly, an appearing child only fades.
+
+**Modal resize is the one place `height` animates** (`glideHeight` in `Modal.tsx`). When a
+modal's content changes (a Settings tab switch, a confirm field appearing), the panel eases
+between its old and new height instead of snapping. A transform-only fake was worse: clipping the
+panel to the old size also clips its drop shadow, and the footer would have to slide over content
+that shows through the translucent glass. The rule below exists for layout dirtied *every frame
+under a pointer*. This runs once per content change, for 220 ms, and the panel's width never
+changes, so no text reflows. Don't take it as precedent for animating height elsewhere.
 
 ### Principles
 

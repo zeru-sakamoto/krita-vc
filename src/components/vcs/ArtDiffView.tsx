@@ -24,6 +24,7 @@ import { ArtCanvas, type HighlightMode } from "./ArtCanvas";
 import { CompareSlider } from "./CompareSlider";
 import { LayerStackPanel, COMPOSITE_ID, PALETTE_ID } from "./LayerStackPanel";
 import { PaletteDiffView } from "./PaletteDiffView";
+import { shiftLayout } from "../../lib/layoutShift";
 
 type ViewMode = "split" | "slider";
 
@@ -261,7 +262,10 @@ export function ArtDiffView({
   return (
     <div className="flex flex-col border-b border-border flex-1 min-h-0">
       {/* File header */}
-      <div className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 h-8">
+      <div
+        ref={shiftLayout}
+        className="sticky top-0 z-(--z-sticky) flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 h-8"
+      >
         <FileStatusChip status={diff.status} />
         <span
           className={[

@@ -522,6 +522,18 @@ because timing is per-machine and belongs with the browser, not the repo).
   unmounts on `transitionend`, and its `footer` is a render prop so a Cancel animates like an
   Escape). Type sizes come from the six `text-*` tokens and icon sizes from `ICON`
   (`src/lib/iconSize.ts`) — an arbitrary `text-[Npx]` or a literal `size={N}` is a bug.
+  **Layout shift**: a row whose children appear, vanish or resize takes `ref={shiftLayout}`
+  (`src/lib/layoutShift.ts`, a React 19 ref callback with cleanup — no hook), which FLIP-glides
+  its direct children with `transform` only (`--ease-in-out`, `--dur-normal`; an appearing child
+  fades/scales in). Nested tracked rows are measured as **one system** against the outermost
+  one (never composed per level as rigid blocks, which pushed a flush-right button into its
+  header's padding whenever a box beside it resized), and a resized item moves by its steadiest
+  edge (min of left/right/centre delta). No glide starts outside the outermost tracked row's
+  content box, so that row must be the one with the visible edge (why `StatusBar`/`ActivityBar`
+  track their `footer`/`nav` too). Rows resized from outside don't animate. `Modal` also eases its
+  own **height** when its content changes (`glideHeight`, triggered by body mutations — the
+  sanctioned exception to transform-only motion, reasoning in DESIGN.md). See
+  DESIGN.md → Motion System → Layout shift.
   Two app-wide pieces live in `src/lib/` rather than here because neither is a control:
   **`toast.tsx`** is a single-slot global toast (`ToastProvider` in `App.tsx`, `useToast().show`;
   a new `show` replaces the old one — a low-frequency manual action like a backup needs a brief

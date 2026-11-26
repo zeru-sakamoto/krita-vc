@@ -12,6 +12,7 @@ import { useRepository } from "../../lib/repository";
 import { useWindowChrome } from "../../lib/windowChrome";
 import { inTauri } from "../../lib/tauri";
 import type { Repository } from "../../types";
+import { shiftLayout } from "../../lib/layoutShift";
 
 // Restoring a backup is rare, so its screens load when first needed rather than with the app.
 const RestoreModal = lazy(() =>
@@ -48,6 +49,7 @@ export function TopBar() {
 
   return (
     <header
+      ref={shiftLayout}
       className="flex h-11 shrink-0 items-center bg-surface pr-2"
       {...(showWindowControls ? { "data-tauri-drag-region": true } : {})}
     >
